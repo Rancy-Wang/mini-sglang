@@ -39,11 +39,20 @@ def make_positions(device: torch.device, reqs: List[Req]) -> torch.Tensor:
     offset = 0
     for req in reqs:
         length = req.extend_len
-        torch.arange(
-            req.cached_len,
-            req.device_len,
-            dtype=torch.int32,
-            out=indices_host[offset : offset + length],
-        )
+        if req.true_seq_len is not None:
+            torch.arange(
+                req.true_seq_len,
+                req.true_seq_len+length,
+                dtype=torch.int32,
+                out=indices_host[offset : offset + length],
+            )
+            req.true_seq_len += length
+        else:
+            torch.arange(
+                req.cached_len,
+                req.device_len,
+                dtype=torch.int32,
+                out=indices_host[offset : offset + length],
+            )
         offset += length
     return indices_host.to(device, non_blocking=True)

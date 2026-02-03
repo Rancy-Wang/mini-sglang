@@ -29,6 +29,7 @@ class DetokenizeMsg(BaseTokenizerMsg):
     uid: int
     next_token: int
     finished: bool
+    table_idx: int | None = None
 
 
 @dataclass

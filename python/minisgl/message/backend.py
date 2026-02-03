@@ -34,3 +34,8 @@ class UserMsg(BaseBackendMsg):
     uid: int
     input_ids: torch.Tensor  # CPU 1D int32 tensor
     sampling_params: SamplingParams
+    table_idx: int | None = None
+    boundaries: List[(int, int, str, int)] | None = None
+    message_id: int | None = None
+    drop_ids: List[int] | None = None
+    new_drop_ids: List[int] | None = None

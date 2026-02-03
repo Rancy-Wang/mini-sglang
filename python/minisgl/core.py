@@ -33,6 +33,10 @@ class Req:
     uid: int
     sampling_params: SamplingParams
     cache_handle: BaseCacheHandle
+    positions: torch.Tensor | None = None  # device tensor
+    drop_ids: List[int] | None = None
+    message_id: int | None = None
+    true_seq_len: int | None = None
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu

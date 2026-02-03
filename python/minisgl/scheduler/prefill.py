@@ -85,6 +85,10 @@ class PrefillAdder:
             uid=pending_req.uid,
             cache_handle=cache_handle,
             sampling_params=pending_req.sampling_params,
+            positions=pending_req.positions,
+            message_id=pending_req.message_id,
+            drop_ids=pending_req.drop_ids,
+            true_seq_len=pending_req.true_seq_len,
         )
 
     def try_add_one(self, pending_req: PendingReq) -> Req | None:
@@ -98,9 +102,37 @@ class PrefillAdder:
                 table_idx=chunked_req.table_idx,
                 cached_len=chunked_req.cached_len,
             )
-
         if resource := self._try_allocate_one(pending_req):
             cache_handle, table_idx = resource
+            if pending_req.table_idx is not None:
+
+                drop_input_ids = torch.tensor([], dtype=pending_req.input_ids.dtype)
+                positions = 0
+                true_seq_len = 0
+                match_indices = torch.tensor([], dtype=torch.int32)
+                seq_len = 0
+                for (start, end, _, msg_id) in pending_req.boundaries:
+                    if msg_id == pending_req.message_id:
+                        break
+                    true_seq_len += end - start
+                    if msg_id in pending_req.new_drop_ids:
+                        seq_len += end - start
+                        continue
+                    elif msg_id in pending_req.drop_ids:
+                        continue
+                    drop_input_ids = torch.cat([drop_input_ids, pending_req.input_ids[start:end]])
+                    positions += end - start
+                    match_indices = torch.cat([match_indices, torch.arange(seq_len, seq_len + end - start, dtype=torch.int32)])
+                    seq_len += end - start
+                pending_req.true_seq_len = true_seq_len
+                pending_req.input_ids = drop_input_ids
+                pending_req.cached_len = positions
+                cache_handle.cached_len = positions
+                device_ids = self.table_manager.token_pool[table_idx][:pending_req.cached_len]
+                page_entry = self.table_manager.page_table[table_idx][:pending_req.cached_len]
+                device_ids.copy_(pending_req.input_ids[match_indices].pin_memory(), non_blocking=True)
+                page_entry.copy_(self.table_manager.page_table[pending_req.table_idx][match_indices].pin_memory(), non_blocking=True)
+                
             return self._add_one_req(
                 pending_req=pending_req,
                 cache_handle=cache_handle,
@@ -119,7 +151,7 @@ class PrefillManager:
     pending_list: List[PendingReq] = field(default_factory=list)
 
     def add_one_req(self, req: UserMsg) -> None:
-        self.pending_list.append(PendingReq(req.uid, req.input_ids, req.sampling_params))
+        self.pending_list.append(PendingReq(req.uid, req.input_ids, req.sampling_params, req.table_idx, req.boundaries, req.message_id, req.drop_ids, req.new_drop_ids))
 
     def schedule_next_batch(self, prefill_budget: int) -> Batch | None:
         if len(self.pending_list) == 0:

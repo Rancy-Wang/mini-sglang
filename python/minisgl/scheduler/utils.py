@@ -17,6 +17,12 @@ class PendingReq:
     input_ids: torch.Tensor
     sampling_params: SamplingParams
     chunked_req: ChunkedReq | None = None
+    table_idx: int | None = None
+    boundaries: List[(int, int, str, int)] | None = None
+    message_id: int | None = None
+    drop_ids: List[int] | None = None
+    new_drop_ids: List[int] | None = None
+    true_seq_len: int | None = None
 
     @property
     def input_len(self) -> int:
