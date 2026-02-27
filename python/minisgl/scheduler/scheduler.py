@@ -102,12 +102,18 @@ class Scheduler(SchedulerIOMixin):
         # free resources for finished but not ongoing reqs
         ongoing_reqs = ongoing_data[0].batch.reqs if ongoing_data else []
         for req in self.finished_reqs.difference(ongoing_reqs):
-            self.table_manager.free(req.table_idx)
-            self.cache_manager.free_and_cache_finished_req(
-                req.cache_handle,
-                req.input_ids[: req.cached_len],
-                self.page_table[req.table_idx, : req.cached_len],
-            )
+            if req.is_table_reuse:
+                # For reused table_idx: keep table slot and pages allocated, track only NEW pages as protected
+                new_pages = req.cached_len - req.previous_cached_len
+                self.cache_manager.add_protected_pages(new_pages)
+            else:
+                # Normal path: free table slot and cache pages
+                self.table_manager.free(req.table_idx)
+                self.cache_manager.free_and_cache_finished_req(
+                    req.cache_handle,
+                    req.input_ids[: req.cached_len],
+                    self.page_table[req.table_idx, : req.cached_len],
+                )
 
         # keep only ongoing reqs in the finished set
         self.finished_reqs.intersection_update(ongoing_reqs)

@@ -16,6 +16,15 @@ class CacheManager:
         self.device = device
         self.manager = create_cache_manager(device=device, type=type)
         self.num_pages = num_pages
+        self._manual_protected_size = 0  # Track pages held by reused table_idx
+
+    def add_protected_pages(self, size: int) -> None:
+        """Mark pages as protected (held by reused table_idx)."""
+        self._manual_protected_size += size
+
+    def remove_protected_pages(self, size: int) -> None:
+        """Unmark pages as protected."""
+        self._manual_protected_size -= size
 
     def _free(self, indices: torch.Tensor) -> None:
         if len(indices) > 0:
@@ -63,9 +72,10 @@ class CacheManager:
 
     def check_integrity(self) -> None:
         self.manager.check_integrity()
-        if len(self._free_slots) + self.manager.size_info.total_size != self.num_pages:
+        total_size = self.manager.size_info.total_size + self._manual_protected_size
+        if len(self._free_slots) + total_size != self.num_pages:
             raise RuntimeError(
                 "CacheManager integrity check failed:"
                 f" free_slots({len(self._free_slots)}) +"
-                f" total_size({self.manager.size_info.total_size}) != num_pages({self.num_pages})"
+                f" total_size({total_size}) != num_pages({self.num_pages})"
             )

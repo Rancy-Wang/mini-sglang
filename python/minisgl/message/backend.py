@@ -39,3 +39,4 @@ class UserMsg(BaseBackendMsg):
     message_id: int | None = None
     drop_ids: List[int] | None = None
     new_drop_ids: List[int] | None = None
+    true_seq_len: int | None = None

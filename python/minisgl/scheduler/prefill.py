@@ -35,6 +35,48 @@ class PrefillAdder:
     cache_manager: CacheManager
     table_manager: TableManager
 
+    def _compute_physical_indices(
+        self,
+        boundaries: List[Tuple[int, int, str, int]],
+        drop_ids: List[int],
+        current_msg_id: int,
+    ) -> dict:
+        """
+        Compute the physical cache indices for each message based on historical drops.
+
+        After drops, the physical cache is compressed. This method maps each
+        message's absolute boundaries to its actual physical position in the
+        PREVIOUS turn's cache state (before new_drop_ids are applied).
+
+        Args:
+            boundaries: List of (start, end, role, msg_id) for all messages
+            drop_ids: Message IDs that were already dropped in previous rounds
+                      (NOT including new_drop_ids, as those haven't been dropped yet)
+            current_msg_id: The current message being processed
+
+        Returns:
+            Dict mapping msg_id -> (physical_start, physical_end)
+        """
+        dropped = set(drop_ids or [])
+        physical_map = {}
+        physical_offset = 0
+
+        for (start, end, _, msg_id) in boundaries:
+            if msg_id >= current_msg_id:
+                break
+
+            msg_len = end - start
+
+            if msg_id in dropped:
+                # This message was already dropped, skip it
+                continue
+
+            # This message exists in the physical cache
+            physical_map[msg_id] = (physical_offset, physical_offset + msg_len)
+            physical_offset += msg_len
+
+        return physical_map
+
     def _try_allocate_one(self, req: PendingReq) -> Tuple[BaseCacheHandle, int] | None:
         if self.table_manager.available_size == 0:
             return None
@@ -66,6 +108,8 @@ class PrefillAdder:
         cache_handle: BaseCacheHandle,
         table_idx: int,
         cached_len: int,
+        is_table_reuse: bool = False,
+        previous_cached_len: int = 0,
     ) -> Req:
         remain_len = pending_req.input_len - cached_len
         chunk_size = min(self.token_budget, remain_len)
@@ -85,10 +129,11 @@ class PrefillAdder:
             uid=pending_req.uid,
             cache_handle=cache_handle,
             sampling_params=pending_req.sampling_params,
-            positions=pending_req.positions,
             message_id=pending_req.message_id,
             drop_ids=pending_req.drop_ids,
             true_seq_len=pending_req.true_seq_len,
+            is_table_reuse=is_table_reuse,
+            previous_cached_len=previous_cached_len,
         )
 
     def try_add_one(self, pending_req: PendingReq) -> Req | None:
@@ -102,42 +147,100 @@ class PrefillAdder:
                 table_idx=chunked_req.table_idx,
                 cached_len=chunked_req.cached_len,
             )
-        if resource := self._try_allocate_one(pending_req):
-            cache_handle, table_idx = resource
-            if pending_req.table_idx is not None:
 
-                drop_input_ids = torch.tensor([], dtype=pending_req.input_ids.dtype)
-                positions = 0
-                true_seq_len = 0
-                match_indices = torch.tensor([], dtype=torch.int32)
-                seq_len = 0
-                for (start, end, _, msg_id) in pending_req.boundaries:
-                    if msg_id == pending_req.message_id:
-                        break
-                    true_seq_len += end - start
-                    if msg_id in pending_req.new_drop_ids:
-                        seq_len += end - start
-                        continue
-                    elif msg_id in pending_req.drop_ids:
-                        continue
-                    drop_input_ids = torch.cat([drop_input_ids, pending_req.input_ids[start:end]])
-                    positions += end - start
-                    match_indices = torch.cat([match_indices, torch.arange(seq_len, seq_len + end - start, dtype=torch.int32)])
-                    seq_len += end - start
-                pending_req.true_seq_len = true_seq_len
-                pending_req.input_ids = drop_input_ids
-                pending_req.cached_len = positions
-                cache_handle.cached_len = positions
-                device_ids = self.table_manager.token_pool[table_idx][:pending_req.cached_len]
-                page_entry = self.table_manager.page_table[table_idx][:pending_req.cached_len]
-                device_ids.copy_(pending_req.input_ids[match_indices].pin_memory(), non_blocking=True)
-                page_entry.copy_(self.table_manager.page_table[pending_req.table_idx][match_indices].pin_memory(), non_blocking=True)
-                
+        # Table reuse path: reconstruct KV cache with correct physical indices after drops
+        if pending_req.table_idx is not None and pending_req.boundaries is not None:
+            # Reusing table_idx - reconstruct retained KV cache without allocating new resources
+            table_idx = pending_req.table_idx
+            retained_input_ids = []
+            retained_page_indices = []
+            true_seq_len = 0
+            cached_len = 0
+            current_msg_start = 0
+
+            # Compute physical indices based on historical drops only
+            # (new_drop_ids haven't been applied yet, so those pages still exist in compressed form)
+            physical_map = self._compute_physical_indices(
+                boundaries=pending_req.boundaries,
+                drop_ids=pending_req.drop_ids,
+                current_msg_id=pending_req.message_id,
+            )
+
+            # Combine all drop IDs for filtering retained messages
+            all_drop_ids = set(pending_req.drop_ids or []) | set(pending_req.new_drop_ids or [])
+
+            for (start, end, _, msg_id) in pending_req.boundaries:
+                if msg_id == pending_req.message_id:
+                    # Found current message start
+                    current_msg_start = start
+                    break
+
+                msg_len = end - start
+                true_seq_len += msg_len  # Always count for absolute position
+
+                # Check if this message should be dropped (either already or now)
+                if msg_id in all_drop_ids:
+                    continue
+
+                # This message is retained
+                # Use physical position for BOTH token_pool and page_table access
+                # (both are stored in compressed form after previous drops)
+                phys_start, phys_end = physical_map[msg_id]
+
+                # Get token ids from token_pool using physical position
+                old_token_ids = self.table_manager.token_pool[table_idx][phys_start:phys_end].cpu()
+                retained_input_ids.append(old_token_ids)
+
+                # Get page indices from page_table using physical position
+                old_pages = self.table_manager.page_table[table_idx][phys_start:phys_end].cpu()
+                retained_page_indices.append(old_pages)
+
+                cached_len += msg_len
+
+            # Reconstruct the table entries and update input_ids
+            if retained_input_ids:
+                new_input_ids = torch.cat(retained_input_ids)
+                new_page_indices = torch.cat(retained_page_indices)
+
+                # Update token_pool and page_table with retained tokens (compacting them)
+                device_ids = self.table_manager.token_pool[table_idx][:cached_len]
+                page_entry = self.table_manager.page_table[table_idx][:cached_len]
+                device_ids.copy_(new_input_ids.pin_memory(), non_blocking=True)
+                page_entry.copy_(new_page_indices.pin_memory(), non_blocking=True)
+
+                # Update input_ids: retained tokens + current message onwards (from original input)
+                pending_req.input_ids = torch.cat([new_input_ids, pending_req.input_ids[current_msg_start:]])
+                print(f"Message {pending_req.message_id}: Reusing table_idx {table_idx} with {cached_len} retained tokens, true_seq_len {true_seq_len}")
+            else:
+                # No retained tokens, just use current message onwards
+                pending_req.input_ids = pending_req.input_ids[current_msg_start:]
+
+            pending_req.cached_len = cached_len
+            pending_req.true_seq_len = true_seq_len
+
+            cache_handle = torch.empty(0, dtype=torch.int32, device=device_ids.device)
+
             return self._add_one_req(
                 pending_req=pending_req,
                 cache_handle=cache_handle,
                 table_idx=table_idx,
-                cached_len=cache_handle.cached_len,
+                cached_len=cached_len,
+                is_table_reuse=True,
+                previous_cached_len=cached_len,  # The reconstructed cache is already protected
+            )
+
+        # Normal path: allocate new resources
+        if resource := self._try_allocate_one(pending_req):
+            cache_handle, table_idx = resource
+            cached_len = 0
+
+            return self._add_one_req(
+                pending_req=pending_req,
+                cache_handle=cache_handle,
+                table_idx=table_idx,
+                cached_len=cached_len,
+                is_table_reuse=False,
+                previous_cached_len=0,
             )
 
         return None
@@ -151,7 +254,17 @@ class PrefillManager:
     pending_list: List[PendingReq] = field(default_factory=list)
 
     def add_one_req(self, req: UserMsg) -> None:
-        self.pending_list.append(PendingReq(req.uid, req.input_ids, req.sampling_params, req.table_idx, req.boundaries, req.message_id, req.drop_ids, req.new_drop_ids))
+        self.pending_list.append(PendingReq(
+            uid=req.uid,
+            input_ids=req.input_ids,
+            sampling_params=req.sampling_params,
+            table_idx=req.table_idx,
+            boundaries=req.boundaries,
+            message_id=req.message_id,
+            drop_ids=req.drop_ids,
+            new_drop_ids=req.new_drop_ids,
+            true_seq_len=req.true_seq_len,
+        ))
 
     def schedule_next_batch(self, prefill_budget: int) -> Batch | None:
         if len(self.pending_list) == 0:

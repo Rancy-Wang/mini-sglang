@@ -37,6 +37,8 @@ class Req:
     drop_ids: List[int] | None = None
     message_id: int | None = None
     true_seq_len: int | None = None
+    is_table_reuse: bool = False  # True if reusing table_idx from previous round
+    previous_cached_len: int = 0  # Cached length already protected in previous rounds
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu
