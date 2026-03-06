@@ -114,6 +114,7 @@ class Scheduler(SchedulerIOMixin):
                     req.input_ids[: req.cached_len],
                     self.page_table[req.table_idx, : req.cached_len],
                 )
+                self.cache_manager.remove_protected_pages(req.previous_cached_len)  # unmark protected pages
 
         # keep only ongoing reqs in the finished set
         self.finished_reqs.intersection_update(ongoing_reqs)

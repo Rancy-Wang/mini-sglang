@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, List, Tuple
 import torch
 from minisgl.core import Batch, Req
 from minisgl.utils import init_logger
+from minisgl.kvcache.naive_manager import NaiveCacheHandle
 
 from .utils import PendingReq
 
@@ -67,7 +68,7 @@ class PrefillAdder:
 
             msg_len = end - start
 
-            if msg_id in dropped:
+            if msg_id in dropped and (not msg_id == current_msg_id - 1):
                 # This message was already dropped, skip it
                 continue
 
@@ -136,6 +137,24 @@ class PrefillAdder:
             previous_cached_len=previous_cached_len,
         )
 
+    def drop_cache_info(
+        self,
+        start: int,
+        end: int,
+        table_idx: int,
+        input_ids: torch.Tensor,
+    ) -> None:
+        # This method is called when a message is dropped, to free up the corresponding cache entries
+        length = end - start
+        tmp_cache_handle = NaiveCacheHandle(0)
+        self.cache_manager.free_and_cache_finished_req(
+            tmp_cache_handle,
+            input_ids,
+            self.table_manager.page_table[table_idx, start: end],
+        )
+        self.cache_manager.remove_protected_pages(length)
+
+
     def try_add_one(self, pending_req: PendingReq) -> Req | None:
         if self.token_budget <= 0:
             return None
@@ -147,10 +166,8 @@ class PrefillAdder:
                 table_idx=chunked_req.table_idx,
                 cached_len=chunked_req.cached_len,
             )
-
-        # Table reuse path: reconstruct KV cache with correct physical indices after drops
+        
         if pending_req.table_idx is not None and pending_req.boundaries is not None:
-            # Reusing table_idx - reconstruct retained KV cache without allocating new resources
             table_idx = pending_req.table_idx
             retained_input_ids = []
             retained_page_indices = []
@@ -180,6 +197,10 @@ class PrefillAdder:
 
                 # Check if this message should be dropped (either already or now)
                 if msg_id in all_drop_ids:
+                    if msg_id in pending_req.new_drop_ids:
+                        phys_start, phys_end = physical_map[msg_id]
+                        tmp_input_ids = self.table_manager.token_pool[table_idx][phys_start:phys_end].cpu()
+                        self.drop_cache_info(phys_start, phys_end, table_idx, tmp_input_ids)
                     continue
 
                 # This message is retained
@@ -210,7 +231,6 @@ class PrefillAdder:
 
                 # Update input_ids: retained tokens + current message onwards (from original input)
                 pending_req.input_ids = torch.cat([new_input_ids, pending_req.input_ids[current_msg_start:]])
-                print(f"Message {pending_req.message_id}: Reusing table_idx {table_idx} with {cached_len} retained tokens, true_seq_len {true_seq_len}")
             else:
                 # No retained tokens, just use current message onwards
                 pending_req.input_ids = pending_req.input_ids[current_msg_start:]
@@ -218,14 +238,14 @@ class PrefillAdder:
             pending_req.cached_len = cached_len
             pending_req.true_seq_len = true_seq_len
 
-            cache_handle = torch.empty(0, dtype=torch.int32, device=device_ids.device)
+            cache_handle = NaiveCacheHandle(0)
 
             return self._add_one_req(
                 pending_req=pending_req,
                 cache_handle=cache_handle,
                 table_idx=table_idx,
                 cached_len=cached_len,
-                is_table_reuse=True,
+                is_table_reuse=pending_req.is_table_reuse,
                 previous_cached_len=cached_len,  # The reconstructed cache is already protected
             )
 
@@ -239,7 +259,7 @@ class PrefillAdder:
                 cache_handle=cache_handle,
                 table_idx=table_idx,
                 cached_len=cached_len,
-                is_table_reuse=False,
+                is_table_reuse=pending_req.is_table_reuse if pending_req.is_table_reuse else False,
                 previous_cached_len=0,
             )
 
@@ -264,6 +284,7 @@ class PrefillManager:
             drop_ids=req.drop_ids,
             new_drop_ids=req.new_drop_ids,
             true_seq_len=req.true_seq_len,
+            is_table_reuse=req.is_table_reuse,  # Pass from frontend
         ))
 
     def schedule_next_batch(self, prefill_budget: int) -> Batch | None:
