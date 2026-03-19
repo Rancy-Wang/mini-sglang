@@ -109,8 +109,6 @@ class PrefillAdder:
         cache_handle: BaseCacheHandle,
         table_idx: int,
         cached_len: int,
-        is_table_reuse: bool = False,
-        previous_cached_len: int = 0,
     ) -> Req:
         remain_len = pending_req.input_len - cached_len
         chunk_size = min(self.token_budget, remain_len)
@@ -133,27 +131,7 @@ class PrefillAdder:
             message_id=pending_req.message_id,
             drop_ids=pending_req.drop_ids,
             true_seq_len=pending_req.true_seq_len,
-            is_table_reuse=is_table_reuse,
-            previous_cached_len=previous_cached_len,
         )
-
-    def drop_cache_info(
-        self,
-        start: int,
-        end: int,
-        table_idx: int,
-        input_ids: torch.Tensor,
-    ) -> None:
-        # This method is called when a message is dropped, to free up the corresponding cache entries
-        length = end - start
-        tmp_cache_handle = NaiveCacheHandle(0)
-        self.cache_manager.free_and_cache_finished_req(
-            tmp_cache_handle,
-            input_ids,
-            self.table_manager.page_table[table_idx, start: end],
-        )
-        self.cache_manager.remove_protected_pages(length)
-
 
     def try_add_one(self, pending_req: PendingReq) -> Req | None:
         if self.token_budget <= 0:
@@ -166,88 +144,118 @@ class PrefillAdder:
                 table_idx=chunked_req.table_idx,
                 cached_len=chunked_req.cached_len,
             )
-        
+
         if pending_req.table_idx is not None and pending_req.boundaries is not None:
-            table_idx = pending_req.table_idx
-            retained_input_ids = []
-            retained_page_indices = []
-            true_seq_len = 0
-            cached_len = 0
-            current_msg_start = 0
+            reuse_key = hash(pending_req.uid)
+            reuse_info = self.table_manager.get_reuse_info(reuse_key)
 
-            # Compute physical indices based on historical drops only
-            # (new_drop_ids haven't been applied yet, so those pages still exist in compressed form)
-            physical_map = self._compute_physical_indices(
-                boundaries=pending_req.boundaries,
-                drop_ids=pending_req.drop_ids,
-                current_msg_id=pending_req.message_id,
-            )
+            if reuse_info is not None:
+                old_table_idx, old_cached_len = reuse_info
 
-            # Combine all drop IDs for filtering retained messages
-            all_drop_ids = set(pending_req.drop_ids or []) | set(pending_req.new_drop_ids or [])
+                if self.table_manager.available_size == 0:
+                    return None
 
-            for (start, end, _, msg_id) in pending_req.boundaries:
-                if msg_id == pending_req.message_id:
-                    # Found current message start
-                    current_msg_start = start
-                    break
+                new_table_idx = self.table_manager.allocate()
 
-                msg_len = end - start
-                true_seq_len += msg_len  # Always count for absolute position
+                # Compute physical positions in old table (based on historical drops only)
+                physical_map = self._compute_physical_indices(
+                    boundaries=pending_req.boundaries,
+                    drop_ids=pending_req.drop_ids,
+                    current_msg_id=pending_req.message_id,
+                )
 
-                # Check if this message should be dropped (either already or now)
-                if msg_id in all_drop_ids:
-                    if msg_id in pending_req.new_drop_ids:
-                        phys_start, phys_end = physical_map[msg_id]
-                        tmp_input_ids = self.table_manager.token_pool[table_idx][phys_start:phys_end].cpu()
-                        self.drop_cache_info(phys_start, phys_end, table_idx, tmp_input_ids)
-                    continue
+                # Combine all drop IDs
+                all_drop_ids = set(pending_req.drop_ids or []) | set(pending_req.new_drop_ids or [])
 
-                # This message is retained
-                # Use physical position for BOTH token_pool and page_table access
-                # (both are stored in compressed form after previous drops)
-                phys_start, phys_end = physical_map[msg_id]
+                retained_indices = []
+                retained_tokens = []
+                dropped_indices = []  # page indices to free immediately
+                true_seq_len = 0
+                cached_len = 0
+                current_msg_start = 0
 
-                # Get token ids from token_pool using physical position
-                old_token_ids = self.table_manager.token_pool[table_idx][phys_start:phys_end].cpu()
-                retained_input_ids.append(old_token_ids)
+                for (start, end, _, msg_id) in pending_req.boundaries:
+                    if msg_id == pending_req.message_id:
+                        current_msg_start = start
+                        break
 
-                # Get page indices from page_table using physical position
-                old_pages = self.table_manager.page_table[table_idx][phys_start:phys_end].cpu()
-                retained_page_indices.append(old_pages)
+                    msg_len = end - start
+                    true_seq_len += msg_len  # Always count for absolute position
 
-                cached_len += msg_len
+                    if msg_id in all_drop_ids:
+                        # Dropped message — collect page indices for immediate freeing
+                        # Only if it has a physical position (not already historically dropped)
+                        if msg_id in physical_map:
+                            phys_start, phys_end = physical_map[msg_id]
+                            dropped_indices.append(
+                                self.table_manager.page_table[old_table_idx][phys_start:phys_end].clone()
+                            )
+                        continue
 
-            # Reconstruct the table entries and update input_ids
-            if retained_input_ids:
-                new_input_ids = torch.cat(retained_input_ids)
-                new_page_indices = torch.cat(retained_page_indices)
+                    if msg_id not in physical_map:
+                        continue
 
-                # Update token_pool and page_table with retained tokens (compacting them)
-                device_ids = self.table_manager.token_pool[table_idx][:cached_len]
-                page_entry = self.table_manager.page_table[table_idx][:cached_len]
-                device_ids.copy_(new_input_ids.pin_memory(), non_blocking=True)
-                page_entry.copy_(new_page_indices.pin_memory(), non_blocking=True)
+                    phys_start, phys_end = physical_map[msg_id]
 
-                # Update input_ids: retained tokens + current message onwards (from original input)
-                pending_req.input_ids = torch.cat([new_input_ids, pending_req.input_ids[current_msg_start:]])
-            else:
-                # No retained tokens, just use current message onwards
-                pending_req.input_ids = pending_req.input_ids[current_msg_start:]
+                    # Extract retained data from old table directly
+                    retained_indices.append(
+                        self.table_manager.page_table[old_table_idx][phys_start:phys_end].cpu()
+                    )
+                    retained_tokens.append(
+                        self.table_manager.token_pool[old_table_idx][phys_start:phys_end].cpu()
+                    )
+                    cached_len += msg_len
 
-            pending_req.cached_len = cached_len
-            pending_req.true_seq_len = true_seq_len
+                # Write retained data to new table
+                if retained_indices:
+                    new_page_indices = torch.cat(retained_indices)
+                    new_token_ids = torch.cat(retained_tokens)
 
-            cache_handle = NaiveCacheHandle(0)
+                    self.table_manager.page_table[new_table_idx][:cached_len].copy_(
+                        new_page_indices.pin_memory(), non_blocking=True
+                    )
+                    self.table_manager.token_pool[new_table_idx][:cached_len].copy_(
+                        new_token_ids.pin_memory(), non_blocking=True
+                    )
 
-            return self._add_one_req(
-                pending_req=pending_req,
-                cache_handle=cache_handle,
-                table_idx=table_idx,
-                cached_len=cached_len,
-                is_table_reuse=pending_req.is_table_reuse,
-                previous_cached_len=cached_len,  # The reconstructed cache is already protected
-            )
+                    # Reconstruct input_ids: [retained tokens] + [current message tokens]
+                    pending_req.input_ids = torch.cat([
+                        new_token_ids, pending_req.input_ids[current_msg_start:]
+                    ])
+                else:
+                    pending_req.input_ids = pending_req.input_ids[current_msg_start:]
+
+                # Mark old table as transferred (ref_count += 1, transferred = True)
+                self.table_manager.mark_as_transferred(
+                    old_table_idx=old_table_idx,
+                    new_table_idx=new_table_idx,
+                    new_cached_len=cached_len,
+                    reuse_key=reuse_key,
+                )
+
+                # Immediately free dropped messages' page indices
+                if dropped_indices:
+                    freed = torch.cat(dropped_indices)
+                    self.cache_manager._free(freed.to(self.cache_manager.device))
+
+                pending_req.cached_len = cached_len
+                pending_req.true_seq_len = true_seq_len
+
+                cache_handle = NaiveCacheHandle(0)
+
+                req = self._add_one_req(
+                    pending_req=pending_req,
+                    cache_handle=cache_handle,
+                    table_idx=new_table_idx,
+                    cached_len=cached_len,
+                )
+                # Record old_table_idx for later cleanup in _process_last_data
+                req.source_old_table_idx = old_table_idx
+                return req
+
+            # Fallback: table_idx provided but not in reuse map (first round)
+            # Fall through to normal allocation
+            pass
 
         # Normal path: allocate new resources
         if resource := self._try_allocate_one(pending_req):
@@ -259,8 +267,6 @@ class PrefillAdder:
                 cache_handle=cache_handle,
                 table_idx=table_idx,
                 cached_len=cached_len,
-                is_table_reuse=pending_req.is_table_reuse if pending_req.is_table_reuse else False,
-                previous_cached_len=0,
             )
 
         return None
@@ -284,7 +290,6 @@ class PrefillManager:
             drop_ids=req.drop_ids,
             new_drop_ids=req.new_drop_ids,
             true_seq_len=req.true_seq_len,
-            is_table_reuse=req.is_table_reuse,  # Pass from frontend
         ))
 
     def schedule_next_batch(self, prefill_budget: int) -> Batch | None:

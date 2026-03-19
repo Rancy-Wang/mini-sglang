@@ -23,7 +23,6 @@ class PendingReq:
     drop_ids: List[int] | None = None
     new_drop_ids: List[int] | None = None
     true_seq_len: int | None = None
-    is_table_reuse: bool = False  # Set by frontend for throwaway context
 
     @property
     def input_len(self) -> int:

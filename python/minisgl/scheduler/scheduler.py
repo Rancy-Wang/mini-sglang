@@ -57,7 +57,7 @@ class Scheduler(SchedulerIOMixin):
 
         # initialize other managers
         self.table_manager = TableManager(config.max_running_req, self.engine.page_table)
-        self.cache_manager = CacheManager(self.device, self.engine.num_pages, config.cache_type)
+        self.cache_manager = CacheManager(self.device, self.engine.num_pages, config.cache_type, table_manager=self.table_manager)
         self.decode_manager = DecodeManager()
         self.prefill_manager = PrefillManager(
             self.cache_manager, self.table_manager, self.decode_manager
@@ -102,19 +102,26 @@ class Scheduler(SchedulerIOMixin):
         # free resources for finished but not ongoing reqs
         ongoing_reqs = ongoing_data[0].batch.reqs if ongoing_data else []
         for req in self.finished_reqs.difference(ongoing_reqs):
-            if req.is_table_reuse:
-                # For reused table_idx: keep table slot and pages allocated, track only NEW pages as protected
-                new_pages = req.cached_len - req.previous_cached_len
-                self.cache_manager.add_protected_pages(new_pages)
+            reuse_key = hash(req.uid) if hasattr(req, 'uid') and req.uid is not None else None
+            old_table_idx = getattr(req, 'source_old_table_idx', None)
+
+            if reuse_key is not None:
+                # Store current table for future reuse, handle old table cleanup
+                self.table_manager.store_for_reuse(
+                    table_idx=req.table_idx,
+                    cached_len=req.cached_len,
+                    reuse_key=reuse_key,
+                    old_table_idx=old_table_idx,
+                )
+                # Do NOT free req.table_idx — it's preserved for reuse
             else:
-                # Normal path: free table slot and cache pages
-                self.table_manager.free(req.table_idx)
+                # Non-contextual request: free page indices normally
                 self.cache_manager.free_and_cache_finished_req(
                     req.cache_handle,
                     req.input_ids[: req.cached_len],
                     self.page_table[req.table_idx, : req.cached_len],
                 )
-                self.cache_manager.remove_protected_pages(req.previous_cached_len)  # unmark protected pages
+                self.table_manager.free(req.table_idx)
 
         # keep only ongoing reqs in the finished set
         self.finished_reqs.intersection_update(ongoing_reqs)

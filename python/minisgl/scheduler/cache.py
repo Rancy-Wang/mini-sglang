@@ -10,21 +10,13 @@ if TYPE_CHECKING:
 
 
 class CacheManager:
-    def __init__(self, device: torch.device, num_pages: int, type: str):
+    def __init__(self, device: torch.device, num_pages: int, type: str, table_manager=None):
         # TODO: support page_size > 1
         self._free_slots = torch.arange(num_pages, dtype=torch.int32, device=device)
         self.device = device
-        self.manager = create_cache_manager(device=device, type=type)
+        self._table_manager = table_manager
+        self.manager = create_cache_manager(device=device, type=type, table_manager=table_manager)
         self.num_pages = num_pages
-        self._manual_protected_size = 0  # Track pages held by reused table_idx
-
-    def add_protected_pages(self, size: int) -> None:
-        """Mark pages as protected (held by reused table_idx)."""
-        self._manual_protected_size += size
-
-    def remove_protected_pages(self, size: int) -> None:
-        """Unmark pages as protected."""
-        self._manual_protected_size -= size
 
     def _free(self, indices: torch.Tensor) -> None:
         if len(indices) > 0:
@@ -51,8 +43,21 @@ class CacheManager:
             self._free_slots = self._free_slots[needed_len:]
             return allocated
 
-        # NOTE: len(evicted) + free_len >= needed_len
-        evicted = self.manager.evict(needed_len - free_len)
+        # Not enough free slots, try evicting reusable tables one by one
+        if self._table_manager is not None:
+            while len(self._free_slots) < needed_len:
+                evicted = self._table_manager.evict_one()
+                if evicted is None:
+                    break
+                self._free(evicted.to(self.device))
+
+        if needed_len <= (free_len := len(self._free_slots)):
+            allocated = self._free_slots[:needed_len]
+            self._free_slots = self._free_slots[needed_len:]
+            return allocated
+
+        # Fallback to cache manager's own eviction
+        evicted = self.manager.evict(needed_len - len(self._free_slots))
         merged = torch.cat([self._free_slots, evicted])
         assert len(merged) >= needed_len, "Eviction did not free enough space."
 
@@ -72,7 +77,7 @@ class CacheManager:
 
     def check_integrity(self) -> None:
         self.manager.check_integrity()
-        total_size = self.manager.size_info.total_size + self._manual_protected_size
+        total_size = self.manager.size_info.total_size
         if len(self._free_slots) + total_size != self.num_pages:
             raise RuntimeError(
                 "CacheManager integrity check failed:"

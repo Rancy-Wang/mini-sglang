@@ -12,9 +12,10 @@ class NaiveCacheHandle(BaseCacheHandle):
 
 
 class NaiveCacheManager(BaseCacheManager):
-    def __init__(self, device: torch.device):
+    def __init__(self, device: torch.device, table_manager=None):
         self.device = device
         self.empty_tensor = torch.empty(0, dtype=torch.int32, device=device)
+        self._table_manager = table_manager
         super().__init__()
 
     def match_prefix(self, input_ids: torch.Tensor) -> Tuple[NaiveCacheHandle, torch.Tensor]:
@@ -38,7 +39,8 @@ class NaiveCacheManager(BaseCacheManager):
 
     @property
     def size_info(self) -> SizeInfo:
-        return SizeInfo(evictable_size=0, protected_size=0)
+        evictable = self._table_manager.get_occupied_pages() if self._table_manager else 0
+        return SizeInfo(evictable_size=evictable, protected_size=0)
 
     def check_integrity(self) -> None:
         pass

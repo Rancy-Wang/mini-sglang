@@ -18,7 +18,7 @@ from .base import (
 
 
 class CacheManagerCreator(Protocol):
-    def __call__(self, device: torch.device) -> BaseCacheManager: ...
+    def __call__(self, device: torch.device, table_manager=None) -> BaseCacheManager: ...
 
 
 SUPPORTED_CACHE_MANAGER = Registry[CacheManagerCreator]("Cache Manager")
@@ -45,21 +45,21 @@ def create_kvcache(
 
 
 @SUPPORTED_CACHE_MANAGER.register("naive")
-def create_naive_cache_manager(device: torch.device):
+def create_naive_cache_manager(device: torch.device, table_manager=None):
     from .naive_manager import NaiveCacheManager
 
-    return NaiveCacheManager(device=device)
+    return NaiveCacheManager(device=device, table_manager=table_manager)
 
 
 @SUPPORTED_CACHE_MANAGER.register("radix")
-def create_radix_cache_manager(device: torch.device):
+def create_radix_cache_manager(device: torch.device, table_manager=None):
     from .radix_manager import RadixCacheManager
 
     return RadixCacheManager(device=device)
 
 
-def create_cache_manager(device: torch.device, type: str) -> BaseCacheManager:
-    return SUPPORTED_CACHE_MANAGER[type](device)
+def create_cache_manager(device: torch.device, type: str, table_manager=None) -> BaseCacheManager:
+    return SUPPORTED_CACHE_MANAGER[type](device, table_manager)
 
 
 __all__ = [
