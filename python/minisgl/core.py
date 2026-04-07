@@ -28,18 +28,36 @@ class SamplingParams:
 @dataclass(eq=False)
 class Req:
     input_ids: torch.Tensor  # cpu tensor
+    true_positions: torch.Tensor  # cpu tensor, absolute position for each input token
+    radix_input_ids: torch.Tensor  # cpu tensor, int64 encoded key ids for radix
+    radix_match_ids: torch.Tensor  # cpu tensor, full int64 encoded key ids for radix matching
+    initial_full_match_indices: torch.Tensor  # tensor for initially matched full-prefix page indices
+    initial_active_cached_len: int
+    true_seq_len: int
     table_idx: int
     cached_len: int
     output_len: int
     uid: int
     sampling_params: SamplingParams
     cache_handle: BaseCacheHandle
+    prefix_keep_mask: torch.Tensor | None = None  # cpu tensor for full->active prefix filtering
+    is_warmup: bool = False
+    cache_hit_ratio: float = 1.0
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu
+        assert self.true_positions.is_cpu
+        assert self.radix_input_ids.is_cpu
+        assert self.radix_match_ids.is_cpu
+        if self.prefix_keep_mask is not None:
+            assert self.prefix_keep_mask.is_cpu
+        assert len(self.input_ids) == len(self.true_positions)
+        assert len(self.input_ids) == len(self.radix_input_ids)
         self.device_len = len(self.input_ids)
         self.max_device_len = len(self.input_ids) + self.output_len
         assert 0 <= self.cached_len < self.device_len <= self.max_device_len
+        assert 0 <= self.initial_active_cached_len <= self.cached_len
+        assert self.true_seq_len >= int(self.true_positions[self.device_len - 1].item()) + 1
 
     @property
     def remain_len(self) -> int:
@@ -50,11 +68,21 @@ class Req:
         return self.device_len - self.cached_len
 
     def complete_one(self) -> None:
+        # `complete_one` is called immediately after forward.
+        # Update position metadata here so both overlap and normal loops
+        # can schedule the next batch with consistent absolute positions.
         self.cached_len = self.device_len
         self.device_len += 1
+        self.true_seq_len += 1
+        next_pos = torch.tensor([self.true_seq_len - 1], dtype=torch.int32, device="cpu")
+        self.true_positions = torch.cat([self.true_positions, next_pos])
 
     def append_host(self, next_token: torch.Tensor) -> None:
+        # Position is already appended in `complete_one`.
         self.input_ids = torch.cat([self.input_ids, next_token])
+        next_token_key = next_token.to(dtype=torch.int64, device="cpu")
+        self.radix_input_ids = torch.cat([self.radix_input_ids, next_token_key])
+        self.radix_match_ids = torch.cat([self.radix_match_ids, next_token_key])
 
     @property
     def can_decode(self) -> bool:
@@ -64,7 +92,7 @@ class Req:
         return (
             f"{type(self)}(table_idx={self.table_idx}, "
             f"cached_len={self.cached_len}, device_len={self.device_len}, "
-            f"max_device_len={self.max_device_len})"
+            f"true_seq_len={self.true_seq_len}, max_device_len={self.max_device_len})"
         )
 
 

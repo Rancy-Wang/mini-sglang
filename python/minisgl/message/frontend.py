@@ -27,3 +27,10 @@ class UserReply(BaseFrontendMsg):
     uid: int
     incremental_output: str
     finished: bool
+
+
+@dataclass
+class WarmupReply(BaseFrontendMsg):
+    uid: int
+    hit_ratio: float
+    finished: bool

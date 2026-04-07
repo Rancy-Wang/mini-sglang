@@ -1,146 +1,207 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
-from typing import TYPE_CHECKING, List, Tuple
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
-from minisgl.core import Req
-from minisgl.kvcache import BaseCacheHandle, MatchResult, create_prefix_cache
-from minisgl.utils import div_ceil
+from minisgl.kvcache import BaseCacheHandle, create_cache_manager
 
 if TYPE_CHECKING:
     from .utils import PendingReq
 
 
+@dataclass(frozen=True)
+class MatchResult:
+    handle: BaseCacheHandle
+    full_match_indices: torch.Tensor
+    full_cached_len: int
+    active_match_indices: torch.Tensor
+    active_cached_len: int
+
+
 class CacheManager:
-    def __init__(self, num_pages: int, page_size: int, page_table: torch.Tensor, type: str):
-        # The `_free_slots` follows a page-aligned manner. For example, if page_size = 2,
-        # the `_free_slots` may look like [0, 2, 4, 6, ...], and each slot represents a page.
-        device = page_table.device
-        self.free_slots = torch.arange(num_pages, dtype=torch.int32, device=device) * page_size
-        self.prefix_cache = create_prefix_cache(device=device, type=type)
+    def __init__(self, device: torch.device, num_pages: int, type: str):
+        # TODO: support page_size > 1
+        self._free_slots = torch.arange(num_pages, dtype=torch.int32, device=device)
         self.device = device
+        self.manager = create_cache_manager(device=device, type=type)
         self.num_pages = num_pages
-        self.page_table = page_table
-        self.page_size = page_size
-
-    def match_req(self, req: PendingReq) -> MatchResult:
-        input_len = req.input_len
-        assert input_len > 0, "Input length must be greater than 0."
-        return self.prefix_cache.match_prefix(req.input_ids[: input_len - 1])
-
-    @property
-    def available_size(self) -> int:
-        return self.prefix_cache.size_info.evictable_size + len(self.free_slots) * self.page_size
-
-    def lock(self, handle: BaseCacheHandle) -> None:
-        self.prefix_cache.lock_handle(handle, unlock=False)
-
-    def unlock(self, handle: BaseCacheHandle) -> None:
-        self.prefix_cache.lock_handle(handle, unlock=True)
-
-    def allocate_paged(self, reqs: List[Req]) -> None:
-        needed_pages = 0
-        allocation_info: List[Tuple[int, int, int]] = []
-        for req in reqs:
-            first_page = div_ceil(req.cached_len, self.page_size)
-            last_page = div_ceil(req.device_len, self.page_size)
-            if last_page > first_page:
-                needed_pages += last_page - first_page
-                allocation_info.append((req.table_idx, first_page, last_page))
-        if needed_pages > 0:
-            allocated = self._page_to_token(self._allocate(needed_pages))
-            _write_page_table(self.page_table, allocated, allocation_info, self.page_size)
-
-    def cache_req(self, req: Req, *, finished: bool) -> None:
-        # ==================================== valid cache region ====================================
-        # [0, req.cached_len)                       This part is valid for attention kernel read/write.
-        # [0, old_handle.cached_len)                This part is in the prefix cache before prefill.
-        # [old_handle.cached_len, req.cached_len)   This part is allocated by cache manager for this request.
-        # ================================== allocated cache region ==================================
-        # [old_handle.cached_len, cached_len)       This part was not in the prefix cache when prefill,
-        #                                           but later cached by other requests.
-        #                                           We must free them to avoid memory leak.
-        # [cached_len, new_handle.cached_len)       This part is newly inserted into the prefix cache.
-        # [new_handle.cached_len, req.cached_len)   This part is tailing part that can not inserted into the prefix cache.
-        #                                           We should free it if the request has finished.
-        insert_ids = req.input_ids[: req.cached_len]
-        page_indices = self.page_table[req.table_idx, : req.cached_len]
-        old_handle = req.cache_handle
-        cached_len, new_handle = self.prefix_cache.insert_prefix(insert_ids, page_indices)
-        # unlock until all operations on handle is done
-        self.unlock(old_handle)
-        # this part is already in the prefix cache, free it
-        self._free(page_indices[old_handle.cached_len : cached_len])
-        if finished:  # this tail part should be freed
-            self._free(page_indices[new_handle.cached_len :])
-        else:  # keep the tail part, update the handle
-            req.cache_handle = new_handle
-            self.lock(new_handle)
-
-    def check_integrity(self) -> None:
-        self.prefix_cache.check_integrity()
-        cache_pages = self.prefix_cache.size_info.total_size // self.page_size
-        if len(self.free_slots) + cache_pages != self.num_pages:
-            raise RuntimeError(
-                "CacheManager integrity check failed:"
-                f" free_pages({len(self.free_slots)}) +"
-                f" cache_pages({cache_pages}) != num_pages({self.num_pages})"
-            )
-        if self.page_size > 1:
-            assert torch.all(self.free_slots % self.page_size == 0)
-
-    @contextmanager
-    def lazy_free_region(self):
-        def lazy_free(indices: torch.Tensor) -> None:
-            lazy_free_list.append(indices[:: self.page_size])
-
-        lazy_free_list: List[torch.Tensor] = []
-        try:
-            self._free = lazy_free
-            yield
-        finally:
-            del self._free
-            self.free_slots = torch.cat([self.free_slots] + lazy_free_list)
-
-    def _allocate(self, needed_pages: int) -> torch.Tensor:
-        if needed_pages > (free_pages := len(self.free_slots)):
-            evicted = self.prefix_cache.evict((needed_pages - free_pages) * self.page_size)
-            self.free_slots = torch.cat([self.free_slots, evicted[:: self.page_size]])
-            assert len(self.free_slots) >= needed_pages, "Eviction did not free enough space."
-        allocated = self.free_slots[:needed_pages]
-        self.free_slots = self.free_slots[needed_pages:]
-        return allocated
 
     def _free(self, indices: torch.Tensor) -> None:
         if len(indices) > 0:
-            self.free_slots = torch.cat([self.free_slots, indices[:: self.page_size]])
+            self._free_slots = torch.cat([self._free_slots, indices])
 
-    def _page_to_token(self, pages: torch.Tensor) -> torch.Tensor:
-        if self.page_size == 1:
-            return pages
-        # [X * page_size] -> [X * page_size, ..., X * page_size + page_size - 1]
-        offsets = torch.arange(self.page_size, device=self.device, dtype=torch.int32)
-        return (pages.unsqueeze(1) + offsets).flatten()
+    def match_req(self, req: PendingReq) -> MatchResult:
+        assert req.input_len > 0, "Input length must be greater than 0."
+        radix_query = req.radix_match_ids if req.radix_match_ids is not None else req.radix_input_ids
+        query_len = len(radix_query)
+        handle, full_match_indices = self.manager.match_prefix(radix_query[: query_len - 1])
+        active_match_indices = full_match_indices
+        if req.prefix_keep_mask is not None and len(full_match_indices) > 0:
+            if len(req.prefix_keep_mask) < len(full_match_indices):
+                raise RuntimeError(
+                    "prefix_keep_mask is shorter than matched full prefix:"
+                    f" {len(req.prefix_keep_mask)} < {len(full_match_indices)}"
+                )
+            keep_mask = (req.prefix_keep_mask[: len(full_match_indices)] != 0).to(
+                device=full_match_indices.device, dtype=torch.bool, non_blocking=True
+            )
+            active_match_indices = full_match_indices[keep_mask]
+        if len(active_match_indices) > 0 and bool(torch.any(active_match_indices < 0).item()):
+            raise RuntimeError("Active matched indices contain invalid negative slots.")
 
+        return MatchResult(
+            handle=handle,
+            full_match_indices=full_match_indices,
+            full_cached_len=handle.cached_len,
+            active_match_indices=active_match_indices,
+            active_cached_len=len(active_match_indices),
+        )
 
-def _write_page_table(
-    page_table: torch.Tensor,
-    allocated: torch.Tensor,
-    allocation_info: List[Tuple[int, int, int]],
-    page_size: int,
-) -> None:
-    needed_tokens = len(allocated)
-    table_idx_host = torch.empty(needed_tokens, dtype=torch.int64, pin_memory=True)
-    positions_host = torch.empty(needed_tokens, dtype=torch.int64, pin_memory=True)
-    offset = 0
-    for table_idx, first_page, last_page in allocation_info:
-        first_pos, last_pos = first_page * page_size, last_page * page_size
-        length = last_pos - first_pos
-        table_idx_host[offset : offset + length].fill_(table_idx)
-        torch.arange(first_pos, last_pos, out=positions_host[offset : offset + length])
-        offset += length
-    assert offset == needed_tokens, "Mismatch in allocated tokens and filled tokens."
-    table_idxs = table_idx_host.to(page_table.device, non_blocking=True)
-    offsets = positions_host.to(page_table.device, non_blocking=True)
-    page_table[table_idxs, offsets] = allocated
+    @property
+    def available_size(self) -> int:
+        return self.manager.size_info.evictable_size + len(self._free_slots)
+
+    def lock(self, handle: BaseCacheHandle) -> None:
+        self.manager.lock_handle(handle, unlock=False)
+
+    def unlock(self, handle: BaseCacheHandle) -> None:
+        self.manager.lock_handle(handle, unlock=True)
+
+    def allocate(self, needed_len: int) -> torch.Tensor:
+        if needed_len <= (free_len := len(self._free_slots)):
+            allocated = self._free_slots[:needed_len]
+            self._free_slots = self._free_slots[needed_len:]
+            return allocated
+
+        # NOTE: len(evicted) + free_len >= needed_len
+        evicted = self.manager.evict(needed_len - free_len)
+        merged = torch.cat([self._free_slots, evicted])
+        assert len(merged) >= needed_len, "Eviction did not free enough space."
+
+        allocated = merged[:needed_len]
+        self._free_slots = merged[needed_len:]
+        return allocated
+
+    def free_and_cache_finished_req(
+        self,
+        old_handle: BaseCacheHandle,
+        full_radix_ids: torch.Tensor,
+        active_indices: torch.Tensor,
+        active_true_positions: torch.Tensor,
+        initial_full_match_indices: torch.Tensor,
+        initial_active_cached_len: int,
+        prefix_keep_mask: torch.Tensor | None = None,
+    ) -> None:
+        old_full_cached_len = old_handle.cached_len
+        try:
+            if len(active_indices) != len(active_true_positions):
+                raise RuntimeError(
+                    "Length mismatch for active_indices and active_true_positions:"
+                    f" {len(active_indices)} vs {len(active_true_positions)}"
+                )
+            if len(active_indices) == 0:
+                raise RuntimeError("Cannot cache finished req with empty active indices.")
+
+            full_cached_len = int(active_true_positions[-1].item()) + 1
+            if full_cached_len > len(full_radix_ids):
+                raise RuntimeError(
+                    f"Full cached length {full_cached_len} exceeds full_radix_ids length {len(full_radix_ids)}."
+                )
+            if full_cached_len < old_full_cached_len:
+                raise RuntimeError(
+                    "Full cached length regressed below old cached length:"
+                    f" {full_cached_len} < {old_full_cached_len}"
+                )
+            if old_full_cached_len > len(initial_full_match_indices):
+                raise RuntimeError(
+                    "Initial full match indices are shorter than old cached length:"
+                    f" {len(initial_full_match_indices)} < {old_full_cached_len}"
+                )
+
+            full_indices = torch.full(
+                (full_cached_len,), -1, dtype=torch.int32, device=active_indices.device
+            )
+            filled = torch.zeros((full_cached_len,), dtype=torch.bool, device=active_indices.device)
+
+            if old_full_cached_len > 0:
+                full_indices[:old_full_cached_len] = initial_full_match_indices[:old_full_cached_len]
+                filled[:old_full_cached_len] = True
+
+            full_positions = active_true_positions.to(
+                dtype=torch.int64, device=active_indices.device, non_blocking=True
+            )
+            if bool(torch.any(full_positions < 0).item()) or bool(
+                torch.any(full_positions >= full_cached_len).item()
+            ):
+                raise RuntimeError("Encountered out-of-range true position while reconstructing full indices.")
+
+            overlap = full_positions < old_full_cached_len
+            if bool(torch.any(overlap).item()):
+                overlap_positions = full_positions[overlap]
+                seeded_overlap = full_indices[overlap_positions]
+                active_overlap = active_indices[overlap]
+                if not torch.equal(seeded_overlap, active_overlap):
+                    raise RuntimeError(
+                        "Mismatch between initial full-match indices and active mapped indices"
+                        " in already-cached overlap region."
+                    )
+
+            full_indices[full_positions] = active_indices
+            filled[full_positions] = True
+            if not bool(torch.all(filled).item()):
+                missing = ~filled
+                expected_keep = torch.ones(
+                    (full_cached_len,), dtype=torch.bool, device=active_indices.device
+                )
+                if prefix_keep_mask is not None and len(prefix_keep_mask) > 0:
+                    keep_len = min(len(prefix_keep_mask), full_cached_len)
+                    expected_keep[:keep_len] = (prefix_keep_mask[:keep_len] != 0).to(
+                        device=active_indices.device, dtype=torch.bool, non_blocking=True
+                    )
+
+                unexpected_missing = missing & expected_keep
+                if bool(torch.any(unexpected_missing).item()):
+                    missing_positions = torch.nonzero(unexpected_missing, as_tuple=False).view(-1)
+                    missing_preview = missing_positions[:16].tolist()
+                    raise RuntimeError(
+                        "Failed to reconstruct full-index mapping for kept positions;"
+                        f" missing kept positions (first 16): {missing_preview}"
+                    )
+
+                dropped_missing = missing & (~expected_keep)
+                full_indices[dropped_missing] = -1
+                filled[dropped_missing] = True
+
+            if not bool(torch.all(filled).item()):
+                missing_positions = torch.nonzero(~filled, as_tuple=False).view(-1)
+                missing_preview = missing_positions[:16].tolist()
+                raise RuntimeError(
+                    "Failed to reconstruct complete full-index mapping for finished request;"
+                    f" missing positions (first 16): {missing_preview}"
+                )
+
+            in_cache_full_len = self.manager.insert_prefix(
+                full_radix_ids[:full_cached_len], full_indices
+            )
+
+            active_slots = torch.arange(
+                len(active_indices), device=active_indices.device, dtype=torch.int64
+            )
+            dedup_mask = (
+                (active_slots >= initial_active_cached_len)
+                & (full_positions >= old_full_cached_len)
+                & (full_positions < in_cache_full_len)
+            )
+            self._free(active_indices[dedup_mask])
+        finally:
+            self.unlock(old_handle)
+
+    def check_integrity(self) -> None:
+        self.manager.check_integrity()
+        if len(self._free_slots) + self.manager.size_info.total_size != self.num_pages:
+            raise RuntimeError(
+                "CacheManager integrity check failed:"
+                f" free_slots({len(self._free_slots)}) +"
+                f" total_size({self.manager.size_info.total_size}) != num_pages({self.num_pages})"
+            )

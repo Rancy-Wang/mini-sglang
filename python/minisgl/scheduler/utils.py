@@ -15,7 +15,15 @@ if TYPE_CHECKING:
 class PendingReq:
     uid: int
     input_ids: torch.Tensor
+    true_positions: torch.Tensor
+    radix_input_ids: torch.Tensor
+    radix_match_ids: torch.Tensor | None
     sampling_params: SamplingParams
+    initial_full_match_indices: torch.Tensor | None = None
+    initial_active_cached_len: int = 0
+    is_warmup: bool = False
+    internal_uid: int | None = None
+    prefix_keep_mask: torch.Tensor | None = None  # bool mask for prefix cache filtering
     chunked_req: ChunkedReq | None = None
 
     @property

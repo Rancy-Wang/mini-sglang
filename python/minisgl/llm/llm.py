@@ -10,6 +10,7 @@ from minisgl.message import (
     BaseBackendMsg,
     DetokenizeMsg,
     UserMsg,
+    WarmupAckMsg,
 )
 from minisgl.scheduler import Scheduler, SchedulerConfig
 
@@ -56,7 +57,19 @@ class LLM(Scheduler):
             input_ids = self._tokenize_one(tokens_or_prompt)
             sum_input_len += len(input_ids)
             uid, added = self.counter + added, added + 1
-            results.append(UserMsg(uid=uid, input_ids=input_ids, sampling_params=sampling_params))
+            true_positions = torch.arange(len(input_ids), dtype=torch.int32, device="cpu")
+            results.append(
+                UserMsg(
+                    uid=uid,
+                    input_ids=input_ids,
+                    true_positions=true_positions,
+                    radix_input_ids=input_ids.to(torch.int64, device="cpu"),
+                    sampling_params=sampling_params,
+                    prefix_keep_mask=torch.ones(
+                        max(len(input_ids) - 1, 0), dtype=torch.bool, device="cpu"
+                    ),
+                )
+            )
             self.status_map[uid] = RequestStatus(
                 uid=uid,
                 input_ids=(
@@ -68,8 +81,10 @@ class LLM(Scheduler):
         self.pending_requests = self.pending_requests[added:]
         return results
 
-    def offline_send_result(self, reply: List[DetokenizeMsg]) -> None:
+    def offline_send_result(self, reply: List[DetokenizeMsg | WarmupAckMsg]) -> None:
         for msg in reply:
+            if isinstance(msg, WarmupAckMsg):
+                continue
             status = self.status_map[msg.uid]
             if not (msg.finished and msg.next_token == self.eos_token_id):
                 status.output_ids.append(msg.next_token)

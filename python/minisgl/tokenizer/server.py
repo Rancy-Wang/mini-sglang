@@ -5,8 +5,6 @@ from typing import List
 
 import torch
 from minisgl.message import (
-    AbortBackendMsg,
-    AbortMsg,
     BaseBackendMsg,
     BaseFrontendMsg,
     BaseTokenizerMsg,
@@ -17,8 +15,11 @@ from minisgl.message import (
     TokenizeMsg,
     UserMsg,
     UserReply,
+    WarmupAckMsg,
+    WarmupReply,
 )
-from minisgl.utils import ZmqPullQueue, ZmqPushQueue, init_logger, load_tokenizer
+from minisgl.utils import ZmqPullQueue, ZmqPushQueue, init_logger
+from transformers import AutoTokenizer, LlamaTokenizer
 
 
 def _unwrap_msg(msg: BaseTokenizerMsg) -> List[BaseTokenizerMsg]:
@@ -37,14 +38,13 @@ def tokenize_worker(
     frontend_addr: str,
     local_bs: int,
     tokenizer_id: int = -1,
-    model_source: str = "huggingface",
     ack_queue: mp.Queue[str] | None = None,
 ) -> None:
     send_backend = ZmqPushQueue(backend_addr, create=False, encoder=BaseBackendMsg.encoder)
     send_frontend = ZmqPushQueue(frontend_addr, create=False, encoder=BaseFrontendMsg.encoder)
     recv_listener = ZmqPullQueue(addr, create=create, decoder=BatchTokenizerMsg.decoder)
     assert local_bs > 0
-    tokenizer = load_tokenizer(tokenizer_path)
+    tokenizer: LlamaTokenizer = AutoTokenizer.from_pretrained(tokenizer_path, use_fast=True)
     logger = init_logger(__name__, f"tokenizer_{tokenizer_id}")
 
     from .detokenize import DetokenizeManager
@@ -65,9 +65,9 @@ def tokenize_worker(
             logger.debug(f"Received {len(pending_msg)} messages")
 
             detokenize_msg = [m for m in pending_msg if isinstance(m, DetokenizeMsg)]
+            warmup_msg = [m for m in pending_msg if isinstance(m, WarmupAckMsg)]
             tokenize_msg = [m for m in pending_msg if isinstance(m, TokenizeMsg)]
-            abort_msg = [m for m in pending_msg if isinstance(m, AbortMsg)]
-            assert len(detokenize_msg) + len(tokenize_msg) + len(abort_msg) == len(pending_msg)
+            assert len(detokenize_msg) + len(tokenize_msg) + len(warmup_msg) == len(pending_msg)
             if len(detokenize_msg) > 0:
                 replies = detokenize_manager.detokenize(detokenize_msg)
                 batch_output = BatchFrontendMsg(
@@ -84,24 +84,38 @@ def tokenize_worker(
                     batch_output = batch_output.data[0]
                 send_frontend.put(batch_output)
 
-            if len(tokenize_msg) > 0:
-                tensors = tokenize_manager.tokenize(tokenize_msg)
-                batch_output = BatchBackendMsg(
+            if len(warmup_msg) > 0:
+                batch_output = BatchFrontendMsg(
                     data=[
-                        UserMsg(
-                            uid=msg.uid,
-                            input_ids=t,
-                            sampling_params=msg.sampling_params,
-                        )
-                        for msg, t in zip(tokenize_msg, tensors, strict=True)
+                        WarmupReply(uid=msg.uid, hit_ratio=msg.hit_ratio, finished=msg.finished)
+                        for msg in warmup_msg
                     ]
                 )
                 if len(batch_output.data) == 1:
                     batch_output = batch_output.data[0]
-                send_backend.put(batch_output)
-            if len(abort_msg) > 0:
+                send_frontend.put(batch_output)
+
+            if len(tokenize_msg) > 0:
+                tokenized = tokenize_manager.tokenize(tokenize_msg)
                 batch_output = BatchBackendMsg(
-                    data=[AbortBackendMsg(uid=msg.uid) for msg in abort_msg]
+                    data=[
+                        UserMsg(
+                            uid=msg.uid,
+                            input_ids=t.input_ids,
+                            true_positions=t.true_positions,
+                            radix_input_ids=t.radix_input_ids,
+                            radix_match_ids=t.radix_match_ids,
+                            sampling_params=msg.sampling_params,
+                            target_msg_id=msg.target_msg_id,
+                            drop_message=msg.drop_message,
+                            enable_thinking=msg.enable_thinking,
+                            message_meta=t.message_meta,
+                            is_warmup=msg.is_warmup,
+                            internal_uid=msg.internal_uid,
+                            prefix_keep_mask=t.prefix_keep_mask,
+                        )
+                        for msg, t in zip(tokenize_msg, tokenized, strict=True)
+                    ]
                 )
                 if len(batch_output.data) == 1:
                     batch_output = batch_output.data[0]

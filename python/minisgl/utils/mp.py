@@ -65,13 +65,13 @@ class ZmqPullQueue(Generic[T]):
 
     def get(self) -> T:
         event = self.socket.recv()
-        return self.decoder(msgpack.unpackb(event, raw=False))
+        return self.decoder(msgpack.unpackb(event, raw=False, strict_map_key=False))
 
     def get_raw(self) -> bytes:
         return self.socket.recv()
 
     def decode(self, raw: bytes) -> T:
-        return self.decoder(msgpack.unpackb(raw, raw=False))
+        return self.decoder(msgpack.unpackb(raw, raw=False, strict_map_key=False))
 
     def empty(self) -> bool:
         return self.socket.poll(timeout=0) == 0
@@ -95,7 +95,7 @@ class ZmqAsyncPullQueue(Generic[T]):
 
     async def get(self) -> T:
         event = await self.socket.recv()
-        return self.decoder(msgpack.unpackb(event, raw=False))
+        return self.decoder(msgpack.unpackb(event, raw=False, strict_map_key=False))
 
     def stop(self):
         self.socket.close()
@@ -141,7 +141,7 @@ class ZmqSubQueue(Generic[T]):
 
     def get(self) -> T:
         event = self.socket.recv()
-        return self.decoder(msgpack.unpackb(event, raw=False))
+        return self.decoder(msgpack.unpackb(event, raw=False, strict_map_key=False))
 
     def empty(self) -> bool:
         return self.socket.poll(timeout=0) == 0

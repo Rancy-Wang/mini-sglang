@@ -3,17 +3,19 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
 
 import torch
+import torch.nn.functional as F
 from minisgl.core import Batch, Req
 from minisgl.env import ENV
 from minisgl.message import (
-    AbortBackendMsg,
     BaseBackendMsg,
     BatchBackendMsg,
     DetokenizeMsg,
     ExitMsg,
     UserMsg,
+    WarmupAckMsg,
 )
-from minisgl.utils import init_logger, load_tokenizer
+from minisgl.utils import init_logger
+from transformers import AutoTokenizer
 
 from .cache import CacheManager
 from .config import SchedulerConfig
@@ -28,15 +30,13 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-Indice2D: TypeAlias = Tuple[torch.Tensor, torch.Tensor]
-
 
 # For overlap scheduling, we also need to cache some other data to avoid IMA
 class ForwardInput(NamedTuple):
     batch: Batch
     sample_args: BatchSamplingArgs
-    input_tuple: Indice2D  # (token_mapping, positions)
-    write_tuple: Indice2D  # (req_mapping, seq_lens or -1)
+    load_indices: torch.Tensor
+    write_indices: torch.Tensor
 
 
 ForwardData: TypeAlias = "Tuple[ForwardInput, ForwardOutput]"
@@ -47,6 +47,8 @@ class Scheduler(SchedulerIOMixin):
         from minisgl.engine import Engine
 
         self.engine = Engine(config)
+        # Initialize the I/O mixin
+        super().__init__(config, self.engine.tp_cpu_group)
 
         # use another stream to overlap metadata processing with computation
         self.device = self.engine.device
@@ -56,24 +58,196 @@ class Scheduler(SchedulerIOMixin):
 
         # initialize other managers
         self.table_manager = TableManager(config.max_running_req, self.engine.page_table)
-        self.cache_manager = CacheManager(
-            self.engine.num_pages, config.page_size, self.engine.page_table, config.cache_type
-        )
-        self.decode_manager = DecodeManager(config.page_size)
+        self.cache_manager = CacheManager(self.device, self.engine.num_pages, config.cache_type)
+        self.decode_manager = DecodeManager()
         self.prefill_manager = PrefillManager(
             self.cache_manager, self.table_manager, self.decode_manager
         )
 
-        # some alias for easy access
+        self.tp_info = config.tp_info
         self.finished_reqs: Set[Req] = set()
-        self.tokenizer = load_tokenizer(config.model_path)
+        self.tokenizer = AutoTokenizer.from_pretrained(config.model_path)
         self.eos_token_id = self.tokenizer.eos_token_id
+        self.page_table = self.engine.page_table
         self.token_pool = self.table_manager.token_pool
         self.prefill_budget = config.max_extend_tokens
-        # self.config = config
+        self.dummy_write_2d_pos = (self.engine.dummy_req.table_idx, 1, 2)  # 0 for load, 1 for write
 
-        # Initialize the I/O mixin
-        super().__init__(config, self.engine.tp_cpu_group)
+    def _process_last_data(
+        self, last_data: ForwardData | None, ongoing_data: ForwardData | None
+    ) -> None:
+        if last_data is None:
+            return
+        batch, (_, next_tokens_cpu, copy_done) = last_data[0].batch, last_data[1]
+        copy_done.synchronize()
+        reply: List[DetokenizeMsg | WarmupAckMsg] = []
+
+        for i, req in enumerate(batch.reqs):
+            if req in self.finished_reqs or isinstance(req, ChunkedReq):
+                continue
+
+            next_token_id = next_tokens_cpu[i]
+            if req.is_warmup:
+                finished = not req.can_decode()
+                reply.append(WarmupAckMsg(uid=req.uid, hit_ratio=req.cache_hit_ratio, finished=finished))
+            else:
+                req.append_host(next_token_id.unsqueeze(0))
+                next_token = int(next_token_id.item())
+                finished = not req.can_decode()
+                if not req.sampling_params.ignore_eos:
+                    finished |= next_token == self.eos_token_id
+                reply.append(DetokenizeMsg(uid=req.uid, next_token=next_token, finished=finished))
+
+            # free resources if the req is finished and not ongoing
+            if finished:
+                self.finished_reqs.add(req)
+                self.decode_manager.remove_req(req)
+                logger.debug_rank0("Request %s is finished", req)
+
+        # free resources for finished but not ongoing reqs
+        ongoing_reqs = ongoing_data[0].batch.reqs if ongoing_data else []
+        for req in self.finished_reqs.difference(ongoing_reqs):
+            active_indices = self.page_table[req.table_idx, : req.cached_len]
+            active_positions = req.true_positions[: req.cached_len]
+
+            logger.debug_rank0(
+                "Finalize req uid=%s table=%s cached_len=%s true_seq_len=%s",
+                req.uid,
+                req.table_idx,
+                req.cached_len,
+                req.true_seq_len,
+            )
+            try:
+                self.cache_manager.free_and_cache_finished_req(
+                    req.cache_handle,
+                    req.radix_match_ids,
+                    active_indices,
+                    active_positions,
+                    req.initial_full_match_indices,
+                    req.initial_active_cached_len,
+                    req.prefix_keep_mask,
+                )
+            finally:
+                self.table_manager.free(req.table_idx)
+
+        # keep only ongoing reqs in the finished set
+        self.finished_reqs.intersection_update(ongoing_reqs)
+        self.send_result(reply)
+
+    def _process_one_msg(self, msg: BaseBackendMsg) -> None:
+        if isinstance(msg, BatchBackendMsg):
+            for msg in msg.data:
+                self._process_one_msg(msg)
+        elif isinstance(msg, ExitMsg):
+            raise KeyboardInterrupt
+        elif isinstance(msg, UserMsg):
+            logger.debug_rank0("Received user msg: %s", msg)
+            input_len = len(msg.input_ids)
+            true_input_len = int(msg.true_positions[-1].item()) + 1 if len(msg.true_positions) > 0 else 0
+            max_seq_len = self.engine.max_seq_len
+            max_output_len = max_seq_len - true_input_len
+            if max_output_len <= 0:
+                return logger.warning_rank0(
+                    f"Input true sequence length {true_input_len} exceeds {max_seq_len}, "
+                    f"request {msg.uid} is dropped."
+                )
+            if msg.sampling_params.max_tokens > max_output_len:
+                msg.sampling_params.max_tokens = max_output_len
+                logger.warning_rank0(
+                    f"Adjust max_tokens to {max_output_len} for request {msg.uid}."
+                )
+            self.prefill_manager.add_one_req(msg)
+        else:
+            logger.error(f"Unknown message type: {type(msg)}")
+            raise NotImplementedError
+
+    def _prepare_batch(self, batch: Batch) -> ForwardInput:
+        needed_size = sum(r.extend_len for r in batch.reqs)
+        batch.out_loc = self.cache_manager.allocate(needed_size)
+        # NOTE: Pad the batch if needed
+        if padding_size := self.engine.graph_runner.pad_batch(batch):
+            batch.out_loc = F.pad(batch.out_loc, (0, padding_size), value=self.engine.dummy_page)
+        # NOTE: prepare 2d indices for token ids loading and writing
+        load_indices = self._make_2d_indices(
+            [(r.table_idx, r.cached_len, r.device_len) for r in batch.padded_reqs]
+        )
+        write_indices = self._make_2d_indices(
+            [
+                (
+                    (r.table_idx, r.device_len, r.device_len + 1)
+                    if r.can_decode()  # NOTE: for chunked req, write to dummy pos
+                    else self.dummy_write_2d_pos
+                )
+                for r in batch.reqs
+            ]
+        )
+        assert all(r.device_len < self.engine.max_seq_len for r in batch.reqs)
+        assert all(r.true_seq_len <= self.engine.max_seq_len for r in batch.reqs)
+        # NOTE: write out_loc to page_table before `prepare_metadata`
+        self.page_table.view(-1)[load_indices] = batch.out_loc
+        self.engine.attn_backend.prepare_metadata(batch)
+        return ForwardInput(
+            batch=batch,
+            sample_args=self.engine.sampler.prepare(batch),
+            load_indices=load_indices,
+            write_indices=write_indices,
+        )
+
+    def _schedule_next_batch(self) -> ForwardInput | None:
+        # TODO: support other policies: e.g. DECODE first
+        batch = (
+            self.prefill_manager.schedule_next_batch(self.prefill_budget)
+            or self.decode_manager.schedule_next_batch()
+        )
+        return self._prepare_batch(batch) if batch else None
+
+    def _make_2d_indices(self, ranges: List[Tuple[int, int, int]]) -> torch.Tensor:
+        """
+        Return the 1D indices for the given 2D table and ranges.
+
+        Example: The underlying indices of a 2D table (3, 4) are:
+            [[ 0,  1,  2,  3],
+             [ 4,  5,  6,  7],
+             [ 8,  9, 10, 11]]
+        For ranges [(0, 1, 3), (2, 0, 2)], the returned indices are [1, 2, 8, 9].
+
+        Args:
+            ranges (List[Tuple[int, int, int]]): A list of tuples (entry, begin, end),
+                where `entry` is the row index in the 2D table, and `begin` and `end`
+                specify the range of column indices to include.
+        Returns:
+            torch.Tensor: A 1D tensor of indices.
+        """
+        STRIDE = self.token_pool.stride(0)
+        needed_size = sum(end - begin for _, begin, end in ranges)
+        indices_host = torch.empty(needed_size, dtype=torch.int32, pin_memory=True)
+        offset = 0
+        for entry, begin, end in ranges:
+            length = end - begin
+            offset += length
+            torch.arange(
+                begin + entry * STRIDE,
+                end + entry * STRIDE,
+                dtype=torch.int32,
+                out=indices_host[offset - length : offset],
+            )
+        return indices_host.to(self.device, non_blocking=True)
+
+    def _load_token_ids(self, input: ForwardInput) -> None:
+        input.batch.input_ids = self.token_pool.view(-1)[input.load_indices]
+
+    def _write_token_ids(self, input: ForwardInput, output: ForwardOutput) -> None:
+        self.token_pool.view(-1)[input.write_indices] = output.next_tokens_gpu
+
+    def _forward(self, forward_input: ForwardInput) -> ForwardOutput:
+        self._load_token_ids(forward_input)
+        batch, sample_args = forward_input.batch, forward_input.sample_args
+        if ENV.OVERLAP_EXTRA_SYNC:  # NOTE: https://github.com/sgl-project/mini-sglang/issues/58
+            self.stream.synchronize()
+        forward_output = self.engine.forward_batch(batch, sample_args)
+        self._write_token_ids(forward_input, forward_output)
+        self.decode_manager.filter_reqs(forward_input.batch.reqs)
+        return forward_output
 
     def run_when_idle(self) -> None:
         """Called when the scheduler is idle to perform background tasks."""
@@ -88,7 +262,7 @@ class Scheduler(SchedulerIOMixin):
         which can effectively hide CPU latency and improve GPU utilization.
         """
         blocking = not (
-            last_data is not None  # don't block if we have a batch to be processed
+            last_data  # don't block if we have a batch to be processed
             or self.prefill_manager.runnable
             or self.decode_manager.runnable
         )
@@ -102,7 +276,7 @@ class Scheduler(SchedulerIOMixin):
                 self.engine.stream.wait_stream(self.stream)
                 ongoing_data = (forward_input, self._forward(forward_input))
 
-        self._process_last_data(last_data)
+        self._process_last_data(last_data, ongoing_data)
         return ongoing_data
 
     def normal_loop(self) -> None:
@@ -115,10 +289,11 @@ class Scheduler(SchedulerIOMixin):
         if forward_input is not None:
             ongoing_data = (forward_input, self._forward(forward_input))
 
-        self._process_last_data(ongoing_data)
+        self._process_last_data(ongoing_data, None)
 
     @torch.inference_mode()
     def run_forever(self) -> NoReturn:
+        ENV.DISABLE_OVERLAP_SCHEDULING = True # TODO: Support overlap scheduling
         if ENV.DISABLE_OVERLAP_SCHEDULING:
             with self.engine_stream_ctx:
                 self.engine.stream.wait_stream(self.stream)
@@ -134,134 +309,3 @@ class Scheduler(SchedulerIOMixin):
         torch.cuda.synchronize(self.device)
         self.sync_all_ranks()
         self.engine.shutdown()
-
-    def _process_last_data(self, last_data: ForwardData | None) -> None:
-        if last_data is None:
-            return
-
-        batch, (_, next_tokens_cpu, copy_done) = last_data[0].batch, last_data[1]
-        copy_done.synchronize()
-        reply: List[DetokenizeMsg] = []
-        new_finished_reqs: Set[Req] = set()
-        with self.cache_manager.lazy_free_region():
-            for i, req in enumerate(batch.reqs):
-                if isinstance(req, ChunkedReq):
-                    continue
-                next_token = next_tokens_cpu[i]
-                req.append_host(next_token.unsqueeze(0))
-                next_token = int(next_token.item())
-                finished = not req.can_decode
-                if not req.sampling_params.ignore_eos:
-                    finished |= next_token == self.eos_token_id
-                reply.append(DetokenizeMsg(uid=req.uid, next_token=next_token, finished=finished))
-
-                # NOTE: overlap scheduling may make the request freed twice, skip second free
-                if finished and req not in self.finished_reqs:
-                    self.decode_manager.remove_req(req)
-                    self._free_req_resources(req)
-                    new_finished_reqs.add(req)
-                elif batch.is_prefill:  # for prefill, non-chunk req, cache the prefix
-                    self.cache_manager.cache_req(req, finished=False)
-
-        self.finished_reqs = new_finished_reqs
-        self.send_result(reply)
-
-    def _process_one_msg(self, msg: BaseBackendMsg) -> None:
-        if isinstance(msg, BatchBackendMsg):
-            for msg in msg.data:
-                self._process_one_msg(msg)
-        elif isinstance(msg, ExitMsg):
-            raise KeyboardInterrupt
-        elif isinstance(msg, UserMsg):
-            logger.debug_rank0("Received user msg: %s", msg)
-            input_len, max_seq_len = len(msg.input_ids), self.engine.max_seq_len
-            max_output_len = max_seq_len - input_len
-            if max_output_len <= 0:
-                return logger.warning_rank0(
-                    f"Input sequence length {input_len} exceeds {max_seq_len}, "
-                    f"request {msg.uid} is dropped."
-                )
-            if msg.sampling_params.max_tokens > max_output_len:
-                msg.sampling_params.max_tokens = max_output_len
-                logger.warning_rank0(
-                    f"Adjust max_tokens to {max_output_len} for request {msg.uid}."
-                )
-            self.prefill_manager.add_one_req(msg)
-        elif isinstance(msg, AbortBackendMsg):
-            logger.debug_rank0("Aborting request %d", msg.uid)
-            req_to_free = self.prefill_manager.abort_req(msg.uid)
-            req_to_free = req_to_free or self.decode_manager.abort_req(msg.uid)
-            if req_to_free is not None:
-                self._free_req_resources(req_to_free)
-        else:
-            logger.error(f"Unknown message type: {type(msg)}")
-            raise NotImplementedError
-
-    def _free_req_resources(self, req: Req) -> None:
-        self.table_manager.free(req.table_idx)
-        self.cache_manager.cache_req(req, finished=True)
-
-    def _prepare_batch(self, batch: Batch) -> ForwardInput:
-        self.engine.graph_runner.pad_batch(batch)
-        self.cache_manager.allocate_paged(batch.reqs)
-        batch.positions = _make_positions(batch, self.device)
-        input_mapping = _make_input_tuple(batch, self.device)
-        write_mapping = _make_write_tuple(batch, self.device)
-        batch.out_loc = self.engine.page_table[input_mapping]
-        self.engine.attn_backend.prepare_metadata(batch)
-        return ForwardInput(
-            batch=batch,
-            sample_args=self.engine.sampler.prepare(batch),
-            input_tuple=input_mapping,
-            write_tuple=write_mapping,
-        )
-
-    def _schedule_next_batch(self) -> ForwardInput | None:
-        # TODO: support other policies: e.g. DECODE first
-        batch = (
-            self.prefill_manager.schedule_next_batch(self.prefill_budget)
-            or self.decode_manager.schedule_next_batch()
-        )
-        return self._prepare_batch(batch) if batch else None
-
-    def _forward(self, forward_input: ForwardInput) -> ForwardOutput:
-        batch, sample_args, input_mapping, output_mapping = forward_input
-        batch.input_ids = self.token_pool[input_mapping]
-        forward_output = self.engine.forward_batch(batch, sample_args)
-        self.token_pool[output_mapping] = forward_output.next_tokens_gpu
-        self.decode_manager.filter_reqs(forward_input.batch.reqs)
-        return forward_output
-
-
-def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:
-    needed_size = sum(r.extend_len for r in batch.padded_reqs)
-    indices_host = torch.empty(needed_size, dtype=torch.int32, pin_memory=True)
-    offset = 0
-    for req in batch.padded_reqs:
-        length = req.extend_len
-        torch.arange(
-            req.cached_len,
-            req.device_len,
-            dtype=torch.int32,
-            out=indices_host[offset : offset + length],
-        )
-        offset += length
-    return indices_host.to(device, non_blocking=True)
-
-
-def _make_input_tuple(batch: Batch, device: torch.device) -> Indice2D:
-    mapping_host = torch.empty(len(batch.positions), dtype=torch.int64, pin_memory=True)
-    offset = 0
-    for req in batch.padded_reqs:
-        length = req.extend_len
-        mapping_host[offset : offset + length].fill_(req.table_idx)
-        offset += length
-    return mapping_host.to(device, non_blocking=True), batch.positions.to(torch.int64)
-
-
-def _make_write_tuple(batch: Batch, device: torch.device) -> Indice2D:
-    mapping_list = [req.table_idx for req in batch.reqs]
-    mapping_host = torch.tensor(mapping_list, dtype=torch.int64, pin_memory=True)
-    write_list = [(req.device_len if req.can_decode else -1) for req in batch.reqs]
-    write_host = torch.tensor(write_list, dtype=torch.int64, pin_memory=True)
-    return mapping_host.to(device, non_blocking=True), write_host.to(device, non_blocking=True)

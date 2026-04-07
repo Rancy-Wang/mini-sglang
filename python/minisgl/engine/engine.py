@@ -88,6 +88,12 @@ class Engine:
         # ======================= Graph capture initialization ========================
         self.dummy_req = Req(
             input_ids=torch.tensor([0], dtype=torch.int32, device="cpu"),
+            true_positions=torch.tensor([0], dtype=torch.int32, device="cpu"),
+            radix_input_ids=torch.tensor([0], dtype=torch.int64, device="cpu"),
+            radix_match_ids=torch.tensor([0], dtype=torch.int64, device="cpu"),
+            initial_full_match_indices=torch.empty(0, dtype=torch.int32, device=self.device),
+            initial_active_cached_len=0,
+            true_seq_len=1,
             table_idx=config.max_running_req,
             cached_len=0,
             output_len=1,
