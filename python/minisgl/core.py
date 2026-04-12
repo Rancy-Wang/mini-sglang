@@ -40,6 +40,8 @@ class Req:
     uid: int
     sampling_params: SamplingParams
     cache_handle: BaseCacheHandle
+    stop: List[str] | None = None
+    stop_token_seqs: List[List[int]] | None = None
     prefix_keep_mask: torch.Tensor | None = None  # cpu tensor for full->active prefix filtering
     is_warmup: bool = False
     cache_hit_ratio: float = 1.0
@@ -87,6 +89,19 @@ class Req:
     @property
     def can_decode(self) -> bool:
         return self.remain_len > 0
+
+    def match_stop(self) -> tuple[bool, str | None]:
+        if not self.stop_token_seqs:
+            return False, None
+        input_ids = self.input_ids.tolist()
+        for idx, stop_seq in enumerate(self.stop_token_seqs):
+            if len(stop_seq) == 0 or len(stop_seq) > len(input_ids):
+                continue
+            if input_ids[-len(stop_seq) :] == stop_seq:
+                if self.stop is not None and idx < len(self.stop):
+                    return True, self.stop[idx]
+                return True, None
+        return False, None
 
     def __repr__(self) -> str:
         return (

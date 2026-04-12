@@ -73,6 +73,22 @@ class Scheduler(SchedulerIOMixin):
         self.prefill_budget = config.max_extend_tokens
         self.dummy_write_2d_pos = (self.engine.dummy_req.table_idx, 1, 2)  # 0 for load, 1 for write
 
+    @staticmethod
+    def _decode_radix_token_id(encoded_token: int) -> int:
+        # radix key: low 32 bits token_id, high 32 bits drop_mask
+        unsigned = encoded_token if encoded_token >= 0 else encoded_token + (1 << 64)
+        return int(unsigned & 0xFFFFFFFF)
+
+    def _decode_text_for_log(self, token_ids: List[int]) -> str:
+        if len(token_ids) == 0:
+            return ""
+        try:
+            return self.tokenizer.decode(token_ids, skip_special_tokens=False)
+        except TypeError:
+            return self.tokenizer.decode(token_ids)
+        except Exception as exc:
+            return f"<decode_error:{exc}>"
+
     def _process_last_data(
         self, last_data: ForwardData | None, ongoing_data: ForwardData | None
     ) -> None:
@@ -94,9 +110,25 @@ class Scheduler(SchedulerIOMixin):
                 req.append_host(next_token_id.unsqueeze(0))
                 next_token = int(next_token_id.item())
                 finished = not req.can_decode()
+                finish_reason = "length" if finished else None
+                matched_stop: str | None = None
                 if not req.sampling_params.ignore_eos:
-                    finished |= next_token == self.eos_token_id
-                reply.append(DetokenizeMsg(uid=req.uid, next_token=next_token, finished=finished))
+                    if next_token == self.eos_token_id:
+                        finished = True
+                        finish_reason = "stop"
+                stop_matched, matched_stop = req.match_stop()
+                if stop_matched:
+                    finished = True
+                    finish_reason = "stop"
+                reply.append(
+                    DetokenizeMsg(
+                        uid=req.uid,
+                        next_token=next_token,
+                        finished=finished,
+                        finish_reason=finish_reason if finished else None,
+                        matched_stop=matched_stop,
+                    )
+                )
 
             # free resources if the req is finished and not ongoing
             if finished:

@@ -19,6 +19,8 @@ class PendingReq:
     radix_input_ids: torch.Tensor
     radix_match_ids: torch.Tensor | None
     sampling_params: SamplingParams
+    stop: List[str] | None = None
+    stop_token_seqs: List[List[int]] | None = None
     initial_full_match_indices: torch.Tensor | None = None
     initial_active_cached_len: int = 0
     is_warmup: bool = False

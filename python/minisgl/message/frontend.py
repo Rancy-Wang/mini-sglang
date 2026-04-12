@@ -27,6 +27,8 @@ class UserReply(BaseFrontendMsg):
     uid: int
     incremental_output: str
     finished: bool
+    finish_reason: str | None = None
+    matched_stop: str | None = None
 
 
 @dataclass
