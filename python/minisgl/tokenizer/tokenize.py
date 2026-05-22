@@ -332,34 +332,23 @@ class TokenizeManager:
         *,
         new_owner: int,
     ) -> tuple[List[int], int, int, bool]:
+        # Conservative attribution policy:
+        # - keep only exact stable prefix/suffix owners from previous round
+        # - attribute rewritten middle to the newly appended message owner
+        # This avoids owner drift when chat templates rewrite delimiters.
         lcp = self._common_prefix_len(prev_ids, curr_ids)
         lcsuf = self._common_suffix_len(prev_ids, curr_ids, lcp)
         unstable = lcp < len(prev_ids)
 
-        old_mid_start = lcp
-        old_mid_end = len(prev_ids) - lcsuf
-        new_mid_start = lcp
-        new_mid_end = len(curr_ids) - lcsuf
+        curr_owner = [new_owner] * len(curr_ids)
 
-        old_mid_owner = prev_owner[old_mid_start:old_mid_end]
-        new_mid_len = new_mid_end - new_mid_start
-        reuse_len = min(len(old_mid_owner), new_mid_len)
+        safe_lcp = min(lcp, len(prev_owner), len(curr_owner))
+        if safe_lcp > 0:
+            curr_owner[:safe_lcp] = prev_owner[:safe_lcp]
 
-        curr_owner = [-1] * len(curr_ids)
-        if lcp > 0:
-            curr_owner[:lcp] = prev_owner[:lcp]
-        if reuse_len > 0:
-            curr_owner[new_mid_start : new_mid_start + reuse_len] = old_mid_owner[:reuse_len]
-        if new_mid_len > reuse_len:
-            curr_owner[new_mid_start + reuse_len : new_mid_end] = [new_owner] * (
-                new_mid_len - reuse_len
-            )
-        if lcsuf > 0:
-            curr_owner[new_mid_end:] = prev_owner[len(prev_ids) - lcsuf :]
+        if lcsuf > 0 and len(prev_owner) >= lcsuf and len(curr_owner) >= lcsuf:
+            curr_owner[len(curr_owner) - lcsuf :] = prev_owner[len(prev_owner) - lcsuf :]
 
-        for idx in range(len(curr_owner)):
-            if curr_owner[idx] < 0:
-                curr_owner[idx] = new_owner
         return curr_owner, lcp, lcsuf, unstable
 
     def _round_by_round_no_gen(

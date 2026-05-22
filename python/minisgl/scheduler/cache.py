@@ -5,9 +5,12 @@ from typing import TYPE_CHECKING
 
 import torch
 from minisgl.kvcache import BaseCacheHandle, create_cache_manager
+from minisgl.utils import init_logger
 
 if TYPE_CHECKING:
     from .utils import PendingReq
+
+logger = init_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -28,8 +31,21 @@ class CacheManager:
         self.num_pages = num_pages
 
     def _free(self, indices: torch.Tensor) -> None:
-        if len(indices) > 0:
-            self._free_slots = torch.cat([self._free_slots, indices])
+        if len(indices) == 0:
+            return
+        flat = indices.view(-1).to(dtype=torch.int64, device=self.device, non_blocking=True)
+        if bool(torch.any(flat < 0).item()) or bool(torch.any(flat >= self.num_pages).item()):
+            bad = flat[(flat < 0) | (flat >= self.num_pages)]
+            raise RuntimeError(f"Attempted to free invalid cache slots: {bad[:16].tolist()}")
+        flat = torch.unique(flat.to(dtype=torch.int32))
+        if len(flat) == 0:
+            return
+        if len(self._free_slots) > 0:
+            existing = torch.isin(flat, self._free_slots)
+            if bool(torch.any(existing).item()):
+                dup = flat[existing]
+                raise RuntimeError(f"Double-free detected for cache slots: {dup[:16].tolist()}")
+        self._free_slots = torch.cat([self._free_slots, flat])
 
     def match_req(self, req: PendingReq) -> MatchResult:
         assert req.input_len > 0, "Input length must be greater than 0."
@@ -48,7 +64,28 @@ class CacheManager:
             )
             active_match_indices = full_match_indices[keep_mask]
         if len(active_match_indices) > 0 and bool(torch.any(active_match_indices < 0).item()):
-            raise RuntimeError("Active matched indices contain invalid negative slots.")
+            neg_mask = active_match_indices < 0
+            neg_pos = torch.nonzero(neg_mask, as_tuple=False).view(-1)
+            neg_count = len(neg_pos)
+            neg_preview = active_match_indices[neg_pos[:16]].tolist()
+            logger.warning(
+                "Active matched indices contain invalid negative slots."
+                " Falling back to root prefix match."
+                " uid=%s full_match_len=%s active_match_len=%s neg_count=%s neg_preview=%s",
+                req.uid,
+                len(full_match_indices),
+                len(active_match_indices),
+                neg_count,
+                neg_preview,
+            )
+            root_handle, root_match_indices = self.manager.match_prefix(radix_query[:0])
+            return MatchResult(
+                handle=root_handle,
+                full_match_indices=root_match_indices,
+                full_cached_len=root_handle.cached_len,
+                active_match_indices=root_match_indices,
+                active_cached_len=len(root_match_indices),
+            )
 
         return MatchResult(
             handle=handle,
@@ -76,6 +113,11 @@ class CacheManager:
 
         # NOTE: len(evicted) + free_len >= needed_len
         evicted = self.manager.evict(needed_len - free_len)
+        if len(evicted) > 0:
+            evicted = evicted.view(-1).to(dtype=torch.int32, device=self.device, non_blocking=True)
+            if bool(torch.any(evicted < 0).item()) or bool(torch.any(evicted >= self.num_pages).item()):
+                bad = evicted[(evicted < 0) | (evicted >= self.num_pages)]
+                raise RuntimeError(f"Evicted invalid cache slots: {bad[:16].tolist()}")
         merged = torch.cat([self._free_slots, evicted])
         assert len(merged) >= needed_len, "Eviction did not free enough space."
 
@@ -192,6 +234,7 @@ class CacheManager:
                 (active_slots >= initial_active_cached_len)
                 & (full_positions >= old_full_cached_len)
                 & (full_positions < in_cache_full_len)
+                & (active_indices >= 0)
             )
             self._free(active_indices[dedup_mask])
         finally:
@@ -205,3 +248,10 @@ class CacheManager:
                 f" free_slots({len(self._free_slots)}) +"
                 f" total_size({self.manager.size_info.total_size}) != num_pages({self.num_pages})"
             )
+        if len(self._free_slots) > 0:
+            if bool(torch.any(self._free_slots < 0).item()) or bool(
+                torch.any(self._free_slots >= self.num_pages).item()
+            ):
+                raise RuntimeError("CacheManager integrity check failed: free_slots contain invalid index.")
+            if len(torch.unique(self._free_slots)) != len(self._free_slots):
+                raise RuntimeError("CacheManager integrity check failed: free_slots contain duplicates.")

@@ -30,12 +30,14 @@ class RadixTreeNode:
         self._key: torch.Tensor
         self._value: torch.Tensor
         self._length: int
+        self._page_length: int
 
     def set_key_value(self, key: torch.Tensor, value: torch.Tensor) -> None:
         assert len(key) == len(value)
         self._key = key
         self._value = value
         self._length = len(key)
+        self._page_length = int(torch.count_nonzero(value >= 0).item())
 
     def set_parent(self, parent: RadixTreeNode) -> None:
         self._parent = parent
@@ -44,6 +46,10 @@ class RadixTreeNode:
     @property
     def length(self) -> int:
         return self._length
+
+    @property
+    def page_length(self) -> int:
+        return self._page_length
 
     @property
     def parent(self) -> RadixTreeNode:
@@ -118,14 +124,14 @@ class RadixPrefixCache(BasePrefixCache):
                 node.ref_count -= 1
                 assert node.ref_count >= 0
                 if node.ref_count == 0:
-                    self.evictable_size += node.length
-                    self.protected_size -= node.length
+                    self.evictable_size += node.page_length
+                    self.protected_size -= node.page_length
                 node = node.parent
         else:
             while not node.is_root():
                 if node.ref_count == 0:
-                    self.evictable_size -= node.length
-                    self.protected_size += node.length
+                    self.evictable_size -= node.page_length
+                    self.protected_size += node.page_length
                 node.ref_count += 1
                 node = node.parent
 
@@ -141,7 +147,7 @@ class RadixPrefixCache(BasePrefixCache):
             new_node = RadixTreeNode(self.key_fn)
             new_node.set_key_value(input_ids[prefix_len:], indices[prefix_len:].clone())
             new_node.set_parent(node)
-            self.evictable_size += new_node.length
+            self.evictable_size += new_node.page_length
             node = new_node
         return InsertResult(prefix_len, RadixCacheHandle(insert_len, node))
 
@@ -163,15 +169,18 @@ class RadixPrefixCache(BasePrefixCache):
             ), f"Cannot evict enough cache, need {size}, only {evicted_size} evicted"
             node = heapq.heappop(leave_nodes)
             assert node.ref_count == 0 and node.is_leaf() and not node.is_root()
-            evicted_size += node.length
-            evicted_indices.append(node.value)
-            self.evictable_size -= node.length
+            evicted_size += node.page_length
+            if node.page_length > 0:
+                evicted_indices.append(node.value[node.value >= 0])
+            self.evictable_size -= node.page_length
             parent = node.parent
             del parent.children[self.key_fn(node._key)]
             # NOTE: root is always protected, so won't be evicted
             if parent.is_leaf() and parent.ref_count == 0:
                 heapq.heappush(leave_nodes, parent)
 
+        if len(evicted_indices) == 0:
+            return self.empty_tensor
         return torch.cat(evicted_indices)
 
     def reset(self) -> None:
@@ -185,7 +194,23 @@ class RadixPrefixCache(BasePrefixCache):
         )
 
     def check_integrity(self) -> None:
-        pass
+        expected_evictable = 0
+        expected_protected = 0
+        stack: List[RadixTreeNode] = [self.root_node]
+        while len(stack) > 0:
+            node = stack.pop()
+            for child in node.children.values():
+                if child.ref_count == 0:
+                    expected_evictable += child.page_length
+                else:
+                    expected_protected += child.page_length
+                stack.append(child)
+        if expected_evictable != self.evictable_size or expected_protected != self.protected_size:
+            raise RuntimeError(
+                "RadixPrefixCache integrity check failed:"
+                f" evictable({self.evictable_size}) != expected({expected_evictable}) or"
+                f" protected({self.protected_size}) != expected({expected_protected})"
+            )
 
     def _collect_leave_nodes_for_evict(self) -> List[RadixTreeNode]:
         nodes: List[RadixTreeNode] = [self.root_node]
