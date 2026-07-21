@@ -6,6 +6,55 @@ from typing import TYPE_CHECKING, List, Literal
 
 import torch
 
+
+def build_context_visibility_mask_reference(
+    full_kv_owner: torch.Tensor,
+    full_query_epoch: torch.Tensor,
+    drop_visible_until: torch.Tensor,
+    *,
+    query_positions: torch.Tensor | None = None,
+    key_positions: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Build the exact dense Drop Message mask used as the CPU correctness oracle."""
+
+    tensors = (full_kv_owner, full_query_epoch, drop_visible_until)
+    if any(tensor.ndim != 1 for tensor in tensors):
+        raise ValueError("Context-mask metadata tensors must be one-dimensional.")
+    if len(full_kv_owner) != len(full_query_epoch):
+        raise ValueError("full_kv_owner and full_query_epoch must have the same length.")
+    if len(full_query_epoch) > 1 and bool(
+        torch.any(full_query_epoch[1:] < full_query_epoch[:-1]).item()
+    ):
+        raise ValueError("full_query_epoch must be monotonically non-decreasing.")
+    if len(full_kv_owner) > 0:
+        if bool(torch.any(full_kv_owner < 0).item()) or bool(
+            torch.any(full_kv_owner >= len(drop_visible_until)).item()
+        ):
+            raise ValueError("full_kv_owner contains an out-of-range message ID.")
+
+    device = full_kv_owner.device
+    if query_positions is None:
+        query_positions = torch.arange(len(full_query_epoch), dtype=torch.int64, device=device)
+    if key_positions is None:
+        key_positions = torch.arange(len(full_kv_owner), dtype=torch.int64, device=device)
+    if query_positions.ndim != 1 or key_positions.ndim != 1:
+        raise ValueError("query_positions and key_positions must be one-dimensional.")
+    query_positions = query_positions.to(dtype=torch.int64, device=device)
+    key_positions = key_positions.to(dtype=torch.int64, device=device)
+    for name, positions in (("query_positions", query_positions), ("key_positions", key_positions)):
+        if len(positions) > 0 and (
+            bool(torch.any(positions < 0).item())
+            or bool(torch.any(positions >= len(full_kv_owner)).item())
+        ):
+            raise ValueError(f"{name} contains an out-of-range full-token position.")
+
+    query_epoch = full_query_epoch[query_positions]
+    key_owner = full_kv_owner[key_positions]
+    visible_until = drop_visible_until[key_owner.to(dtype=torch.int64)]
+    causal = key_positions.unsqueeze(0) <= query_positions.unsqueeze(1)
+    visible = query_epoch.unsqueeze(1) <= visible_until.unsqueeze(0)
+    return causal & visible
+
 if TYPE_CHECKING:
     from minisgl.attention import BaseAttnBackend, BaseAttnMetadata
     from minisgl.kvcache import BaseCacheHandle, BaseKVCachePool
@@ -45,12 +94,20 @@ class Req:
     prefix_keep_mask: torch.Tensor | None = None  # cpu tensor for full->active prefix filtering
     is_warmup: bool = False
     cache_hit_ratio: float = 1.0
+    full_input_ids: torch.Tensor | None = None
+    full_kv_owner: torch.Tensor | None = None
+    full_query_epoch: torch.Tensor | None = None
+    drop_visible_until: torch.Tensor | None = None
+    full_keep_mask: torch.Tensor | None = None
+    use_context_mask: bool = False
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu
         assert self.true_positions.is_cpu
         assert self.radix_input_ids.is_cpu
         assert self.radix_match_ids.is_cpu
+        if self.use_context_mask and not self.is_warmup:
+            raise ValueError("Context-mask Prefill is restricted to internal warmup requests.")
         if self.prefix_keep_mask is not None:
             assert self.prefix_keep_mask.is_cpu
         assert len(self.input_ids) == len(self.true_positions)
@@ -60,6 +117,50 @@ class Req:
         assert 0 <= self.cached_len < self.device_len <= self.max_device_len
         assert 0 <= self.initial_active_cached_len <= self.cached_len
         assert self.true_seq_len >= int(self.true_positions[self.device_len - 1].item()) + 1
+
+        context_tensors = (
+            self.full_input_ids,
+            self.full_kv_owner,
+            self.full_query_epoch,
+            self.drop_visible_until,
+            self.full_keep_mask,
+        )
+        if any(tensor is not None for tensor in context_tensors):
+            if not all(tensor is not None for tensor in context_tensors):
+                raise ValueError("Context-mask metadata must be provided as one complete set.")
+            assert self.full_input_ids is not None
+            assert self.full_kv_owner is not None
+            assert self.full_query_epoch is not None
+            assert self.drop_visible_until is not None
+            assert self.full_keep_mask is not None
+            for tensor in context_tensors:
+                assert tensor is not None and tensor.is_cpu and tensor.ndim == 1
+                if tensor.dtype != torch.int32:
+                    raise ValueError("Context-mask metadata tensors must use torch.int32.")
+            full_len = len(self.full_input_ids)
+            if not (
+                len(self.full_kv_owner)
+                == len(self.full_query_epoch)
+                == len(self.full_keep_mask)
+                == len(self.radix_match_ids)
+                == full_len
+            ):
+                raise ValueError("Full context-mask tensors and Radix keys must have equal lengths.")
+            if not torch.equal(
+                self.input_ids,
+                self.full_input_ids[self.true_positions.to(dtype=torch.int64)],
+            ):
+                raise ValueError("Active input_ids do not match full_input_ids at true_positions.")
+            if len(self.full_query_epoch) > 1 and bool(
+                torch.any(self.full_query_epoch[1:] < self.full_query_epoch[:-1]).item()
+            ):
+                raise ValueError("full_query_epoch must be monotonically non-decreasing.")
+            if bool(torch.any(self.full_kv_owner < 0).item()) or bool(
+                torch.any(self.full_kv_owner >= len(self.drop_visible_until)).item()
+            ):
+                raise ValueError("full_kv_owner contains an out-of-range message ID.")
+        if self.use_context_mask and not all(tensor is not None for tensor in context_tensors):
+            raise ValueError("Context-mask Prefill requires complete context metadata.")
 
     @property
     def remain_len(self) -> int:

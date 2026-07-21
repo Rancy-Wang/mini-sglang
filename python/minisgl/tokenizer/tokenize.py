@@ -1,14 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import json
-from typing import TYPE_CHECKING, Any, Dict, List
+from dataclasses import dataclass
+from typing import Any, Dict, List
 
 import torch
 from minisgl.message import TokenizeMsg
-
-if TYPE_CHECKING:
-    from transformers import LlamaTokenizer
+from transformers import PreTrainedTokenizerBase
 
 
 @dataclass
@@ -18,13 +16,26 @@ class TokenizedResult:
     radix_input_ids: torch.Tensor
     radix_match_ids: torch.Tensor | None
     prefix_keep_mask: torch.Tensor
+    full_input_ids: torch.Tensor | None = None
+    full_kv_owner: torch.Tensor | None = None
+    full_query_epoch: torch.Tensor | None = None
+    drop_visible_until: torch.Tensor | None = None
+    full_keep_mask: torch.Tensor | None = None
     stop_token_seqs: List[List[int]] | None = None
     message_meta: dict | None = None
 
 
 class TokenizeManager:
-    def __init__(self, tokenizer: LlamaTokenizer) -> None:
+    def __init__(
+        self,
+        tokenizer: PreTrainedTokenizerBase,
+        *,
+        radix_drop_key_mode: str = "symbol",
+    ) -> None:
+        if radix_drop_key_mode not in {"bitmask", "symbol"}:
+            raise ValueError(f"Unsupported radix drop key mode: {radix_drop_key_mode}")
         self.tokenizer = tokenizer
+        self.radix_drop_key_mode = radix_drop_key_mode
         # Be optimistic: many tokenizers accept extra kwargs via **kwargs even
         # when the explicit signature does not list `enable_thinking`.
         self._supports_enable_thinking = True
@@ -238,14 +249,49 @@ class TokenizeManager:
         normalized: dict[int, List[int]] = {}
         for k, value in drop_message.items():
             n = int(k)
-            if n < 0 or n >= 32:
+            if n < 0:
+                raise ValueError(f"drop_message key must be non-negative: {n}")
+            if self.radix_drop_key_mode == "bitmask" and n >= 32:
                 raise ValueError(f"drop_message key out of range [0, 31]: {n}")
+            if self.radix_drop_key_mode == "symbol" and n >= (1 << 63):
+                raise ValueError(f"drop_message key out of int64 range: {n}")
             ids = [int(v) for v in value]
             for msg_id in ids:
-                if msg_id < 0 or msg_id >= 32:
+                if msg_id < 0:
+                    raise ValueError(f"drop_message id must be non-negative: {msg_id}")
+                if self.radix_drop_key_mode == "bitmask" and msg_id >= 32:
                     raise ValueError(f"drop_message id out of range [0, 31]: {msg_id}")
+                if self.radix_drop_key_mode == "symbol" and msg_id >= (1 << 63):
+                    raise ValueError(f"drop_message id out of int64 range: {msg_id}")
             normalized[n] = ids
         return normalized
+
+    @staticmethod
+    def _shift_and_validate_drop_message(
+        drop_message: dict[int, List[int]],
+        *,
+        target_offset: int,
+        normalized_message_count: int,
+    ) -> dict[int, List[int]]:
+        shifted: dict[int, List[int]] = {}
+        for raw_n, raw_ids in drop_message.items():
+            n = raw_n + target_offset
+            ids = [msg_id + target_offset for msg_id in raw_ids]
+            if n >= normalized_message_count:
+                # Staged warmup tokenizes message prefixes while carrying the full
+                # request schedule. Events beyond this prefix have not happened yet.
+                continue
+            for raw_id, msg_id in zip(raw_ids, ids, strict=True):
+                if msg_id >= normalized_message_count:
+                    raise ValueError(
+                        f"drop_message id {raw_id} refers to a message outside the conversation."
+                    )
+                if msg_id > n:
+                    raise ValueError(
+                        f"drop_message event {raw_n} cannot drop future message {raw_id}."
+                    )
+            shifted[n] = ids
+        return shifted
 
     def _build_drop_set(self, drop_message: dict[int, List[int]], upper_n: int) -> set[int]:
         dropped: set[int] = set()
@@ -259,6 +305,21 @@ class TokenizeManager:
         for dropped_id in self._build_drop_set(drop_message, msg_id):
             mask |= 1 << dropped_id
         return mask
+
+    @staticmethod
+    def _build_drop_visible_until(
+        drop_message: dict[int, List[int]], message_count_with_generation: int
+    ) -> torch.Tensor:
+        result = torch.full(
+            (message_count_with_generation,),
+            torch.iinfo(torch.int32).max,
+            dtype=torch.int32,
+            device="cpu",
+        )
+        for n, ids in drop_message.items():
+            for msg_id in ids:
+                result[msg_id] = min(int(result[msg_id].item()), n)
+        return result
 
     @staticmethod
     def _encode_radix_key(token_id: int, drop_mask: int) -> int:
@@ -351,14 +412,33 @@ class TokenizeManager:
 
         return curr_owner, lcp, lcsuf, unstable
 
+    @staticmethod
+    def _merge_query_epoch_track(
+        prev_epoch: List[int],
+        curr_len: int,
+        *,
+        stable_prefix_len: int,
+        new_epoch: int,
+    ) -> List[int]:
+        """Keep only the stable prefix epoch; all rewritten/suffix tokens use the new epoch."""
+
+        curr_epoch = [new_epoch] * curr_len
+        safe_lcp = min(stable_prefix_len, len(prev_epoch), curr_len)
+        if safe_lcp > 0:
+            curr_epoch[:safe_lcp] = prev_epoch[:safe_lcp]
+        if any(curr_epoch[i] > curr_epoch[i + 1] for i in range(len(curr_epoch) - 1)):
+            raise RuntimeError("Query epoch construction produced a non-monotonic token sequence.")
+        return curr_epoch
+
     def _round_by_round_no_gen(
         self,
         messages: List[dict[str, Any]],
         enable_thinking: bool | None,
         tools: List[Dict[str, Any]] | None,
-    ) -> tuple[List[int], List[int], int]:
+    ) -> tuple[List[int], List[int], List[int], int]:
         assembled: List[int] = []
         owner: List[int] = []
+        query_epoch: List[int] = []
         unstable_rounds = 0
 
         for i in range(len(messages)):
@@ -371,15 +451,22 @@ class TokenizeManager:
             if i == 0:
                 assembled = curr
                 owner = [0] * len(curr)
+                query_epoch = [0] * len(curr)
                 continue
 
-            owner, _, _, unstable = self._merge_owner_track(
+            owner, lcp, _, unstable = self._merge_owner_track(
                 assembled, owner, curr, new_owner=i
+            )
+            query_epoch = self._merge_query_epoch_track(
+                query_epoch,
+                len(curr),
+                stable_prefix_len=lcp,
+                new_epoch=i,
             )
             unstable_rounds += int(unstable)
             assembled = curr
 
-        return assembled, owner, unstable_rounds
+        return assembled, owner, query_epoch, unstable_rounds
 
     @staticmethod
     def _map_no_gen_pos_to_with_gen(
@@ -417,11 +504,12 @@ class TokenizeManager:
         )
         safe_mode = False
         try:
-            full_no_gen, no_gen_owner, unstable_rounds = self._round_by_round_no_gen(
-                messages, msg.enable_thinking, selected_tools
+            full_no_gen, no_gen_owner, no_gen_query_epoch, unstable_rounds = (
+                self._round_by_round_no_gen(messages, msg.enable_thinking, selected_tools)
             )
             if len(messages) == 0:
                 no_gen_owner = []
+                no_gen_query_epoch = []
             full_with_gen = self._apply_chat_template(
                 messages,
                 add_generation_prompt=True,
@@ -437,20 +525,27 @@ class TokenizeManager:
                 safe_mode=True,
             )
             safe_mode = True
-            full_no_gen, no_gen_owner, unstable_rounds = self._round_by_round_no_gen(
-                messages, msg.enable_thinking, None
+            full_no_gen, no_gen_owner, no_gen_query_epoch, unstable_rounds = (
+                self._round_by_round_no_gen(messages, msg.enable_thinking, None)
             )
             if len(messages) == 0:
                 no_gen_owner = []
+                no_gen_query_epoch = []
             full_with_gen = self._apply_chat_template(
                 messages,
                 add_generation_prompt=True,
                 enable_thinking=msg.enable_thinking,
                 tools=None,
             )
+        drop_message = self._shift_and_validate_drop_message(
+            drop_message,
+            target_offset=target_offset,
+            normalized_message_count=len(messages),
+        )
         full_no_gen_tensor = torch.tensor(full_no_gen, dtype=torch.int32, device="cpu")
         full_with_gen_tensor = torch.tensor(full_with_gen, dtype=torch.int32, device="cpu")
         next_assistant_id = len(messages)
+        generation_prompt_epoch = next_assistant_id
         owner_with_gen, no_gen_with_gen_lcp, no_gen_with_gen_lcsuf, unstable_with_gen = (
             self._merge_owner_track(
                 full_no_gen,
@@ -461,6 +556,16 @@ class TokenizeManager:
             if len(full_no_gen) > 0
             else ([next_assistant_id] * len(full_with_gen), 0, 0, False)
         )
+        query_epoch_with_gen = (
+            self._merge_query_epoch_track(
+                no_gen_query_epoch,
+                len(full_with_gen),
+                stable_prefix_len=no_gen_with_gen_lcp,
+                new_epoch=generation_prompt_epoch,
+            )
+            if len(full_no_gen) > 0
+            else [generation_prompt_epoch] * len(full_with_gen)
+        )
 
         target_msg_id = self._resolve_target_msg_id(
             msg,
@@ -469,6 +574,10 @@ class TokenizeManager:
         )
         dropped_for_target = self._build_drop_set(drop_message, target_msg_id)
         owner_tensor = torch.tensor(owner_with_gen, dtype=torch.int32, device="cpu")
+        query_epoch_tensor = torch.tensor(query_epoch_with_gen, dtype=torch.int32, device="cpu")
+        drop_visible_until = self._build_drop_visible_until(
+            drop_message, len(messages) + 1
+        )
 
         keep_mask = torch.ones(len(full_with_gen_tensor), dtype=torch.bool, device="cpu")
         for msg_id in dropped_for_target:
@@ -487,7 +596,7 @@ class TokenizeManager:
             return int(keep_mask[:raw_pos].sum().item())
 
         # Apply drop mask encoding to first token of every message in the full stream.
-        message_starts: List[dict[str, int]] = []
+        message_starts: List[dict[str, Any]] = []
         for msg_id in range(len(messages)):
             try:
                 start = owner_with_gen.index(msg_id)
@@ -496,17 +605,20 @@ class TokenizeManager:
             if start >= len(radix_match_ids):
                 continue
             encoded_pos = compact_pos(start)
-            drop_mask = self._build_drop_mask(drop_message, msg_id)
-            token_id = int(radix_match_ids[start].item())
-            radix_match_ids[start] = self._encode_radix_key(token_id, drop_mask)
-            message_starts.append(
-                {
-                    "msg_id": msg_id,
-                    "raw_start": start,
-                    "compact_start": encoded_pos,
-                    "drop_mask": drop_mask,
-                }
-            )
+            dropped_ids = sorted(self._build_drop_set(drop_message, msg_id))
+            start_meta: dict[str, Any] = {
+                "msg_id": msg_id,
+                "raw_start": start,
+                "compact_start": encoded_pos,
+            }
+            if self.radix_drop_key_mode == "bitmask":
+                drop_mask = self._build_drop_mask(drop_message, msg_id)
+                token_id = int(radix_match_ids[start].item())
+                radix_match_ids[start] = self._encode_radix_key(token_id, drop_mask)
+                start_meta["drop_mask"] = drop_mask
+            else:
+                start_meta["dropped_ids"] = dropped_ids
+            message_starts.append(start_meta)
 
         # Also encode the generation-prompt start as the "next assistant message" start.
         try:
@@ -515,17 +627,20 @@ class TokenizeManager:
             gen_prompt_start = len(full_no_gen)
         if gen_prompt_start < len(radix_match_ids):
             encoded_pos = compact_pos(gen_prompt_start)
-            drop_mask = self._build_drop_mask(drop_message, next_assistant_id)
-            token_id = int(radix_match_ids[gen_prompt_start].item())
-            radix_match_ids[gen_prompt_start] = self._encode_radix_key(token_id, drop_mask)
-            message_starts.append(
-                {
-                    "msg_id": next_assistant_id,
-                    "raw_start": gen_prompt_start,
-                    "compact_start": encoded_pos,
-                    "drop_mask": drop_mask,
-                }
-            )
+            dropped_ids = sorted(self._build_drop_set(drop_message, next_assistant_id))
+            start_meta = {
+                "msg_id": next_assistant_id,
+                "raw_start": gen_prompt_start,
+                "compact_start": encoded_pos,
+            }
+            if self.radix_drop_key_mode == "bitmask":
+                drop_mask = self._build_drop_mask(drop_message, next_assistant_id)
+                token_id = int(radix_match_ids[gen_prompt_start].item())
+                radix_match_ids[gen_prompt_start] = self._encode_radix_key(token_id, drop_mask)
+                start_meta["drop_mask"] = drop_mask
+            else:
+                start_meta["dropped_ids"] = dropped_ids
+            message_starts.append(start_meta)
 
         radix_input_ids = radix_match_ids[keep_mask].contiguous()
 
@@ -535,6 +650,11 @@ class TokenizeManager:
             radix_input_ids=radix_input_ids,
             radix_match_ids=radix_match_ids,
             prefix_keep_mask=prefix_keep_mask,
+            full_input_ids=(full_with_gen_tensor if drop_message else None),
+            full_kv_owner=(owner_tensor if drop_message else None),
+            full_query_epoch=(query_epoch_tensor if drop_message else None),
+            drop_visible_until=(drop_visible_until if drop_message else None),
+            full_keep_mask=(keep_mask.to(dtype=torch.int32).contiguous() if drop_message else None),
             stop_token_seqs=self._build_stop_token_seqs(msg.stop),
             message_meta={
                 "raw_len_with_gen": len(full_with_gen_tensor),
@@ -548,6 +668,7 @@ class TokenizeManager:
                 "normalized_messages": len(messages),
                 "target_offset": target_offset,
                 "safe_mode": int(safe_mode),
+                "radix_drop_key_mode": self.radix_drop_key_mode,
             },
         )
 

@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-import sys
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -11,12 +10,12 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Literal, Tuple
 
 import uvicorn
-from fastapi import FastAPI
-from fastapi import HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from minisgl.core import SamplingParams
 from minisgl.env import ENV
 from minisgl.message import (
+    AbortMsg,
     BaseFrontendMsg,
     BaseTokenizerMsg,
     BatchFrontendMsg,
@@ -54,16 +53,32 @@ def _unwrap_msg(msg: BaseFrontendMsg) -> List[UserReply | WarmupReply]:
     return [msg]
 
 
-def _validate_drop_message(drop_message: Dict[int, List[int]]) -> None:
+def _validate_drop_message(
+    drop_message: Dict[int, List[int]],
+    *,
+    radix_drop_key_mode: str = "symbol",
+) -> None:
     for raw_n, raw_ids in drop_message.items():
         n = int(raw_n)
-        if n < 0 or n >= 32:
+        if n < 0:
+            raise HTTPException(status_code=400, detail=f"drop_message key must be non-negative: {n}")
+        if radix_drop_key_mode == "bitmask" and n >= 32:
             raise HTTPException(status_code=400, detail=f"drop_message key out of range [0, 31]: {n}")
+        if radix_drop_key_mode == "symbol" and n >= (1 << 63):
+            raise HTTPException(status_code=400, detail=f"drop_message key out of int64 range: {n}")
         for raw_id in raw_ids:
             msg_id = int(raw_id)
-            if msg_id < 0 or msg_id >= 32:
+            if msg_id < 0:
+                raise HTTPException(
+                    status_code=400, detail=f"drop_message id must be non-negative: {msg_id}"
+                )
+            if radix_drop_key_mode == "bitmask" and msg_id >= 32:
                 raise HTTPException(
                     status_code=400, detail=f"drop_message id out of range [0, 31]: {msg_id}"
+                )
+            if radix_drop_key_mode == "symbol" and msg_id >= (1 << 63):
+                raise HTTPException(
+                    status_code=400, detail=f"drop_message id out of int64 range: {msg_id}"
                 )
 
 
@@ -483,7 +498,8 @@ class FrontendManager:
         while True:
             msg = await self.recv_tokenizer.get()
             for msg in _unwrap_msg(msg):
-                assert msg.uid in self.ack_map
+                if msg.uid not in self.ack_map:
+                    continue
                 self.ack_map[msg.uid].append(msg)
                 self.event_map[msg.uid].set()
 
@@ -528,8 +544,13 @@ class FrontendManager:
         tools: List[Dict[str, Any]] | None,
         tool_choice: str | Dict[str, Any] | None,
     ) -> None:
+        # Event n changes visibility only for messages after n. A future event
+        # therefore needs no special warmup for the current generation prompt.
+        if not any(int(raw_n) < len(messages) for raw_n in drop_message):
+            return
         warmup_target = max(len(messages) - 1, 0)
         warmup_uid = self.new_user()
+        use_context_mask = self.config.contextual_prefill_mode != "staged"
         await self.send_one(
             TokenizeMsg(
                 uid=warmup_uid,
@@ -542,9 +563,12 @@ class FrontendManager:
                 tool_choice=tool_choice,
                 is_warmup=True,
                 internal_uid=warmup_uid,
+                use_context_mask=use_context_mask,
             )
         )
         warmup_ack = await self.wait_for_warmup(warmup_uid)
+        if use_context_mask:
+            return
         if warmup_ack.hit_ratio >= 0.95:
             return
 
@@ -667,6 +691,18 @@ class FrontendManager:
         yield b"data: [DONE]\n\n"
         logger.debug("Finished streaming response for user %s", uid)
 
+    async def stream_with_cancellation(self, generator, request: Request, uid: int):
+        try:
+            async for chunk in generator:
+                # detect if the client has disconnected
+                if await request.is_disconnected():
+                    logger.info("Client disconnected for user %s", uid)
+                    raise asyncio.CancelledError
+                yield chunk
+        except asyncio.CancelledError:
+            asyncio.create_task(self.abort_user(uid))
+            raise
+
     async def abort_user(self, uid: int):
         await asyncio.sleep(0.1)
         if uid in self.ack_map:
@@ -674,6 +710,7 @@ class FrontendManager:
         if uid in self.event_map:
             del self.event_map[uid]
         logger.warning("Aborting request for user %s", uid)
+        await self.send_one(AbortMsg(uid=uid))
 
     def shutdown(self):
         self.send_tokenizer.stop()
@@ -693,7 +730,7 @@ app = FastAPI(title="MiniSGL API Server", version="0.0.1", lifespan=lifespan)
 
 
 @app.post("/generate")
-async def generate(req: GenerateRequest):
+async def generate(req: GenerateRequest, request: Request):
     logger.debug("Received generate request %s", req)
     state = get_global_state()
     uid = state.new_user()
@@ -708,13 +745,9 @@ async def generate(req: GenerateRequest):
         )
     )
 
-    async def _abort():
-        await state.abort_user(uid)
-
     return StreamingResponse(
-        state.stream_generate(uid),
+        state.stream_with_cancellation(state.stream_generate(uid), request, uid),
         media_type="text/event-stream",
-        background=BackgroundTask(lambda: _abort),
     )
 
 
@@ -724,10 +757,13 @@ async def v1_root():
 
 
 @app.post("/v1/chat/completions")
-async def v1_completions(req: OpenAICompletionRequest):
+async def v1_completions(req: OpenAICompletionRequest, request: Request):
     state = get_global_state()
     if req.drop_message is not None:
-        _validate_drop_message(req.drop_message)
+        _validate_drop_message(
+            req.drop_message,
+            radix_drop_key_mode=state.config.radix_drop_key_mode,
+        )
     wire_drop_message = _to_wire_drop_message(req.drop_message)
     normalized_tool_choice: str | Dict[str, Any] = "none"
     if req.messages:
@@ -786,14 +822,45 @@ async def v1_completions(req: OpenAICompletionRequest):
         )
     )
 
-    async def _abort():
-        await state.abort_user(uid)
+    if req.stream:
+        return StreamingResponse(
+            state.stream_with_cancellation(
+                state.stream_chat_completions(
+                    uid,
+                    tools=req.tools,
+                    tool_choice=normalized_tool_choice,
+                ),
+                request,
+                uid,
+            ),
+            media_type="text/event-stream",
+        )
 
-    return StreamingResponse(
-        state.stream_chat_completions(uid, tools=req.tools, tool_choice=normalized_tool_choice),
-        media_type="text/event-stream",
-        background=BackgroundTask(lambda: _abort),
-    )
+    # Non-streaming: collect all chunks and return a single JSON response
+    full_content = ""
+    async for ack in state.wait_for_ack(uid):
+        full_content += ack.incremental_output
+        if ack.finished:
+            break
+
+    return {
+        "id": f"chatcmpl-{uid}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": req.model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": full_content},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        },
+    }
 
 
 @app.get("/v1/models")
@@ -806,7 +873,10 @@ async def shell_completion(req: OpenAICompletionRequest):
     state = get_global_state()
     assert req.messages is not None, "Shell completion only supports chat-completions"
     if req.drop_message is not None:
-        _validate_drop_message(req.drop_message)
+        _validate_drop_message(
+            req.drop_message,
+            radix_drop_key_mode=state.config.radix_drop_key_mode,
+        )
     wire_drop_message = _to_wire_drop_message(req.drop_message)
     prompt = [msg.model_dump() for msg in req.messages]
     normalized_tool_choice = _normalize_tool_choice(req.tools, req.tool_choice)
@@ -849,21 +919,6 @@ async def shell_completion(req: OpenAICompletionRequest):
     )
 
 
-async def read_stdin():
-    loop = asyncio.get_running_loop()
-    reader = asyncio.StreamReader()
-    protocol = asyncio.StreamReaderProtocol(reader)
-    await loop.connect_read_pipe(lambda: protocol, sys.stdin)
-
-    while True:
-        line = await reader.readline()
-        line = line.decode().rstrip("\n")
-
-
-async def async_input(prompt=""):
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, lambda: input(prompt))
-
 
 async def shell():
     commands = ["/exit", "/reset"]
@@ -873,7 +928,6 @@ async def shell():
     try:
         history: List[Tuple[str, str]] = []
         while True:
-            need_stop = False
             cmd = (await session.prompt_async()).strip()
             if cmd == "":
                 continue
@@ -900,8 +954,6 @@ async def shell():
             )
             cur_msg = ""
             async for chunk in (await shell_completion(req)).body_iterator:
-                if need_stop:
-                    break
                 msg = chunk.decode()  # type: ignore
                 assert msg.startswith("data: "), msg
                 msg = msg[6:]

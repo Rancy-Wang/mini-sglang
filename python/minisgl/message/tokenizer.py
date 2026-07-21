@@ -54,6 +54,7 @@ class TokenizeMsg(BaseTokenizerMsg):
     message_meta: Dict | None = None
     is_warmup: bool = False
     internal_uid: int | None = None
+    use_context_mask: bool = False
 
 
 @dataclass

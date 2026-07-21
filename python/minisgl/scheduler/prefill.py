@@ -22,10 +22,11 @@ logger = init_logger(__name__)
 
 class ChunkedReq(Req):
     def append_host(self, next_token: torch.Tensor) -> None:
-        raise NotImplementedError("ChunkedReq should be sampled")
+        raise NotImplementedError("ChunkedReq should not be sampled")
 
+    @property
     def can_decode(self) -> bool:
-        return False
+        return False  # avoid being added to decode manager
 
 
 @dataclass
@@ -41,8 +42,22 @@ class PrefillAdder:
         if self.table_manager.available_size == 0:
             return None
 
-        match = self.cache_manager.match_req(req)
-        cached_len = match.active_cached_len
+        if req.use_context_mask:
+            match = self.cache_manager.match_full_req(req)
+            if match is None:
+                return None
+            cache_handle = match.handle
+            cached_len = match.safe_cached_len
+            cached_indices = match.safe_match_indices
+            initial_full_match_indices = match.full_match_indices
+        else:
+            match = self.cache_manager.match_req(req)
+            if match is None:
+                return None
+            cache_handle = match.handle
+            cached_len = match.active_cached_len
+            cached_indices = match.active_match_indices
+            initial_full_match_indices = match.full_match_indices[: match.full_cached_len]
         effective_prefix_len = max(req.input_len - 1, 0)
         hit_ratio = 1.0 if effective_prefix_len == 0 else cached_len / effective_prefix_len
         # TODO: better estimate policy
@@ -51,23 +66,28 @@ class PrefillAdder:
 
         if estimated_len + self.reserved_size > self.cache_manager.available_size:
             return None
-        self.cache_manager.lock(match.handle)
+        self.cache_manager.lock(cache_handle)
         if estimated_len + self.reserved_size > self.cache_manager.available_size:
-            self.cache_manager.unlock(match.handle)
+            self.cache_manager.unlock(cache_handle)
             return None
 
         table_idx = self.table_manager.allocate()
-        if cached_len > 0:  # NOTE: set the cached part
-            device_ids = self.table_manager.token_pool[table_idx][:cached_len]
-            page_entry = self.table_manager.page_table[table_idx][:cached_len]
-            device_ids.copy_(req.input_ids[:cached_len].pin_memory(), non_blocking=True)
-            page_entry.copy_(match.active_match_indices)
+        try:
+            if cached_len > 0:  # NOTE: set the cached part
+                device_ids = self.table_manager.token_pool[table_idx][:cached_len]
+                page_entry = self.table_manager.page_table[table_idx][:cached_len]
+                device_ids.copy_(req.input_ids[:cached_len].pin_memory(), non_blocking=True)
+                page_entry.copy_(cached_indices)
+        except Exception:
+            self.table_manager.free(table_idx)
+            self.cache_manager.unlock(cache_handle)
+            raise
 
         return (
-            match.handle,
+            cache_handle,
             table_idx,
             hit_ratio,
-            match.full_match_indices[: match.full_cached_len].clone(),
+            initial_full_match_indices.clone(),
             cached_len,
         )
 
@@ -89,7 +109,7 @@ class PrefillAdder:
         self.reserved_size += remain_len + pending_req.output_len
         # NOTE: update the tokens ids only; new pages will be allocated in the scheduler
         _slice = slice(cached_len, cached_len + chunk_size)
-        device_ids = self.table_manager.token_pool[table_idx][_slice]
+        device_ids = self.table_manager.token_pool[table_idx, _slice]
         device_ids.copy_(pending_req.input_ids[_slice].pin_memory(), non_blocking=True)
         return CLS(
             input_ids=pending_req.input_ids[: cached_len + chunk_size],
@@ -114,6 +134,12 @@ class PrefillAdder:
             prefix_keep_mask=pending_req.prefix_keep_mask,
             is_warmup=pending_req.is_warmup,
             cache_hit_ratio=cache_hit_ratio,
+            full_input_ids=pending_req.full_input_ids,
+            full_kv_owner=pending_req.full_kv_owner,
+            full_query_epoch=pending_req.full_query_epoch,
+            drop_visible_until=pending_req.drop_visible_until,
+            full_keep_mask=pending_req.full_keep_mask,
+            use_context_mask=pending_req.use_context_mask,
         )
 
     def try_add_one(self, pending_req: PendingReq) -> Req | None:
@@ -160,12 +186,23 @@ class PrefillManager:
     pending_list: List[PendingReq] = field(default_factory=list)
 
     def add_one_req(self, req: UserMsg) -> None:
+        input_ids = req.input_ids
+        true_positions = req.true_positions
+        radix_input_ids = req.radix_input_ids
+        if req.use_context_mask:
+            if not req.is_warmup:
+                raise ValueError("Context-mask Prefill is restricted to warmup requests.")
+            if req.full_input_ids is None or req.radix_match_ids is None:
+                raise ValueError("Context-mask Prefill requires a full token stream and Radix keys.")
+            input_ids = req.full_input_ids
+            true_positions = torch.arange(len(input_ids), dtype=torch.int32, device="cpu")
+            radix_input_ids = req.radix_match_ids
         self.pending_list.append(
             PendingReq(
                 uid=req.uid,
-                input_ids=req.input_ids,
-                true_positions=req.true_positions,
-                radix_input_ids=req.radix_input_ids,
+                input_ids=input_ids,
+                true_positions=true_positions,
+                radix_input_ids=radix_input_ids,
                 radix_match_ids=req.radix_match_ids,
                 sampling_params=req.sampling_params,
                 stop=req.stop,
@@ -173,6 +210,12 @@ class PrefillManager:
                 is_warmup=req.is_warmup,
                 internal_uid=req.internal_uid,
                 prefix_keep_mask=req.prefix_keep_mask,
+                full_input_ids=req.full_input_ids,
+                full_kv_owner=req.full_kv_owner,
+                full_query_epoch=req.full_query_epoch,
+                drop_visible_until=req.drop_visible_until,
+                full_keep_mask=req.full_keep_mask,
+                use_context_mask=req.use_context_mask,
             )
         )
 
@@ -190,18 +233,29 @@ class PrefillManager:
         reqs: List[Req] = []
         chunked_list: List[PendingReq] = []
         for pending_req in self.pending_list:
+            if len(reqs) > 0 and (pending_req.use_context_mask or reqs[0].use_context_mask):
+                break
             if req := adder.try_add_one(pending_req):
                 pending_req.chunked_req = None
                 if isinstance(req, ChunkedReq):
                     pending_req.chunked_req = req
                     chunked_list.append(pending_req)
                 reqs.append(req)
+                if pending_req.use_context_mask:
+                    break
             else:
                 break  # We cannot add more requests
         if len(reqs) == 0:
             return None
         self.pending_list = chunked_list + self.pending_list[len(reqs) :]
         return Batch(reqs=reqs, phase="prefill")
+
+    def abort_req(self, uid: int) -> Req | None:
+        for i, req in enumerate(self.pending_list):
+            if req.uid == uid:
+                self.pending_list.pop(i)
+                return req.chunked_req
+        return None
 
     @property
     def runnable(self) -> bool:

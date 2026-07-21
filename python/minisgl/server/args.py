@@ -218,6 +218,31 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     )
 
     parser.add_argument(
+        "--radix-drop-key-mode",
+        type=str,
+        choices=["bitmask", "symbol"],
+        default=ServerArgs.radix_drop_key_mode,
+        help=(
+            "How drop-message state is injected into Radix keys. "
+            "'bitmask' keeps the legacy high-32-bit mask; 'symbol' interns the exact "
+            "(token, drop-state) pair into one int64 Radix symbol."
+        ),
+    )
+
+    parser.add_argument(
+        "--contextual-prefill-mode",
+        type=str,
+        choices=["staged", "flashinfer-mask", "flashattention-mask"],
+        default=ServerArgs.contextual_prefill_mode,
+        help=(
+            "How a low-hit contextual warmup is Prefilled. 'staged' keeps the "
+            "legacy per-message fallback; 'flashinfer-mask' uses one isolated "
+            "full-context Prefill with a GPU packed custom mask; "
+            "'flashattention-mask' uses an FA4 CuTe GPU mask on Hopper/Blackwell."
+        ),
+    )
+
+    parser.add_argument(
         "--shell-mode",
         action="store_true",
         help="Run the server in shell mode.",

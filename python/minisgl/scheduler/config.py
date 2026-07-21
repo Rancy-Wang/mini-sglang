@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Literal
 
 from minisgl.engine import EngineConfig
 
@@ -15,6 +16,10 @@ def _get_pid_suffix() -> str:
 class SchedulerConfig(EngineConfig):
     max_extend_tokens: int = 8192
     cache_type: str = "radix"
+    radix_drop_key_mode: Literal["bitmask", "symbol"] = "symbol"
+    contextual_prefill_mode: Literal[
+        "staged", "flashinfer-mask", "flashattention-mask"
+    ] = "staged"
     offline_mode: bool = False
 
     # networking config

@@ -46,3 +46,14 @@ class UserMsg(BaseBackendMsg):
     is_warmup: bool = False
     internal_uid: int | None = None
     prefix_keep_mask: torch.Tensor | None = None  # CPU 1D bool tensor for prefix filtering
+    full_input_ids: torch.Tensor | None = None  # CPU 1D int32 full token stream
+    full_kv_owner: torch.Tensor | None = None  # CPU 1D int32 KV deletion ownership
+    full_query_epoch: torch.Tensor | None = None  # CPU 1D int32 monotonic drop-state epoch
+    drop_visible_until: torch.Tensor | None = None  # CPU 1D int32 first drop event by owner
+    full_keep_mask: torch.Tensor | None = None  # CPU 1D int32 final full-to-active mask
+    use_context_mask: bool = False  # internal warmup: Prefill the full stream with a custom mask
+
+
+@dataclass
+class AbortBackendMsg(BaseBackendMsg):
+    uid: int

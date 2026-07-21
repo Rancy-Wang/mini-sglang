@@ -26,6 +26,12 @@ class PendingReq:
     is_warmup: bool = False
     internal_uid: int | None = None
     prefix_keep_mask: torch.Tensor | None = None  # bool mask for prefix cache filtering
+    full_input_ids: torch.Tensor | None = None
+    full_kv_owner: torch.Tensor | None = None
+    full_query_epoch: torch.Tensor | None = None
+    drop_visible_until: torch.Tensor | None = None
+    full_keep_mask: torch.Tensor | None = None
+    use_context_mask: bool = False
     chunked_req: ChunkedReq | None = None
 
     @property

@@ -37,6 +37,7 @@ class RadixTreeNode:
         self._key = key
         self._value = value
         self._length = len(key)
+        # Count real page slots only; dropped-hole sentinels use -1.
         self._page_length = int(torch.count_nonzero(value >= 0).item())
 
     def set_parent(self, parent: RadixTreeNode) -> None:
@@ -140,16 +141,74 @@ class RadixPrefixCache(BasePrefixCache):
         return MatchResult(RadixCacheHandle(prefix_len, node))
 
     def insert_prefix(self, input_ids: torch.Tensor, indices: torch.Tensor) -> InsertResult:
+        if len(input_ids) != len(indices):
+            raise ValueError("Radix keys and page indices must have equal lengths.")
+        if bool(torch.any(indices < 0).item()):
+            raise ValueError("Radix page indices must not contain negative holes.")
+
         insert_len = align_down(len(input_ids), self.page_size)
         input_ids, indices = input_ids[:insert_len], indices[:insert_len]
         node, prefix_len = self._tree_walk(input_ids)
-        if prefix_len != insert_len:  # NOTE: prefix_len < insert_len
+        if prefix_len != insert_len:
             new_node = RadixTreeNode(self.key_fn)
             new_node.set_key_value(input_ids[prefix_len:], indices[prefix_len:].clone())
             new_node.set_parent(node)
             self.evictable_size += new_node.page_length
             node = new_node
         return InsertResult(prefix_len, RadixCacheHandle(insert_len, node))
+
+    def prune_suffix(
+        self, input_ids: torch.Tensor, valid_prefix_len: int
+    ) -> torch.Tensor | None:
+        """Remove an unprotected legacy sparse branch after its first invalid slot."""
+
+        if self.page_size != 1:
+            raise RuntimeError("Legacy sparse Radix pruning is only supported for page_size=1.")
+        if valid_prefix_len < 0 or valid_prefix_len >= len(input_ids):
+            raise ValueError("The prune boundary must point inside the matched path.")
+
+        boundary = self.root_node
+        cursor = 0
+        while cursor < valid_prefix_len:
+            child = boundary.children.get(self.key_fn(input_ids[cursor:]))
+            if child is None:
+                raise RuntimeError("Cannot prune a Radix path that is not present.")
+            span = min(child.length, valid_prefix_len - cursor)
+            if not torch.equal(child._key[:span], input_ids[cursor : cursor + span]):
+                raise RuntimeError("Radix path changed while locating the prune boundary.")
+            if span < child.length:
+                if child.ref_count > 0:
+                    return None
+                boundary = child.split_at(span)
+            else:
+                boundary = child
+            cursor += span
+
+        stale_key = self.key_fn(input_ids[valid_prefix_len:])
+        stale_root = boundary.children.get(stale_key)
+        if stale_root is None:
+            raise RuntimeError("Cannot find the stale Radix suffix to prune.")
+
+        stack = [stale_root]
+        subtree: List[RadixTreeNode] = []
+        while stack:
+            node = stack.pop()
+            if node.ref_count > 0:
+                return None
+            subtree.append(node)
+            stack.extend(node.children.values())
+
+        page_count = sum(node.page_length for node in subtree)
+        pages = [node.value[node.value >= 0] for node in subtree if node.page_length > 0]
+        del boundary.children[stale_key]
+        self.evictable_size -= page_count
+        if self.evictable_size < 0:
+            raise RuntimeError("Radix evictable-size accounting underflow during prune.")
+
+        if not pages:
+            return self.empty_tensor
+        return torch.cat(pages)
+
 
     def evict(self, size: int) -> torch.Tensor:
         if size == 0:
@@ -197,9 +256,13 @@ class RadixPrefixCache(BasePrefixCache):
         expected_evictable = 0
         expected_protected = 0
         stack: List[RadixTreeNode] = [self.root_node]
-        while len(stack) > 0:
+        while stack:
             node = stack.pop()
             for child in node.children.values():
+                if bool(torch.any(child.value < 0).item()):
+                    raise RuntimeError(
+                        "RadixPrefixCache integrity check failed: a node contains a negative page hole."
+                    )
                 if child.ref_count == 0:
                     expected_evictable += child.page_length
                 else:

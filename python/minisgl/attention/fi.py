@@ -9,6 +9,7 @@ import torch
 from minisgl.core import Batch, get_global_ctx
 from minisgl.distributed import get_tp_info
 from minisgl.env import ENV
+from minisgl.kernel import build_context_visibility_mask
 from minisgl.utils import div_even, init_logger
 
 from .base import BaseAttnBackend, BaseAttnMetadata
@@ -59,6 +60,7 @@ class FIMetadata(BaseAttnMetadata):
     seq_lens_cpu:       torch.Tensor  # on cpu
     dtype:              torch.dtype
     wrapper:            BatchPrefillWithPagedKVCacheWrapper | BatchDecodeWithPagedKVCacheWrapper
+    custom_mask: torch.Tensor | None
     initialized:        bool = False
     # fmt: on
 
@@ -72,6 +74,9 @@ class FIMetadata(BaseAttnMetadata):
             and self.last_page_len_cpu.is_cpu
             and self.seq_lens_cpu.is_cpu
         )
+        if self.custom_mask is not None:
+            assert self.custom_mask.is_cuda
+            assert self.custom_mask.dtype == torch.uint8
 
     def get_last_indices(self, bs: int) -> torch.Tensor:
         return self.cu_seqlens_q_gpu[1 : 1 + bs] - 1
@@ -147,11 +152,24 @@ class FlashInferBackend(BaseAttnBackend):
                 non_blocking=True,
             )
         else:
+            custom_mask_kwargs = {}
+            qo_indptr = metadata.cu_seqlens_q_cpu
+            kv_indptr = metadata.cu_seqlens_k_cpu
+            last_page_len = metadata.last_page_len_cpu
+            if metadata.custom_mask is not None:
+                custom_mask_kwargs["custom_mask"] = metadata.custom_mask
+                # FlashInfer 0.5.x runs segment_packbits on GPU for the public
+                # custom_mask path, so all mask-shape indptr inputs must be on
+                # the same CUDA device. Ordinary planning keeps the faster
+                # upstream CPU-indptr path.
+                qo_indptr = metadata.cu_seqlens_q_gpu
+                kv_indptr = metadata.cu_seqlens_k_cpu.to(self.device, non_blocking=True)
+                last_page_len = metadata.last_page_len_cpu.to(self.device, non_blocking=True)
             metadata.wrapper.plan(
-                qo_indptr=metadata.cu_seqlens_q_cpu,
-                paged_kv_indptr=metadata.cu_seqlens_k_cpu,
+                qo_indptr=qo_indptr,
+                paged_kv_indptr=kv_indptr,
                 paged_kv_indices=metadata.indices,
-                paged_kv_last_page_len=metadata.last_page_len_cpu,
+                paged_kv_last_page_len=last_page_len,
                 num_qo_heads=metadata.num_qo_heads,
                 num_kv_heads=metadata.num_kv_heads,
                 head_dim_qk=metadata.head_dim,
@@ -161,7 +179,8 @@ class FlashInferBackend(BaseAttnBackend):
                 q_data_type=metadata.dtype,
                 kv_data_type=metadata.dtype,
                 non_blocking=True,
-                causal=True,
+                causal=metadata.custom_mask is None,
+                **custom_mask_kwargs,
             )
         self.last_event.record()
 
@@ -189,6 +208,14 @@ class FlashInferBackend(BaseAttnBackend):
 
     def prepare_metadata(self, batch: Batch) -> None:
         reqs = batch.padded_reqs
+        masked_reqs = [req for req in reqs if req.use_context_mask]
+        if masked_reqs:
+            if not batch.is_prefill or batch.size != 1 or len(reqs) != 1:
+                raise RuntimeError(
+                    "FlashInfer context-mask Prefill must be an unpadded, single-request batch."
+                )
+            if len(masked_reqs) != 1:
+                raise RuntimeError("Mixed masked and ordinary FlashInfer requests are unsupported.")
 
         padded_size = len(reqs)
         seqlens_q = [req.extend_len for req in reqs]
@@ -207,6 +234,33 @@ class FlashInferBackend(BaseAttnBackend):
         else:  # normal extend prefill, with partial cache hit
             cu_seqlens_q_cpu = torch.tensor([0] + seqlens_q, **CPU_KWARGS).cumsum_(dim=0)
 
+        custom_mask = None
+        if masked_reqs:
+            req = masked_reqs[0]
+            if (
+                req.full_kv_owner is None
+                or req.full_query_epoch is None
+                or req.drop_visible_until is None
+            ):
+                raise RuntimeError("Context-mask Prefill request is missing visibility metadata.")
+            full_kv_owner = req.full_kv_owner.to(
+                device=device, dtype=torch.int32, non_blocking=True
+            )
+            full_query_epoch = req.full_query_epoch.to(
+                device=device, dtype=torch.int32, non_blocking=True
+            )
+            drop_visible_until = req.drop_visible_until.to(
+                device=device, dtype=torch.int32, non_blocking=True
+            )
+            custom_mask = build_context_visibility_mask(
+                full_kv_owner,
+                full_query_epoch,
+                drop_visible_until,
+                query_start=req.cached_len,
+                query_length=req.extend_len,
+                key_length=req.device_len,
+            )
+
         page_table = get_global_ctx().page_table
         batch.attn_metadata = FIMetadata(
             cu_seqlens_q_cpu=cu_seqlens_q_cpu,
@@ -222,6 +276,7 @@ class FlashInferBackend(BaseAttnBackend):
             seq_lens_cpu=seq_len_cpu,
             dtype=self.kvcache.dtype,
             wrapper=self.decode_wrappers if batch.is_decode else self.prefill_wrapper,
+            custom_mask=custom_mask,
         )
 
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
