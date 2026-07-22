@@ -277,12 +277,8 @@ class TokenizeManager:
         for raw_n, raw_ids in drop_message.items():
             n = raw_n + target_offset
             ids = [msg_id + target_offset for msg_id in raw_ids]
-            if n >= normalized_message_count:
-                # Staged warmup tokenizes message prefixes while carrying the full
-                # request schedule. Events beyond this prefix have not happened yet.
-                continue
             for raw_id, msg_id in zip(raw_ids, ids, strict=True):
-                if msg_id >= normalized_message_count:
+                if n < normalized_message_count and msg_id >= normalized_message_count:
                     raise ValueError(
                         f"drop_message id {raw_id} refers to a message outside the conversation."
                     )
@@ -290,6 +286,10 @@ class TokenizeManager:
                     raise ValueError(
                         f"drop_message event {raw_n} cannot drop future message {raw_id}."
                     )
+            if n >= normalized_message_count:
+                # Staged warmup tokenizes message prefixes while carrying the full
+                # request schedule. Events beyond this prefix have not happened yet.
+                continue
             shifted[n] = ids
         return shifted
 

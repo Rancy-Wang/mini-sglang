@@ -17,6 +17,7 @@ class ServerArgs(SchedulerConfig):
     server_port: int = 1919
     num_tokenizer: int = 0
     silent_output: bool = False
+    request_timeout: float = 300.0
 
     @property
     def share_tokenizer(self) -> bool:
@@ -159,6 +160,16 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         type=int,
         default=ServerArgs.num_tokenizer,
         help="The number of tokenizer processes to launch. 0 means the tokenizer is shared with the detokenizer.",
+    )
+
+    parser.add_argument(
+        "--request-timeout",
+        type=float,
+        default=ServerArgs.request_timeout,
+        help=(
+            "Maximum seconds to wait without a reply for one request. "
+            "Set to 0 to disable the timeout."
+        ),
     )
 
     parser.add_argument(

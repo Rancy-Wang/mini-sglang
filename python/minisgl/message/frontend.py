@@ -36,3 +36,14 @@ class WarmupReply(BaseFrontendMsg):
     uid: int
     hit_ratio: float
     finished: bool
+
+
+@dataclass
+class RequestErrorReply(BaseFrontendMsg):
+    """Terminal request error propagated back to the HTTP frontend."""
+
+    uid: int
+    status_code: int
+    error_code: str
+    detail: str
+    finished: bool = True

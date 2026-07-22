@@ -11,6 +11,7 @@ from minisgl.message import (
     BatchBackendMsg,
     DetokenizeMsg,
     ExitMsg,
+    RequestRejectMsg,
     UserMsg,
     WarmupAckMsg,
 )
@@ -233,6 +234,33 @@ class Scheduler(SchedulerIOMixin):
             raise KeyboardInterrupt
         elif isinstance(msg, UserMsg):
             logger.debug_rank0("Received user msg: %s", msg)
+            true_input_len = (
+                len(msg.full_input_ids)
+                if msg.use_context_mask and msg.full_input_ids is not None
+                else int(msg.true_positions[-1].item()) + 1
+                if len(msg.true_positions) > 0
+                else 0
+            )
+            max_seq_len = self.engine.max_seq_len
+            max_output_len = max_seq_len - true_input_len
+            if max_output_len <= 0:
+                detail = (
+                    f"Input true sequence length {true_input_len} exceeds the usable "
+                    f"context length {max_seq_len - 1}; at least one output token is required."
+                )
+                logger.warning_rank0("Rejecting request %s: %s", msg.uid, detail)
+                self.send_result(
+                    [
+                        RequestRejectMsg(
+                            uid=msg.uid,
+                            status_code=413,
+                            error_code="context_length_exceeded",
+                            detail=detail,
+                        )
+                    ]
+                )
+                return
+
             if self.radix_symbol_registry is not None and msg.message_meta is not None:
                 message_starts = msg.message_meta.get("message_starts", [])
                 if not isinstance(message_starts, list):
@@ -246,20 +274,6 @@ class Scheduler(SchedulerIOMixin):
                     self.radix_symbol_registry,
                 )
 
-            true_input_len = (
-                len(msg.full_input_ids)
-                if msg.use_context_mask and msg.full_input_ids is not None
-                else int(msg.true_positions[-1].item()) + 1
-                if len(msg.true_positions) > 0
-                else 0
-            )
-            max_seq_len = self.engine.max_seq_len
-            max_output_len = max_seq_len - true_input_len
-            if max_output_len <= 0:
-                return logger.warning_rank0(
-                    f"Input true sequence length {true_input_len} exceeds {max_seq_len}, "
-                    f"request {msg.uid} is dropped."
-                )
             if msg.sampling_params.max_tokens > max_output_len:
                 msg.sampling_params.max_tokens = max_output_len
                 logger.warning_rank0(

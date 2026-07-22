@@ -19,6 +19,7 @@ from minisgl.message import (
     BaseFrontendMsg,
     BaseTokenizerMsg,
     BatchFrontendMsg,
+    RequestErrorReply,
     TokenizeMsg,
     UserReply,
     WarmupReply,
@@ -42,14 +43,42 @@ def get_global_state() -> FrontendManager:
     return _GLOBAL_STATE
 
 
-def _unwrap_msg(msg: BaseFrontendMsg) -> List[UserReply | WarmupReply]:
+class RequestRejected(RuntimeError):
+    def __init__(self, status_code: int, error_code: str, detail: str):
+        super().__init__(detail)
+        self.status_code = status_code
+        self.error_code = error_code
+        self.detail = detail
+
+
+def _http_error(exc: RequestRejected) -> HTTPException:
+    return HTTPException(
+        status_code=exc.status_code,
+        detail={"message": exc.detail, "type": exc.error_code, "code": exc.error_code},
+    )
+
+
+def _stream_error_event(exc: RequestRejected) -> bytes:
+    payload = {
+        "error": {
+            "message": exc.detail,
+            "type": exc.error_code,
+            "code": exc.error_code,
+        }
+    }
+    return f"data: {json.dumps(payload)}\n\n".encode()
+
+
+def _unwrap_msg(
+    msg: BaseFrontendMsg,
+) -> List[UserReply | WarmupReply | RequestErrorReply]:
     if isinstance(msg, BatchFrontendMsg):
-        result: List[UserReply | WarmupReply] = []
+        result: List[UserReply | WarmupReply | RequestErrorReply] = []
         for reply in msg.data:
-            assert isinstance(reply, (UserReply, WarmupReply))
+            assert isinstance(reply, (UserReply, WarmupReply, RequestErrorReply))
             result.append(reply)
         return result
-    assert isinstance(msg, (UserReply, WarmupReply))
+    assert isinstance(msg, (UserReply, WarmupReply, RequestErrorReply))
     return [msg]
 
 
@@ -57,6 +86,7 @@ def _validate_drop_message(
     drop_message: Dict[int, List[int]],
     *,
     radix_drop_key_mode: str = "symbol",
+    message_count: int | None = None,
 ) -> None:
     for raw_n, raw_ids in drop_message.items():
         n = int(raw_n)
@@ -79,6 +109,23 @@ def _validate_drop_message(
             if radix_drop_key_mode == "symbol" and msg_id >= (1 << 63):
                 raise HTTPException(
                     status_code=400, detail=f"drop_message id out of int64 range: {msg_id}"
+                )
+            # Future schedules are intentionally accepted. For an event that
+            # already applies to this prompt, however, every referenced message
+            # must already exist.
+            if message_count is not None and n < message_count:
+                if msg_id >= message_count:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"drop_message id {msg_id} is outside the current message "
+                            f"range [0, {message_count - 1}] for trigger {n}"
+                        ),
+                    )
+            if msg_id > n:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"drop_message event {n} cannot drop future message {msg_id}",
                 )
 
 
@@ -484,7 +531,9 @@ class FrontendManager:
     recv_tokenizer: ZmqAsyncPullQueue[BaseFrontendMsg]
     uid_counter: int = 0
     initialized: bool = False
-    ack_map: Dict[int, List[UserReply | WarmupReply]] = field(default_factory=dict)
+    ack_map: Dict[int, List[UserReply | WarmupReply | RequestErrorReply]] = field(
+        default_factory=dict
+    )
     event_map: Dict[int, asyncio.Event] = field(default_factory=dict)
 
     def new_user(self) -> int:
@@ -514,21 +563,48 @@ class FrontendManager:
 
     async def wait_for_ack(self, uid: int):
         event = self.event_map[uid]
+        timeout = self.config.request_timeout
 
-        while True:
-            await event.wait()
-            event.clear()
+        try:
+            while True:
+                try:
+                    if timeout > 0:
+                        await asyncio.wait_for(event.wait(), timeout=timeout)
+                    else:
+                        await event.wait()
+                except asyncio.TimeoutError as exc:
+                    logger.error("Timed out waiting for request %s after %.1fs", uid, timeout)
+                    try:
+                        await self.send_one(AbortMsg(uid=uid))
+                    except Exception:
+                        logger.exception("Failed to send timeout abort for request %s", uid)
+                    raise RequestRejected(
+                        status_code=504,
+                        error_code="backend_timeout",
+                        detail=f"No backend reply was received for {timeout:.1f} seconds.",
+                    ) from exc
+                event.clear()
 
-            pending = self.ack_map[uid]
-            self.ack_map[uid] = []
-            ack: UserReply | WarmupReply | None = None
-            for ack in pending:
-                yield ack
-            if ack and ack.finished:
-                break
-
-        del self.ack_map[uid]
-        del self.event_map[uid]
+                pending = self.ack_map.get(uid, [])
+                self.ack_map[uid] = []
+                for ack in pending:
+                    if isinstance(ack, RequestErrorReply):
+                        raise RequestRejected(
+                            status_code=ack.status_code,
+                            error_code=ack.error_code,
+                            detail=ack.detail,
+                        )
+                    if ack.finished:
+                        # Clean synchronously before exposing the terminal ack.
+                        # Callers often return/break immediately after receiving it.
+                        self.ack_map.pop(uid, None)
+                        self.event_map.pop(uid, None)
+                        yield ack
+                        return
+                    yield ack
+        finally:
+            self.ack_map.pop(uid, None)
+            self.event_map.pop(uid, None)
 
     async def wait_for_warmup(self, uid: int) -> WarmupReply:
         async for ack in self.wait_for_ack(uid):
@@ -592,12 +668,15 @@ class FrontendManager:
             await self.wait_for_warmup(staged_uid)
 
     async def stream_generate(self, uid: int):
-        async for ack in self.wait_for_ack(uid):
-            if not isinstance(ack, UserReply):
-                continue
-            yield f"data: {ack.incremental_output}\n".encode()
-            if ack.finished:
-                break
+        try:
+            async for ack in self.wait_for_ack(uid):
+                if not isinstance(ack, UserReply):
+                    continue
+                yield f"data: {ack.incremental_output}\n".encode()
+                if ack.finished:
+                    break
+        except RequestRejected as exc:
+            yield _stream_error_event(exc)
         yield "data: [DONE]\n".encode()
         logger.debug("Finished streaming response for user %s", uid)
 
@@ -616,37 +695,42 @@ class FrontendManager:
         require_tool_call = mode in {"required", "function"}
         buffer_mode = tools is not None and len(tools) > 0 and mode != "none"
         tool_call_missing = False
-        async for ack in self.wait_for_ack(uid):
-            if not isinstance(ack, UserReply):
-                continue
-            if ack.finish_reason is not None:
-                final_finish_reason = ack.finish_reason
-            if ack.matched_stop is not None:
-                matched_stop = ack.matched_stop
+        try:
+            async for ack in self.wait_for_ack(uid):
+                if not isinstance(ack, UserReply):
+                    continue
+                if ack.finish_reason is not None:
+                    final_finish_reason = ack.finish_reason
+                if ack.matched_stop is not None:
+                    matched_stop = ack.matched_stop
 
-            if buffer_mode:
+                if buffer_mode:
+                    if ack.incremental_output:
+                        buffered_output += ack.incremental_output
+                    if ack.finished:
+                        break
+                    continue
+
+                delta = {}
+                if first_chunk:
+                    delta["role"] = "assistant"
+                    first_chunk = False
                 if ack.incremental_output:
-                    buffered_output += ack.incremental_output
+                    delta["content"] = ack.incremental_output
+
+                chunk = {
+                    "id": f"cmpl-{uid}",
+                    "object": "text_completion.chunk",
+                    "choices": [{"delta": delta, "index": 0, "finish_reason": None}],
+                }
+                yield f"data: {json.dumps(chunk)}\n\n".encode()
+
                 if ack.finished:
                     break
-                continue
-
-            delta = {}
-            if first_chunk:
-                delta["role"] = "assistant"
-                first_chunk = False
-            if ack.incremental_output:
-                delta["content"] = ack.incremental_output
-
-            chunk = {
-                "id": f"cmpl-{uid}",
-                "object": "text_completion.chunk",
-                "choices": [{"delta": delta, "index": 0, "finish_reason": None}],
-            }
-            yield f"data: {json.dumps(chunk)}\n\n".encode()
-
-            if ack.finished:
-                break
+        except RequestRejected as exc:
+            yield _stream_error_event(exc)
+            yield b"data: [DONE]\n\n"
+            return
 
         if buffer_mode:
             clean_text, tool_calls = _parse_tool_calls_from_text(
@@ -784,6 +868,13 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
                 detail="tool_choice is only supported with chat `messages` and `tools`.",
             )
 
+    if req.drop_message is not None and isinstance(prompt, list):
+        _validate_drop_message(
+            req.drop_message,
+            radix_drop_key_mode=state.config.radix_drop_key_mode,
+            message_count=len(prompt),
+        )
+
     effective_stop = _build_effective_stop(
         req.stop,
         req.tools,
@@ -792,13 +883,16 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
     )
 
     if wire_drop_message is not None and isinstance(prompt, list):
-        await state.run_contextual_warmup(
-            prompt,
-            wire_drop_message,
-            req.enable_thinking,
-            req.tools,
-            normalized_tool_choice,
-        )
+        try:
+            await state.run_contextual_warmup(
+                prompt,
+                wire_drop_message,
+                req.enable_thinking,
+                req.tools,
+                normalized_tool_choice,
+            )
+        except RequestRejected as exc:
+            raise _http_error(exc) from exc
 
     # TODO: support more sampling parameters
     uid = state.new_user()
@@ -838,10 +932,15 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
 
     # Non-streaming: collect all chunks and return a single JSON response
     full_content = ""
-    async for ack in state.wait_for_ack(uid):
-        full_content += ack.incremental_output
-        if ack.finished:
-            break
+    try:
+        async for ack in state.wait_for_ack(uid):
+            if not isinstance(ack, UserReply):
+                continue
+            full_content += ack.incremental_output
+            if ack.finished:
+                break
+    except RequestRejected as exc:
+        raise _http_error(exc) from exc
 
     return {
         "id": f"chatcmpl-{uid}",
@@ -879,6 +978,12 @@ async def shell_completion(req: OpenAICompletionRequest):
         )
     wire_drop_message = _to_wire_drop_message(req.drop_message)
     prompt = [msg.model_dump() for msg in req.messages]
+    if req.drop_message is not None:
+        _validate_drop_message(
+            req.drop_message,
+            radix_drop_key_mode=state.config.radix_drop_key_mode,
+            message_count=len(prompt),
+        )
     normalized_tool_choice = _normalize_tool_choice(req.tools, req.tool_choice)
     effective_stop = _build_effective_stop(
         req.stop,

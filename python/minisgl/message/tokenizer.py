@@ -41,6 +41,16 @@ class WarmupAckMsg(BaseTokenizerMsg):
 
 
 @dataclass
+class RequestRejectMsg(BaseTokenizerMsg):
+    """Terminal request rejection sent from the scheduler to the frontend."""
+
+    uid: int
+    status_code: int
+    error_code: str
+    detail: str
+
+
+@dataclass
 class TokenizeMsg(BaseTokenizerMsg):
     uid: int
     text: str | List[Dict[str, Any]]
