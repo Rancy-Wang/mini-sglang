@@ -85,7 +85,7 @@ def _unwrap_msg(
 def _validate_drop_message(
     drop_message: Dict[int, List[int]],
     *,
-    radix_drop_key_mode: str = "symbol",
+    radix_drop_key_mode: str = "delta-marker",
     message_count: int | None = None,
 ) -> None:
     for raw_n, raw_ids in drop_message.items():
@@ -94,7 +94,7 @@ def _validate_drop_message(
             raise HTTPException(status_code=400, detail=f"drop_message key must be non-negative: {n}")
         if radix_drop_key_mode == "bitmask" and n >= 32:
             raise HTTPException(status_code=400, detail=f"drop_message key out of range [0, 31]: {n}")
-        if radix_drop_key_mode == "symbol" and n >= (1 << 63):
+        if radix_drop_key_mode in {"symbol", "delta-marker"} and n >= (1 << 63):
             raise HTTPException(status_code=400, detail=f"drop_message key out of int64 range: {n}")
         for raw_id in raw_ids:
             msg_id = int(raw_id)
@@ -106,7 +106,7 @@ def _validate_drop_message(
                 raise HTTPException(
                     status_code=400, detail=f"drop_message id out of range [0, 31]: {msg_id}"
                 )
-            if radix_drop_key_mode == "symbol" and msg_id >= (1 << 63):
+            if radix_drop_key_mode in {"symbol", "delta-marker"} and msg_id >= (1 << 63):
                 raise HTTPException(
                     status_code=400, detail=f"drop_message id out of int64 range: {msg_id}"
                 )
@@ -480,6 +480,7 @@ class GenerateRequest(BaseModel):
 class Message(BaseModel):
     role: Literal["system", "user", "assistant", "tool", "function"]
     content: str | None = None
+    reasoning_content: str | None = None
     name: str | None = None
     tool_call_id: str | None = None
     tool_calls: List[Dict[str, Any]] | None = None

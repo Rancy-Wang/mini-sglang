@@ -100,6 +100,10 @@ class Req:
     drop_visible_until: torch.Tensor | None = None
     full_keep_mask: torch.Tensor | None = None
     use_context_mask: bool = False
+    radix_key_virtual_mask: torch.Tensor | None = None
+    radix_key_to_token: torch.Tensor | None = None
+    radix_token_to_key: torch.Tensor | None = None
+    radix_commit_key_len: int | None = None
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu
@@ -112,6 +116,47 @@ class Req:
             assert self.prefix_keep_mask.is_cpu
         assert len(self.input_ids) == len(self.true_positions)
         assert len(self.input_ids) == len(self.radix_input_ids)
+        radix_layout = (
+            self.radix_key_virtual_mask,
+            self.radix_key_to_token,
+            self.radix_token_to_key,
+        )
+        if any(tensor is not None for tensor in radix_layout):
+            if not all(tensor is not None for tensor in radix_layout):
+                raise ValueError("Delta-marker Radix layout must be provided as one complete set.")
+            virtual_mask, key_to_token, token_to_key = radix_layout
+            assert virtual_mask is not None
+            assert key_to_token is not None
+            assert token_to_key is not None
+            for tensor in radix_layout:
+                assert tensor is not None and tensor.is_cpu and tensor.ndim == 1
+            if virtual_mask.dtype != torch.bool:
+                raise ValueError("radix_key_virtual_mask must use torch.bool.")
+            if key_to_token.dtype != torch.int64 or token_to_key.dtype != torch.int64:
+                raise ValueError("Delta-marker Radix mappings must use torch.int64.")
+            if len(virtual_mask) != len(self.radix_match_ids) or len(key_to_token) != len(
+                self.radix_match_ids
+            ):
+                raise ValueError("Delta-marker key-axis tensors must match radix_match_ids.")
+            if len(token_to_key) == 0 and len(self.input_ids) > 0:
+                raise ValueError("Delta-marker token_to_key must cover the input token stream.")
+            if bool(torch.any(key_to_token[virtual_mask] != -1).item()):
+                raise ValueError("Virtual Radix keys must map to token -1.")
+            real_key_positions = torch.nonzero(~virtual_mask, as_tuple=False).view(-1)
+            if not torch.equal(
+                key_to_token[real_key_positions],
+                torch.arange(len(token_to_key), dtype=torch.int64, device="cpu"),
+            ):
+                raise ValueError("Real Radix keys must preserve full-token order.")
+            if not torch.equal(token_to_key, real_key_positions):
+                raise ValueError("radix_token_to_key is not the inverse key mapping.")
+        if self.radix_commit_key_len is not None:
+            if self.radix_key_virtual_mask is None:
+                raise ValueError(
+                    "radix_commit_key_len requires a delta-marker Radix layout."
+                )
+            if not 0 <= self.radix_commit_key_len <= len(self.radix_match_ids):
+                raise ValueError("radix_commit_key_len is outside the Radix key stream.")
         self.device_len = len(self.input_ids)
         self.max_device_len = len(self.input_ids) + self.output_len
         assert 0 <= self.cached_len < self.device_len <= self.max_device_len
@@ -142,10 +187,18 @@ class Req:
                 len(self.full_kv_owner)
                 == len(self.full_query_epoch)
                 == len(self.full_keep_mask)
-                == len(self.radix_match_ids)
                 == full_len
             ):
                 raise ValueError("Full context-mask tensors and Radix keys must have equal lengths.")
+            if self.radix_token_to_key is None:
+                if len(self.radix_match_ids) != full_len:
+                    raise ValueError(
+                        "Full context-mask tensors and Radix keys must have equal lengths."
+                    )
+            elif len(self.radix_token_to_key) != full_len:
+                raise ValueError(
+                    "Full context-mask tensors and delta-marker token mapping must have equal lengths."
+                )
             if not torch.equal(
                 self.input_ids,
                 self.full_input_ids[self.true_positions.to(dtype=torch.int64)],
@@ -186,6 +239,29 @@ class Req:
         next_token_key = next_token.to(dtype=torch.int64, device="cpu")
         self.radix_input_ids = torch.cat([self.radix_input_ids, next_token_key])
         self.radix_match_ids = torch.cat([self.radix_match_ids, next_token_key])
+        if self.radix_key_virtual_mask is not None:
+            assert self.radix_key_to_token is not None
+            assert self.radix_token_to_key is not None
+            token_pos = len(self.radix_token_to_key)
+            key_pos = len(self.radix_match_ids) - 1
+            self.radix_key_virtual_mask = torch.cat(
+                [
+                    self.radix_key_virtual_mask,
+                    torch.tensor([False], dtype=torch.bool, device="cpu"),
+                ]
+            )
+            self.radix_key_to_token = torch.cat(
+                [
+                    self.radix_key_to_token,
+                    torch.tensor([token_pos], dtype=torch.int64, device="cpu"),
+                ]
+            )
+            self.radix_token_to_key = torch.cat(
+                [
+                    self.radix_token_to_key,
+                    torch.tensor([key_pos], dtype=torch.int64, device="cpu"),
+                ]
+            )
 
     @property
     def can_decode(self) -> bool:

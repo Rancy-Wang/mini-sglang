@@ -44,6 +44,13 @@ class BaseCacheHandle(ABC):
     @abstractmethod
     def get_matched_indices(self) -> torch.Tensor: ...
 
+    @abstractmethod
+    def get_matched_virtual_mask(self) -> torch.Tensor: ...
+
+    @property
+    @abstractmethod
+    def physical_cached_len(self) -> int: ...
+
 
 class SizeInfo(NamedTuple):
     evictable_size: int
@@ -80,7 +87,9 @@ class BasePrefixCache(ABC):
         """
 
     @abstractmethod
-    def match_prefix(self, input_ids: torch.Tensor) -> MatchResult:
+    def match_prefix(
+        self, input_ids: torch.Tensor, virtual_mask: torch.Tensor | None = None
+    ) -> MatchResult:
         """
         Match prefix and return the indices of the matched prefix in the cache.
         This operation will not modify the cache.
@@ -93,13 +102,19 @@ class BasePrefixCache(ABC):
         """
 
     @abstractmethod
-    def insert_prefix(self, input_ids: torch.Tensor, indices: torch.Tensor) -> InsertResult:
+    def insert_prefix(
+        self,
+        input_ids: torch.Tensor,
+        indices: torch.Tensor,
+        virtual_mask: torch.Tensor | None = None,
+    ) -> InsertResult:
         """
         Insert a new prefix into the cache.
         This operation will modify the cache.
         Args:
             input_ids (torch.Tensor): The input ids to insert. Shape: (seq_len,)
-            indices (torch.Tensor): The indices to store the new prefix. Shape: (seq_len,)
+            indices (torch.Tensor): Key-axis indices. Virtual entries must be -1.
+            virtual_mask (torch.Tensor | None): Explicit key-axis virtual markers.
 
         Returns:
             InsertResult: The result of the insertion.

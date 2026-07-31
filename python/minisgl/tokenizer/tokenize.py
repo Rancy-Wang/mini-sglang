@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+from bisect import bisect_right
 from dataclasses import dataclass
 from typing import Any, Dict, List
 
 import torch
 from minisgl.message import TokenizeMsg
+from minisgl.tokenizer.template_provenance import build_template_token_provenance
 from transformers import PreTrainedTokenizerBase
 
 
@@ -30,9 +32,9 @@ class TokenizeManager:
         self,
         tokenizer: PreTrainedTokenizerBase,
         *,
-        radix_drop_key_mode: str = "symbol",
+        radix_drop_key_mode: str = "delta-marker",
     ) -> None:
-        if radix_drop_key_mode not in {"bitmask", "symbol"}:
+        if radix_drop_key_mode not in {"bitmask", "symbol", "delta-marker"}:
             raise ValueError(f"Unsupported radix drop key mode: {radix_drop_key_mode}")
         self.tokenizer = tokenizer
         self.radix_drop_key_mode = radix_drop_key_mode
@@ -42,16 +44,17 @@ class TokenizeManager:
         # Many recent chat templates support `tools`; gracefully downgrade when unsupported.
         self._supports_tools = True
 
-    def _apply_chat_template(
+    def _call_chat_template(
         self,
         messages: List[dict[str, Any]],
         *,
+        tokenize: bool,
         add_generation_prompt: bool,
         enable_thinking: bool | None,
         tools: List[Dict[str, Any]] | None,
-    ) -> List[int]:
+    ) -> Any:
         kwargs = {
-            "tokenize": True,
+            "tokenize": tokenize,
             "add_generation_prompt": add_generation_prompt,
         }
         if enable_thinking is not None and self._supports_enable_thinking:
@@ -73,6 +76,44 @@ class TokenizeManager:
                     self._supports_tools = False
                     continue
                 raise
+
+    def _apply_chat_template(
+        self,
+        messages: List[dict[str, Any]],
+        *,
+        add_generation_prompt: bool,
+        enable_thinking: bool | None,
+        tools: List[Dict[str, Any]] | None,
+    ) -> List[int]:
+        result = self._call_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=add_generation_prompt,
+            enable_thinking=enable_thinking,
+            tools=tools,
+        )
+        if isinstance(result, torch.Tensor):
+            result = result.view(-1).tolist()
+        return [int(token_id) for token_id in result]
+
+    def _render_chat_template(
+        self,
+        messages: List[dict[str, Any]],
+        *,
+        add_generation_prompt: bool,
+        enable_thinking: bool | None,
+        tools: List[Dict[str, Any]] | None,
+    ) -> str:
+        result = self._call_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=add_generation_prompt,
+            enable_thinking=enable_thinking,
+            tools=tools,
+        )
+        if not isinstance(result, str):
+            raise RuntimeError("Chat template did not return text with tokenize=False.")
+        return result
 
     @staticmethod
     def _json_dumps(value: Any) -> str:
@@ -197,6 +238,8 @@ class TokenizeManager:
 
             content = self._normalize_message_content(raw.get("content"))
             message: dict[str, Any] = {"role": role, "content": content}
+            if role == "assistant" and isinstance(raw.get("reasoning_content"), str):
+                message["reasoning_content"] = raw["reasoning_content"]
 
             if safe_mode:
                 if role == "assistant" and isinstance(raw.get("tool_calls"), list):
@@ -253,7 +296,7 @@ class TokenizeManager:
                 raise ValueError(f"drop_message key must be non-negative: {n}")
             if self.radix_drop_key_mode == "bitmask" and n >= 32:
                 raise ValueError(f"drop_message key out of range [0, 31]: {n}")
-            if self.radix_drop_key_mode == "symbol" and n >= (1 << 63):
+            if self.radix_drop_key_mode in {"symbol", "delta-marker"} and n >= (1 << 63):
                 raise ValueError(f"drop_message key out of int64 range: {n}")
             ids = [int(v) for v in value]
             for msg_id in ids:
@@ -261,7 +304,7 @@ class TokenizeManager:
                     raise ValueError(f"drop_message id must be non-negative: {msg_id}")
                 if self.radix_drop_key_mode == "bitmask" and msg_id >= 32:
                     raise ValueError(f"drop_message id out of range [0, 31]: {msg_id}")
-                if self.radix_drop_key_mode == "symbol" and msg_id >= (1 << 63):
+                if self.radix_drop_key_mode in {"symbol", "delta-marker"} and msg_id >= (1 << 63):
                     raise ValueError(f"drop_message id out of int64 range: {msg_id}")
             normalized[n] = ids
         return normalized
@@ -305,6 +348,50 @@ class TokenizeManager:
         for dropped_id in self._build_drop_set(drop_message, msg_id):
             mask |= 1 << dropped_id
         return mask
+
+    @staticmethod
+    def _canonical_delta_ranges(dropped_ids: set[int]) -> List[List[int]]:
+        ids = sorted(dropped_ids)
+        if not ids:
+            return []
+        ranges: List[List[int]] = []
+        start = previous = ids[0]
+        for msg_id in ids[1:]:
+            if msg_id == previous + 1:
+                previous = msg_id
+                continue
+            ranges.append([start, previous + 1])
+            start = previous = msg_id
+        ranges.append([start, previous + 1])
+        return ranges
+
+    def _build_delta_markers(
+        self,
+        drop_message: dict[int, List[int]],
+        query_epoch: List[int],
+    ) -> List[dict[str, Any]]:
+        """Place newly effective deltas before the first query epoch after each event."""
+
+        effective: set[int] = set()
+        delta_by_pos: dict[int, set[int]] = {}
+        events_by_pos: dict[int, List[int]] = {}
+        for event_n in sorted(drop_message):
+            newly_effective = set(drop_message[event_n]) - effective
+            effective.update(drop_message[event_n])
+            if not newly_effective:
+                continue
+            insertion_pos = bisect_right(query_epoch, event_n)
+            delta_by_pos.setdefault(insertion_pos, set()).update(newly_effective)
+            events_by_pos.setdefault(insertion_pos, []).append(event_n)
+
+        return [
+            {
+                "insertion_pos": insertion_pos,
+                "delta": self._canonical_delta_ranges(delta_by_pos[insertion_pos]),
+                "event_ns": events_by_pos[insertion_pos],
+            }
+            for insertion_pos in sorted(delta_by_pos)
+        ]
 
     @staticmethod
     def _build_drop_visible_until(
@@ -503,6 +590,7 @@ class TokenizeManager:
             safe_mode=False,
         )
         safe_mode = False
+        effective_tools = selected_tools
         try:
             full_no_gen, no_gen_owner, no_gen_query_epoch, unstable_rounds = (
                 self._round_by_round_no_gen(messages, msg.enable_thinking, selected_tools)
@@ -525,6 +613,7 @@ class TokenizeManager:
                 safe_mode=True,
             )
             safe_mode = True
+            effective_tools = None
             full_no_gen, no_gen_owner, no_gen_query_epoch, unstable_rounds = (
                 self._round_by_round_no_gen(messages, msg.enable_thinking, None)
             )
@@ -537,6 +626,11 @@ class TokenizeManager:
                 enable_thinking=msg.enable_thinking,
                 tools=None,
             )
+        if not self._supports_tools:
+            effective_tools = None
+        effective_enable_thinking = (
+            msg.enable_thinking if self._supports_enable_thinking else None
+        )
         drop_message = self._shift_and_validate_drop_message(
             drop_message,
             target_offset=target_offset,
@@ -567,14 +661,51 @@ class TokenizeManager:
             else [generation_prompt_epoch] * len(full_with_gen)
         )
 
+        cross_owner_tokens = 0
+        if drop_message:
+            canonical_no_gen = self._render_chat_template(
+                messages,
+                add_generation_prompt=False,
+                enable_thinking=effective_enable_thinking,
+                tools=effective_tools,
+            )
+            canonical_with_gen = self._render_chat_template(
+                messages,
+                add_generation_prompt=True,
+                enable_thinking=effective_enable_thinking,
+                tools=effective_tools,
+            )
+            provenance = build_template_token_provenance(
+                self.tokenizer,
+                messages,
+                canonical_text=canonical_with_gen,
+                canonical_no_generation_text=canonical_no_gen,
+                expected_input_ids=full_with_gen,
+                tools=effective_tools,
+                add_generation_prompt=True,
+                enable_thinking=effective_enable_thinking,
+            )
+            owner_with_gen = provenance.owners
+            cross_owner_tokens = provenance.cross_owner_tokens
+
         target_msg_id = self._resolve_target_msg_id(
             msg,
             len(messages),
             target_offset=target_offset,
         )
+        warmup_commit_token_len = (
+            bisect_right(query_epoch_with_gen, target_msg_id)
+            if msg.is_warmup and not msg.use_context_mask
+            else None
+        )
         dropped_for_target = self._build_drop_set(drop_message, target_msg_id)
         owner_tensor = torch.tensor(owner_with_gen, dtype=torch.int32, device="cpu")
         query_epoch_tensor = torch.tensor(query_epoch_with_gen, dtype=torch.int32, device="cpu")
+        delta_markers = (
+            self._build_delta_markers(drop_message, query_epoch_with_gen)
+            if self.radix_drop_key_mode == "delta-marker"
+            else []
+        )
         drop_visible_until = self._build_drop_visible_until(
             drop_message, len(messages) + 1
         )
@@ -595,52 +726,52 @@ class TokenizeManager:
                 return 0
             return int(keep_mask[:raw_pos].sum().item())
 
-        # Apply drop mask encoding to first token of every message in the full stream.
-        message_starts: List[dict[str, Any]] = []
-        for msg_id in range(len(messages)):
+        # Logical owner starts are diagnostic only; Radix state starts follow query epochs.
+        owner_starts: List[dict[str, Any]] = []
+        for msg_id in range(len(messages) + 1):
             try:
                 start = owner_with_gen.index(msg_id)
             except ValueError:
                 continue
-            if start >= len(radix_match_ids):
-                continue
-            encoded_pos = compact_pos(start)
-            dropped_ids = sorted(self._build_drop_set(drop_message, msg_id))
-            start_meta: dict[str, Any] = {
-                "msg_id": msg_id,
-                "raw_start": start,
-                "compact_start": encoded_pos,
-            }
-            if self.radix_drop_key_mode == "bitmask":
-                drop_mask = self._build_drop_mask(drop_message, msg_id)
-                token_id = int(radix_match_ids[start].item())
-                radix_match_ids[start] = self._encode_radix_key(token_id, drop_mask)
-                start_meta["drop_mask"] = drop_mask
-            else:
-                start_meta["dropped_ids"] = dropped_ids
-            message_starts.append(start_meta)
+            owner_starts.append(
+                {
+                    "msg_id": msg_id,
+                    "raw_start": start,
+                    "compact_start": compact_pos(start),
+                }
+            )
 
-        # Also encode the generation-prompt start as the "next assistant message" start.
         try:
             gen_prompt_start = owner_with_gen.index(next_assistant_id)
         except ValueError:
             gen_prompt_start = len(full_no_gen)
-        if gen_prompt_start < len(radix_match_ids):
-            encoded_pos = compact_pos(gen_prompt_start)
-            dropped_ids = sorted(self._build_drop_set(drop_message, next_assistant_id))
-            start_meta = {
-                "msg_id": next_assistant_id,
-                "raw_start": gen_prompt_start,
-                "compact_start": encoded_pos,
+
+        radix_state_starts: List[dict[str, Any]] = []
+        previous_epoch: int | None = None
+        for start, epoch in enumerate(query_epoch_with_gen):
+            if epoch == previous_epoch:
+                continue
+            previous_epoch = epoch
+            if start >= len(radix_match_ids):
+                continue
+            dropped_ids = sorted(self._build_drop_set(drop_message, epoch))
+            start_meta: dict[str, Any] = {
+                "msg_id": epoch,
+                "epoch": epoch,
+                "raw_start": start,
+                "compact_start": compact_pos(start),
             }
             if self.radix_drop_key_mode == "bitmask":
-                drop_mask = self._build_drop_mask(drop_message, next_assistant_id)
-                token_id = int(radix_match_ids[gen_prompt_start].item())
-                radix_match_ids[gen_prompt_start] = self._encode_radix_key(token_id, drop_mask)
+                drop_mask = self._build_drop_mask(drop_message, epoch)
+                token_id = int(radix_match_ids[start].item())
+                radix_match_ids[start] = self._encode_radix_key(token_id, drop_mask)
                 start_meta["drop_mask"] = drop_mask
-            else:
+            elif self.radix_drop_key_mode == "symbol":
                 start_meta["dropped_ids"] = dropped_ids
-            message_starts.append(start_meta)
+            radix_state_starts.append(start_meta)
+
+        # Backward-compatible alias for legacy consumers.
+        message_starts = radix_state_starts
 
         radix_input_ids = radix_match_ids[keep_mask].contiguous()
 
@@ -660,6 +791,10 @@ class TokenizeManager:
                 "raw_len_with_gen": len(full_with_gen_tensor),
                 "raw_len_no_gen": len(full_no_gen_tensor),
                 "message_starts": message_starts,
+                "owner_starts": owner_starts,
+                "radix_state_starts": radix_state_starts,
+                "cross_owner_tokens": cross_owner_tokens,
+                "delta_markers": delta_markers,
                 "unstable_rounds": unstable_rounds,
                 "no_gen_with_gen_unstable": int(unstable_with_gen),
                 "no_gen_with_gen_lcp": no_gen_with_gen_lcp,
@@ -667,6 +802,7 @@ class TokenizeManager:
                 "gen_prompt_start": gen_prompt_start,
                 "normalized_messages": len(messages),
                 "target_offset": target_offset,
+                "warmup_commit_token_len": warmup_commit_token_len,
                 "safe_mode": int(safe_mode),
                 "radix_drop_key_mode": self.radix_drop_key_mode,
             },

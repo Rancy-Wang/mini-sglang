@@ -37,6 +37,10 @@ class UserMsg(BaseBackendMsg):
     radix_input_ids: torch.Tensor  # CPU 1D int64 tensor for radix match
     sampling_params: SamplingParams
     radix_match_ids: torch.Tensor | None = None  # CPU 1D int64 tensor for radix query
+    radix_key_virtual_mask: torch.Tensor | None = None  # CPU 1D bool, key-axis virtual markers
+    radix_key_to_token: torch.Tensor | None = None  # CPU 1D int64, -1 for virtual markers
+    radix_token_to_key: torch.Tensor | None = None  # CPU 1D int64, full-token to key axis
+    radix_commit_key_len: int | None = None  # internal upper bound for Radix match/commit
     target_msg_id: int | None = None
     drop_message: Dict[int, List[int]] | None = None
     enable_thinking: bool | None = None

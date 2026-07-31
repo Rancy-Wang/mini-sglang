@@ -12,6 +12,13 @@ class NaiveCacheHandle(BaseCacheHandle):
     def get_matched_indices(self) -> torch.Tensor:
         return self.empty_tensor
 
+    def get_matched_virtual_mask(self) -> torch.Tensor:
+        return torch.empty(0, dtype=torch.bool, device="cpu")
+
+    @property
+    def physical_cached_len(self) -> int:
+        return 0
+
 
 class NaivePrefixCache(BasePrefixCache):
     def __init__(self, device: torch.device):
@@ -23,10 +30,17 @@ class NaivePrefixCache(BasePrefixCache):
     def lock_handle(self, handle: BaseCacheHandle, unlock: bool = False) -> None:
         pass
 
-    def match_prefix(self, input_ids: torch.Tensor) -> MatchResult:
+    def match_prefix(
+        self, input_ids: torch.Tensor, virtual_mask: torch.Tensor | None = None
+    ) -> MatchResult:
         return MatchResult(NaiveCacheHandle())
 
-    def insert_prefix(self, input_ids: torch.Tensor, indices: torch.Tensor) -> InsertResult:
+    def insert_prefix(
+        self,
+        input_ids: torch.Tensor,
+        indices: torch.Tensor,
+        virtual_mask: torch.Tensor | None = None,
+    ) -> InsertResult:
         return InsertResult(0, NaiveCacheHandle())
 
     def evict(self, size: int) -> torch.Tensor:

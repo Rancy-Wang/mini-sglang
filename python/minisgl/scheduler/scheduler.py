@@ -22,6 +22,11 @@ from .config import SchedulerConfig
 from .decode import DecodeManager
 from .io import SchedulerIOMixin
 from .prefill import ChunkedReq, PrefillManager
+from .radix_delta import (
+    DeltaMarkerRegistry,
+    inject_delta_markers,
+    key_prefix_len_for_token_boundary,
+)
 from .radix_symbol import RadixSymbolRegistry, inject_radix_symbols
 from .table import TableManager
 
@@ -47,9 +52,31 @@ ForwardData: TypeAlias = "Tuple[ForwardInput, ForwardOutput]"
 
 class Scheduler(SchedulerIOMixin):
     def __init__(self, config: SchedulerConfig):
+        if config.radix_drop_key_mode == "delta-marker" and config.page_size != 1:
+            raise ValueError("Delta-marker Radix mode requires --page-size 1.")
+        if (
+            config.radix_drop_key_mode == "delta-marker"
+            and "trtllm" in config.attention_backend
+        ):
+            raise ValueError(
+                "Delta-marker Radix mode is incompatible with TRTLLM because "
+                "TRTLLM requires a non-unit page size."
+            )
         from minisgl.engine import Engine
 
         self.engine = Engine(config)
+        if config.radix_drop_key_mode == "delta-marker" and config.page_size != 1:
+            final_page_size = config.page_size
+            try:
+                self.engine.shutdown()
+            except Exception:
+                logger.exception(
+                    "Failed to shut down Engine after an incompatible page-size adjustment."
+                )
+            raise ValueError(
+                "Delta-marker Radix mode requires final --page-size 1, but Engine "
+                f"selected {final_page_size}."
+            )
 
         # use another stream to overlap metadata processing with computation
         self.device = self.engine.device
@@ -69,6 +96,9 @@ class Scheduler(SchedulerIOMixin):
         self.radix_drop_key_mode = config.radix_drop_key_mode
         self.radix_symbol_registry = (
             RadixSymbolRegistry() if self.radix_drop_key_mode == "symbol" else None
+        )
+        self.delta_marker_registry = (
+            DeltaMarkerRegistry() if self.radix_drop_key_mode == "delta-marker" else None
         )
         if config.contextual_prefill_mode != "staged":
             if config.page_size != 1:
@@ -262,17 +292,44 @@ class Scheduler(SchedulerIOMixin):
                 return
 
             if self.radix_symbol_registry is not None and msg.message_meta is not None:
-                message_starts = msg.message_meta.get("message_starts", [])
-                if not isinstance(message_starts, list):
-                    raise ValueError("message_meta.message_starts must be a list.")
+                state_starts = msg.message_meta.get(
+                    "radix_state_starts", msg.message_meta.get("message_starts", [])
+                )
+                if not isinstance(state_starts, list):
+                    raise ValueError("message_meta.radix_state_starts must be a list.")
                 if msg.radix_match_ids is None:
                     raise ValueError("Symbol Radix mode requires full radix_match_ids.")
                 msg.radix_match_ids, msg.radix_input_ids = inject_radix_symbols(
                     msg.radix_match_ids,
                     msg.true_positions,
-                    message_starts,
+                    state_starts,
                     self.radix_symbol_registry,
                 )
+            elif self.delta_marker_registry is not None and msg.message_meta is not None:
+                if msg.radix_match_ids is None:
+                    raise ValueError("Delta-marker Radix mode requires full radix_match_ids.")
+                marker_meta = msg.message_meta.get("delta_markers", [])
+                if not isinstance(marker_meta, list):
+                    raise ValueError("message_meta.delta_markers must be a list.")
+                layout = inject_delta_markers(
+                    msg.radix_match_ids,
+                    marker_meta,
+                    self.delta_marker_registry,
+                )
+                if layout is not None:
+                    msg.radix_match_ids = layout.keys
+                    msg.radix_key_virtual_mask = layout.virtual_mask
+                    msg.radix_key_to_token = layout.key_to_token
+                    msg.radix_token_to_key = layout.token_to_key
+                    commit_token_len = msg.message_meta.get(
+                        "warmup_commit_token_len"
+                    )
+                    if commit_token_len is not None:
+                        msg.radix_commit_key_len = (
+                            key_prefix_len_for_token_boundary(
+                                layout, commit_token_len
+                            )
+                        )
 
             if msg.sampling_params.max_tokens > max_output_len:
                 msg.sampling_params.max_tokens = max_output_len

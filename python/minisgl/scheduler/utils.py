@@ -32,6 +32,10 @@ class PendingReq:
     drop_visible_until: torch.Tensor | None = None
     full_keep_mask: torch.Tensor | None = None
     use_context_mask: bool = False
+    radix_key_virtual_mask: torch.Tensor | None = None
+    radix_key_to_token: torch.Tensor | None = None
+    radix_token_to_key: torch.Tensor | None = None
+    radix_commit_key_len: int | None = None
     chunked_req: ChunkedReq | None = None
 
     @property

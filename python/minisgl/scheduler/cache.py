@@ -49,73 +49,147 @@ class CacheManager:
         return handle.get_matched_indices()
 
     def _match_and_prune_legacy_holes(
-        self, radix_query: torch.Tensor
-    ) -> tuple[BaseCacheHandle, torch.Tensor] | None:
-        result = self.prefix_cache.match_prefix(radix_query)
+        self,
+        radix_query: torch.Tensor,
+        virtual_mask: torch.Tensor | None = None,
+    ) -> tuple[BaseCacheHandle, torch.Tensor, torch.Tensor] | None:
+        result = self.prefix_cache.match_prefix(radix_query, virtual_mask)
         handle = result.cuda_handle
         indices = self._matched_indices(handle)
-        holes = torch.nonzero(indices < 0, as_tuple=False).view(-1)
+        matched_virtual_mask = (
+            handle.get_matched_virtual_mask()
+            if handle.cached_len > 0
+            else torch.empty(0, dtype=torch.bool, device="cpu")
+        )
+        value_virtual_mask = matched_virtual_mask.to(
+            device=indices.device, non_blocking=True
+        )
+        holes = torch.nonzero(
+            (indices < 0) & (~value_virtual_mask), as_tuple=False
+        ).view(-1)
         if len(holes) == 0:
-            return handle, indices
+            return handle, indices, matched_virtual_mask
 
         from minisgl.kvcache.radix_cache import RadixPrefixCache
 
         if not isinstance(self.prefix_cache, RadixPrefixCache):
             raise RuntimeError("A non-Radix prefix cache returned a negative page slot.")
         valid_prefix_len = int(holes[0].item())
-        released = self.prefix_cache.prune_suffix(radix_query, valid_prefix_len)
+        released = self.prefix_cache.prune_suffix(
+            radix_query, valid_prefix_len, virtual_mask
+        )
         if released is None:
             return None
         self._free(released)
 
-        result = self.prefix_cache.match_prefix(radix_query)
+        result = self.prefix_cache.match_prefix(radix_query, virtual_mask)
         handle = result.cuda_handle
         indices = self._matched_indices(handle)
-        if handle.cached_len != valid_prefix_len or bool(torch.any(indices < 0).item()):
+        matched_virtual_mask = (
+            handle.get_matched_virtual_mask()
+            if handle.cached_len > 0
+            else torch.empty(0, dtype=torch.bool, device="cpu")
+        )
+        value_virtual_mask = matched_virtual_mask.to(
+            device=indices.device, non_blocking=True
+        )
+        if handle.cached_len != valid_prefix_len or bool(
+            torch.any((indices < 0) & (~value_virtual_mask)).item()
+        ):
             raise RuntimeError(
                 "Radix legacy-hole pruning did not leave the expected safe prefix:"
                 f" expected={valid_prefix_len}, actual={handle.cached_len}"
             )
-        return handle, indices
+        return handle, indices, matched_virtual_mask
+
+    @staticmethod
+    def _radix_query_prefix(
+        req: PendingReq,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if req.radix_match_ids is None:
+            raise ValueError("Prefix matching requires radix_match_ids.")
+        if req.radix_token_to_key is None:
+            return req.radix_match_ids[:-1], None
+        if req.radix_key_virtual_mask is None:
+            raise ValueError("Delta-marker key mapping requires a virtual mask.")
+        last_token_pos = int(req.true_positions[-1].item())
+        if last_token_pos < 0 or last_token_pos >= len(req.radix_token_to_key):
+            raise ValueError("The final input token is outside radix_token_to_key.")
+        key_prefix_len = int(req.radix_token_to_key[last_token_pos].item())
+        if req.radix_commit_key_len is not None:
+            key_prefix_len = min(key_prefix_len, req.radix_commit_key_len)
+        return (
+            req.radix_match_ids[:key_prefix_len],
+            req.radix_key_virtual_mask[:key_prefix_len],
+        )
+
+    @classmethod
+    def matchable_active_prefix_len(cls, req: PendingReq) -> int:
+        radix_query, query_virtual_mask = cls._radix_query_prefix(req)
+        if query_virtual_mask is None:
+            return max(req.input_len - 1, 0)
+        full_token_prefix_len = int(
+            torch.count_nonzero(~query_virtual_mask).item()
+        )
+        return int(
+            torch.count_nonzero(req.true_positions < full_token_prefix_len).item()
+        )
 
     def match_req(self, req: PendingReq) -> ContextMatchResult | None:
         assert req.input_len > 0, "Input length must be greater than 0."
-        radix_query = req.radix_match_ids
-        matched = self._match_and_prune_legacy_holes(radix_query[:-1])
+        radix_query, query_virtual_mask = self._radix_query_prefix(req)
+        matched = self._match_and_prune_legacy_holes(
+            radix_query, query_virtual_mask
+        )
         if matched is None:
             return None
-        handle, full_match_indices = matched
+        handle, key_match_indices, matched_virtual_mask = matched
+        full_match_indices = key_match_indices[
+            (~matched_virtual_mask).to(
+                device=key_match_indices.device, non_blocking=True
+            )
+        ]
         active_match_indices = full_match_indices
         if req.prefix_keep_mask is not None and len(full_match_indices) > 0:
             if len(req.prefix_keep_mask) < len(full_match_indices):
                 raise RuntimeError(
-                    "prefix_keep_mask is shorter than matched full prefix:"
+                    "prefix_keep_mask is shorter than matched full-token prefix:"
                     f" {len(req.prefix_keep_mask)} < {len(full_match_indices)}"
                 )
             keep_mask = (req.prefix_keep_mask[: len(full_match_indices)] != 0).to(
-                device=full_match_indices.device, dtype=torch.bool, non_blocking=True
+                device=full_match_indices.device,
+                dtype=torch.bool,
+                non_blocking=True,
             )
             active_match_indices = full_match_indices[keep_mask]
         return ContextMatchResult(
             handle=handle,
             full_match_indices=full_match_indices,
-            full_cached_len=handle.cached_len,
+            full_cached_len=len(full_match_indices),
             active_match_indices=active_match_indices,
             active_cached_len=len(active_match_indices),
         )
 
     def match_full_req(self, req: PendingReq) -> FullMatchResult | None:
         assert req.input_len > 0, "Input length must be greater than 0."
-        matched = self._match_and_prune_legacy_holes(req.radix_match_ids[:-1])
+        radix_query, query_virtual_mask = self._radix_query_prefix(req)
+        matched = self._match_and_prune_legacy_holes(
+            radix_query, query_virtual_mask
+        )
         if matched is None:
             return None
-        handle, indices = matched
+        handle, key_match_indices, matched_virtual_mask = matched
+        full_match_indices = key_match_indices[
+            (~matched_virtual_mask).to(
+                device=key_match_indices.device, non_blocking=True
+            )
+        ]
         return FullMatchResult(
             handle=handle,
-            full_match_indices=indices,
-            full_cached_len=handle.cached_len,
-            safe_match_indices=indices,
-            safe_cached_len=handle.cached_len,
+            full_match_indices=full_match_indices,
+            full_cached_len=len(full_match_indices),
+            safe_match_indices=full_match_indices,
+            safe_cached_len=len(full_match_indices),
         )
 
     @property
@@ -142,6 +216,11 @@ class CacheManager:
             _write_page_table(self.page_table, allocated, allocation_info, self.page_size)
 
     def cache_req(self, req: Req, *, finished: bool) -> None:
+        if req.radix_key_virtual_mask is not None:
+            if not finished:
+                return
+            self._cache_finished_delta_req(req)
+            return
         sparse = len(req.radix_match_ids) != len(req.radix_input_ids)
         if req.use_context_mask:
             if not finished:
@@ -154,6 +233,171 @@ class CacheManager:
             self._cache_finished_sparse_req(req)
             return
         self._cache_linear_req(req, finished=finished)
+
+    @staticmethod
+    def _delta_key_prefix_len(req: Req) -> int:
+        assert req.radix_token_to_key is not None
+        if req.cached_len < len(req.input_ids):
+            next_token_pos = int(req.true_positions[req.cached_len].item())
+            if next_token_pos < 0 or next_token_pos >= len(req.radix_token_to_key):
+                raise RuntimeError("The next active token is outside radix_token_to_key.")
+            key_prefix_len = int(req.radix_token_to_key[next_token_pos].item())
+        else:
+            last_token_pos = int(req.true_positions[len(req.input_ids) - 1].item())
+            if last_token_pos < 0 or last_token_pos >= len(req.radix_token_to_key):
+                raise RuntimeError("The final active token is outside radix_token_to_key.")
+            token_boundary = last_token_pos + 1
+            key_prefix_len = (
+                int(req.radix_token_to_key[token_boundary].item())
+                if token_boundary < len(req.radix_token_to_key)
+                else len(req.radix_match_ids)
+            )
+        if req.radix_commit_key_len is not None:
+            key_prefix_len = min(key_prefix_len, req.radix_commit_key_len)
+        return key_prefix_len
+
+    def _cache_finished_delta_req(self, req: Req) -> None:
+        if self.page_size != 1:
+            raise RuntimeError("Delta-marker caching requires page_size=1.")
+        assert req.radix_key_virtual_mask is not None
+        assert req.radix_key_to_token is not None
+        assert req.radix_token_to_key is not None
+
+        old_handle = req.cache_handle
+        all_active_indices = self.page_table[req.table_idx, : req.cached_len]
+        all_active_positions = req.true_positions[: req.cached_len].to(
+            dtype=torch.int64, device="cpu"
+        )
+        key_prefix_len = self._delta_key_prefix_len(req)
+        try:
+            if len(all_active_indices) != len(all_active_positions):
+                raise RuntimeError("Active cache indices and true positions have different lengths.")
+            if key_prefix_len < old_handle.cached_len:
+                raise RuntimeError("Delta-marker key prefix regressed below the matched prefix.")
+
+            key_virtual_mask = req.radix_key_virtual_mask[:key_prefix_len]
+            full_token_prefix_len = int(
+                torch.count_nonzero(~key_virtual_mask).item()
+            )
+            within_prefix = all_active_positions < full_token_prefix_len
+            active_indices = all_active_indices[
+                within_prefix.to(
+                    device=all_active_indices.device,
+                    dtype=torch.bool,
+                    non_blocking=True,
+                )
+            ]
+            active_positions = all_active_positions[within_prefix]
+            excluded_indices = all_active_indices[
+                (~within_prefix).to(
+                    device=all_active_indices.device,
+                    dtype=torch.bool,
+                    non_blocking=True,
+                )
+            ]
+            if req.initial_active_cached_len > len(active_indices):
+                raise RuntimeError(
+                    "Matched active prefix exceeds the delta-marker commit boundary."
+                )
+            full_indices = torch.full(
+                (full_token_prefix_len,),
+                -1,
+                dtype=torch.int32,
+                device=active_indices.device,
+            )
+            filled = torch.zeros(
+                full_token_prefix_len,
+                dtype=torch.bool,
+                device=active_indices.device,
+            )
+
+            old_full_cached_len = old_handle.physical_cached_len
+            if old_full_cached_len > 0:
+                if len(req.initial_full_match_indices) < old_full_cached_len:
+                    raise RuntimeError(
+                        "Initial full-token match indices are shorter than the cache handle."
+                    )
+                full_indices[:old_full_cached_len] = req.initial_full_match_indices[
+                    :old_full_cached_len
+                ]
+                filled[:old_full_cached_len] = True
+
+            if bool(torch.any(active_positions >= full_token_prefix_len).item()):
+                raise RuntimeError("A cached active token lies outside the full-token prefix.")
+            active_positions_device = active_positions.to(
+                device=active_indices.device, non_blocking=True
+            )
+            overlap = active_positions < old_full_cached_len
+            if bool(torch.any(overlap).item()):
+                overlap_device = overlap.to(
+                    device=active_indices.device, non_blocking=True
+                )
+                if not torch.equal(
+                    full_indices[active_positions_device[overlap_device]],
+                    active_indices[overlap_device],
+                ):
+                    raise RuntimeError("Matched delta-marker tokens use different KV slots.")
+            full_indices[active_positions_device] = active_indices
+            filled[active_positions_device] = True
+
+            missing_positions = torch.nonzero(~filled, as_tuple=False).view(-1)
+            cacheable_full_len = (
+                int(missing_positions[0].item())
+                if len(missing_positions) > 0
+                else full_token_prefix_len
+            )
+            if cacheable_full_len < old_full_cached_len:
+                raise RuntimeError("A new real-token hole overlaps the matched Radix prefix.")
+            cacheable_key_len = (
+                int(req.radix_token_to_key[cacheable_full_len].item())
+                if cacheable_full_len < full_token_prefix_len
+                else key_prefix_len
+            )
+
+            commit_virtual_mask = req.radix_key_virtual_mask[:cacheable_key_len]
+            commit_key_to_token = req.radix_key_to_token[:cacheable_key_len]
+            key_indices = torch.full(
+                (cacheable_key_len,),
+                -1,
+                dtype=torch.int32,
+                device=active_indices.device,
+            )
+            real_key_mask = ~commit_virtual_mask
+            real_token_positions = commit_key_to_token[real_key_mask]
+            key_indices[
+                real_key_mask.to(device=active_indices.device, non_blocking=True)
+            ] = full_indices[
+                real_token_positions.to(
+                    device=active_indices.device, non_blocking=True
+                )
+            ]
+
+            insert_result = self.prefix_cache.insert_prefix(
+                req.radix_match_ids[:cacheable_key_len],
+                key_indices,
+                commit_virtual_mask,
+            )
+            active_slots = torch.arange(
+                len(active_indices), dtype=torch.int64, device=active_indices.device
+            )
+            newly_allocated = active_slots >= req.initial_active_cached_len
+            active_key_positions = req.radix_token_to_key[active_positions]
+            key_positions_device = active_key_positions.to(
+                device=active_indices.device, non_blocking=True
+            )
+            adopted = (key_positions_device >= insert_result.cached_len) & (
+                key_positions_device < insert_result.handle.cached_len
+            )
+            self._free(
+                torch.cat(
+                    [
+                        active_indices[newly_allocated & (~adopted)],
+                        excluded_indices,
+                    ]
+                )
+            )
+        finally:
+            self.unlock(old_handle)
 
     def _cache_linear_req(self, req: Req, *, finished: bool) -> None:
         insert_ids = req.radix_input_ids[: req.cached_len]

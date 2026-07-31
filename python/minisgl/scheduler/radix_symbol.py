@@ -52,7 +52,7 @@ class RadixSymbolRegistry:
 def inject_radix_symbols(
     full_radix_ids: torch.Tensor,
     true_positions: torch.Tensor,
-    message_starts: list[dict],
+    state_starts: list[dict],
     registry: RadixSymbolRegistry,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return exact full/active Radix keys while keeping one int64 key per real token."""
@@ -64,14 +64,14 @@ def inject_radix_symbols(
 
     encoded = full_radix_ids.clone()
     seen_starts: set[int] = set()
-    for start_meta in message_starts:
+    for start_meta in state_starts:
         raw_start = int(start_meta["raw_start"])
         if raw_start in seen_starts:
-            raise ValueError(f"Duplicate message-start position: {raw_start}")
+            raise ValueError(f"Duplicate Radix state-start position: {raw_start}")
         seen_starts.add(raw_start)
         if raw_start < 0 or raw_start >= len(encoded):
             raise ValueError(
-                f"Message-start position {raw_start} is outside Radix key length {len(encoded)}."
+                f"Radix state-start position {raw_start} is outside key length {len(encoded)}."
             )
 
         token_id = int(encoded[raw_start].item())

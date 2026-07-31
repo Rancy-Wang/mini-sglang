@@ -58,7 +58,7 @@ class PrefillAdder:
             cached_len = match.active_cached_len
             cached_indices = match.active_match_indices
             initial_full_match_indices = match.full_match_indices[: match.full_cached_len]
-        effective_prefix_len = max(req.input_len - 1, 0)
+        effective_prefix_len = self.cache_manager.matchable_active_prefix_len(req)
         hit_ratio = 1.0 if effective_prefix_len == 0 else cached_len / effective_prefix_len
         # TODO: better estimate policy
         extend_len = req.input_len - cached_len
@@ -140,6 +140,10 @@ class PrefillAdder:
             drop_visible_until=pending_req.drop_visible_until,
             full_keep_mask=pending_req.full_keep_mask,
             use_context_mask=pending_req.use_context_mask,
+            radix_key_virtual_mask=pending_req.radix_key_virtual_mask,
+            radix_key_to_token=pending_req.radix_key_to_token,
+            radix_token_to_key=pending_req.radix_token_to_key,
+            radix_commit_key_len=pending_req.radix_commit_key_len,
         )
 
     def try_add_one(self, pending_req: PendingReq) -> Req | None:
@@ -196,7 +200,11 @@ class PrefillManager:
                 raise ValueError("Context-mask Prefill requires a full token stream and Radix keys.")
             input_ids = req.full_input_ids
             true_positions = torch.arange(len(input_ids), dtype=torch.int32, device="cpu")
-            radix_input_ids = req.radix_match_ids
+            radix_input_ids = (
+                req.radix_match_ids[req.radix_token_to_key]
+                if req.radix_token_to_key is not None
+                else req.radix_match_ids
+            )
         self.pending_list.append(
             PendingReq(
                 uid=req.uid,
@@ -216,6 +224,10 @@ class PrefillManager:
                 drop_visible_until=req.drop_visible_until,
                 full_keep_mask=req.full_keep_mask,
                 use_context_mask=req.use_context_mask,
+                radix_key_virtual_mask=req.radix_key_virtual_mask,
+                radix_key_to_token=req.radix_key_to_token,
+                radix_token_to_key=req.radix_token_to_key,
+                radix_commit_key_len=req.radix_commit_key_len,
             )
         )
 

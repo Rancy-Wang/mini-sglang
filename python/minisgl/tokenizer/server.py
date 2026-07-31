@@ -71,7 +71,7 @@ def tokenize_worker(
     backend_addr: str,
     frontend_addr: str,
     local_bs: int,
-    radix_drop_key_mode: str = "symbol",
+    radix_drop_key_mode: str = "delta-marker",
     tokenizer_id: int = -1,
     model_source: str = "huggingface",
     ack_queue: mp.Queue[str] | None = None,
