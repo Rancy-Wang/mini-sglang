@@ -84,9 +84,7 @@ def _get_context_visibility_mask_mod():
     def context_visibility_mask_mod(batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
         full_token_visible_until, query_start = aux_tensors
         query_position = q_idx + query_start[0]
-        return (kv_idx <= query_position) & (
-            query_position < full_token_visible_until[kv_idx]
-        )
+        return (kv_idx <= query_position) & (query_position < full_token_visible_until[kv_idx])
 
     return context_visibility_mask_mod
 

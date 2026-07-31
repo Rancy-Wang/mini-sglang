@@ -67,12 +67,8 @@ class CacheManager:
             if handle.cached_len > 0
             else torch.empty(0, dtype=torch.bool, device="cpu")
         )
-        value_virtual_mask = matched_virtual_mask.to(
-            device=indices.device, non_blocking=True
-        )
-        holes = torch.nonzero(
-            (indices < 0) & (~value_virtual_mask), as_tuple=False
-        ).view(-1)
+        value_virtual_mask = matched_virtual_mask.to(device=indices.device, non_blocking=True)
+        holes = torch.nonzero((indices < 0) & (~value_virtual_mask), as_tuple=False).view(-1)
         if len(holes) == 0:
             return handle, indices, matched_virtual_mask
 
@@ -81,9 +77,7 @@ class CacheManager:
         if not isinstance(self.prefix_cache, RadixPrefixCache):
             raise RuntimeError("A non-Radix prefix cache returned a negative page slot.")
         valid_prefix_len = int(holes[0].item())
-        released = self.prefix_cache.prune_suffix(
-            radix_query, valid_prefix_len, virtual_mask
-        )
+        released = self.prefix_cache.prune_suffix(radix_query, valid_prefix_len, virtual_mask)
         if released is None:
             return None
         self._free(released)
@@ -96,9 +90,7 @@ class CacheManager:
             if handle.cached_len > 0
             else torch.empty(0, dtype=torch.bool, device="cpu")
         )
-        value_virtual_mask = matched_virtual_mask.to(
-            device=indices.device, non_blocking=True
-        )
+        value_virtual_mask = matched_virtual_mask.to(device=indices.device, non_blocking=True)
         if handle.cached_len != valid_prefix_len or bool(
             torch.any((indices < 0) & (~value_virtual_mask)).item()
         ):
@@ -134,26 +126,18 @@ class CacheManager:
         radix_query, query_virtual_mask = cls._radix_query_prefix(req)
         if query_virtual_mask is None:
             return max(req.input_len - 1, 0)
-        full_token_prefix_len = int(
-            torch.count_nonzero(~query_virtual_mask).item()
-        )
-        return int(
-            torch.count_nonzero(req.true_positions < full_token_prefix_len).item()
-        )
+        full_token_prefix_len = int(torch.count_nonzero(~query_virtual_mask).item())
+        return int(torch.count_nonzero(req.true_positions < full_token_prefix_len).item())
 
     def match_req(self, req: PendingReq) -> ContextMatchResult | None:
         assert req.input_len > 0, "Input length must be greater than 0."
         radix_query, query_virtual_mask = self._radix_query_prefix(req)
-        matched = self._match_and_prune_legacy_holes(
-            radix_query, query_virtual_mask
-        )
+        matched = self._match_and_prune_legacy_holes(radix_query, query_virtual_mask)
         if matched is None:
             return None
         handle, key_match_indices, matched_virtual_mask = matched
         full_match_indices = key_match_indices[
-            (~matched_virtual_mask).to(
-                device=key_match_indices.device, non_blocking=True
-            )
+            (~matched_virtual_mask).to(device=key_match_indices.device, non_blocking=True)
         ]
         active_match_indices = full_match_indices
         if req.prefix_keep_mask is not None and len(full_match_indices) > 0:
@@ -179,16 +163,12 @@ class CacheManager:
     def match_full_req(self, req: PendingReq) -> FullMatchResult | None:
         assert req.input_len > 0, "Input length must be greater than 0."
         radix_query, query_virtual_mask = self._radix_query_prefix(req)
-        matched = self._match_and_prune_legacy_holes(
-            radix_query, query_virtual_mask
-        )
+        matched = self._match_and_prune_legacy_holes(radix_query, query_virtual_mask)
         if matched is None:
             return None
         handle, key_match_indices, matched_virtual_mask = matched
         full_match_indices = key_match_indices[
-            (~matched_virtual_mask).to(
-                device=key_match_indices.device, non_blocking=True
-            )
+            (~matched_virtual_mask).to(device=key_match_indices.device, non_blocking=True)
         ]
         return FullMatchResult(
             handle=handle,
@@ -277,14 +257,14 @@ class CacheManager:
         key_prefix_len = self._delta_key_prefix_len(req)
         try:
             if len(all_active_indices) != len(all_active_positions):
-                raise RuntimeError("Active cache indices and true positions have different lengths.")
+                raise RuntimeError(
+                    "Active cache indices and true positions have different lengths."
+                )
             if key_prefix_len < old_handle.cached_len:
                 raise RuntimeError("Delta-marker key prefix regressed below the matched prefix.")
 
             key_virtual_mask = req.radix_key_virtual_mask[:key_prefix_len]
-            full_token_prefix_len = int(
-                torch.count_nonzero(~key_virtual_mask).item()
-            )
+            full_token_prefix_len = int(torch.count_nonzero(~key_virtual_mask).item())
             within_prefix = all_active_positions < full_token_prefix_len
             active_indices = all_active_indices[
                 within_prefix.to(
@@ -335,9 +315,7 @@ class CacheManager:
             )
             overlap = active_positions < old_full_cached_len
             if bool(torch.any(overlap).item()):
-                overlap_device = overlap.to(
-                    device=active_indices.device, non_blocking=True
-                )
+                overlap_device = overlap.to(device=active_indices.device, non_blocking=True)
                 if not torch.equal(
                     full_indices[active_positions_device[overlap_device]],
                     active_indices[overlap_device],
@@ -370,13 +348,11 @@ class CacheManager:
             )
             real_key_mask = ~commit_virtual_mask
             real_token_positions = commit_key_to_token[real_key_mask]
-            key_indices[
-                real_key_mask.to(device=active_indices.device, non_blocking=True)
-            ] = full_indices[
-                real_token_positions.to(
-                    device=active_indices.device, non_blocking=True
-                )
-            ]
+            key_indices[real_key_mask.to(device=active_indices.device, non_blocking=True)] = (
+                full_indices[
+                    real_token_positions.to(device=active_indices.device, non_blocking=True)
+                ]
+            )
 
             insert_result = self.prefix_cache.insert_prefix(
                 req.radix_match_ids[:cacheable_key_len],
@@ -427,7 +403,9 @@ class CacheManager:
         old_full_cached_len = old_handle.cached_len
         try:
             if len(active_indices) != len(active_positions):
-                raise RuntimeError("Active cache indices and true positions have different lengths.")
+                raise RuntimeError(
+                    "Active cache indices and true positions have different lengths."
+                )
             full_cached_len = int(active_positions[-1].item()) + 1
             if full_cached_len > len(req.radix_match_ids):
                 raise RuntimeError("Full cached length exceeds Radix key length.")
@@ -447,9 +425,7 @@ class CacheManager:
             )
             overlap = full_positions < old_full_cached_len
             if bool(torch.any(overlap).item()):
-                if not torch.equal(
-                    full_indices[full_positions[overlap]], active_indices[overlap]
-                ):
+                if not torch.equal(full_indices[full_positions[overlap]], active_indices[overlap]):
                     raise RuntimeError("Cached full/active overlap uses different KV slots.")
             full_indices[full_positions] = active_indices
             filled[full_positions] = True
@@ -503,12 +479,9 @@ class CacheManager:
             )
             if insert_result.cached_len < req.initial_active_cached_len:
                 raise RuntimeError("Full-stream Radix prefix regressed during commit.")
-            slots = torch.arange(
-                len(full_indices), dtype=torch.int64, device=full_indices.device
-            )
-            duplicates = (
-                (slots >= req.initial_active_cached_len)
-                & (slots < insert_result.cached_len)
+            slots = torch.arange(len(full_indices), dtype=torch.int64, device=full_indices.device)
+            duplicates = (slots >= req.initial_active_cached_len) & (
+                slots < insert_result.cached_len
             )
             self._free(full_indices[duplicates])
         finally:

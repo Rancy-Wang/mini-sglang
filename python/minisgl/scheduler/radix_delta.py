@@ -215,9 +215,7 @@ def inject_delta_markers(
         raise ValueError("full_radix_ids must be a CPU int64 tensor.")
     if full_radix_ids.ndim != 1:
         raise ValueError("full_radix_ids must be one-dimensional.")
-    _validate_position_wire(
-        len(full_radix_ids), event_positions, range_offsets, position_ranges
-    )
+    _validate_position_wire(len(full_radix_ids), event_positions, range_offsets, position_ranges)
     if len(event_positions) == 0:
         return None
 

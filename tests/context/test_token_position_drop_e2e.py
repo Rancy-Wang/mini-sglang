@@ -83,15 +83,11 @@ def test_long_agent_chat_message_drop_and_position_drop_are_text_identical():
     result = _tokenize(manager, messages, {3: [2]})
     no_drop = _tokenize(manager, messages, None)
     full_ids = result.full_input_ids.tolist()
-    provenance, legacy_keep = _legacy_message_keep_mask(
-        tokenizer, messages, full_ids, {2}
-    )
+    provenance, legacy_keep = _legacy_message_keep_mask(tokenizer, messages, full_ids, {2})
     legacy_positions = torch.arange(len(full_ids), dtype=torch.int32)[legacy_keep]
     legacy_input_ids = result.full_input_ids[legacy_keep]
 
-    rendered = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
+    rendered = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     assert len(rendered) >= 8000
     assert "FIRST_PRIVATE_REASON_" not in rendered
     assert "SECOND_PRIVATE_REASON_" not in rendered
@@ -146,8 +142,4 @@ def test_multiple_message_drop_union_equals_position_range_union():
         position
         for start, end in result.drop_position_ranges.view(-1, 2).tolist()
         for position in range(start, end)
-    } == {
-        position
-        for position, owner in enumerate(provenance.owners)
-        if owner in {1, 2, 3}
-    }
+    } == {position for position, owner in enumerate(provenance.owners) if owner in {1, 2, 3}}

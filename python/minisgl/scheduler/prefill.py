@@ -196,7 +196,9 @@ class PrefillManager:
             if not req.is_warmup:
                 raise ValueError("Context-mask Prefill is restricted to warmup requests.")
             if req.full_input_ids is None or req.radix_match_ids is None:
-                raise ValueError("Context-mask Prefill requires a full token stream and Radix keys.")
+                raise ValueError(
+                    "Context-mask Prefill requires a full token stream and Radix keys."
+                )
             input_ids = req.full_input_ids
             true_positions = torch.arange(len(input_ids), dtype=torch.int32, device="cpu")
             radix_input_ids = (

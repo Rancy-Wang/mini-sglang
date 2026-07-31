@@ -42,6 +42,7 @@ def build_context_visibility_mask_reference(
     visible = query_positions.unsqueeze(1) < visible_until.unsqueeze(0)
     return causal & visible
 
+
 if TYPE_CHECKING:
     from minisgl.attention import BaseAttnBackend, BaseAttnMetadata
     from minisgl.kvcache import BaseCacheHandle, BaseKVCachePool
@@ -67,7 +68,9 @@ class Req:
     true_positions: torch.Tensor  # cpu tensor, absolute position for each input token
     radix_input_ids: torch.Tensor  # cpu tensor, int64 encoded key ids for radix
     radix_match_ids: torch.Tensor  # cpu tensor, full int64 encoded key ids for radix matching
-    initial_full_match_indices: torch.Tensor  # tensor for initially matched full-prefix page indices
+    initial_full_match_indices: (
+        torch.Tensor
+    )  # tensor for initially matched full-prefix page indices
     initial_active_cached_len: int
     true_seq_len: int
     table_idx: int
@@ -143,9 +146,7 @@ class Req:
             raise ValueError("radix_marker_ids require a delta-marker Radix layout.")
         if self.radix_commit_key_len is not None:
             if self.radix_key_virtual_mask is None:
-                raise ValueError(
-                    "radix_commit_key_len requires a delta-marker Radix layout."
-                )
+                raise ValueError("radix_commit_key_len requires a delta-marker Radix layout.")
             if not 0 <= self.radix_commit_key_len <= len(self.radix_match_ids):
                 raise ValueError("radix_commit_key_len is outside the Radix key stream.")
         self.device_len = len(self.input_ids)
@@ -171,7 +172,9 @@ class Req:
                     raise ValueError("Context-mask metadata tensors must use torch.int32.")
             full_len = len(self.full_input_ids)
             if not len(self.full_token_visible_until) == len(self.full_keep_mask) == full_len:
-                raise ValueError("Full context-mask tensors and Radix keys must have equal lengths.")
+                raise ValueError(
+                    "Full context-mask tensors and Radix keys must have equal lengths."
+                )
             if self.radix_token_to_key is None:
                 if len(self.radix_match_ids) != full_len:
                     raise ValueError(
@@ -188,9 +191,7 @@ class Req:
                 raise ValueError("Active input_ids do not match full_input_ids at true_positions.")
             key_positions = torch.arange(full_len, dtype=torch.int32, device="cpu")
             if bool(torch.any(self.full_token_visible_until <= key_positions).item()):
-                raise ValueError(
-                    "A token cannot become invisible before it has been computed."
-                )
+                raise ValueError("A token cannot become invisible before it has been computed.")
         if self.use_context_mask and not all(tensor is not None for tensor in context_tensors):
             raise ValueError("Context-mask Prefill requires complete context metadata.")
 

@@ -55,10 +55,7 @@ class Scheduler(SchedulerIOMixin):
     def __init__(self, config: SchedulerConfig):
         if config.radix_drop_key_mode == "delta-marker" and config.page_size != 1:
             raise ValueError("Delta-marker Radix mode requires --page-size 1.")
-        if (
-            config.radix_drop_key_mode == "delta-marker"
-            and "trtllm" in config.attention_backend
-        ):
+        if config.radix_drop_key_mode == "delta-marker" and "trtllm" in config.attention_backend:
             raise ValueError(
                 "Delta-marker Radix mode is incompatible with TRTLLM because "
                 "TRTLLM requires a non-unit page size."
@@ -270,9 +267,7 @@ class Scheduler(SchedulerIOMixin):
             true_input_len = (
                 len(msg.full_input_ids)
                 if msg.use_context_mask and msg.full_input_ids is not None
-                else int(msg.true_positions[-1].item()) + 1
-                if len(msg.true_positions) > 0
-                else 0
+                else int(msg.true_positions[-1].item()) + 1 if len(msg.true_positions) > 0 else 0
             )
             max_seq_len = self.engine.max_seq_len
             max_output_len = max_seq_len - true_input_len
@@ -339,10 +334,8 @@ class Scheduler(SchedulerIOMixin):
                         msg.radix_token_to_key = layout.token_to_key
                         msg.radix_marker_ids = list(layout.marker_ids)
                     if layout is not None and msg.radix_commit_token_len is not None:
-                        msg.radix_commit_key_len = (
-                            key_prefix_len_for_token_boundary(
-                                layout, msg.radix_commit_token_len
-                            )
+                        msg.radix_commit_key_len = key_prefix_len_for_token_boundary(
+                            layout, msg.radix_commit_token_len
                         )
 
             if msg.sampling_params.max_tokens > max_output_len:
@@ -363,9 +356,7 @@ class Scheduler(SchedulerIOMixin):
             req_to_free = req_to_free or self.decode_manager.abort_req(msg.uid)
             if isinstance(req_to_free, PendingReq):
                 if self.delta_marker_registry is not None and req_to_free.radix_marker_ids:
-                    self.delta_marker_registry.release_request_refs(
-                        req_to_free.radix_marker_ids
-                    )
+                    self.delta_marker_registry.release_request_refs(req_to_free.radix_marker_ids)
                     req_to_free.radix_marker_ids = ()
             elif req_to_free is not None:
                 self._free_req_resources(req_to_free)

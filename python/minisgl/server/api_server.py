@@ -99,9 +99,13 @@ def _validate_drop_message(
     for raw_n, raw_ids in drop_message.items():
         n = int(raw_n)
         if n < 0:
-            raise HTTPException(status_code=400, detail=f"drop_message key must be non-negative: {n}")
+            raise HTTPException(
+                status_code=400, detail=f"drop_message key must be non-negative: {n}"
+            )
         if radix_drop_key_mode == "bitmask" and n >= 32:
-            raise HTTPException(status_code=400, detail=f"drop_message key out of range [0, 31]: {n}")
+            raise HTTPException(
+                status_code=400, detail=f"drop_message key out of range [0, 31]: {n}"
+            )
         if radix_drop_key_mode in {"symbol", "delta-marker"} and n >= (1 << 63):
             raise HTTPException(status_code=400, detail=f"drop_message key out of int64 range: {n}")
         for raw_id in raw_ids:
@@ -140,7 +144,10 @@ def _validate_drop_message(
 def _to_wire_drop_message(drop_message: Dict[int, List[int]] | None) -> Dict[str, List[int]] | None:
     if drop_message is None:
         return None
-    return {str(int(raw_n)): [int(raw_id) for raw_id in raw_ids] for raw_n, raw_ids in drop_message.items()}
+    return {
+        str(int(raw_n)): [int(raw_id) for raw_id in raw_ids]
+        for raw_n, raw_ids in drop_message.items()
+    }
 
 
 def _extract_tool_function_name(tool: Dict[str, Any]) -> str | None:
@@ -189,7 +196,9 @@ def _normalize_tool_choice(
 ) -> str | Dict[str, Any]:
     available_tools = tools or []
     available_names = {
-        name for name in (_extract_tool_function_name(tool) for tool in available_tools) if name is not None
+        name
+        for name in (_extract_tool_function_name(tool) for tool in available_tools)
+        if name is not None
     }
 
     if tool_choice is None:
@@ -213,14 +222,18 @@ def _normalize_tool_choice(
             raise HTTPException(status_code=400, detail="tool_choice.function must be an object.")
         name = fn.get("name")
         if not isinstance(name, str) or len(name.strip()) == 0:
-            raise HTTPException(status_code=400, detail="tool_choice.function.name must be a non-empty string.")
+            raise HTTPException(
+                status_code=400, detail="tool_choice.function.name must be a non-empty string."
+            )
         normalized = {"type": "function", "function": {"name": name.strip()}}
     else:
         raise HTTPException(status_code=400, detail="tool_choice must be a string or an object.")
 
     mode = _tool_choice_mode(normalized)
     if mode == "required" and len(available_tools) == 0:
-        raise HTTPException(status_code=400, detail="tools cannot be empty when tool_choice is 'required'.")
+        raise HTTPException(
+            status_code=400, detail="tools cannot be empty when tool_choice is 'required'."
+        )
     if mode == "function" and len(available_tools) == 0:
         raise HTTPException(
             status_code=400,
@@ -293,7 +306,9 @@ def _format_tool_arguments(arguments: Any) -> str:
     return json.dumps(arguments, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
 
 
-def _build_tool_call(name: str, arguments: Any, idx: int, call_id: str | None = None) -> Dict[str, Any]:
+def _build_tool_call(
+    name: str, arguments: Any, idx: int, call_id: str | None = None
+) -> Dict[str, Any]:
     return {
         "id": call_id or f"call_{uuid.uuid4().hex[:24]}",
         "type": "function",
@@ -870,7 +885,9 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
                 status_code=400, detail="drop_message is only supported with chat `messages` input."
             )
         if req.tools is not None:
-            raise HTTPException(status_code=400, detail="tools are only supported with chat `messages`.")
+            raise HTTPException(
+                status_code=400, detail="tools are only supported with chat `messages`."
+            )
         if req.tool_choice is not None:
             raise HTTPException(
                 status_code=400,
@@ -1031,7 +1048,6 @@ async def shell_completion(req: OpenAICompletionRequest):
         media_type="text/event-stream",
         background=BackgroundTask(lambda: _abort),
     )
-
 
 
 async def shell():

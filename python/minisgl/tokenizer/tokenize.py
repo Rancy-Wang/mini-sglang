@@ -127,7 +127,9 @@ class TokenizeManager:
 
     @staticmethod
     def _json_dumps(value: Any) -> str:
-        return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+        return json.dumps(
+            value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str
+        )
 
     def _normalize_message_content(self, content: Any) -> str:
         if content is None:
@@ -175,7 +177,7 @@ class TokenizeManager:
                 chunks.append("Tool policy: you must call at least one tool before final answer.")
             chunks.append(
                 "When calling a tool, output strictly in this format only:\n"
-                "<tool_call>{\"name\":\"<tool_name>\",\"arguments\":{...}}</tool_call>"
+                '<tool_call>{"name":"<tool_name>","arguments":{...}}</tool_call>'
             )
             chunks.append("Do not provide final answer before tool responses are received.")
         chunks.append("Available tools:\n" + self._json_dumps(tools))
@@ -223,11 +225,7 @@ class TokenizeManager:
             return None
         if mode != "function" or forced_tool_name is None:
             return tools
-        selected = [
-            tool
-            for tool in tools
-            if self._extract_tool_name(tool) == forced_tool_name
-        ]
+        selected = [tool for tool in tools if self._extract_tool_name(tool) == forced_tool_name]
         # Keep all tools as fallback if we cannot find an exact match.
         return selected if len(selected) > 0 else tools
 
@@ -270,7 +268,9 @@ class TokenizeManager:
                 continue
 
             if role == "assistant" and isinstance(raw.get("tool_calls"), list):
-                message["tool_calls"] = self._normalize_tool_calls_for_template(raw.get("tool_calls"))
+                message["tool_calls"] = self._normalize_tool_calls_for_template(
+                    raw.get("tool_calls")
+                )
 
             if role == "tool":
                 if raw.get("tool_call_id") is not None:
@@ -296,7 +296,9 @@ class TokenizeManager:
 
         return messages, target_offset
 
-    def _normalize_drop_message(self, drop_message: dict[int, List[int]] | None) -> dict[int, List[int]]:
+    def _normalize_drop_message(
+        self, drop_message: dict[int, List[int]] | None
+    ) -> dict[int, List[int]]:
         if not drop_message:
             return {}
         normalized: dict[int, List[int]] = {}
@@ -455,9 +457,7 @@ class TokenizeManager:
                     torch.tensor(insertion_pos, dtype=torch.int32, device="cpu"),
                 )
 
-        position_ranges = torch.tensor(
-            flat_ranges, dtype=torch.int32, device="cpu"
-        ).reshape(-1)
+        position_ranges = torch.tensor(flat_ranges, dtype=torch.int32, device="cpu").reshape(-1)
         return PositionDropPlan(
             event_positions=torch.tensor(event_positions, dtype=torch.int32, device="cpu"),
             range_offsets=torch.tensor(range_offsets, dtype=torch.int32, device="cpu"),
@@ -482,7 +482,9 @@ class TokenizeManager:
         target_offset: int,
     ) -> int:
         if msg.target_msg_id is None:
-            target_msg_id = max(normalized_msg_count - 1, 0) if msg.is_warmup else normalized_msg_count
+            target_msg_id = (
+                max(normalized_msg_count - 1, 0) if msg.is_warmup else normalized_msg_count
+            )
         else:
             target_msg_id = int(msg.target_msg_id) + target_offset
         if target_msg_id < 0 or target_msg_id > normalized_msg_count:
@@ -598,9 +600,7 @@ class TokenizeManager:
                 query_epoch = [0] * len(curr)
                 continue
 
-            owner, lcp, _, unstable = self._merge_owner_track(
-                assembled, owner, curr, new_owner=i
-            )
+            owner, lcp, _, unstable = self._merge_owner_track(assembled, owner, curr, new_owner=i)
             query_epoch = self._merge_query_epoch_track(
                 query_epoch,
                 len(curr),
@@ -690,9 +690,7 @@ class TokenizeManager:
             )
         if not self._supports_tools:
             effective_tools = None
-        effective_enable_thinking = (
-            msg.enable_thinking if self._supports_enable_thinking else None
-        )
+        effective_enable_thinking = msg.enable_thinking if self._supports_enable_thinking else None
         drop_message = self._shift_and_validate_drop_message(
             drop_message,
             target_offset=target_offset,

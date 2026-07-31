@@ -39,9 +39,7 @@ def test_token_position_mask_is_exactly_equivalent_to_message_mask():
     query_epoch = [0, 0, 1, 1, 2, 2, 3, 4, 5]
     sentinel = torch.iinfo(torch.int32).max
     message_visible_until = [2, sentinel, 3, sentinel, sentinel, sentinel]
-    token_visible_until = _compile_token_visible_until(
-        owners, query_epoch, message_visible_until
-    )
+    token_visible_until = _compile_token_visible_until(owners, query_epoch, message_visible_until)
 
     expected = _message_reference(owners, query_epoch, message_visible_until)
     actual = build_context_visibility_mask_reference(token_visible_until)

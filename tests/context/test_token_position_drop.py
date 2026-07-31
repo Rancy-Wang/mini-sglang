@@ -29,9 +29,7 @@ class RepeatedTokenChatTokenizer:
         **kwargs,
     ):
         text = "".join(
-            message["content"]
-            for message in messages
-            if message.get("content") != "<empty>"
+            message["content"] for message in messages if message.get("content") != "<empty>"
         )
         if add_generation_prompt:
             text += "G"
@@ -43,9 +41,7 @@ class RepeatedTokenChatTokenizer:
         assert not add_special_tokens
         result = {"input_ids": [9 if char == "G" else 7 for char in text]}
         if return_offsets_mapping:
-            result["offset_mapping"] = [
-                (position, position + 1) for position in range(len(text))
-            ]
+            result["offset_mapping"] = [(position, position + 1) for position in range(len(text))]
         return result
 
     def encode(self, text, **kwargs):
@@ -53,9 +49,7 @@ class RepeatedTokenChatTokenizer:
 
 
 def _tokenize(messages, drop_message=None, *, mode="delta-marker"):
-    manager = TokenizeManager(
-        RepeatedTokenChatTokenizer(), radix_drop_key_mode=mode
-    )
+    manager = TokenizeManager(RepeatedTokenChatTokenizer(), radix_drop_key_mode=mode)
     return manager.tokenize(
         [
             TokenizeMsg(
@@ -107,9 +101,7 @@ def test_noncontiguous_message_ownership_does_not_shift_positions():
     owners = [0, 1, 2, 2, 9, 2, 3]
     query_epoch = [0, 1, 2, 2, 3, 3, 4]
     owner_ranges = TokenizeManager._build_owner_position_ranges(owners)
-    plan = TokenizeManager._build_position_drop_plan(
-        {3: [2]}, query_epoch, owner_ranges
-    )
+    plan = TokenizeManager._build_position_drop_plan({3: [2]}, query_epoch, owner_ranges)
 
     assert owner_ranges[2] == [(2, 4), (5, 6)]
     assert plan.event_positions.tolist() == [6]

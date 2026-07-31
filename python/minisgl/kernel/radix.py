@@ -28,6 +28,4 @@ def fast_compare_radix_key(
 ) -> int:
     """Return the first key or virtual-kind mismatch without Python temporaries."""
 
-    return _load_radix_module().fast_compare_radix_key(
-        x, y, x_virtual_mask, y_virtual_mask
-    )
+    return _load_radix_module().fast_compare_radix_key(x, y, x_virtual_mask, y_virtual_mask)
