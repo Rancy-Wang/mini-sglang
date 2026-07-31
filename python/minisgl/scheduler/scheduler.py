@@ -320,23 +320,31 @@ class Scheduler(SchedulerIOMixin):
                     assert event_positions is not None
                     assert range_offsets is not None
                     assert position_ranges is not None
-                    layout = inject_delta_markers(
-                        msg.radix_match_ids,
-                        event_positions,
-                        range_offsets,
-                        position_ranges,
-                        self.delta_marker_registry,
-                    )
-                    if layout is not None:
-                        msg.radix_match_ids = layout.keys
-                        msg.radix_key_virtual_mask = layout.virtual_mask
-                        msg.radix_key_to_token = layout.key_to_token
-                        msg.radix_token_to_key = layout.token_to_key
-                        msg.radix_marker_ids = list(layout.marker_ids)
-                    if layout is not None and msg.radix_commit_token_len is not None:
-                        msg.radix_commit_key_len = key_prefix_len_for_token_boundary(
-                            layout, msg.radix_commit_token_len
+                    marker_ids: tuple[int, ...] = ()
+                    try:
+                        layout = inject_delta_markers(
+                            msg.radix_match_ids,
+                            event_positions,
+                            range_offsets,
+                            position_ranges,
+                            self.delta_marker_registry,
                         )
+                        if layout is not None:
+                            marker_ids = layout.marker_ids
+                            msg.radix_match_ids = layout.keys
+                            msg.radix_key_virtual_mask = layout.virtual_mask
+                            msg.radix_key_to_token = layout.key_to_token
+                            msg.radix_token_to_key = layout.token_to_key
+                            msg.radix_marker_ids = list(marker_ids)
+                        if layout is not None and msg.radix_commit_token_len is not None:
+                            msg.radix_commit_key_len = key_prefix_len_for_token_boundary(
+                                layout, msg.radix_commit_token_len
+                            )
+                    except Exception:
+                        if marker_ids:
+                            self.delta_marker_registry.release_request_refs(marker_ids)
+                            msg.radix_marker_ids = None
+                        raise
 
             if msg.sampling_params.max_tokens > max_output_len:
                 msg.sampling_params.max_tokens = max_output_len

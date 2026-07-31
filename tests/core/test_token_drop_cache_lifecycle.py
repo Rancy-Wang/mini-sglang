@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
+import pytest
 import torch
 
 import minisgl.core as core
 from minisgl.core import Req, SamplingParams
+from minisgl.message import UserMsg
 from minisgl.scheduler.cache import CacheManager
 from minisgl.scheduler.radix_delta import DeltaMarkerRegistry, inject_delta_markers
+from minisgl.scheduler.scheduler import Scheduler
 from minisgl.scheduler.utils import PendingReq
 
 
@@ -92,3 +97,34 @@ def test_token_position_branch_caches_matches_evicts_and_releases_registry():
         cache.check_integrity()
     finally:
         core._GLOBAL_CTX = previous_ctx
+
+
+def test_scheduler_releases_markers_when_commit_boundary_is_invalid():
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.engine = SimpleNamespace(max_seq_len=32)
+    scheduler.radix_symbol_registry = None
+    scheduler.delta_marker_registry = DeltaMarkerRegistry()
+    scheduler.prefill_manager = SimpleNamespace(
+        add_one_req=lambda _msg: pytest.fail("invalid request reached PrefillManager")
+    )
+
+    full_ids = torch.arange(100, 104, dtype=torch.int64)
+    msg = UserMsg(
+        uid=1,
+        input_ids=full_ids.to(torch.int32),
+        true_positions=torch.arange(4, dtype=torch.int32),
+        radix_input_ids=full_ids,
+        radix_match_ids=full_ids.clone(),
+        sampling_params=SamplingParams(max_tokens=1),
+        drop_event_positions=torch.tensor([4], dtype=torch.int32),
+        drop_range_offsets=torch.tensor([0, 1], dtype=torch.int32),
+        drop_position_ranges=torch.tensor([1, 3], dtype=torch.int32),
+        radix_commit_token_len=5,
+    )
+
+    with pytest.raises(ValueError, match="outside token length"):
+        scheduler._process_one_msg(msg)
+
+    assert msg.radix_marker_ids is None
+    assert scheduler.delta_marker_registry.request_ref_count == 0
+    assert scheduler.delta_marker_registry.size == 0
