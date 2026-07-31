@@ -104,7 +104,7 @@ def test_long_agent_chat_message_drop_and_position_drop_are_text_identical():
 
     dropped_positions = {
         position
-        for start, end in result.drop_position_ranges.tolist()
+        for start, end in result.drop_position_ranges.view(-1, 2).tolist()
         for position in range(start, end)
     }
     expected_dropped_positions = {
@@ -144,7 +144,7 @@ def test_multiple_message_drop_union_equals_position_range_union():
     assert len(result.drop_event_positions) == 2
     assert {
         position
-        for start, end in result.drop_position_ranges.tolist()
+        for start, end in result.drop_position_ranges.view(-1, 2).tolist()
         for position in range(start, end)
     } == {
         position

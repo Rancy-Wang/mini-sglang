@@ -455,9 +455,9 @@ class TokenizeManager:
                     torch.tensor(insertion_pos, dtype=torch.int32, device="cpu"),
                 )
 
-        position_ranges = torch.tensor(flat_ranges, dtype=torch.int32, device="cpu")
-        if len(flat_ranges) == 0:
-            position_ranges = torch.empty((0, 2), dtype=torch.int32, device="cpu")
+        position_ranges = torch.tensor(
+            flat_ranges, dtype=torch.int32, device="cpu"
+        ).reshape(-1)
         return PositionDropPlan(
             event_positions=torch.tensor(event_positions, dtype=torch.int32, device="cpu"),
             range_offsets=torch.tensor(range_offsets, dtype=torch.int32, device="cpu"),

@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from minisgl.core import SamplingParams
-from minisgl.message import TokenizeMsg, UserMsg
+from minisgl.message import BaseBackendMsg, TokenizeMsg, UserMsg
 from minisgl.tokenizer.tokenize import TokenizeManager
 
 
@@ -83,7 +83,7 @@ def test_message_drop_compiles_to_exact_absolute_position_ranges():
 
     assert result.drop_event_positions.tolist() == [5]
     assert result.drop_range_offsets.tolist() == [0, 1]
-    assert result.drop_position_ranges.tolist() == [[2, 4]]
+    assert result.drop_position_ranges.tolist() == [2, 4]
     assert result.full_keep_mask.tolist() == [1, 1, 0, 0, 1, 1, 1, 1, 1, 1]
     assert result.true_positions.tolist() == [0, 1, 4, 5, 6, 7, 8, 9]
     assert result.input_ids.tolist() == [7, 7, 7, 7, 7, 7, 7, 9]
@@ -114,10 +114,10 @@ def test_noncontiguous_message_ownership_does_not_shift_positions():
     assert owner_ranges[2] == [(2, 4), (5, 6)]
     assert plan.event_positions.tolist() == [6]
     assert plan.range_offsets.tolist() == [0, 2]
-    assert plan.position_ranges.tolist() == [[2, 4], [5, 6]]
+    assert plan.position_ranges.tolist() == [2, 4, 5, 6]
 
     keep = torch.ones(len(owners), dtype=torch.bool)
-    for start, end in plan.position_ranges.tolist():
+    for start, end in plan.position_ranges.view(-1, 2).tolist():
         keep[start:end] = False
     assert torch.arange(len(owners), dtype=torch.int32)[keep].tolist() == [0, 1, 4, 6]
 
@@ -134,9 +134,34 @@ def test_more_than_128_drop_events_have_no_round_limit():
     )
 
     assert len(plan.event_positions) == count - 1
-    assert len(plan.position_ranges) == count - 1
+    assert len(plan.position_ranges) == 2 * (count - 1)
     assert plan.event_positions[-1].item() == count
-    assert plan.position_ranges[-1].tolist() == [count - 2, count - 1]
+    assert plan.position_ranges[-2:].tolist() == [count - 2, count - 1]
+
+
+def test_position_drop_backend_wire_round_trips_only_one_dimensional_tensors():
+    result = _tokenize(
+        [{"role": "user", "content": "X"} for _ in range(5)],
+        {3: [1, 2]},
+    )
+    msg = UserMsg(
+        uid=1,
+        input_ids=result.input_ids,
+        true_positions=result.true_positions,
+        radix_input_ids=result.radix_input_ids,
+        radix_match_ids=result.radix_match_ids,
+        sampling_params=SamplingParams(max_tokens=1),
+        drop_event_positions=result.drop_event_positions,
+        drop_range_offsets=result.drop_range_offsets,
+        drop_position_ranges=result.drop_position_ranges,
+    )
+
+    decoded = BaseBackendMsg.decoder(msg.encoder())
+    assert isinstance(decoded, UserMsg)
+    assert decoded.drop_position_ranges.ndim == 1
+    assert torch.equal(decoded.drop_event_positions, msg.drop_event_positions)
+    assert torch.equal(decoded.drop_range_offsets, msg.drop_range_offsets)
+    assert torch.equal(decoded.drop_position_ranges, msg.drop_position_ranges)
 
 
 def test_no_drop_keeps_linear_token_stream_and_has_no_position_metadata():

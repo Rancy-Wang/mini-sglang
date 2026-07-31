@@ -177,17 +177,17 @@ def _validate_position_wire(
     tensors = (event_positions, range_offsets, position_ranges)
     if any(tensor.device.type != "cpu" for tensor in tensors):
         raise ValueError("Token-position Drop metadata must use CPU tensors.")
-    if event_positions.ndim != 1 or range_offsets.ndim != 1 or position_ranges.ndim != 2:
+    if event_positions.ndim != 1 or range_offsets.ndim != 1 or position_ranges.ndim != 1:
         raise ValueError("Token-position Drop metadata has an invalid rank.")
-    if position_ranges.shape[1:] != (2,):
-        raise ValueError("drop_position_ranges must have shape [range_count, 2].")
+    if len(position_ranges) % 2 != 0:
+        raise ValueError("drop_position_ranges must contain flattened start/end pairs.")
     if any(tensor.dtype not in (torch.int32, torch.int64) for tensor in tensors):
         raise ValueError("Token-position Drop metadata must use integer tensors.")
     if len(range_offsets) != len(event_positions) + 1:
         raise ValueError("drop_range_offsets must have event_count + 1 entries.")
     if len(range_offsets) == 0 or int(range_offsets[0].item()) != 0:
         raise ValueError("drop_range_offsets must start at zero.")
-    if int(range_offsets[-1].item()) != len(position_ranges):
+    if int(range_offsets[-1].item()) * 2 != len(position_ranges):
         raise ValueError("drop_range_offsets does not cover all position ranges.")
     if len(range_offsets) > 1 and bool(torch.any(range_offsets[1:] < range_offsets[:-1]).item()):
         raise ValueError("drop_range_offsets must be monotonically non-decreasing.")
@@ -226,7 +226,9 @@ def inject_delta_markers(
         insertion_pos = int(raw_position)
         range_start = int(range_offsets[event_idx].item())
         range_end = int(range_offsets[event_idx + 1].item())
-        canonical = canonicalize_delta_ranges(position_ranges[range_start:range_end].tolist())
+        canonical = canonicalize_delta_ranges(
+            position_ranges[2 * range_start : 2 * range_end].view(-1, 2).tolist()
+        )
         if not canonical:
             raise ValueError("A token-position Drop event must contain at least one range.")
         if canonical[-1][1] > insertion_pos:

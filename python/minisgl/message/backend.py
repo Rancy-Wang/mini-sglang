@@ -44,7 +44,7 @@ class UserMsg(BaseBackendMsg):
     radix_marker_ids: List[int] | None = None  # scheduler-owned request leases
     drop_event_positions: torch.Tensor | None = None  # CPU 1D int32 absolute boundaries
     drop_range_offsets: torch.Tensor | None = None  # CPU 1D int32 CSR offsets
-    drop_position_ranges: torch.Tensor | None = None  # CPU 2D int32 half-open ranges
+    drop_position_ranges: torch.Tensor | None = None  # CPU 1D int32 flattened [start, end, ...]
     radix_commit_token_len: int | None = None  # full-token warmup commit boundary
     enable_thinking: bool | None = None
     stop: List[str] | None = None

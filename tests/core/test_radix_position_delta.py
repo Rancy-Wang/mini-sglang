@@ -16,7 +16,7 @@ def _wire(events, offsets, ranges):
     return (
         torch.tensor(events, dtype=torch.int32),
         torch.tensor(offsets, dtype=torch.int32),
-        torch.tensor(ranges, dtype=torch.int32).reshape(-1, 2),
+        torch.tensor(ranges, dtype=torch.int32).reshape(-1),
     )
 
 

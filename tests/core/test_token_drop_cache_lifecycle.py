@@ -27,7 +27,7 @@ def test_token_position_branch_caches_matches_evicts_and_releases_registry():
             full_ids,
             torch.tensor([5], dtype=torch.int32),
             torch.tensor([0, 1], dtype=torch.int32),
-            torch.tensor([[2, 4]], dtype=torch.int32),
+            torch.tensor([2, 4], dtype=torch.int32),
             registry,
         )
         assert layout is not None
