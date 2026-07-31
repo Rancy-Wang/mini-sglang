@@ -99,7 +99,12 @@ def test_token_position_branch_caches_matches_evicts_and_releases_registry():
         core._GLOBAL_CTX = previous_ctx
 
 
-def test_scheduler_releases_markers_when_commit_boundary_is_invalid():
+def test_scheduler_releases_markers_when_commit_boundary_is_invalid(monkeypatch):
+    monkeypatch.setattr(
+        Scheduler._process_one_msg.__globals__["logger"],
+        "debug_rank0",
+        lambda *_args, **_kwargs: None,
+    )
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.engine = SimpleNamespace(max_seq_len=32)
     scheduler.radix_symbol_registry = None
