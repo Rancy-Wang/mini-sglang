@@ -237,25 +237,13 @@ class FlashInferBackend(BaseAttnBackend):
         custom_mask = None
         if masked_reqs:
             req = masked_reqs[0]
-            if (
-                req.full_kv_owner is None
-                or req.full_query_epoch is None
-                or req.drop_visible_until is None
-            ):
+            if req.full_token_visible_until is None:
                 raise RuntimeError("Context-mask Prefill request is missing visibility metadata.")
-            full_kv_owner = req.full_kv_owner.to(
-                device=device, dtype=torch.int32, non_blocking=True
-            )
-            full_query_epoch = req.full_query_epoch.to(
-                device=device, dtype=torch.int32, non_blocking=True
-            )
-            drop_visible_until = req.drop_visible_until.to(
+            full_token_visible_until = req.full_token_visible_until.to(
                 device=device, dtype=torch.int32, non_blocking=True
             )
             custom_mask = build_context_visibility_mask(
-                full_kv_owner,
-                full_query_epoch,
-                drop_visible_until,
+                full_token_visible_until,
                 query_start=req.cached_len,
                 query_length=req.extend_len,
                 key_length=req.device_len,

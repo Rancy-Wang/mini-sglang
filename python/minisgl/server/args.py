@@ -234,10 +234,10 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         choices=["bitmask", "symbol", "delta-marker"],
         default=ServerArgs.radix_drop_key_mode,
         help=(
-            "How drop-message state is injected into Radix keys. "
-            "'delta-marker' inserts virtual canonical-delta markers and is the default; "
-            "'bitmask' keeps the legacy high-32-bit mask; 'symbol' interns the exact "
-            "(token, drop-state) pair into one int64 Radix symbol."
+            "How Drop state is injected into Radix keys. Token-position Drop requires "
+            "'delta-marker', which interns canonical absolute-position ranges into "
+            "virtual keys and is the default. 'bitmask' and 'symbol' remain available "
+            "only for no-Drop legacy operation."
         ),
     )
 

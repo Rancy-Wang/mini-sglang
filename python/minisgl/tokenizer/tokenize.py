@@ -19,12 +19,22 @@ class TokenizedResult:
     radix_match_ids: torch.Tensor | None
     prefix_keep_mask: torch.Tensor
     full_input_ids: torch.Tensor | None = None
-    full_kv_owner: torch.Tensor | None = None
-    full_query_epoch: torch.Tensor | None = None
-    drop_visible_until: torch.Tensor | None = None
+    full_token_visible_until: torch.Tensor | None = None
     full_keep_mask: torch.Tensor | None = None
+    drop_event_positions: torch.Tensor | None = None
+    drop_range_offsets: torch.Tensor | None = None
+    drop_position_ranges: torch.Tensor | None = None
+    radix_commit_token_len: int | None = None
     stop_token_seqs: List[List[int]] | None = None
     message_meta: dict | None = None
+
+
+@dataclass(frozen=True)
+class PositionDropPlan:
+    event_positions: torch.Tensor
+    range_offsets: torch.Tensor
+    position_ranges: torch.Tensor
+    full_token_visible_until: torch.Tensor
 
 
 class TokenizeManager:
@@ -350,63 +360,110 @@ class TokenizeManager:
         return mask
 
     @staticmethod
-    def _canonical_delta_ranges(dropped_ids: set[int]) -> List[List[int]]:
-        ids = sorted(dropped_ids)
-        if not ids:
-            return []
-        ranges: List[List[int]] = []
-        start = previous = ids[0]
-        for msg_id in ids[1:]:
-            if msg_id == previous + 1:
-                previous = msg_id
+    def _build_owner_position_ranges(
+        owners: List[int],
+    ) -> dict[int, List[tuple[int, int]]]:
+        """Return exact full-token ranges for every provenance owner."""
+
+        ranges: dict[int, List[tuple[int, int]]] = {}
+        if not owners:
+            return ranges
+        start = 0
+        owner = int(owners[0])
+        for pos in range(1, len(owners) + 1):
+            next_owner = int(owners[pos]) if pos < len(owners) else None
+            if next_owner == owner:
                 continue
-            ranges.append([start, previous + 1])
-            start = previous = msg_id
-        ranges.append([start, previous + 1])
+            ranges.setdefault(owner, []).append((start, pos))
+            if pos < len(owners):
+                start = pos
+                owner = int(next_owner)
         return ranges
 
-    def _build_delta_markers(
-        self,
+    @staticmethod
+    def _canonicalize_position_ranges(
+        ranges: List[tuple[int, int]],
+    ) -> List[tuple[int, int]]:
+        if not ranges:
+            return []
+        normalized = sorted((int(start), int(end)) for start, end in ranges)
+        merged: List[tuple[int, int]] = []
+        for start, end in normalized:
+            if start < 0 or end <= start:
+                raise ValueError(f"Invalid token-position Drop range: [{start}, {end})")
+            if merged and start <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+            else:
+                merged.append((start, end))
+        return merged
+
+    @classmethod
+    def _ranges_for_messages(
+        cls,
+        owner_ranges: dict[int, List[tuple[int, int]]],
+        message_ids: set[int],
+    ) -> List[tuple[int, int]]:
+        ranges: List[tuple[int, int]] = []
+        for msg_id in sorted(message_ids):
+            ranges.extend(owner_ranges.get(msg_id, ()))
+        return cls._canonicalize_position_ranges(ranges)
+
+    @classmethod
+    def _build_position_drop_plan(
+        cls,
         drop_message: dict[int, List[int]],
         query_epoch: List[int],
-    ) -> List[dict[str, Any]]:
-        """Place newly effective deltas before the first query epoch after each event."""
+        owner_ranges: dict[int, List[tuple[int, int]]],
+    ) -> PositionDropPlan:
+        """Compile message selectors into absolute half-open position deltas."""
 
-        effective: set[int] = set()
-        delta_by_pos: dict[int, set[int]] = {}
-        events_by_pos: dict[int, List[int]] = {}
+        delta_by_pos: dict[int, List[tuple[int, int]]] = {}
+        effective_messages: set[int] = set()
         for event_n in sorted(drop_message):
-            newly_effective = set(drop_message[event_n]) - effective
-            effective.update(drop_message[event_n])
-            if not newly_effective:
+            newly_effective = set(drop_message[event_n]) - effective_messages
+            effective_messages.update(drop_message[event_n])
+            delta_ranges = cls._ranges_for_messages(owner_ranges, newly_effective)
+            if not delta_ranges:
                 continue
             insertion_pos = bisect_right(query_epoch, event_n)
-            delta_by_pos.setdefault(insertion_pos, set()).update(newly_effective)
-            events_by_pos.setdefault(insertion_pos, []).append(event_n)
+            if any(end > insertion_pos for _, end in delta_ranges):
+                raise ValueError(
+                    "A Drop event cannot hide a token before that token has been computed: "
+                    f"event={event_n}, insertion_pos={insertion_pos}, ranges={delta_ranges}"
+                )
+            delta_by_pos.setdefault(insertion_pos, []).extend(delta_ranges)
 
-        return [
-            {
-                "insertion_pos": insertion_pos,
-                "delta": self._canonical_delta_ranges(delta_by_pos[insertion_pos]),
-                "event_ns": events_by_pos[insertion_pos],
-            }
-            for insertion_pos in sorted(delta_by_pos)
-        ]
-
-    @staticmethod
-    def _build_drop_visible_until(
-        drop_message: dict[int, List[int]], message_count_with_generation: int
-    ) -> torch.Tensor:
-        result = torch.full(
-            (message_count_with_generation,),
+        event_positions: List[int] = []
+        range_offsets: List[int] = [0]
+        flat_ranges: List[tuple[int, int]] = []
+        visible_until = torch.full(
+            (len(query_epoch),),
             torch.iinfo(torch.int32).max,
             dtype=torch.int32,
             device="cpu",
         )
-        for n, ids in drop_message.items():
-            for msg_id in ids:
-                result[msg_id] = min(int(result[msg_id].item()), n)
-        return result
+        for insertion_pos in sorted(delta_by_pos):
+            canonical = cls._canonicalize_position_ranges(delta_by_pos[insertion_pos])
+            if not canonical:
+                continue
+            event_positions.append(insertion_pos)
+            flat_ranges.extend(canonical)
+            range_offsets.append(len(flat_ranges))
+            for start, end in canonical:
+                visible_until[start:end] = torch.minimum(
+                    visible_until[start:end],
+                    torch.tensor(insertion_pos, dtype=torch.int32, device="cpu"),
+                )
+
+        position_ranges = torch.tensor(flat_ranges, dtype=torch.int32, device="cpu")
+        if len(flat_ranges) == 0:
+            position_ranges = torch.empty((0, 2), dtype=torch.int32, device="cpu")
+        return PositionDropPlan(
+            event_positions=torch.tensor(event_positions, dtype=torch.int32, device="cpu"),
+            range_offsets=torch.tensor(range_offsets, dtype=torch.int32, device="cpu"),
+            position_ranges=position_ranges,
+            full_token_visible_until=visible_until,
+        )
 
     @staticmethod
     def _encode_radix_key(token_id: int, drop_mask: int) -> int:
@@ -575,6 +632,11 @@ class TokenizeManager:
     def _chat_tokenize(self, msg: TokenizeMsg) -> TokenizedResult:
         assert isinstance(msg.text, list)
         drop_message = self._normalize_drop_message(msg.drop_message)
+        if drop_message and self.radix_drop_key_mode != "delta-marker":
+            raise ValueError(
+                "Token-position Drop requires radix_drop_key_mode='delta-marker'; "
+                f"got {self.radix_drop_key_mode!r}."
+            )
         tool_choice_mode, forced_tool_name = self._normalize_tool_choice(msg.tool_choice)
         selected_tools = self._select_tools_for_choice(
             msg.tools,
@@ -688,6 +750,8 @@ class TokenizeManager:
             owner_with_gen = provenance.owners
             cross_owner_tokens = provenance.cross_owner_tokens
 
+        owner_ranges = self._build_owner_position_ranges(owner_with_gen)
+
         target_msg_id = self._resolve_target_msg_id(
             msg,
             len(messages),
@@ -699,20 +763,19 @@ class TokenizeManager:
             else None
         )
         dropped_for_target = self._build_drop_set(drop_message, target_msg_id)
-        owner_tensor = torch.tensor(owner_with_gen, dtype=torch.int32, device="cpu")
-        query_epoch_tensor = torch.tensor(query_epoch_with_gen, dtype=torch.int32, device="cpu")
-        delta_markers = (
-            self._build_delta_markers(drop_message, query_epoch_with_gen)
-            if self.radix_drop_key_mode == "delta-marker"
-            else []
-        )
-        drop_visible_until = self._build_drop_visible_until(
-            drop_message, len(messages) + 1
+        position_drop_plan = (
+            self._build_position_drop_plan(
+                drop_message,
+                query_epoch_with_gen,
+                owner_ranges,
+            )
+            if drop_message
+            else None
         )
 
         keep_mask = torch.ones(len(full_with_gen_tensor), dtype=torch.bool, device="cpu")
-        for msg_id in dropped_for_target:
-            keep_mask &= owner_tensor != msg_id
+        for start, end in self._ranges_for_messages(owner_ranges, dropped_for_target):
+            keep_mask[start:end] = False
 
         input_ids = full_with_gen_tensor[keep_mask].contiguous()
         true_positions = torch.arange(len(full_with_gen_tensor), dtype=torch.int32)[keep_mask]
@@ -782,10 +845,22 @@ class TokenizeManager:
             radix_match_ids=radix_match_ids,
             prefix_keep_mask=prefix_keep_mask,
             full_input_ids=(full_with_gen_tensor if drop_message else None),
-            full_kv_owner=(owner_tensor if drop_message else None),
-            full_query_epoch=(query_epoch_tensor if drop_message else None),
-            drop_visible_until=(drop_visible_until if drop_message else None),
+            full_token_visible_until=(
+                position_drop_plan.full_token_visible_until
+                if position_drop_plan is not None
+                else None
+            ),
             full_keep_mask=(keep_mask.to(dtype=torch.int32).contiguous() if drop_message else None),
+            drop_event_positions=(
+                position_drop_plan.event_positions if position_drop_plan is not None else None
+            ),
+            drop_range_offsets=(
+                position_drop_plan.range_offsets if position_drop_plan is not None else None
+            ),
+            drop_position_ranges=(
+                position_drop_plan.position_ranges if position_drop_plan is not None else None
+            ),
+            radix_commit_token_len=warmup_commit_token_len,
             stop_token_seqs=self._build_stop_token_seqs(msg.stop),
             message_meta={
                 "raw_len_with_gen": len(full_with_gen_tensor),
@@ -794,7 +869,6 @@ class TokenizeManager:
                 "owner_starts": owner_starts,
                 "radix_state_starts": radix_state_starts,
                 "cross_owner_tokens": cross_owner_tokens,
-                "delta_markers": delta_markers,
                 "unstable_rounds": unstable_rounds,
                 "no_gen_with_gen_unstable": int(unstable_with_gen),
                 "no_gen_with_gen_lcp": no_gen_with_gen_lcp,

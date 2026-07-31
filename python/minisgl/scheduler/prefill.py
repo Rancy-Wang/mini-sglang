@@ -135,15 +135,14 @@ class PrefillAdder:
             is_warmup=pending_req.is_warmup,
             cache_hit_ratio=cache_hit_ratio,
             full_input_ids=pending_req.full_input_ids,
-            full_kv_owner=pending_req.full_kv_owner,
-            full_query_epoch=pending_req.full_query_epoch,
-            drop_visible_until=pending_req.drop_visible_until,
+            full_token_visible_until=pending_req.full_token_visible_until,
             full_keep_mask=pending_req.full_keep_mask,
             use_context_mask=pending_req.use_context_mask,
             radix_key_virtual_mask=pending_req.radix_key_virtual_mask,
             radix_key_to_token=pending_req.radix_key_to_token,
             radix_token_to_key=pending_req.radix_token_to_key,
             radix_commit_key_len=pending_req.radix_commit_key_len,
+            radix_marker_ids=pending_req.radix_marker_ids,
         )
 
     def try_add_one(self, pending_req: PendingReq) -> Req | None:
@@ -219,15 +218,14 @@ class PrefillManager:
                 internal_uid=req.internal_uid,
                 prefix_keep_mask=req.prefix_keep_mask,
                 full_input_ids=req.full_input_ids,
-                full_kv_owner=req.full_kv_owner,
-                full_query_epoch=req.full_query_epoch,
-                drop_visible_until=req.drop_visible_until,
+                full_token_visible_until=req.full_token_visible_until,
                 full_keep_mask=req.full_keep_mask,
                 use_context_mask=req.use_context_mask,
                 radix_key_virtual_mask=req.radix_key_virtual_mask,
                 radix_key_to_token=req.radix_key_to_token,
                 radix_token_to_key=req.radix_token_to_key,
                 radix_commit_key_len=req.radix_commit_key_len,
+                radix_marker_ids=tuple(req.radix_marker_ids or ()),
             )
         )
 
@@ -262,11 +260,11 @@ class PrefillManager:
         self.pending_list = chunked_list + self.pending_list[len(reqs) :]
         return Batch(reqs=reqs, phase="prefill")
 
-    def abort_req(self, uid: int) -> Req | None:
+    def abort_req(self, uid: int) -> Req | PendingReq | None:
         for i, req in enumerate(self.pending_list):
             if req.uid == uid:
                 self.pending_list.pop(i)
-                return req.chunked_req
+                return req.chunked_req or req
         return None
 
     @property

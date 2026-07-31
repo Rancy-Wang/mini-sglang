@@ -29,7 +29,7 @@ class FAMetadata(BaseAttnMetadata):
     max_seqlen_q: int
 
     page_table: torch.Tensor
-    context_mask_aux: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None
+    context_mask_aux: tuple[torch.Tensor, torch.Tensor] | None = None
 
     def get_last_indices(self, bs: int) -> torch.Tensor:
         return self.cu_seqlens_q[1 : 1 + bs] - 1
@@ -82,11 +82,10 @@ def _get_context_visibility_mask_mod():
 
     @cute.jit
     def context_visibility_mask_mod(batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
-        full_kv_owner, full_query_epoch, drop_visible_until, query_start = aux_tensors
+        full_token_visible_until, query_start = aux_tensors
         query_position = q_idx + query_start[0]
-        owner = full_kv_owner[kv_idx]
         return (kv_idx <= query_position) & (
-            full_query_epoch[query_position] <= drop_visible_until[owner]
+            query_position < full_token_visible_until[kv_idx]
         )
 
     return context_visibility_mask_mod
@@ -173,16 +172,12 @@ class FlashAttentionBackend(BaseAttnBackend):
                     "FlashAttention context-mask Prefill currently requires page_size=1."
                 )
             req = masked_reqs[0]
-            if (
-                req.full_kv_owner is None
-                or req.full_query_epoch is None
-                or req.drop_visible_until is None
-            ):
+            if req.full_token_visible_until is None:
                 raise RuntimeError("Context-mask Prefill request is missing visibility metadata.")
             context_mask_aux = (
-                req.full_kv_owner.to(device=device, dtype=torch.int32, non_blocking=True),
-                req.full_query_epoch.to(device=device, dtype=torch.int32, non_blocking=True),
-                req.drop_visible_until.to(device=device, dtype=torch.int32, non_blocking=True),
+                req.full_token_visible_until.to(
+                    device=device, dtype=torch.int32, non_blocking=True
+                ),
                 torch.tensor([req.cached_len], device=device, dtype=torch.int32),
             )
         batch.attn_metadata = FAMetadata(
@@ -253,7 +248,7 @@ def _fa4_context_mask_impl(
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
     page_table: torch.Tensor,
-    context_mask_aux: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    context_mask_aux: tuple[torch.Tensor, torch.Tensor],
     softmax_scale: float,
     softcap: float,
     pack_gqa: bool | None,
@@ -314,7 +309,7 @@ def _fa_sgl_impl(
     num_splits: int = 0,  # Can be tuned for speed
     pack_gqa: bool | None = None,  # Can be tuned for speed
     causal: bool = True,
-    context_mask_aux: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    context_mask_aux: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     if context_mask_aux is not None:
         return _fa4_context_mask_impl(

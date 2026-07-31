@@ -88,6 +88,14 @@ def _validate_drop_message(
     radix_drop_key_mode: str = "delta-marker",
     message_count: int | None = None,
 ) -> None:
+    if drop_message and radix_drop_key_mode != "delta-marker":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Drop Message now compiles to token-position ranges and requires "
+                "radix_drop_key_mode='delta-marker'."
+            ),
+        )
     for raw_n, raw_ids in drop_message.items():
         n = int(raw_n)
         if n < 0:

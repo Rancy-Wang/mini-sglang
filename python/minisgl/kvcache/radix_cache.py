@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import heapq
 import time
+from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Tuple, TypeAlias
 
@@ -86,15 +87,11 @@ class RadixTreeNode:
     def get_match_len(
         self, input_ids: torch.Tensor, virtual_mask: torch.Tensor
     ) -> int:
-        from minisgl.kernel import fast_compare_key
+        from minisgl.kernel.radix import fast_compare_radix_key
 
-        # compare key and input_ids, find the first diff
-        key_match_len = fast_compare_key(self._key, input_ids)
-        virtual_match = self._virtual_mask[:key_match_len] == virtual_mask[:key_match_len]
-        mismatch = torch.nonzero(~virtual_match, as_tuple=False).view(-1)
-        if len(mismatch) > 0:
-            return int(mismatch[0].item())
-        return key_match_len
+        return fast_compare_radix_key(
+            self._key, input_ids, self._virtual_mask, virtual_mask
+        )
 
     def split_at(self, pos: int) -> RadixTreeNode:
         assert 0 < pos < self.length
@@ -161,6 +158,18 @@ class RadixPrefixCache(BasePrefixCache):
         self.protected_size = 0
         self.root_node = RadixTreeNode(self.key_fn)
         self.root_node.ref_count = 1  # root is always protected
+        self.delta_marker_registry = None
+
+    def bind_delta_marker_registry(self, registry) -> None:
+        if self.root_node.children:
+            raise RuntimeError("Delta marker registry must be bound before Radix insertion.")
+        self.delta_marker_registry = registry
+
+    @staticmethod
+    def _marker_ids(key: torch.Tensor, virtual_mask: torch.Tensor) -> List[int]:
+        if not bool(torch.any(virtual_mask).item()):
+            return []
+        return [int(value) for value in key[virtual_mask].tolist()]
 
     def lock_handle(self, handle: BaseCacheHandle, unlock: bool = False) -> None:
         assert isinstance(handle, RadixCacheHandle)
@@ -223,6 +232,10 @@ class RadixPrefixCache(BasePrefixCache):
             )
             new_node.set_parent(node)
             self.evictable_size += new_node.page_length
+            if self.delta_marker_registry is not None:
+                self.delta_marker_registry.add_tree_refs(
+                    self._marker_ids(new_node._key, new_node.virtual_mask)
+                )
             node = new_node
         return InsertResult(prefix_len, RadixCacheHandle(insert_len, node))
 
@@ -290,6 +303,11 @@ class RadixPrefixCache(BasePrefixCache):
             if node.page_length > 0
         ]
         del boundary.children[stale_key]
+        if self.delta_marker_registry is not None:
+            for stale_node in subtree:
+                self.delta_marker_registry.remove_tree_refs(
+                    self._marker_ids(stale_node._key, stale_node.virtual_mask)
+                )
         self.evictable_size -= page_count
         if self.evictable_size < 0:
             raise RuntimeError("Radix evictable-size accounting underflow during prune.")
@@ -325,6 +343,10 @@ class RadixPrefixCache(BasePrefixCache):
             self.evictable_size -= node.page_length
             parent = node.parent
             del parent.children[_edge_key(self.key_fn, node._key, node.virtual_mask)]
+            if self.delta_marker_registry is not None:
+                self.delta_marker_registry.remove_tree_refs(
+                    self._marker_ids(node._key, node.virtual_mask)
+                )
             # NOTE: root is always protected, so won't be evicted
             if parent.is_leaf() and parent.ref_count == 0:
                 heapq.heappush(leave_nodes, parent)
@@ -346,6 +368,7 @@ class RadixPrefixCache(BasePrefixCache):
     def check_integrity(self) -> None:
         expected_evictable = 0
         expected_protected = 0
+        actual_marker_refs: Counter[int] = Counter()
         stack: List[RadixTreeNode] = [self.root_node]
         while stack:
             node = stack.pop()
@@ -361,6 +384,7 @@ class RadixPrefixCache(BasePrefixCache):
                     raise RuntimeError(
                         "RadixPrefixCache integrity check failed: a real key has a negative page."
                     )
+                actual_marker_refs.update(self._marker_ids(child._key, child.virtual_mask))
                 if child.ref_count == 0:
                     expected_evictable += child.page_length
                 else:
@@ -372,6 +396,8 @@ class RadixPrefixCache(BasePrefixCache):
                 f" evictable({self.evictable_size}) != expected({expected_evictable}) or"
                 f" protected({self.protected_size}) != expected({expected_protected})"
             )
+        if self.delta_marker_registry is not None:
+            self.delta_marker_registry.check_tree_refs(actual_marker_refs)
 
     def _collect_leave_nodes_for_evict(self) -> List[RadixTreeNode]:
         nodes: List[RadixTreeNode] = [self.root_node]

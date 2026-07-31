@@ -43,6 +43,12 @@ class CacheManager:
         self.page_table = page_table
         self.page_size = page_size
 
+    def bind_delta_marker_registry(self, registry) -> None:
+        from minisgl.kvcache.radix_cache import RadixPrefixCache
+
+        if isinstance(self.prefix_cache, RadixPrefixCache):
+            self.prefix_cache.bind_delta_marker_registry(registry)
+
     def _matched_indices(self, handle: BaseCacheHandle) -> torch.Tensor:
         if handle.cached_len == 0:
             return torch.empty(0, dtype=torch.int32, device=self.device)
