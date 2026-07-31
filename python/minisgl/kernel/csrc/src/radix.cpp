@@ -19,7 +19,7 @@ auto _is_1d_cpu_int_tensor(const tvm::ffi::TensorView tensor) -> bool {
 auto _is_1d_cpu_bool_tensor(const tvm::ffi::TensorView tensor) -> bool {
   return tensor.ndim() == 1 && tensor.is_contiguous() &&
          tensor.device().device_type == kDLCPU &&
-         tensor.dtype().code == kDLBool && tensor.dtype().bits == 1;
+         tensor.dtype().code == kDLBool && tensor.dtype().bits == 8;
 }
 
 auto fast_compare_key(const tvm::ffi::TensorView a,
