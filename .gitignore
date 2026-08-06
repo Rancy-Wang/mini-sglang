@@ -31,3 +31,7 @@ env/
 # .vscode
 .vscode/
 .coverage
+
+# OS metadata
+.DS_Store
+._*

@@ -1,0 +1,17 @@
+model_auto_compact_token_limit = 150000
+model_auto_compact_token_limit_scope = "total"
+tool_output_token_limit = 8000
+experimental_compact_prompt_file = "../mini-sglang/python/minisgl/.codex/compact_prompt.txt"
+
+[agents]
+max_concurrent_threads_per_session = 4
+
+[[hooks.SessionStart]]
+matcher = "^(startup|resume|compact)$"
+
+[[hooks.SessionStart.hooks]]
+type = "command"
+command = 'python3 "mini-sglang/python/minisgl/.codex/hooks/session_start.py"'
+timeout = 20
+statusMessage = "Loading mini-sglang project context"
+additionalContextLimit = 5000

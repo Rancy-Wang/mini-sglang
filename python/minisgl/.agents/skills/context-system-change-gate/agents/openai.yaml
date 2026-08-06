@@ -1,0 +1,4 @@
+interface:
+  display_name: "Context System Change Gate"
+  short_description: "Gate Context System edits behind an approved plan"
+  default_prompt: "Use $context-system-change-gate to prepare and enforce an approved Context System change plan."

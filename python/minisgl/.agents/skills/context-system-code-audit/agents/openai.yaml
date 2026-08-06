@@ -1,0 +1,4 @@
+interface:
+  display_name: "Context System Code Audit"
+  short_description: "Trace Context System behavior from source evidence"
+  default_prompt: "Use $context-system-code-audit to trace the Context System implementation with exact source evidence."

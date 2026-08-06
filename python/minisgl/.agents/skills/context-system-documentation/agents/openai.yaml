@@ -1,0 +1,4 @@
+interface:
+  display_name: "Context System Documentation"
+  short_description: "Write precise Context System technical documentation"
+  default_prompt: "Use $context-system-documentation to document the verified Context System implementation."

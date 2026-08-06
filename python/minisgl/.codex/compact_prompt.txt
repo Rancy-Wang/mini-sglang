@@ -1,0 +1,18 @@
+压缩本会话时，生成一份可执行的续接摘要。必须保留：当前用户任务；Codex 项目根与仓库
+路径；branch、HEAD、tracked/untracked dirty 状态；适用的 APPROVED_PLAN_ID、
+APPROVED_ROUND、ALLOWED_FILES 与剩余轮次；本轮实际修改；已运行测试的精确命令和结果；
+未运行测试；失败分类、阻塞与不确定性；checkpoint/push/remote pull 状态；安全的下一步。
+
+明确区分当前 working-tree 事实、文档 snapshot、推断和旧 transcript。不得省略或改写
+Context System 的 full/active KV、absolute position、delta-marker/page 生命周期不变量，
+也不得把未验证 GPT-OSS 或 FA3 custom mask 写成已支持。
+
+压缩后的第一步必须重新读取：
+`mini-sglang/docs/codex/PROJECT_CONTEXT.md`、
+`mini-sglang/docs/codex/CURRENT_STATE.md`、
+`mini-sglang/docs/codex/HANDOFF_019fafc9-22dc-7c80-90a0-746297fe72eb.md`，然后动态运行
+`git branch --show-current`、`git rev-parse --short HEAD`、`git status --short --branch`、
+`git diff --stat` 和近期 `git log`。working tree 优先于所有摘要。
+
+摘要只能恢复上下文，不能推断修改授权。缺失、过期或含糊的 Plan ID、轮次、允许文件或
+外部操作权限必须重新向用户/主代理确认；不得因“继续”、compact 摘要或旧批准扩大范围。
