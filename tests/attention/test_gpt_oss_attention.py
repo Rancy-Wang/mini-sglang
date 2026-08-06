@@ -67,17 +67,19 @@ def test_flash_attention_forwards_sinks_and_window(monkeypatch):
 
 
 def test_fa3_kernel_receives_sinks_and_window(monkeypatch):
-    kernel = MagicMock(return_value=object())
+    output = torch.ones(2, 1, 4)
+    lse = torch.zeros(1, 2)
+    kernel = MagicMock(return_value=(output, lse, None, None))
     package = ModuleType("sgl_kernel")
     package.__path__ = []
     module = ModuleType("sgl_kernel.flash_attn")
     module.flash_attn_with_kvcache = kernel
     monkeypatch.setitem(sys.modules, "sgl_kernel", package)
     monkeypatch.setitem(sys.modules, "sgl_kernel.flash_attn", module)
-    tensor = torch.empty(1)
-    sinks = torch.empty(1)
+    tensor = torch.empty(2, 1, 4)
+    sinks = torch.zeros(1)
 
-    _fa_sgl_impl(
+    corrected = _fa_sgl_impl(
         q=tensor,
         k_cache=tensor,
         v_cache=tensor,
@@ -93,8 +95,10 @@ def test_fa3_kernel_receives_sinks_and_window(monkeypatch):
     )
 
     call = kernel.call_args.kwargs
-    assert call["sinks"] is sinks
+    assert call["sinks"] is None
+    assert call["return_softmax_lse"] is True
     assert call["window_size"] == (127, 0)
+    assert torch.equal(corrected, torch.full_like(output, 0.5))
 
 
 def test_context_segments_match_dense_mask_with_cached_prefix_and_drops():
@@ -181,20 +185,22 @@ def test_flashinfer_forwards_sinks_and_matching_window():
     backend.kvcache = _FakeKVCache()
     backend._initialize_metadata_once = MagicMock()
     wrapper = MagicMock()
+    wrapper.run.return_value = (torch.ones(1, 1, 4), torch.ones(1, 1))
     backend._ordinary_wrapper = MagicMock(return_value=wrapper)
     metadata = _fi_metadata()
     batch = SimpleNamespace(attn_metadata=metadata, out_loc=object())
     q = torch.empty(1, 1, 4)
     k = torch.empty(1, 1, 4)
     v = torch.empty(1, 1, 4)
-    sinks = torch.empty(1)
+    sinks = torch.zeros(1)
 
-    backend.forward(q, k, v, 5, batch, sinks=sinks, sliding_window=127)
+    output = backend.forward(q, k, v, 5, batch, sinks=sinks, sliding_window=127)
 
     call = wrapper.run.call_args.kwargs
     assert call["q"] is q
-    assert call["sinks"] is sinks
+    assert call["return_lse"] is True
     assert call["window_left"] == 127
+    assert torch.allclose(output, torch.full_like(output, 2 / 3))
     backend._initialize_metadata_once.assert_called_once_with(
         metadata,
         wrapper,

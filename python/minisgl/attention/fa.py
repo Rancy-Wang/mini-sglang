@@ -443,7 +443,7 @@ def _fa_sgl_impl(
             "If you're sure it's correctly installed, try `apt update && apt install libnuma1`."
         ) from e
 
-    return flash_attn_with_kvcache(  # type: ignore
+    kwargs = dict(
         q=q,
         k_cache=k_cache,
         v_cache=v_cache,
@@ -459,6 +459,29 @@ def _fa_sgl_impl(
         num_splits=num_splits,
         pack_gqa=pack_gqa,
         causal=causal,
-        sinks=sinks,
         ver=version,  # TODO: support FA4 on blackwell
+    )
+    if version == 3 and sinks is not None:
+        # sgl-kernel FA3 accepts a sinks argument on SM80, but its kernel does
+        # not include it in the softmax denominator. Recover the exact GPT-OSS
+        # result from the ordinary output and per-row natural-log LSE:
+        #   sum(exp(scores) * V) / (sum(exp(scores)) + exp(sink)).
+        out, lse, *_ = flash_attn_with_kvcache(  # type: ignore
+            **kwargs,
+            sinks=None,
+            return_softmax_lse=True,
+        )
+        if lse.shape != (out.shape[1], out.shape[0]):
+            raise RuntimeError(
+                "Unexpected FA3 LSE shape while applying GPT-OSS attention sinks: "
+                f"output={tuple(out.shape)}, lse={tuple(lse.shape)}."
+            )
+        sink_scale = torch.sigmoid(
+            lse.float() - sinks.float().reshape(-1, 1)
+        ).transpose(0, 1)
+        return (out.float() * sink_scale.unsqueeze(-1)).to(out.dtype)
+
+    return flash_attn_with_kvcache(  # type: ignore
+        **kwargs,
+        sinks=sinks,
     )

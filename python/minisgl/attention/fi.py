@@ -253,8 +253,30 @@ class FlashInferBackend(BaseAttnBackend):
         kv_cache = (_flatten_cache(kv_cache[0]), _flatten_cache(kv_cache[1]))
         window_left = self._window_left(sliding_window)
         run_kwargs = {"window_left": window_left}
-        if sinks is not None:
-            run_kwargs["sinks"] = sinks
+
+        def _run(wrapper, query: torch.Tensor) -> torch.Tensor:
+            if sinks is None:
+                return wrapper.run(q=query, paged_kv_cache=kv_cache, **run_kwargs)
+
+            # FlashInfer FA2 exposes a sinks argument but does not apply it.
+            # Its returned LSE is base-2, so convert it to a natural logarithm
+            # before adding the GPT-OSS sink as an extra softmax denominator
+            # term. This also works inside an ordinary fixed CUDA Graph.
+            out, lse = wrapper.run(
+                q=query,
+                paged_kv_cache=kv_cache,
+                return_lse=True,
+                **run_kwargs,
+            )
+            if lse.shape != out.shape[:2]:
+                raise RuntimeError(
+                    "Unexpected FlashInfer LSE shape while applying GPT-OSS attention "
+                    f"sinks: output={tuple(out.shape)}, lse={tuple(lse.shape)}."
+                )
+            sink_scale = torch.sigmoid(
+                lse.float() * math.log(2.0) - sinks.float().reshape(1, -1)
+            )
+            return (out.float() * sink_scale.unsqueeze(-1)).to(out.dtype)
 
         if metadata.context_segments is not None:
             outputs = []
@@ -269,13 +291,7 @@ class FlashInferBackend(BaseAttnBackend):
                     is_decode=False,
                     window_left=window_left,
                 )
-                outputs.append(
-                    wrapper.run(
-                        q=q[segment.query_start : segment.query_end],
-                        paged_kv_cache=kv_cache,
-                        **run_kwargs,
-                    )
-                )
+                outputs.append(_run(wrapper, q[segment.query_start : segment.query_end]))
             return torch.cat(outputs, dim=0)
 
         wrapper = self._ordinary_wrapper(metadata, window_left)
@@ -285,7 +301,7 @@ class FlashInferBackend(BaseAttnBackend):
             is_decode=metadata.is_decode,
             window_left=window_left,
         )
-        return wrapper.run(q=q, paged_kv_cache=kv_cache, **run_kwargs)
+        return _run(wrapper, q)
 
     def prepare_metadata(self, batch: Batch) -> None:
         reqs = batch.padded_reqs
