@@ -129,6 +129,55 @@ def test_context_segments_match_dense_mask_with_cached_prefix_and_drops():
     assert torch.equal(reconstructed, expected)
 
 
+def test_context_sliding_segments_use_absolute_positions_across_drops():
+    visible_until = torch.tensor([4, 6, 3, 6, 6, 6], dtype=torch.int32)
+    query_start = 3
+    query_length = 3
+    window_left = 2
+    segments = build_context_attention_segments(
+        visible_until,
+        query_start=query_start,
+        query_length=query_length,
+        key_length=6,
+        sliding_window=window_left,
+    )
+    reconstructed = torch.zeros((query_length, 6), dtype=torch.bool)
+    for segment in segments:
+        assert segment.query_end - segment.query_start == 1
+        reconstructed[segment.query_start, segment.key_positions] = True
+
+    query_positions = torch.arange(query_start, query_start + query_length)
+    expected = build_context_visibility_mask_reference(
+        visible_until,
+        query_positions=query_positions,
+        key_positions=torch.arange(6),
+    )
+    expected &= torch.arange(6).unsqueeze(0) >= (query_positions - window_left).unsqueeze(1)
+    assert torch.equal(reconstructed, expected)
+
+
+def test_flash_attention_uses_preclipped_context_segments_for_sliding(monkeypatch):
+    backend = object.__new__(FlashAttentionBackend)
+    backend.kvcache = _FakeKVCache()
+    backend.scale = 0.125
+    backend.version = 3
+    metadata = _fa_metadata()
+    metadata.context_segments = (object(),)
+    metadata.sliding_context_segments = (object(), object())
+    batch = SimpleNamespace(attn_metadata=metadata, out_loc=object())
+    expected = torch.empty(1, 1, 4)
+    implementation = MagicMock(return_value=expected)
+    monkeypatch.setattr("minisgl.attention.fa._fa3_context_mask_impl", implementation)
+    q = torch.empty(1, 1, 4)
+
+    output = backend.forward(q, q, q, 0, batch, sliding_window=127)
+
+    assert output is expected
+    call = implementation.call_args.kwargs
+    assert call["segments"] is metadata.sliding_context_segments
+    assert call["window_size"] == (-1, -1)
+
+
 def test_fa3_context_segments_preserve_window_and_sinks(monkeypatch):
     kernel = MagicMock(side_effect=lambda **kwargs: kwargs["q"])
     monkeypatch.setattr("minisgl.attention.fa._fa_sgl_impl", kernel)
@@ -256,6 +305,33 @@ def test_flashinfer_plans_full_and_sliding_wrappers_with_matching_windows():
 
     assert full_wrapper.plan.call_args.kwargs["window_left"] == -1
     assert sliding_wrapper.plan.call_args.kwargs["window_left"] == 127
+
+
+def test_flashinfer_uses_preclipped_context_segments_for_sliding():
+    backend = object.__new__(FlashInferBackend)
+    backend.kvcache = _FakeKVCache()
+    backend._initialize_metadata_once = MagicMock()
+    wrapper = MagicMock()
+    wrapper.run.side_effect = lambda **kwargs: kwargs["q"]
+    backend._new_prefill_wrapper = MagicMock(return_value=wrapper)
+    metadata = _fi_metadata()
+    metadata.context_segments = (SimpleNamespace(query_start=0, query_end=1, wrappers={}),)
+    metadata.sliding_context_segments = (
+        SimpleNamespace(query_start=0, query_end=1, wrappers={}),
+    )
+    batch = SimpleNamespace(attn_metadata=metadata, out_loc=object())
+    q = torch.empty(1, 1, 4)
+
+    output = backend.forward(q, q, q, 0, batch, sliding_window=127)
+
+    assert torch.equal(output, q)
+    backend._initialize_metadata_once.assert_called_once_with(
+        metadata.sliding_context_segments[0],
+        wrapper,
+        is_decode=False,
+        window_left=-1,
+    )
+    assert wrapper.run.call_args.kwargs["window_left"] == -1
 
 
 def test_hybrid_ordinary_forward_does_not_expand_legacy_backend_call():

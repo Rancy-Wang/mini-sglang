@@ -25,6 +25,7 @@ def build_context_attention_segments(
     query_start: int,
     query_length: int,
     key_length: int,
+    sliding_window: int | None = None,
 ) -> tuple[ContextAttentionSegment, ...]:
     """Compile the exact token-position Drop mask into causal KV segments.
 
@@ -37,6 +38,8 @@ def build_context_attention_segments(
         raise ValueError("full_token_visible_until must be a one-dimensional CPU tensor.")
     if query_start < 0 or query_length < 1 or key_length < 1:
         raise ValueError("Context attention lengths must be positive and query_start non-negative.")
+    if sliding_window is not None and sliding_window < 0:
+        raise ValueError("sliding_window must be non-negative when provided.")
     query_end = query_start + query_length
     if query_end > key_length or key_length > len(full_token_visible_until):
         raise ValueError("Context attention query/key bounds exceed the full token stream.")
@@ -45,6 +48,28 @@ def build_context_attention_segments(
     key_positions = torch.arange(key_length, dtype=torch.int64, device="cpu")
     if bool(torch.any(visible_until <= key_positions).item()):
         raise ValueError("A token cannot become invisible before it has been computed.")
+
+    if sliding_window is not None:
+        # A compacted active-KV view has gaps in its absolute positions, so a
+        # kernel window over compact indices is not equivalent to a model
+        # window. Preselect each query's exact absolute-position window and run
+        # causal attention without an additional kernel-side window.
+        segments = []
+        for absolute_query in range(query_start, query_end):
+            prefix_positions = key_positions[
+                max(0, absolute_query - sliding_window) : absolute_query
+            ]
+            active_prefix = prefix_positions[visible_until[prefix_positions] > absolute_query]
+            segments.append(
+                ContextAttentionSegment(
+                    query_start=absolute_query - query_start,
+                    query_end=absolute_query - query_start + 1,
+                    key_positions=torch.cat(
+                        (active_prefix, key_positions[absolute_query : absolute_query + 1])
+                    ),
+                )
+            )
+        return tuple(segments)
 
     boundaries = {query_start, query_end}
     boundaries.update(

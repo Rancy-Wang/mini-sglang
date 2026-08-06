@@ -41,6 +41,7 @@ class FAMetadata(BaseAttnMetadata):
     page_table: torch.Tensor
     context_mask_aux: tuple[torch.Tensor, torch.Tensor] | None = None
     context_segments: tuple[FAContextSegmentMetadata, ...] | None = None
+    sliding_context_segments: tuple[FAContextSegmentMetadata, ...] | None = None
 
     def get_last_indices(self, bs: int) -> torch.Tensor:
         return self.cu_seqlens_q[1 : 1 + bs] - 1
@@ -138,13 +139,23 @@ class FlashAttentionBackend(BaseAttnBackend):
         assert isinstance(metadata, FAMetadata)
         self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
         if metadata.context_segments is not None and self.version == 3:
+            segments = metadata.context_segments
+            window_size = (sliding_window, 0) if sliding_window is not None else (-1, -1)
+            if sliding_window is not None:
+                if metadata.sliding_context_segments is None:
+                    raise RuntimeError(
+                        "FlashAttention context-mask metadata is missing absolute-position "
+                        "sliding segments."
+                    )
+                segments = metadata.sliding_context_segments
+                window_size = (-1, -1)
             return _fa3_context_mask_impl(
                 q=q,
                 k_cache=self.kvcache.k_cache(layer_id),
                 v_cache=self.kvcache.v_cache(layer_id),
-                segments=metadata.context_segments,
+                segments=segments,
                 softmax_scale=self.scale,
-                window_size=(sliding_window, 0) if sliding_window is not None else (-1, -1),
+                window_size=window_size,
                 sinks=sinks,
             )
         if metadata.context_segments is not None and (sinks is not None or sliding_window is not None):
@@ -212,6 +223,7 @@ class FlashAttentionBackend(BaseAttnBackend):
 
         context_mask_aux = None
         context_segments = None
+        sliding_context_segments = None
         if masked_reqs:
             if self.page_size != 1:
                 raise RuntimeError(
@@ -226,37 +238,52 @@ class FlashAttentionBackend(BaseAttnBackend):
                 ),
                 torch.tensor([req.cached_len], device=device, dtype=torch.int32),
             )
-            context_segments = tuple(
-                FAContextSegmentMetadata(
-                    query_start=segment.query_start,
-                    query_end=segment.query_end,
-                    page_table=new_page_table[0]
-                    .index_select(
-                        0,
-                        segment.key_positions.to(
-                            device=device, dtype=torch.int64, non_blocking=True
+            def _to_fa_segments(segments):
+                return tuple(
+                    FAContextSegmentMetadata(
+                        query_start=segment.query_start,
+                        query_end=segment.query_end,
+                        page_table=new_page_table[0]
+                        .index_select(
+                            0,
+                            segment.key_positions.to(
+                                device=device, dtype=torch.int64, non_blocking=True
+                            ),
+                        )
+                        .unsqueeze(0),
+                        cache_seqlens=torch.tensor(
+                            [len(segment.key_positions)], device=device, dtype=torch.int32
+                        ),
+                        cu_seqlens_q=torch.tensor(
+                            [0, segment.query_end - segment.query_start],
+                            device=device,
+                            dtype=torch.int32,
+                        ),
+                        cu_seqlens_k=torch.tensor(
+                            [0, len(segment.key_positions)], device=device, dtype=torch.int32
                         ),
                     )
-                    .unsqueeze(0),
-                    cache_seqlens=torch.tensor(
-                        [len(segment.key_positions)], device=device, dtype=torch.int32
-                    ),
-                    cu_seqlens_q=torch.tensor(
-                        [0, segment.query_end - segment.query_start],
-                        device=device,
-                        dtype=torch.int32,
-                    ),
-                    cu_seqlens_k=torch.tensor(
-                        [0, len(segment.key_positions)], device=device, dtype=torch.int32
-                    ),
+                    for segment in segments
                 )
-                for segment in build_context_attention_segments(
+
+            context_segments = _to_fa_segments(
+                build_context_attention_segments(
                     req.full_token_visible_until,
                     query_start=req.cached_len,
                     query_length=req.extend_len,
                     key_length=req.device_len,
                 )
             )
+            if self.config.sliding_window is not None:
+                sliding_context_segments = _to_fa_segments(
+                    build_context_attention_segments(
+                        req.full_token_visible_until,
+                        query_start=req.cached_len,
+                        query_length=req.extend_len,
+                        key_length=req.device_len,
+                        sliding_window=self.config.sliding_window - 1,
+                    )
+                )
         batch.attn_metadata = FAMetadata(
             cu_seqlens_k=cu_seqlens_k,
             cu_seqlens_q=cu_seqlens_q,
@@ -266,6 +293,7 @@ class FlashAttentionBackend(BaseAttnBackend):
             page_table=new_page_table,
             context_mask_aux=context_mask_aux,
             context_segments=context_segments,
+            sliding_context_segments=sliding_context_segments,
         )
 
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
@@ -443,24 +471,24 @@ def _fa_sgl_impl(
             "If you're sure it's correctly installed, try `apt update && apt install libnuma1`."
         ) from e
 
-    kwargs = dict(
-        q=q,
-        k_cache=k_cache,
-        v_cache=v_cache,
-        page_table=page_table,
-        cache_seqlens=cache_seqlens,
-        cu_seqlens_q=cu_seqlens_q,
-        cu_seqlens_k_new=cu_seqlens_k,
-        max_seqlen_q=max_seqlen_q,
-        softmax_scale=softmax_scale,
-        sm_margin=sm_margin,
-        window_size=window_size,
-        softcap=softcap,
-        num_splits=num_splits,
-        pack_gqa=pack_gqa,
-        causal=causal,
-        ver=version,  # TODO: support FA4 on blackwell
-    )
+    kwargs = {
+        "q": q,
+        "k_cache": k_cache,
+        "v_cache": v_cache,
+        "page_table": page_table,
+        "cache_seqlens": cache_seqlens,
+        "cu_seqlens_q": cu_seqlens_q,
+        "cu_seqlens_k_new": cu_seqlens_k,
+        "max_seqlen_q": max_seqlen_q,
+        "softmax_scale": softmax_scale,
+        "sm_margin": sm_margin,
+        "window_size": window_size,
+        "softcap": softcap,
+        "num_splits": num_splits,
+        "pack_gqa": pack_gqa,
+        "causal": causal,
+        "ver": version,  # TODO: support FA4 on blackwell
+    }
     if version == 3 and sinks is not None:
         # sgl-kernel FA3 accepts a sinks argument on SM80, but its kernel does
         # not include it in the softmax denominator. Recover the exact GPT-OSS

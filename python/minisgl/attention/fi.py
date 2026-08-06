@@ -74,6 +74,7 @@ class FIMetadata(BaseAttnMetadata):
     dtype:              torch.dtype
     is_decode:          bool
     context_segments:  tuple[FIContextSegmentMetadata, ...] | None = None
+    sliding_context_segments: tuple[FIContextSegmentMetadata, ...] | None = None
     graph_bs:           int | None = None
     initialized_wrappers: set[int] = field(default_factory=set)
     # fmt: on
@@ -252,9 +253,9 @@ class FlashInferBackend(BaseAttnBackend):
         kv_cache = (self.kvcache.k_cache(layer_id), self.kvcache.v_cache(layer_id))
         kv_cache = (_flatten_cache(kv_cache[0]), _flatten_cache(kv_cache[1]))
         window_left = self._window_left(sliding_window)
-        run_kwargs = {"window_left": window_left}
 
-        def _run(wrapper, query: torch.Tensor) -> torch.Tensor:
+        def _run(wrapper, query: torch.Tensor, run_window_left: int) -> torch.Tensor:
+            run_kwargs = {"window_left": run_window_left}
             if sinks is None:
                 return wrapper.run(q=query, paged_kv_cache=kv_cache, **run_kwargs)
 
@@ -279,19 +280,35 @@ class FlashInferBackend(BaseAttnBackend):
             return (out.float() * sink_scale.unsqueeze(-1)).to(out.dtype)
 
         if metadata.context_segments is not None:
+            segments = metadata.context_segments
+            segment_window_left = window_left
+            if sliding_window is not None:
+                if metadata.sliding_context_segments is None:
+                    raise RuntimeError(
+                        "FlashInfer context-mask metadata is missing absolute-position "
+                        "sliding segments."
+                    )
+                segments = metadata.sliding_context_segments
+                segment_window_left = -1
             outputs = []
-            for segment in metadata.context_segments:
-                wrapper = segment.wrappers.get(window_left)
+            for segment in segments:
+                wrapper = segment.wrappers.get(segment_window_left)
                 if wrapper is None:
                     wrapper = self._new_prefill_wrapper()
-                    segment.wrappers[window_left] = wrapper
+                    segment.wrappers[segment_window_left] = wrapper
                 self._initialize_metadata_once(
                     segment,
                     wrapper,
                     is_decode=False,
-                    window_left=window_left,
+                    window_left=segment_window_left,
                 )
-                outputs.append(_run(wrapper, q[segment.query_start : segment.query_end]))
+                outputs.append(
+                    _run(
+                        wrapper,
+                        q[segment.query_start : segment.query_end],
+                        segment_window_left,
+                    )
+                )
             return torch.cat(outputs, dim=0)
 
         wrapper = self._ordinary_wrapper(metadata, window_left)
@@ -301,7 +318,7 @@ class FlashInferBackend(BaseAttnBackend):
             is_decode=metadata.is_decode,
             window_left=window_left,
         )
-        return _run(wrapper, q)
+        return _run(wrapper, q, window_left)
 
     def prepare_metadata(self, batch: Batch) -> None:
         reqs = batch.padded_reqs
@@ -332,6 +349,7 @@ class FlashInferBackend(BaseAttnBackend):
             cu_seqlens_q_cpu = torch.tensor([0] + seqlens_q, **CPU_KWARGS).cumsum_(dim=0)
 
         context_segments = None
+        sliding_context_segments = None
         if masked_reqs:
             req = masked_reqs[0]
             if req.full_token_visible_until is None:
@@ -343,37 +361,54 @@ class FlashInferBackend(BaseAttnBackend):
             req = masked_reqs[0]
             assert req.full_token_visible_until is not None
             base_indices = page_table[req.table_idx, : req.device_len]
-            context_segments = tuple(
-                FIContextSegmentMetadata(
-                    query_start=segment.query_start,
-                    query_end=segment.query_end,
-                    cu_seqlens_q_cpu=torch.tensor(
-                        [0, segment.query_end - segment.query_start], **CPU_KWARGS
-                    ),
-                    cu_seqlens_k_cpu=torch.tensor(
-                        [0, len(segment.key_positions)], **CPU_KWARGS
-                    ),
-                    cu_seqlens_q_gpu=torch.tensor(
-                        [0, segment.query_end - segment.query_start],
-                        device=device,
-                        dtype=torch.int32,
-                    ),
-                    indices=base_indices.index_select(
-                        0,
-                        segment.key_positions.to(
-                            device=device, dtype=torch.int64, non_blocking=True
+            def _to_fi_segments(segments):
+                return tuple(
+                    FIContextSegmentMetadata(
+                        query_start=segment.query_start,
+                        query_end=segment.query_end,
+                        cu_seqlens_q_cpu=torch.tensor(
+                            [0, segment.query_end - segment.query_start], **CPU_KWARGS
                         ),
-                    ),
-                    last_page_len_cpu=self._get_ones_cpu(1),
-                    seq_lens_cpu=torch.tensor([len(segment.key_positions)], **CPU_KWARGS),
+                        cu_seqlens_k_cpu=torch.tensor(
+                            [0, len(segment.key_positions)], **CPU_KWARGS
+                        ),
+                        cu_seqlens_q_gpu=torch.tensor(
+                            [0, segment.query_end - segment.query_start],
+                            device=device,
+                            dtype=torch.int32,
+                        ),
+                        indices=base_indices.index_select(
+                            0,
+                            segment.key_positions.to(
+                                device=device, dtype=torch.int64, non_blocking=True
+                            ),
+                        ),
+                        last_page_len_cpu=self._get_ones_cpu(1),
+                        seq_lens_cpu=torch.tensor(
+                            [len(segment.key_positions)], **CPU_KWARGS
+                        ),
+                    )
+                    for segment in segments
                 )
-                for segment in build_context_attention_segments(
+
+            context_segments = _to_fi_segments(
+                build_context_attention_segments(
                     req.full_token_visible_until,
                     query_start=req.cached_len,
                     query_length=req.extend_len,
                     key_length=req.device_len,
                 )
             )
+            if self.config.sliding_window is not None:
+                sliding_context_segments = _to_fi_segments(
+                    build_context_attention_segments(
+                        req.full_token_visible_until,
+                        query_start=req.cached_len,
+                        query_length=req.extend_len,
+                        key_length=req.device_len,
+                        sliding_window=self.config.sliding_window - 1,
+                    )
+                )
         batch.attn_metadata = FIMetadata(
             cu_seqlens_q_cpu=cu_seqlens_q_cpu,
             cu_seqlens_k_cpu=cu_seqlens_k_cpu,
@@ -389,6 +424,7 @@ class FlashInferBackend(BaseAttnBackend):
             dtype=self.kvcache.dtype,
             is_decode=batch.is_decode,
             context_segments=context_segments,
+            sliding_context_segments=sliding_context_segments,
         )
 
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
