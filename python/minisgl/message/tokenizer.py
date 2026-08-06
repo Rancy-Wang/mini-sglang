@@ -1,11 +1,29 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import cache
 from typing import Any, Dict, List
 
 from minisgl.core import SamplingParams
 
 from .utils import deserialize_type, serialize_type
+
+
+@cache
+def get_gpt_oss_terminal_stop_token_ids() -> tuple[int, ...]:
+    """Return terminal Harmony stops while preserving message continuation."""
+    try:
+        from openai_harmony import HarmonyEncodingName, load_harmony_encoding
+    except ImportError as exc:
+        raise RuntimeError("GPT-OSS stop handling requires openai-harmony>=0.0.8.") from exc
+
+    encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
+    message_end = "".join(("<", "|", "end", "|", ">"))
+    return tuple(
+        int(token_id)
+        for token_id in encoding.stop_tokens()
+        if encoding.decode([int(token_id)]) != message_end
+    )
 
 
 @dataclass

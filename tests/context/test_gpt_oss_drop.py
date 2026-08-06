@@ -1,6 +1,7 @@
 import torch
 from minisgl.core import SamplingParams
 from minisgl.message import TokenizeMsg
+from minisgl.message.tokenizer import get_gpt_oss_terminal_stop_token_ids
 from minisgl.tokenizer.tokenize import TokenizeManager
 from openai_harmony import HarmonyEncodingName, load_harmony_encoding
 
@@ -13,6 +14,20 @@ class GptOssTokenizerStub:
 
     def encode(self, text, **kwargs):
         return load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS).encode(text)
+
+
+def test_harmony_analysis_boundary_is_not_a_terminal_generation_stop():
+    encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
+    message_end = "".join(("<", "|", "end", "|", ">"))
+    continuation_id = next(
+        int(token_id)
+        for token_id in encoding.stop_tokens()
+        if encoding.decode([int(token_id)]) == message_end
+    )
+    terminal_ids = set(get_gpt_oss_terminal_stop_token_ids())
+
+    assert continuation_id not in terminal_ids
+    assert terminal_ids == set(map(int, encoding.stop_tokens())) - {continuation_id}
 
 
 def test_harmony_agent_history_drop_preserves_system_tools_and_absolute_positions():

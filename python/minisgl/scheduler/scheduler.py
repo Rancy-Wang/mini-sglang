@@ -15,6 +15,7 @@ from minisgl.message import (
     UserMsg,
     WarmupAckMsg,
 )
+from minisgl.message.tokenizer import get_gpt_oss_terminal_stop_token_ids
 from minisgl.utils import init_logger, load_tokenizer
 
 from .cache import CacheManager
@@ -140,19 +141,7 @@ class Scheduler(SchedulerIOMixin):
         )
         self.eos_token_ids = {int(token_id) for token_id in eos_values if token_id is not None}
         if config.model_config.is_gpt_oss:
-            try:
-                from openai_harmony import HarmonyEncodingName, load_harmony_encoding
-
-                self.eos_token_ids.update(
-                    int(token_id)
-                    for token_id in load_harmony_encoding(
-                        HarmonyEncodingName.HARMONY_GPT_OSS
-                    ).stop_tokens()
-                )
-            except ImportError as exc:
-                raise RuntimeError(
-                    "GPT-OSS scheduling requires openai-harmony>=0.0.8."
-                ) from exc
+            self.eos_token_ids.update(get_gpt_oss_terminal_stop_token_ids())
         self.token_pool = self.table_manager.token_pool
         self.prefill_budget = config.max_extend_tokens
         # self.config = config

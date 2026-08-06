@@ -7,6 +7,7 @@ from typing import Any, Dict, List
 
 import torch
 from minisgl.message import TokenizeMsg
+from minisgl.message.tokenizer import get_gpt_oss_terminal_stop_token_ids
 from minisgl.tokenizer.template_provenance import build_template_token_provenance
 from transformers import PreTrainedTokenizerBase
 
@@ -673,7 +674,7 @@ class TokenizeManager:
             dedup.add(key)
             result.append(token_ids)
         if self.is_gpt_oss:
-            for token_id in self._get_harmony_encoding().stop_tokens():
+            for token_id in get_gpt_oss_terminal_stop_token_ids():
                 key = (int(token_id),)
                 if key not in dedup:
                     dedup.add(key)
