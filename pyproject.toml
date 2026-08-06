@@ -25,8 +25,8 @@ dependencies = [
     "accelerate",
     "msgpack",
     "modelscope",
-    "torch==2.11.0",
-    "triton==3.6.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "torch==2.9.1",
+    "triton==3.5.1; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "transformers>=4.56.0,<=4.57.3",
     "flashinfer-python>=0.6.12",
     "openai-harmony>=0.0.8",
@@ -36,7 +36,7 @@ dependencies = [
     "prompt_toolkit",
     "openai",
     "apache-tvm-ffi>=0.1.4",
-    "sgl_kernel>=0.3.17.post1",
+    "sgl_kernel==0.3.21",
     "quack-kernels",
 ]
 
