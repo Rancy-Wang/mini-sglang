@@ -28,7 +28,7 @@ def _load_triton_kernels_abi() -> SimpleNamespace:
         from triton_kernels.tensor_details import layout
     except (ImportError, AttributeError) as exc:
         raise RuntimeError(
-            "GPT-OSS MXFP4 requires the triton_kernels 3.6 ABI "
+            "GPT-OSS MXFP4 requires a compatible bundled triton_kernels ABI "
             "(matmul_ogs, topk, FP4 layout conversion, and PrecisionConfig)."
         ) from exc
 

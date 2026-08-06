@@ -259,9 +259,9 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         default=ServerArgs.contextual_prefill_mode,
         help=(
             "How a low-hit contextual warmup is Prefilled. 'staged' keeps the "
-            "legacy per-message fallback; 'flashinfer-mask' uses one isolated "
-            "full-context Prefill with a GPU packed custom mask; "
-            "'flashattention-mask' uses an FA4 CuTe GPU mask on Hopper/Blackwell."
+            "legacy per-message fallback; 'flashinfer-mask' uses exact active-KV "
+            "segments with FlashInfer; 'flashattention-mask' uses FA3 segments on "
+            "SM80/SM90 or an FA4 CuTe GPU mask on SM100/SM110."
         ),
     )
 
