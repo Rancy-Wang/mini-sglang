@@ -14,22 +14,18 @@ def _load_triton_kernels_abi() -> SimpleNamespace:
             FlexCtx,
             FnSpecs,
             FusedActivation,
-            GatherIndx,
             PrecisionConfig,
-            RoutingData,
-            ScatterIndx,
             matmul_ogs,
         )
         from triton_kernels.numerics import InFlexData
+        from triton_kernels.routing import routing
         from triton_kernels.swiglu import swiglu_fn
         from triton_kernels.tensor import (
             FP4,
             convert_layout,
-            make_ragged_tensor_metadata,
             wrap_torch_tensor,
         )
         from triton_kernels.tensor_details import layout
-        from triton_kernels.topk import topk
     except (ImportError, AttributeError) as exc:
         raise RuntimeError(
             "GPT-OSS MXFP4 requires the triton_kernels 3.6 ABI "
@@ -40,19 +36,15 @@ def _load_triton_kernels_abi() -> SimpleNamespace:
         FlexCtx=FlexCtx,
         FnSpecs=FnSpecs,
         FusedActivation=FusedActivation,
-        GatherIndx=GatherIndx,
         PrecisionConfig=PrecisionConfig,
-        RoutingData=RoutingData,
-        ScatterIndx=ScatterIndx,
         matmul_ogs=matmul_ogs,
         InFlexData=InFlexData,
+        routing=routing,
         swiglu_fn=swiglu_fn,
         FP4=FP4,
         convert_layout=convert_layout,
-        make_ragged_tensor_metadata=make_ragged_tensor_metadata,
         wrap_torch_tensor=wrap_torch_tensor,
         layout=layout,
-        topk=topk,
     )
 
 
@@ -76,33 +68,13 @@ def _swizzle_mxfp4(weight: torch.Tensor, scale: torch.Tensor, abi: SimpleNamespa
 
 
 def _route(router_logits: torch.Tensor, top_k: int, abi: SimpleNamespace):
-    sparse_logits = abi.topk(
+    return abi.routing(
         router_logits,
         top_k,
-        apply_softmax=True,
-        dim=1,
-        y_indx=None,
+        sm_first=False,
+        expt_indx=None,
+        simulated_ep=1,
         n_rows=None,
-        all_gather=False,
-    )
-    dispatch_indices = sparse_logits.mask_metadata.row_sorted_indx
-    combine_indices = sparse_logits.mask_metadata.col_sorted_indx
-    ragged = abi.make_ragged_tensor_metadata(
-        sparse_logits.mask_metadata.col_sum,
-        dispatch_indices.shape[0],
-    )
-    gate_scale = sparse_logits.vals.flatten()[combine_indices]
-    routing_data = abi.RoutingData(
-        gate_scale,
-        ragged.slice_sizes,
-        router_logits.shape[-1],
-        top_k,
-        ragged,
-    )
-    return (
-        routing_data,
-        abi.GatherIndx(combine_indices, dispatch_indices),
-        abi.ScatterIndx(dispatch_indices, combine_indices),
     )
 
 
@@ -228,9 +200,9 @@ class GptOssMxfp4Experts(BaseOP):
                 "swiglu",
                 self._abi.swiglu_fn,
                 ("alpha", "limit"),
-                reduction_n=2,
             ),
             (self.alpha, self.limit),
+            2,
         )
         self._abi.matmul_ogs(
             hidden_states,

@@ -6,36 +6,23 @@ import torch
 from minisgl.moe.mxfp4 import GptOssMxfp4Experts, _route, _swizzle_mxfp4
 
 
-def test_route_uses_normalized_topk_and_builds_official_routing_objects():
-    sparse = SimpleNamespace(
-        vals=torch.tensor([[0.75, 0.25]]),
-        mask_metadata=SimpleNamespace(
-            row_sorted_indx=torch.tensor([1, 0]),
-            col_sorted_indx=torch.tensor([0, 1]),
-            col_sum=torch.tensor([1, 1]),
-        ),
-    )
+def test_route_uses_official_normalized_routing():
+    result = (SimpleNamespace(gate_scal=torch.tensor([0.75, 0.25])), "gather", "scatter")
     abi = SimpleNamespace(
-        topk=MagicMock(return_value=sparse),
-        make_ragged_tensor_metadata=MagicMock(
-            return_value=SimpleNamespace(slice_sizes=torch.tensor([1, 1]))
-        ),
-        RoutingData=MagicMock(return_value=SimpleNamespace(gate_scal=sparse.vals.flatten())),
-        GatherIndx=MagicMock(return_value="gather"),
-        ScatterIndx=MagicMock(return_value="scatter"),
+        routing=MagicMock(return_value=result),
     )
 
     routing, gather, scatter = _route(torch.empty(1, 4), 2, abi)
 
-    assert gather == "gather"
-    assert scatter == "scatter"
+    assert (routing, gather, scatter) == result
     assert routing.gate_scal.sum().item() == 1.0
-    assert abi.topk.call_args.kwargs == {
-        "apply_softmax": True,
-        "dim": 1,
-        "y_indx": None,
+    abi.routing.assert_called_once()
+    assert abi.routing.call_args.args[1] == 2
+    assert abi.routing.call_args.kwargs == {
+        "sm_first": False,
+        "expt_indx": None,
+        "simulated_ep": 1,
         "n_rows": None,
-        "all_gather": False,
     }
 
 
@@ -111,9 +98,8 @@ def test_forward_uses_swiglu_and_two_matmul_ogs_calls(monkeypatch):
         "swiglu",
         abi.swiglu_fn,
         ("alpha", "limit"),
-        reduction_n=2,
     )
-    abi.FusedActivation.assert_called_once_with("spec", (1.702, 7.0))
+    abi.FusedActivation.assert_called_once_with("spec", (1.702, 7.0), 2)
 
 
 def test_constructor_fails_fast_below_sm80(monkeypatch):
