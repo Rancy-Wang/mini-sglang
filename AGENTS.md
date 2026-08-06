@@ -65,5 +65,8 @@ checkpoint`。
 - 从仓库根目录启动且任务涉及 `python/minisgl` 时，先手动读取该目录的
   `AGENTS.md` 及所需 skill；从 `python/minisgl` 作为项目窗口启动时，Codex 会
   直接发现这些配置。
-- 只有用户明确要求，或适用的 `AGENTS.md`/skill 明确要求时才启动子代理。并行
-  agent 只承担互不依赖的只读工作；写源码保持单线程。
+- `SUBAGENT_POLICY_ONE_HELPER_MAX`：主代理默认自行完成任务，简单任务不启动
+  subagent。每个用户任务或修改轮次最多启动一个不同的辅助 agent；需要继续协助时
+  复用同一个 helper，不得依次新建多个角色 agent，也不得并行启动多个 agent。
+- 辅助 agent 不得派生下级 agent。主代理保持最终责任并抽查其结论。只有用户明确
+  批准突破预算时才可使用更多 agent；所有写操作仍保持单写者、单线程。

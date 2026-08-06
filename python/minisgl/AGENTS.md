@@ -57,7 +57,14 @@ Context System 任务按以下状态推进：
 
 ## Agent 编排
 
-复杂 Context System 任务按需使用：
+`SUBAGENT_POLICY_ONE_HELPER_MAX`：主代理默认自行完成调查、实现、验证、review 和
+checkpoint。简单任务不启动 subagent；每个用户任务或修改轮次最多启动一个不同的
+辅助 agent。后续工作必须复用同一个 helper，不得把 mapper、architect、implementer、
+verifier、reviewer 依次创建成多个 agent；辅助 agent 也不得继续派生 agent。只有用户
+明确批准突破预算时例外。
+
+确有必要时，唯一 helper 可从以下角色中选择一个职责，也可在同一 helper 上顺序调整
+职责：
 
 - `context_code_mapper`：只读追踪代码、调用链和精确引用；
 - `context_architect`：只读整合数据流、不变量、风险和计划；
@@ -65,9 +72,11 @@ Context System 任务按以下状态推进：
 - `context_verifier`：独立运行检查与测试，不修源码；
 - `context_reviewer`：只读审查 diff、引用、回归风险和完成度。
 
-只读调查可拆为四条独立证据链：chat template/message 边界；Drop/Radix/page
-释放；full-active/position/check_integrity；match ratio/逐 message prefill。
-主代理必须回到源码抽查子代理结论。不得让多个写 agent 并行修改同一工作树。
+只读调查仍须覆盖适用的四条证据链：chat template/message 边界；Drop/Radix/page
+释放；full-active/position/check_integrity；match ratio/逐 message prefill，但不得
+为每条证据链分别启动 agent。若 helper 写入文件，主代理负责只读复核和验证；若主代理
+写入，helper 可承担只读验证或 review。没有 helper 时，主代理按同一检查清单完成独立
+验证阶段。任何时候都只允许一个写者修改工作树。
 
 ## Context System 不变量
 
@@ -87,6 +96,7 @@ Context System 任务按以下状态推进：
 
 ## 完成条件
 
-只有获批范围内的修改完成、验证通过或环境阻塞已准确列出、独立 reviewer 无阻塞
+只有获批范围内的修改完成、验证通过或环境阻塞已准确列出、独立 review 阶段无阻塞
 问题、checkpoint 已 push、服务器已 fast-forward pull 且适用远端测试完成时，才
-声称 `PASSED`。最终报告轮次、修改摘要、验证证据、checkpoint 和剩余风险。
+声称 `PASSED`。review 阶段可由主代理或本任务唯一 helper 执行，不要求额外启动
+reviewer。最终报告轮次、修改摘要、验证证据、checkpoint 和剩余风险。

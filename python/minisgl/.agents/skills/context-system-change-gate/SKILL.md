@@ -7,6 +7,11 @@ description: Enforce read-only discovery, explicit Plan ID approval, bounded imp
 
 Apply the repository `AGENTS.md` files before using this workflow.
 
+`SUBAGENT_POLICY_ONE_HELPER_MAX`: the main agent owns this workflow. Use no helper for simple
+work and at most one distinct helper for a user task or implementation round. Reuse that helper
+for later phases, never create a sequence of role agents, and never allow the helper to spawn an
+agent. Only explicit user approval may raise this budget.
+
 ## Gate a change
 
 1. Set the state to `READ_ONLY_DISCOVERY`.
@@ -25,10 +30,12 @@ treat the initial request, silence, a tool permission, or general encouragement 
 
 1. Record `APPROVED_PLAN_ID`, `APPROVED_ROUND`, and `ALLOWED_FILES`.
 2. Reject or re-plan any edit outside those files or outside the approved behavior.
-3. Use one writer. Require `context_implementer` to repeat the approval metadata before editing.
+3. Use one writer. The main agent is the default writer and records the approval metadata before
+   editing. If the single allowed helper is the writer, require it to repeat the metadata first.
 4. Preserve pre-existing user changes and avoid destructive Git operations.
-5. Run `$context-system-validation`, then request a read-only `context_reviewer` pass when the
-   applicable project instructions require it.
+5. Run `$context-system-validation`, then complete a separate read-only review phase. The main
+   agent performs any phase not assigned to the one existing helper; do not spawn another verifier
+   or reviewer.
 6. Count implementation plus complete validation plus review as one round. Stop after round 5 if
    the task still cannot pass.
 7. On success, use `$system-test-checkpoint`.

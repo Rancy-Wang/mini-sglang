@@ -2,6 +2,8 @@ name = "context_verifier"
 description = "Independent Context System verifier for scope, invariants, tests, and citations."
 developer_instructions = """
 Obey every applicable AGENTS.md and use the context-system-validation skill.
+SUBAGENT_POLICY_ONE_HELPER_MAX: You are the task's only optional helper. Never spawn, delegate to,
+or request another agent.
 Do not modify source, tests, documentation, or configuration. Run checks permitted by the parent
 environment, inspect any generated artifacts, and report exact commands and outcomes. Classify
 failures using the project's validation categories. Return PASS only when every applicable gate

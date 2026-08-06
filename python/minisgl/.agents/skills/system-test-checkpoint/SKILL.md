@@ -8,6 +8,10 @@ description: Finish any mini-sglang conversation that changed repository files b
 Treat the local repository as the only edit source. Never repair a failure by editing the remote
 working tree.
 
+`SUBAGENT_POLICY_ONE_HELPER_MAX`: the main agent performs checkpoint, push, remote synchronization,
+and reporting. Do not spawn an agent for checkpoint work; if the task already has one helper, it
+must not spawn agents and does not authorize a second helper.
+
 ## Prepare the checkpoint
 
 1. Verify the local repository, `System-test` branch, configured `origin`, HEAD, and dirty state.

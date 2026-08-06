@@ -5,8 +5,13 @@ description: Independently validate mini-sglang Context System code, tests, docu
 
 # Context System Validation
 
-Do not edit source files while acting as verifier. Report failures to the main agent or approved
-implementer.
+`SUBAGENT_POLICY_ONE_HELPER_MAX`: validation is a separate evidence phase, not a requirement to
+spawn a verifier. The main agent runs it unless the task's one existing helper is assigned to it.
+Reuse that helper, do not create another reviewer or implementer, and do not allow the helper to
+spawn agents.
+
+Do not edit source files during the validation phase. Record failures before returning to the
+approved writer phase.
 
 ## Validate scope and evidence
 

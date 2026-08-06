@@ -27,6 +27,7 @@ REQUIRED_SKILLS = {
     "context-system-validation",
     "system-test-checkpoint",
 }
+ONE_HELPER_POLICY = "SUBAGENT_POLICY_ONE_HELPER_MAX"
 REQUIRED_DOCS = {
     "PROJECT_CONTEXT.md": ("delta-marker", "staged", "pasted-text"),
     "CURRENT_STATE.md": ("b43e5c8", "17", "git status --short --branch"),
@@ -104,6 +105,14 @@ def read_project_config(path: Path) -> tuple[dict, str]:
         match = re.search(rf'(?m)^{field}\s*=\s*"([^"]+)"\s*$', text)
         if match:
             data[field] = match.group(1)
+    agents_match = re.search(
+        r"(?ms)^\[agents\]\s*.*?^max_concurrent_threads_per_session\s*=\s*(\d+)\s*$",
+        text,
+    )
+    if agents_match:
+        data["agents"] = {
+            "max_concurrent_threads_per_session": int(agents_match.group(1))
+        }
     return data, text
 
 
@@ -147,6 +156,48 @@ def validate_session_hook(hook_path: Path, workspace_root: Path) -> None:
     json.loads(empty_input.stdout)
 
 
+def validate_session_hook_command(command: str, workdirs: tuple[Path, ...]) -> None:
+    for workdir in workdirs:
+        result = subprocess.run(
+            ["/bin/sh", "-c", command],
+            input=json.dumps({"source": "startup"}),
+            cwd=workdir,
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+        if result.returncode != 0:
+            fail(
+                f"SessionStart command exited {result.returncode} from {workdir}: "
+                f"{result.stderr.strip()}"
+            )
+        try:
+            payload = json.loads(result.stdout)
+            output = payload["hookSpecificOutput"]
+            context = output["additionalContext"]
+        except (json.JSONDecodeError, KeyError, TypeError) as error:
+            fail(f"SessionStart command returned invalid JSON from {workdir}: {error}")
+        if output.get("hookEventName") != "SessionStart" or "startup" not in context:
+            fail(f"SessionStart command returned wrong payload from {workdir}")
+
+
+def validate_workspace_links(repo_root: Path, minisgl_dir: Path) -> None:
+    workspace_root = repo_root.parent
+    links = {
+        workspace_root / ".agents" / "skills": minisgl_dir / ".agents" / "skills",
+        workspace_root / ".codex" / "agents": minisgl_dir / ".codex" / "agents",
+        workspace_root / ".codex" / "config.toml": minisgl_dir / ".codex" / "config.toml",
+    }
+    if not any(path.exists() or path.is_symlink() for path in links):
+        return
+    for path, expected in links.items():
+        if not path.is_symlink():
+            fail(f"{path}: expected workspace symlink")
+        if path.resolve() != expected.resolve():
+            fail(f"{path}: expected symlink target {expected}")
+
+
 def main() -> int:
     script_path = Path(__file__).resolve()
     minisgl_dir = script_path.parents[4]
@@ -160,6 +211,14 @@ def main() -> int:
     for agents_file in (repo_root / "AGENTS.md", minisgl_dir / "AGENTS.md"):
         if not agents_file.is_file():
             fail(f"missing {agents_file}")
+        if ONE_HELPER_POLICY not in agents_file.read_text(encoding="utf-8"):
+            fail(f"{agents_file}: missing one-helper policy")
+
+    workspace_agents = repo_root.parent / "AGENTS.md"
+    if workspace_agents.is_file():
+        if ONE_HELPER_POLICY not in workspace_agents.read_text(encoding="utf-8"):
+            fail(f"{workspace_agents}: missing one-helper policy")
+    validate_workspace_links(repo_root, minisgl_dir)
 
     docs_dir = repo_root / "docs" / "codex"
     for filename, markers in REQUIRED_DOCS.items():
@@ -182,12 +241,16 @@ def main() -> int:
     for field, expected in expected_config.items():
         if config.get(field) != expected:
             fail(f"{config_path}: expected {field}={expected!r}")
+    if config.get("agents", {}).get("max_concurrent_threads_per_session") != 1:
+        fail(f"{config_path}: expected one spawned-agent thread")
     for marker in (
         "[[hooks.SessionStart]]",
         'matcher = "^(startup|resume|compact)$"',
         "[[hooks.SessionStart.hooks]]",
         "additionalContextLimit = 5000",
-        'python3 "mini-sglang/python/minisgl/.codex/hooks/session_start.py"',
+        'context_hook_script="mini-sglang/python/minisgl/.codex/hooks/session_start.py"',
+        'context_hook_script="python/minisgl/.codex/hooks/session_start.py"',
+        'context_hook_script=".codex/hooks/session_start.py"',
     ):
         if marker not in config_text:
             fail(f"{config_path}: missing {marker!r}")
@@ -211,6 +274,13 @@ def main() -> int:
 
     hook_path = minisgl_dir / ".codex" / "hooks" / "session_start.py"
     validate_session_hook(hook_path, repo_root.parent)
+    command_match = re.search(r"(?m)^command = '([^']+)'\s*$", config_text)
+    if not command_match:
+        fail(f"{config_path}: missing SessionStart command")
+    validate_session_hook_command(
+        command_match.group(1),
+        (repo_root.parent, repo_root, minisgl_dir),
+    )
 
     agent_dir = minisgl_dir / ".codex" / "agents"
     for filename, expected_name in REQUIRED_AGENTS.items():
@@ -221,6 +291,8 @@ def main() -> int:
                 fail(f"{path}: missing {field}")
         if data["name"] != expected_name:
             fail(f"{path}: expected name {expected_name!r}")
+        if ONE_HELPER_POLICY not in data["developer_instructions"]:
+            fail(f"{path}: missing no-fanout helper policy")
 
     skill_dir = minisgl_dir / ".agents" / "skills"
     discovered = {path.parent.name for path in skill_dir.glob("*/SKILL.md")}
@@ -232,6 +304,8 @@ def main() -> int:
         metadata = read_frontmatter(path)
         if metadata["name"] != skill_name:
             fail(f"{path}: name does not match directory")
+        if ONE_HELPER_POLICY not in path.read_text(encoding="utf-8"):
+            fail(f"{path}: missing one-helper policy")
         ui_path = path.parent / "agents" / "openai.yaml"
         ui_text = ui_path.read_text(encoding="utf-8")
         for marker in ("display_name:", "short_description:", "default_prompt:"):
@@ -244,8 +318,9 @@ def main() -> int:
     subprocess.run(["bash", "-n", str(sync_script)], check=True)
     print(
         f"PASS: {len(REQUIRED_AGENTS)} agents, {len(REQUIRED_SKILLS)} skills, "
-        f"{len(REQUIRED_DOCS)} context docs, compact config/prompt, SessionStart hook, "
-        "AGENTS.md files, and checkpoint script are valid"
+        f"{len(REQUIRED_DOCS)} context docs, one-helper policy, compact config/prompt, "
+        "portable SessionStart hook, workspace links, AGENTS.md files, and checkpoint script "
+        "are valid"
     )
     return 0
 

@@ -2,6 +2,8 @@ name = "context_implementer"
 description = "Single writer for an explicitly approved Context System plan and exact file scope."
 developer_instructions = """
 Obey every applicable AGENTS.md and project skill.
+SUBAGENT_POLICY_ONE_HELPER_MAX: You are the task's only optional helper. Never spawn, delegate to,
+or request another agent.
 Before editing, require APPROVED_PLAN_ID, APPROVED_ROUND, and ALLOWED_FILES in the assignment and
 repeat them in the result. Stop if they are missing or ambiguous. Make the smallest change inside
 the approved files and semantics, preserve all pre-existing work, and avoid unrelated formatting

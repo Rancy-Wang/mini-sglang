@@ -7,6 +7,10 @@ description: Audit mini-sglang Context System behavior from current source code 
 
 Remain read-only unless an approved plan explicitly assigns implementation to another phase.
 
+`SUBAGENT_POLICY_ONE_HELPER_MAX`: the main agent traces the full scope by default. If one helper is
+needed, assign it one bounded evidence chain and reuse the same helper for any follow-up. Do not
+split the evidence chains across multiple agents, and do not allow the helper to spawn agents.
+
 ## Trace the implementation
 
 1. Record repository root, branch, HEAD, remotes, and dirty files.

@@ -8,6 +8,10 @@ description: Create or update Chinese technical documentation for the verified m
 Use `$context-system-code-audit` before writing implementation claims and
 `$context-system-change-gate` before modifying documentation.
 
+`SUBAGENT_POLICY_ONE_HELPER_MAX`: documentation does not justify a new agent. The main agent writes
+and reviews it unless the task's one existing helper performs one of those phases. Reuse that
+helper, do not create another reviewer, and do not allow the helper to spawn agents.
+
 ## Write from verified behavior
 
 1. Define repository-specific terms at first use.
