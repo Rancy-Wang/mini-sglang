@@ -2,9 +2,16 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, List, Sequence
 
 import torch
+
+try:
+    import triton
+    import triton.language as tl
+except ImportError:  # Triton is only installed for the Linux CUDA runtime.
+    triton = None
+    tl = None
 
 if TYPE_CHECKING:
     from minisgl.core import Batch
@@ -17,6 +24,79 @@ class ContextAttentionSegment:
     query_start: int
     query_end: int
     key_positions: torch.Tensor
+
+
+@dataclass(frozen=True)
+class ContextAttentionBatch:
+    """Ragged Context segments for a flattened multi-request Prefill batch."""
+
+    segment_table_indices: torch.Tensor
+    key_positions: torch.Tensor
+    cu_seqlens_q: torch.Tensor
+    cu_seqlens_k: torch.Tensor
+    max_seqlen_q: int
+    max_seqlen_k: int
+
+    @property
+    def num_segments(self) -> int:
+        return len(self.segment_table_indices)
+
+    @property
+    def num_queries(self) -> int:
+        return int(self.cu_seqlens_q[-1])
+
+
+@dataclass(frozen=True)
+class CompiledContextPageTables:
+    """Backend layouts emitted together by the Context page-table compiler."""
+
+    flat_indices: torch.Tensor
+    padded_page_table: torch.Tensor
+
+
+if triton is not None:
+
+    @triton.jit
+    def _compile_context_page_tables_kernel(
+        page_table_ptr,
+        segment_table_indices_ptr,
+        key_positions_ptr,
+        key_offsets_ptr,
+        flat_indices_ptr,
+        padded_page_table_ptr,
+        page_table_stride,
+        padded_stride,
+        max_seqlen_k,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        segment_idx = tl.program_id(0)
+        key_block_idx = tl.program_id(1)
+        local_key_idx = key_block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        key_start = tl.load(key_offsets_ptr + segment_idx)
+        key_end = tl.load(key_offsets_ptr + segment_idx + 1)
+        key_count = key_end - key_start
+        valid = local_key_idx < key_count
+        key_position = tl.load(
+            key_positions_ptr + key_start + local_key_idx,
+            mask=valid,
+            other=0,
+        )
+        table_idx = tl.load(segment_table_indices_ptr + segment_idx)
+        page = tl.load(
+            page_table_ptr + table_idx * page_table_stride + key_position,
+            mask=valid,
+            other=0,
+        )
+        tl.store(flat_indices_ptr + key_start + local_key_idx, page, mask=valid)
+        padded_offset = segment_idx * padded_stride + local_key_idx
+        tl.store(
+            padded_page_table_ptr + padded_offset,
+            page,
+            mask=local_key_idx < max_seqlen_k,
+        )
+
+else:
+    _compile_context_page_tables_kernel = None
 
 
 def build_context_attention_segments(
@@ -72,11 +152,8 @@ def build_context_attention_segments(
         return tuple(segments)
 
     boundaries = {query_start, query_end}
-    boundaries.update(
-        int(position)
-        for position in visible_until.tolist()
-        if query_start < int(position) < query_end
-    )
+    expiring = visible_until[(visible_until > query_start) & (visible_until < query_end)]
+    boundaries.update(int(position) for position in torch.unique(expiring).tolist())
     ordered = sorted(boundaries)
 
     segments = []
@@ -94,6 +171,122 @@ def build_context_attention_segments(
     return tuple(segments)
 
 
+def build_context_attention_batch(
+    reqs: Sequence,
+    *,
+    sliding_window: int | None = None,
+) -> ContextAttentionBatch:
+    """Compile per-request visibility into one ordered ragged attention batch.
+
+    Segments are emitted request-by-request and query-order-preserving, so their
+    concatenated Q layout is identical to the scheduler's flattened Prefill Q.
+    Absolute key positions and table ownership remain explicit until the GPU
+    page-table compiler resolves them.
+    """
+
+    if not reqs:
+        raise ValueError("Context attention batching requires at least one request.")
+
+    segment_table_indices = []
+    key_positions = []
+    query_lengths = []
+    key_lengths = []
+    expected_query_offset = 0
+    for req in reqs:
+        if req.full_token_visible_until is None:
+            raise RuntimeError("Context-mask Prefill request is missing visibility metadata.")
+        segments = build_context_attention_segments(
+            req.full_token_visible_until,
+            query_start=req.cached_len,
+            query_length=req.extend_len,
+            key_length=req.device_len,
+            sliding_window=sliding_window,
+        )
+        local_query_offset = 0
+        for segment in segments:
+            if segment.query_start != local_query_offset:
+                raise RuntimeError("Context segments do not form a contiguous query partition.")
+            query_length = segment.query_end - segment.query_start
+            segment_table_indices.append(req.table_idx)
+            key_positions.append(segment.key_positions.to(dtype=torch.int32))
+            query_lengths.append(query_length)
+            key_lengths.append(len(segment.key_positions))
+            local_query_offset = segment.query_end
+        if local_query_offset != req.extend_len:
+            raise RuntimeError("Context segments do not cover the complete request extension.")
+        expected_query_offset += req.extend_len
+
+    cu_seqlens_q = torch.tensor([0] + query_lengths, dtype=torch.int32).cumsum_(dim=0)
+    cu_seqlens_k = torch.tensor([0] + key_lengths, dtype=torch.int32).cumsum_(dim=0)
+    if int(cu_seqlens_q[-1]) != expected_query_offset:
+        raise RuntimeError("Context batch query layout diverged from flattened Prefill Q.")
+    return ContextAttentionBatch(
+        segment_table_indices=torch.tensor(segment_table_indices, dtype=torch.int32),
+        key_positions=torch.cat(key_positions),
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max(query_lengths),
+        max_seqlen_k=max(key_lengths),
+    )
+
+
+def compile_context_page_tables(
+    page_table: torch.Tensor,
+    context_batch: ContextAttentionBatch,
+) -> CompiledContextPageTables:
+    """Resolve absolute Context keys into FA/FI page layouts in one GPU kernel."""
+
+    num_segments = context_batch.num_segments
+    total_keys = len(context_batch.key_positions)
+    flat_indices = torch.empty(total_keys, dtype=page_table.dtype, device=page_table.device)
+    padded_page_table = torch.empty(
+        (num_segments, context_batch.max_seqlen_k),
+        dtype=page_table.dtype,
+        device=page_table.device,
+    )
+
+    if page_table.is_cuda:
+        if _compile_context_page_tables_kernel is None or triton is None:
+            raise RuntimeError("CUDA Context mask compilation requires Triton.")
+        table_indices = context_batch.segment_table_indices.pin_memory().to(
+            page_table.device, non_blocking=True
+        )
+        key_positions = context_batch.key_positions.pin_memory().to(
+            page_table.device, non_blocking=True
+        )
+        key_offsets = context_batch.cu_seqlens_k.pin_memory().to(
+            page_table.device, non_blocking=True
+        )
+        block_size = 256
+        grid = (num_segments, triton.cdiv(context_batch.max_seqlen_k, block_size))
+        _compile_context_page_tables_kernel[grid](
+            page_table,
+            table_indices,
+            key_positions,
+            key_offsets,
+            flat_indices,
+            padded_page_table,
+            page_table.stride(0),
+            padded_page_table.stride(0),
+            context_batch.max_seqlen_k,
+            BLOCK_SIZE=block_size,
+        )
+    else:
+        for segment_idx, table_idx in enumerate(context_batch.segment_table_indices.tolist()):
+            key_start = int(context_batch.cu_seqlens_k[segment_idx])
+            key_end = int(context_batch.cu_seqlens_k[segment_idx + 1])
+            positions = context_batch.key_positions[key_start:key_end].to(dtype=torch.int64)
+            pages = page_table[table_idx].index_select(0, positions)
+            flat_indices[key_start:key_end] = pages
+            padded_page_table[segment_idx, : len(pages)] = pages
+            padded_page_table[segment_idx, len(pages) :] = 0
+
+    return CompiledContextPageTables(
+        flat_indices=flat_indices,
+        padded_page_table=padded_page_table,
+    )
+
+
 @dataclass
 class BaseAttnMetadata(ABC):
     @abstractmethod
@@ -101,6 +294,10 @@ class BaseAttnMetadata(ABC):
 
 
 class BaseAttnBackend(ABC):
+    @property
+    def supports_multi_context_mask_prefill(self) -> bool:
+        return False
+
     @abstractmethod
     def forward(
         self,
@@ -135,6 +332,10 @@ class HybridBackend(BaseAttnBackend):
     ) -> None:
         self.prefill_backend = prefill_backend
         self.decode_backend = decode_backend
+
+    @property
+    def supports_multi_context_mask_prefill(self) -> bool:
+        return self.prefill_backend.supports_multi_context_mask_prefill
 
     def forward(
         self,

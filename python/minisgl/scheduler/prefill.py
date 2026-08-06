@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Tuple
 
 import torch
-from minisgl.core import Batch, Req
+from minisgl.core import Batch, Req, get_global_ctx
 from minisgl.utils import init_logger
 
 from .utils import PendingReq
@@ -18,6 +18,14 @@ if TYPE_CHECKING:
     from .table import TableManager
 
 logger = init_logger(__name__)
+
+
+def _supports_multi_context_mask_prefill() -> bool:
+    try:
+        backend = get_global_ctx().attn_backend
+    except AssertionError:
+        return False
+    return backend.supports_multi_context_mask_prefill
 
 
 class ChunkedReq(Req):
@@ -244,16 +252,21 @@ class PrefillManager:
         )
         reqs: List[Req] = []
         chunked_list: List[PendingReq] = []
+        supports_multi_context_mask = _supports_multi_context_mask_prefill()
         for pending_req in self.pending_list:
-            if len(reqs) > 0 and (pending_req.use_context_mask or reqs[0].use_context_mask):
-                break
+            if len(reqs) > 0:
+                first_uses_context_mask = reqs[0].use_context_mask
+                if pending_req.use_context_mask != first_uses_context_mask:
+                    break
+                if pending_req.use_context_mask and not supports_multi_context_mask:
+                    break
             if req := adder.try_add_one(pending_req):
                 pending_req.chunked_req = None
                 if isinstance(req, ChunkedReq):
                     pending_req.chunked_req = req
                     chunked_list.append(pending_req)
                 reqs.append(req)
-                if pending_req.use_context_mask:
+                if pending_req.use_context_mask and not supports_multi_context_mask:
                     break
             else:
                 break  # We cannot add more requests

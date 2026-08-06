@@ -11,7 +11,12 @@ from minisgl.distributed import get_tp_info
 from minisgl.env import ENV
 from minisgl.utils import div_even, init_logger
 
-from .base import BaseAttnBackend, BaseAttnMetadata, build_context_attention_segments
+from .base import (
+    BaseAttnBackend,
+    BaseAttnMetadata,
+    build_context_attention_batch,
+    compile_context_page_tables,
+)
 from .utils import BaseCaptureData
 
 if TYPE_CHECKING:
@@ -73,8 +78,8 @@ class FIMetadata(BaseAttnMetadata):
     seq_lens_cpu:       torch.Tensor  # on cpu
     dtype:              torch.dtype
     is_decode:          bool
-    context_segments:  tuple[FIContextSegmentMetadata, ...] | None = None
-    sliding_context_segments: tuple[FIContextSegmentMetadata, ...] | None = None
+    context_segments:  FIContextSegmentMetadata | None = None
+    sliding_context_segments: FIContextSegmentMetadata | None = None
     graph_bs:           int | None = None
     initialized_wrappers: set[int] = field(default_factory=set)
     # fmt: on
@@ -134,6 +139,10 @@ class FlashInferBackend(BaseAttnBackend):
         self.capture: FICaptureData | None = None
         self.last_event = torch.cuda.Event()
         self.last_event.record()
+
+    @property
+    def supports_multi_context_mask_prefill(self) -> bool:
+        return True
 
     def _new_prefill_wrapper(self):
         return self._prefill_wrapper_cls(
@@ -280,7 +289,7 @@ class FlashInferBackend(BaseAttnBackend):
             return (out.float() * sink_scale.unsqueeze(-1)).to(out.dtype)
 
         if metadata.context_segments is not None:
-            segments = metadata.context_segments
+            segment = metadata.context_segments
             segment_window_left = window_left
             if sliding_window is not None:
                 if metadata.sliding_context_segments is None:
@@ -288,28 +297,23 @@ class FlashInferBackend(BaseAttnBackend):
                         "FlashInfer context-mask metadata is missing absolute-position "
                         "sliding segments."
                     )
-                segments = metadata.sliding_context_segments
+                segment = metadata.sliding_context_segments
                 segment_window_left = -1
-            outputs = []
-            for segment in segments:
-                wrapper = segment.wrappers.get(segment_window_left)
-                if wrapper is None:
-                    wrapper = self._new_prefill_wrapper()
-                    segment.wrappers[segment_window_left] = wrapper
-                self._initialize_metadata_once(
-                    segment,
-                    wrapper,
-                    is_decode=False,
-                    window_left=segment_window_left,
-                )
-                outputs.append(
-                    _run(
-                        wrapper,
-                        q[segment.query_start : segment.query_end],
-                        segment_window_left,
-                    )
-                )
-            return torch.cat(outputs, dim=0)
+            wrapper = segment.wrappers.get(segment_window_left)
+            if wrapper is None:
+                wrapper = self._new_prefill_wrapper()
+                segment.wrappers[segment_window_left] = wrapper
+            self._initialize_metadata_once(
+                segment,
+                wrapper,
+                is_decode=False,
+                window_left=segment_window_left,
+            )
+            return _run(
+                wrapper,
+                q[segment.query_start : segment.query_end],
+                segment_window_left,
+            )
 
         wrapper = self._ordinary_wrapper(metadata, window_left)
         self._initialize_metadata_once(
@@ -324,12 +328,10 @@ class FlashInferBackend(BaseAttnBackend):
         reqs = batch.padded_reqs
         masked_reqs = [req for req in reqs if req.use_context_mask]
         if masked_reqs:
-            if not batch.is_prefill or batch.size != 1 or len(reqs) != 1:
+            if not batch.is_prefill or len(masked_reqs) != len(reqs):
                 raise RuntimeError(
-                    "FlashInfer context-mask Prefill must be an unpadded, single-request batch."
+                    "FlashInfer context-mask Prefill cannot mix masked and ordinary requests."
                 )
-            if len(masked_reqs) != 1:
-                raise RuntimeError("Mixed masked and ordinary FlashInfer requests are unsupported.")
 
         padded_size = len(reqs)
         seqlens_q = [req.extend_len for req in reqs]
@@ -348,67 +350,43 @@ class FlashInferBackend(BaseAttnBackend):
         else:  # normal extend prefill, with partial cache hit
             cu_seqlens_q_cpu = torch.tensor([0] + seqlens_q, **CPU_KWARGS).cumsum_(dim=0)
 
+        page_table = get_global_ctx().page_table
         context_segments = None
         sliding_context_segments = None
         if masked_reqs:
-            req = masked_reqs[0]
-            if req.full_token_visible_until is None:
-                raise RuntimeError("Context-mask Prefill request is missing visibility metadata.")
 
-        page_table = get_global_ctx().page_table
-        flat_indices = torch.cat([page_table[req.table_idx, : req.device_len] for req in reqs])
-        if masked_reqs:
-            req = masked_reqs[0]
-            assert req.full_token_visible_until is not None
-            base_indices = page_table[req.table_idx, : req.device_len]
-            def _to_fi_segments(segments):
-                return tuple(
-                    FIContextSegmentMetadata(
-                        query_start=segment.query_start,
-                        query_end=segment.query_end,
-                        cu_seqlens_q_cpu=torch.tensor(
-                            [0, segment.query_end - segment.query_start], **CPU_KWARGS
-                        ),
-                        cu_seqlens_k_cpu=torch.tensor(
-                            [0, len(segment.key_positions)], **CPU_KWARGS
-                        ),
-                        cu_seqlens_q_gpu=torch.tensor(
-                            [0, segment.query_end - segment.query_start],
-                            device=device,
-                            dtype=torch.int32,
-                        ),
-                        indices=base_indices.index_select(
-                            0,
-                            segment.key_positions.to(
-                                device=device, dtype=torch.int64, non_blocking=True
-                            ),
-                        ),
-                        last_page_len_cpu=self._get_ones_cpu(1),
-                        seq_lens_cpu=torch.tensor(
-                            [len(segment.key_positions)], **CPU_KWARGS
-                        ),
-                    )
-                    for segment in segments
+            def _compile_fi_context(sliding_window: int | None):
+                context_batch = build_context_attention_batch(
+                    masked_reqs, sliding_window=sliding_window
+                )
+                compiled = compile_context_page_tables(page_table, context_batch)
+                context_cu_q_cpu = context_batch.cu_seqlens_q.pin_memory()
+                context_cu_k_cpu = context_batch.cu_seqlens_k.pin_memory()
+                context_seq_lens_cpu = (
+                    context_batch.cu_seqlens_k[1:]
+                    - context_batch.cu_seqlens_k[:-1]
+                ).pin_memory()
+                return FIContextSegmentMetadata(
+                    query_start=0,
+                    query_end=context_batch.num_queries,
+                    cu_seqlens_q_cpu=context_cu_q_cpu,
+                    cu_seqlens_k_cpu=context_cu_k_cpu,
+                    cu_seqlens_q_gpu=context_cu_q_cpu.to(device, non_blocking=True),
+                    indices=compiled.flat_indices,
+                    last_page_len_cpu=self._get_ones_cpu(context_batch.num_segments),
+                    seq_lens_cpu=context_seq_lens_cpu,
                 )
 
-            context_segments = _to_fi_segments(
-                build_context_attention_segments(
-                    req.full_token_visible_until,
-                    query_start=req.cached_len,
-                    query_length=req.extend_len,
-                    key_length=req.device_len,
-                )
-            )
+            context_segments = _compile_fi_context(None)
             if self.config.sliding_window is not None:
-                sliding_context_segments = _to_fi_segments(
-                    build_context_attention_segments(
-                        req.full_token_visible_until,
-                        query_start=req.cached_len,
-                        query_length=req.extend_len,
-                        key_length=req.device_len,
-                        sliding_window=self.config.sliding_window - 1,
-                    )
+                sliding_context_segments = _compile_fi_context(
+                    self.config.sliding_window - 1
                 )
+            flat_indices = context_segments.indices
+        else:
+            flat_indices = torch.cat(
+                [page_table[req.table_idx, : req.device_len] for req in reqs]
+            )
         batch.attn_metadata = FIMetadata(
             cu_seqlens_q_cpu=cu_seqlens_q_cpu,
             cu_seqlens_k_cpu=cu_seqlens_k_cpu,

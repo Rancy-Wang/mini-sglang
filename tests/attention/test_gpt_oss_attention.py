@@ -2,8 +2,14 @@ import sys
 from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
 import torch
-from minisgl.attention.base import HybridBackend, build_context_attention_segments
+from minisgl.attention.base import (
+    HybridBackend,
+    build_context_attention_batch,
+    build_context_attention_segments,
+    compile_context_page_tables,
+)
 from minisgl.attention.fa import (
     FAContextSegmentMetadata,
     FAMetadata,
@@ -156,6 +162,87 @@ def test_context_sliding_segments_use_absolute_positions_across_drops():
     assert torch.equal(reconstructed, expected)
 
 
+def _context_batch_requests():
+    return (
+        SimpleNamespace(
+            table_idx=1,
+            cached_len=2,
+            extend_len=4,
+            device_len=6,
+            full_token_visible_until=torch.tensor(
+                [4, 6, 6, 4, 6, 6], dtype=torch.int32
+            ),
+        ),
+        SimpleNamespace(
+            table_idx=3,
+            cached_len=1,
+            extend_len=4,
+            device_len=5,
+            full_token_visible_until=torch.tensor(
+                [3, 5, 3, 5, 5], dtype=torch.int32
+            ),
+        ),
+    )
+
+
+def test_multi_request_context_batch_preserves_flattened_q_and_table_ownership():
+    requests = _context_batch_requests()
+    context_batch = build_context_attention_batch(requests)
+    page_table = torch.arange(4 * 8, dtype=torch.int32).view(4, 8)
+
+    compiled = compile_context_page_tables(page_table, context_batch)
+
+    assert context_batch.num_queries == sum(req.extend_len for req in requests)
+    assert context_batch.segment_table_indices.tolist() == [1, 1, 3, 3]
+    request_q_start = {1: 0, 3: requests[0].extend_len}
+    reconstructed = {
+        req.table_idx: torch.zeros((req.extend_len, req.device_len), dtype=torch.bool)
+        for req in requests
+    }
+    for segment_idx, table_idx in enumerate(context_batch.segment_table_indices.tolist()):
+        query_start = int(context_batch.cu_seqlens_q[segment_idx])
+        query_end = int(context_batch.cu_seqlens_q[segment_idx + 1])
+        key_start = int(context_batch.cu_seqlens_k[segment_idx])
+        key_end = int(context_batch.cu_seqlens_k[segment_idx + 1])
+        positions = context_batch.key_positions[key_start:key_end].to(torch.int64)
+        expected = page_table[table_idx].index_select(0, positions)
+        assert torch.equal(compiled.flat_indices[key_start:key_end], expected)
+        assert torch.equal(
+            compiled.padded_page_table[segment_idx, : len(expected)], expected
+        )
+        query_count = query_end - query_start
+        prefix_count = len(positions) - query_count
+        local_query_start = query_start - request_q_start[table_idx]
+        for query_offset in range(query_count):
+            reconstructed[table_idx][
+                local_query_start + query_offset,
+                positions[: prefix_count + query_offset + 1],
+            ] = True
+
+    for req in requests:
+        expected_mask = build_context_visibility_mask_reference(
+            req.full_token_visible_until,
+            query_positions=torch.arange(req.cached_len, req.device_len),
+            key_positions=torch.arange(req.device_len),
+        )
+        assert torch.equal(reconstructed[req.table_idx], expected_mask)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA Triton")
+def test_context_page_table_gpu_kernel_matches_cpu_reference():
+    context_batch = build_context_attention_batch(
+        _context_batch_requests(), sliding_window=2
+    )
+    page_table_cpu = torch.arange(4 * 8, dtype=torch.int32).view(4, 8)
+
+    expected = compile_context_page_tables(page_table_cpu, context_batch)
+    actual = compile_context_page_tables(page_table_cpu.cuda(), context_batch)
+    torch.cuda.synchronize()
+
+    assert torch.equal(actual.flat_indices.cpu(), expected.flat_indices)
+    assert torch.equal(actual.padded_page_table.cpu(), expected.padded_page_table)
+
+
 def test_flash_attention_uses_preclipped_context_segments_for_sliding(monkeypatch):
     backend = object.__new__(FlashAttentionBackend)
     backend.kvcache = _FakeKVCache()
@@ -182,23 +269,14 @@ def test_fa3_context_segments_preserve_window_and_sinks(monkeypatch):
     kernel = MagicMock(side_effect=lambda **kwargs: kwargs["q"])
     monkeypatch.setattr("minisgl.attention.fa._fa_sgl_impl", kernel)
     sinks = torch.empty(1)
-    segments = (
-        FAContextSegmentMetadata(
-            query_start=0,
-            query_end=2,
-            page_table=torch.tensor([[7, 8, 9]], dtype=torch.int32),
-            cache_seqlens=torch.tensor([3], dtype=torch.int32),
-            cu_seqlens_q=torch.tensor([0, 2], dtype=torch.int32),
-            cu_seqlens_k=torch.tensor([0, 3], dtype=torch.int32),
-        ),
-        FAContextSegmentMetadata(
-            query_start=2,
-            query_end=3,
-            page_table=torch.tensor([[8, 10]], dtype=torch.int32),
-            cache_seqlens=torch.tensor([2], dtype=torch.int32),
-            cu_seqlens_q=torch.tensor([0, 1], dtype=torch.int32),
-            cu_seqlens_k=torch.tensor([0, 2], dtype=torch.int32),
-        ),
+    segments = FAContextSegmentMetadata(
+        query_start=0,
+        query_end=3,
+        page_table=torch.tensor([[7, 8, 9], [8, 10, 0]], dtype=torch.int32),
+        cache_seqlens=torch.tensor([3, 2], dtype=torch.int32),
+        cu_seqlens_q=torch.tensor([0, 2, 3], dtype=torch.int32),
+        cu_seqlens_k=torch.tensor([0, 3, 5], dtype=torch.int32),
+        max_seqlen_q=2,
     )
     q = torch.empty(3, 1, 4)
 
@@ -213,11 +291,12 @@ def test_fa3_context_segments_preserve_window_and_sinks(monkeypatch):
     )
 
     assert output.shape == q.shape
-    assert kernel.call_count == 2
-    for call in kernel.call_args_list:
-        assert call.kwargs["version"] == 3
-        assert call.kwargs["window_size"] == (127, 0)
-        assert call.kwargs["sinks"] is sinks
+    kernel.assert_called_once()
+    call = kernel.call_args
+    assert call.kwargs["version"] == 3
+    assert call.kwargs["window_size"] == (127, 0)
+    assert call.kwargs["sinks"] is sinks
+    assert call.kwargs["max_seqlen_q"] == 2
 
 
 def _fi_metadata():
@@ -315,9 +394,9 @@ def test_flashinfer_uses_preclipped_context_segments_for_sliding():
     wrapper.run.side_effect = lambda **kwargs: kwargs["q"]
     backend._new_prefill_wrapper = MagicMock(return_value=wrapper)
     metadata = _fi_metadata()
-    metadata.context_segments = (SimpleNamespace(query_start=0, query_end=1, wrappers={}),)
-    metadata.sliding_context_segments = (
-        SimpleNamespace(query_start=0, query_end=1, wrappers={}),
+    metadata.context_segments = SimpleNamespace(query_start=0, query_end=1, wrappers={})
+    metadata.sliding_context_segments = SimpleNamespace(
+        query_start=0, query_end=1, wrappers={}
     )
     batch = SimpleNamespace(attn_metadata=metadata, out_loc=object())
     q = torch.empty(1, 1, 4)
@@ -326,7 +405,7 @@ def test_flashinfer_uses_preclipped_context_segments_for_sliding():
 
     assert torch.equal(output, q)
     backend._initialize_metadata_once.assert_called_once_with(
-        metadata.sliding_context_segments[0],
+        metadata.sliding_context_segments,
         wrapper,
         is_decode=False,
         window_left=-1,
