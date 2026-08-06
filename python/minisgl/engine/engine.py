@@ -45,11 +45,26 @@ class Engine:
         init_free_memory = self._sync_get_memory()[1]
         logger.info_rank0(f"Free memory before loading model: {mem_GB(init_free_memory)}")
 
+        if config.model_config.is_gpt_oss:
+            if config.dtype != torch.bfloat16:
+                raise ValueError("GPT-OSS MXFP4 requires --dtype bfloat16.")
+            if config.model_config.num_experts >= 128 and config.tp_info.size != 8:
+                raise ValueError("GPT-OSS-120B requires --tp-size 8 (EP is not supported).")
+            logger.info_rank0(
+                "GPT-OSS capability check passed: packed MXFP4, BF16 activations, "
+                f"TP={config.tp_info.size}, attention={config.attention_backend}."
+            )
+
         # ======================= Model initialization ========================
+        logger.info_rank0("Loading model weights...")
         set_rope_device(self.device)
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
         self.model.load_state_dict(self._load_weight_state_dict(config))
+        if post_load := getattr(self.model, "post_load", None):
+            logger.info_rank0("Converting GPT-OSS MXFP4 weights to runtime layouts...")
+            post_load()
+        logger.info_rank0("Model weights are ready.")
 
         # ======================= KV cache initialization ========================
         self.num_pages = self._determine_num_pages(init_free_memory, config)
@@ -76,7 +91,7 @@ class Engine:
         self.ctx.attn_backend = self.attn_backend = create_attention_backend(
             config.attention_backend, config.model_config
         )
-        if config.model_config.is_moe:
+        if config.model_config.is_moe and not config.model_config.is_gpt_oss:
             self.ctx.moe_backend = self.moe_backend = create_moe_backend(config.moe_backend)
 
         # ======================= Sampler initialization ========================
@@ -113,6 +128,8 @@ class Engine:
             max_seq_len=aligned_max_seq_len,
             vocab_size=config.model_config.vocab_size,
             dummy_req=self.dummy_req,
+            tp_cpu_group=self.tp_cpu_group,
+            is_gpt_oss=config.model_config.is_gpt_oss,
         )
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
@@ -143,13 +160,20 @@ class Engine:
         return tp_cpu_group
 
     def _load_weight_state_dict(self, config: EngineConfig) -> Dict[str, torch.Tensor]:
+        template = self.model.state_dict()
         if config.use_dummy_weight:
             return {
-                k: torch.randn_like(v, device=self.device)
-                for k, v in self.model.state_dict().items()
+                key: (
+                    torch.randn_like(value, device=self.device)
+                    if value.is_floating_point()
+                    else torch.zeros_like(value, device=self.device)
+                )
+                for key, value in template.items()
             }
-        else:
-            return {k: v.to(self.dtype) for k, v in load_weight(config.model_path, self.device)}
+        return {
+            key: value.to(dtype=template[key].dtype)
+            for key, value in load_weight(config.model_path, self.device)
+        }
 
     def _determine_num_pages(self, old_free_memory: int, config: EngineConfig) -> int:
         new_free_memory = self._sync_get_memory()[1]
@@ -226,7 +250,13 @@ def _adjust_config(config: EngineConfig):
         object.__setattr__(config, attr, value)
 
     if config.attention_backend == "auto":
-        backend = "trtllm" if is_sm100_supported() else ("fa,fi" if is_sm90_supported() else "fi")
+        backend = (
+            "fa"
+            if config.model_config.is_gpt_oss
+            else "trtllm"
+            if is_sm100_supported()
+            else ("fa,fi" if is_sm90_supported() else "fi")
+        )
         override("attention_backend", backend)
         logger.info_rank0(f"Auto-selected attention backend: {config.attention_backend}")
 
@@ -234,6 +264,10 @@ def _adjust_config(config: EngineConfig):
         override("page_size", 64)
         logger.warning_rank0("Page size is overridden to 64 for TRTLLM backend")
 
-    if config.model_config.is_moe and config.moe_backend == "auto":
+    if (
+        config.model_config.is_moe
+        and not config.model_config.is_gpt_oss
+        and config.moe_backend == "auto"
+    ):
         override("moe_backend", "fused")
         logger.info_rank0(f"Auto-selected MoE backend: {config.moe_backend}")

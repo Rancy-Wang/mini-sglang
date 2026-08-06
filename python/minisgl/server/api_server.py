@@ -7,6 +7,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Any, Callable, Dict, List, Literal, Tuple
 
 import uvicorn
@@ -494,6 +495,86 @@ def _parse_tool_calls_from_text(
     return working_text, (tool_calls if len(tool_calls) > 0 else None)
 
 
+@lru_cache(maxsize=8)
+def _is_gpt_oss_model(model_path: str) -> bool:
+    try:
+        from minisgl.utils import cached_load_hf_config
+
+        config = cached_load_hf_config(model_path)
+        return getattr(config, "model_type", None) == "gpt_oss"
+    except Exception:
+        normalized = model_path.lower().replace("_", "-")
+        return "gpt-oss" in normalized
+
+
+@dataclass(frozen=True)
+class HarmonyOutput:
+    content: str
+    reasoning_content: str
+    tool_calls: List[Dict[str, Any]] | None
+
+
+def _harmony_content_text(message: Any) -> str:
+    parts = []
+    for content in getattr(message, "content", ()):
+        text = getattr(content, "text", None)
+        if isinstance(text, str):
+            parts.append(text)
+    return "".join(parts)
+
+
+def _parse_harmony_output(raw_text: str) -> HarmonyOutput:
+    try:
+        from openai_harmony import (
+            HarmonyEncodingName,
+            Role,
+            StreamableParser,
+            load_harmony_encoding,
+        )
+    except ImportError as exc:
+        raise RuntimeError("GPT-OSS responses require openai-harmony>=0.0.8.") from exc
+
+    encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
+    tokens = encoding.encode(raw_text, allowed_special="all")
+    parser = StreamableParser(encoding, Role.ASSISTANT, strict=False)
+    for token in tokens:
+        parser.process(int(token))
+
+    entries: List[tuple[str | None, str | None, str]] = []
+    for message in parser.messages:
+        entries.append(
+            (message.channel, message.recipient, _harmony_content_text(message))
+        )
+    current = parser.current_content
+    if current:
+        current_entry = (parser.current_channel, parser.current_recipient, current)
+        if not entries or entries[-1] != current_entry:
+            entries.append(current_entry)
+
+    final_parts: List[str] = []
+    reasoning_parts: List[str] = []
+    tool_calls: List[Dict[str, Any]] = []
+    for channel, recipient, content in entries:
+        if recipient:
+            name = recipient.removeprefix("functions.")
+            tool_calls.append(
+                _build_tool_call(
+                    name=name,
+                    arguments=content,
+                    idx=len(tool_calls),
+                )
+            )
+        elif channel == "analysis":
+            reasoning_parts.append(content)
+        elif channel in {"final", "commentary", None}:
+            final_parts.append(content)
+    return HarmonyOutput(
+        content="".join(final_parts),
+        reasoning_content="".join(reasoning_parts),
+        tool_calls=tool_calls or None,
+    )
+
+
 class GenerateRequest(BaseModel):
     prompt: str
     max_tokens: int
@@ -531,6 +612,7 @@ class OpenAICompletionRequest(BaseModel):
     ignore_eos: bool = False
     drop_message: Dict[int, List[int]] | None = None
     enable_thinking: bool | None = None
+    reasoning_effort: Literal["low", "medium", "high"] | None = None
     tools: List[Dict[str, Any]] | None = None
     tool_choice: str | Dict[str, Any] | None = None
 
@@ -641,6 +723,7 @@ class FrontendManager:
         messages: List[Dict[str, Any]],
         drop_message: Dict[str, List[int]],
         enable_thinking: bool | None,
+        reasoning_effort: str | None,
         tools: List[Dict[str, Any]] | None,
         tool_choice: str | Dict[str, Any] | None,
     ) -> None:
@@ -659,6 +742,7 @@ class FrontendManager:
                 target_msg_id=warmup_target,
                 drop_message=drop_message,
                 enable_thinking=enable_thinking,
+                reasoning_effort=reasoning_effort,
                 tools=tools,
                 tool_choice=tool_choice,
                 is_warmup=True,
@@ -683,6 +767,7 @@ class FrontendManager:
                     target_msg_id=end - 1,
                     drop_message=drop_message,
                     enable_thinking=enable_thinking,
+                    reasoning_effort=reasoning_effort,
                     tools=tools,
                     tool_choice=tool_choice,
                     is_warmup=True,
@@ -717,7 +802,13 @@ class FrontendManager:
         mode = _tool_choice_mode(tool_choice)
         forced_tool_name = _tool_choice_forced_name(tool_choice)
         require_tool_call = mode in {"required", "function"}
-        buffer_mode = tools is not None and len(tools) > 0 and mode != "none"
+        is_gpt_oss = _is_gpt_oss_model(self.config.model_path)
+        # Harmony channels and recipients can only be interpreted after their
+        # control-token-delimited message is complete. Buffer GPT-OSS output so
+        # those tokens never leak through the OpenAI-compatible response.
+        buffer_mode = is_gpt_oss or (
+            tools is not None and len(tools) > 0 and mode != "none"
+        )
         tool_call_missing = False
         try:
             async for ack in self.wait_for_ack(uid):
@@ -757,9 +848,16 @@ class FrontendManager:
             return
 
         if buffer_mode:
-            clean_text, tool_calls = _parse_tool_calls_from_text(
-                buffered_output, forced_tool_name=forced_tool_name
-            )
+            reasoning_content = ""
+            if is_gpt_oss:
+                harmony = _parse_harmony_output(buffered_output)
+                clean_text = harmony.content
+                reasoning_content = harmony.reasoning_content
+                tool_calls = harmony.tool_calls
+            else:
+                clean_text, tool_calls = _parse_tool_calls_from_text(
+                    buffered_output, forced_tool_name=forced_tool_name
+                )
             if tool_calls is not None and final_finish_reason == "stop":
                 final_finish_reason = "tool_calls"
             if require_tool_call and tool_calls is None:
@@ -767,9 +865,11 @@ class FrontendManager:
                 tool_call_missing = True
 
             delta: Dict[str, Any] = {"role": "assistant"}
+            if reasoning_content:
+                delta["reasoning_content"] = reasoning_content
             if tool_calls is not None:
                 delta["tool_calls"] = tool_calls
-            elif len(clean_text) > 0:
+            if len(clean_text) > 0:
                 delta["content"] = clean_text
             if tool_call_missing:
                 delta["tool_call_missing"] = True
@@ -914,6 +1014,7 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
                 prompt,
                 wire_drop_message,
                 req.enable_thinking,
+                req.reasoning_effort,
                 req.tools,
                 normalized_tool_choice,
             )
@@ -936,6 +1037,7 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
             target_msg_id=(len(prompt) if isinstance(prompt, list) else None),
             drop_message=wire_drop_message,
             enable_thinking=req.enable_thinking,
+            reasoning_effort=req.reasoning_effort,
             tools=req.tools,
             tool_choice=normalized_tool_choice,
             stop=effective_stop,
@@ -958,15 +1060,29 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
 
     # Non-streaming: collect all chunks and return a single JSON response
     full_content = ""
+    finish_reason = "stop"
     try:
         async for ack in state.wait_for_ack(uid):
             if not isinstance(ack, UserReply):
                 continue
             full_content += ack.incremental_output
+            if ack.finish_reason is not None:
+                finish_reason = ack.finish_reason
             if ack.finished:
                 break
     except RequestRejected as exc:
         raise _http_error(exc) from exc
+
+    response_message: Dict[str, Any] = {"role": "assistant", "content": full_content}
+    if _is_gpt_oss_model(state.config.model_path):
+        harmony = _parse_harmony_output(full_content)
+        response_message["content"] = harmony.content
+        if harmony.reasoning_content:
+            response_message["reasoning_content"] = harmony.reasoning_content
+        if harmony.tool_calls is not None:
+            response_message["tool_calls"] = harmony.tool_calls
+            if finish_reason == "stop":
+                finish_reason = "tool_calls"
 
     return {
         "id": f"chatcmpl-{uid}",
@@ -976,8 +1092,8 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": full_content},
-                "finish_reason": "stop",
+                "message": response_message,
+                "finish_reason": finish_reason,
             }
         ],
         "usage": {
@@ -1034,6 +1150,7 @@ async def shell_completion(req: OpenAICompletionRequest):
             target_msg_id=len(prompt),
             drop_message=wire_drop_message,
             enable_thinking=req.enable_thinking,
+            reasoning_effort=req.reasoning_effort,
             tools=req.tools,
             tool_choice=normalized_tool_choice,
             stop=effective_stop,

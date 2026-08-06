@@ -8,7 +8,7 @@ import torch
 from minisgl.core import Batch, get_global_ctx
 from minisgl.utils import is_sm100_supported
 
-from .base import BaseAttnBackend, BaseAttnMetadata
+from .base import BaseAttnBackend, BaseAttnMetadata, build_context_attention_segments
 from .utils import BaseCaptureData
 
 if TYPE_CHECKING:
@@ -18,6 +18,16 @@ if TYPE_CHECKING:
 @dataclass
 class FACaptureData(BaseCaptureData):
     pass
+
+
+@dataclass(frozen=True)
+class FAContextSegmentMetadata:
+    query_start: int
+    query_end: int
+    page_table: torch.Tensor
+    cache_seqlens: torch.Tensor
+    cu_seqlens_q: torch.Tensor
+    cu_seqlens_k: torch.Tensor
 
 
 @dataclass
@@ -30,28 +40,40 @@ class FAMetadata(BaseAttnMetadata):
 
     page_table: torch.Tensor
     context_mask_aux: tuple[torch.Tensor, torch.Tensor] | None = None
+    context_segments: tuple[FAContextSegmentMetadata, ...] | None = None
 
     def get_last_indices(self, bs: int) -> torch.Tensor:
         return self.cu_seqlens_q[1 : 1 + bs] - 1
 
 
 def is_fa_context_mask_supported(device: torch.device | int | None = None) -> bool:
-    """Whether FA4's CuTe custom mask can run on the selected CUDA device."""
+    """Whether an exact FA3-segment or FA4 custom-mask adapter is available."""
 
     if not torch.cuda.is_available():
         return False
     major, _ = torch.cuda.get_device_capability(device)
-    return major in (9, 10, 11)
+    return major in (8, 9, 10, 11)
 
 
 def validate_fa_context_mask_support(device: torch.device | int | None = None) -> None:
     if not is_fa_context_mask_supported(device):
         capability = torch.cuda.get_device_capability(device) if torch.cuda.is_available() else None
         raise ValueError(
-            "--contextual-prefill-mode flashattention-mask requires the FA4 CuTe "
-            "custom-mask kernel on SM90/SM100/SM110; "
-            f"current CUDA capability is {capability}. Use flashinfer-mask on SM80."
+            "--contextual-prefill-mode flashattention-mask requires the FA3 segmented "
+            "adapter on SM80/SM90 or the FA4 CuTe custom-mask adapter on SM100/SM110; "
+            f"current CUDA capability is {capability}."
         )
+
+    major, _ = torch.cuda.get_device_capability(device)
+    if major in (8, 9):
+        try:
+            from sgl_kernel.flash_attn import flash_attn_with_kvcache  # noqa: F401
+        except Exception as exc:
+            raise RuntimeError(
+                "FlashAttention context-mask mode on SM80/SM90 requires a working "
+                "sgl-kernel FA3 installation for the selected architecture."
+            ) from exc
+        return
 
     try:
         import inspect
@@ -102,11 +124,34 @@ class FlashAttentionBackend(BaseAttnBackend):
         self.version = 4 if is_sm100_supported() else 3
 
     def forward(
-        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer_id: int, batch: Batch
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer_id: int,
+        batch: Batch,
+        *,
+        sinks: torch.Tensor | None = None,
+        sliding_window: int | None = None,
     ) -> torch.Tensor:
         metadata = batch.attn_metadata
         assert isinstance(metadata, FAMetadata)
         self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
+        if metadata.context_segments is not None and self.version == 3:
+            return _fa3_context_mask_impl(
+                q=q,
+                k_cache=self.kvcache.k_cache(layer_id),
+                v_cache=self.kvcache.v_cache(layer_id),
+                segments=metadata.context_segments,
+                softmax_scale=self.scale,
+                window_size=(sliding_window, 0) if sliding_window is not None else (-1, -1),
+                sinks=sinks,
+            )
+        if metadata.context_segments is not None and (sinks is not None or sliding_window is not None):
+            raise RuntimeError(
+                "FA4 Context mask with GPT-OSS sinks/sliding attention is not enabled; "
+                "use the FA3 adapter on SM80/SM90."
+            )
         return _fa_sgl_impl(
             q=q,
             k_cache=self.kvcache.k_cache(layer_id),
@@ -118,6 +163,8 @@ class FlashAttentionBackend(BaseAttnBackend):
             max_seqlen_q=metadata.max_seqlen_q,
             softmax_scale=self.scale,
             version=self.version,
+            window_size=(sliding_window, 0) if sliding_window is not None else (-1, -1),
+            sinks=sinks,
             context_mask_aux=metadata.context_mask_aux,
         )
 
@@ -164,6 +211,7 @@ class FlashAttentionBackend(BaseAttnBackend):
             new_page_table.div_(self.page_size, rounding_mode="floor")
 
         context_mask_aux = None
+        context_segments = None
         if masked_reqs:
             if self.page_size != 1:
                 raise RuntimeError(
@@ -178,6 +226,37 @@ class FlashAttentionBackend(BaseAttnBackend):
                 ),
                 torch.tensor([req.cached_len], device=device, dtype=torch.int32),
             )
+            context_segments = tuple(
+                FAContextSegmentMetadata(
+                    query_start=segment.query_start,
+                    query_end=segment.query_end,
+                    page_table=new_page_table[0]
+                    .index_select(
+                        0,
+                        segment.key_positions.to(
+                            device=device, dtype=torch.int64, non_blocking=True
+                        ),
+                    )
+                    .unsqueeze(0),
+                    cache_seqlens=torch.tensor(
+                        [len(segment.key_positions)], device=device, dtype=torch.int32
+                    ),
+                    cu_seqlens_q=torch.tensor(
+                        [0, segment.query_end - segment.query_start],
+                        device=device,
+                        dtype=torch.int32,
+                    ),
+                    cu_seqlens_k=torch.tensor(
+                        [0, len(segment.key_positions)], device=device, dtype=torch.int32
+                    ),
+                )
+                for segment in build_context_attention_segments(
+                    req.full_token_visible_until,
+                    query_start=req.cached_len,
+                    query_length=req.extend_len,
+                    key_length=req.device_len,
+                )
+            )
         batch.attn_metadata = FAMetadata(
             cu_seqlens_k=cu_seqlens_k,
             cu_seqlens_q=cu_seqlens_q,
@@ -186,6 +265,7 @@ class FlashAttentionBackend(BaseAttnBackend):
             max_seqlen_q=max_seqlen_q,
             page_table=new_page_table,
             context_mask_aux=context_mask_aux,
+            context_segments=context_segments,
         )
 
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
@@ -239,6 +319,39 @@ def _get_fa4_context_mask_runner():
     if private_func is None or "mask_mod" not in inspect.signature(private_func).parameters:
         raise RuntimeError("The installed sgl-kernel FA4 interface does not provide mask_mod.")
     return private_func, False
+
+
+def _fa3_context_mask_impl(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    segments: tuple[FAContextSegmentMetadata, ...],
+    softmax_scale: float,
+    window_size: Tuple[int, int],
+    sinks: torch.Tensor | None,
+) -> torch.Tensor:
+    """Run exact Context mask Prefill as causal FA3 over active-KV segments."""
+
+    outputs = []
+    for segment in segments:
+        query = q[segment.query_start : segment.query_end]
+        outputs.append(
+            _fa_sgl_impl(
+                q=query,
+                k_cache=k_cache,
+                v_cache=v_cache,
+                page_table=segment.page_table,
+                cache_seqlens=segment.cache_seqlens,
+                cu_seqlens_q=segment.cu_seqlens_q,
+                cu_seqlens_k=segment.cu_seqlens_k,
+                max_seqlen_q=segment.query_end - segment.query_start,
+                softmax_scale=softmax_scale,
+                version=3,
+                window_size=window_size,
+                sinks=sinks,
+            )
+        )
+    return torch.cat(outputs, dim=0)
 
 
 def _fa4_context_mask_impl(
@@ -307,6 +420,7 @@ def _fa_sgl_impl(
     num_splits: int = 0,  # Can be tuned for speed
     pack_gqa: bool | None = None,  # Can be tuned for speed
     causal: bool = True,
+    sinks: torch.Tensor | None = None,
     context_mask_aux: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     if context_mask_aux is not None:
@@ -345,5 +459,6 @@ def _fa_sgl_impl(
         num_splits=num_splits,
         pack_gqa=pack_gqa,
         causal=causal,
+        sinks=sinks,
         ver=version,  # TODO: support FA4 on blackwell
     )

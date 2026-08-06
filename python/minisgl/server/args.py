@@ -151,7 +151,18 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         "--graph",
         type=int,
         default=ServerArgs.cuda_graph_max_bs,
-        help="The maximum batch size for CUDA graph capture. None means auto-tuning based on the GPU memory.",
+        help=(
+            "The maximum fixed batch size for whole-model CUDA graph capture. "
+            "GPT-OSS defaults to eager when omitted; use --graph 1 to opt in. "
+            "Piecewise capture and GPT-OSS graph auto-tuning are unsupported."
+        ),
+    )
+    parser.add_argument(
+        "--disable-cuda-graph",
+        action="store_const",
+        const=0,
+        dest="cuda_graph_max_bs",
+        help="Disable CUDA graph capture and always use eager decode.",
     )
 
     parser.add_argument(
@@ -266,7 +277,8 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     # resolve some arguments
     run_shell |= kwargs.pop("shell_mode")
     if run_shell:
-        kwargs["cuda_graph_max_bs"] = 1
+        if kwargs["cuda_graph_max_bs"] != 0:
+            kwargs["cuda_graph_max_bs"] = 1
         kwargs["max_running_req"] = 1
         kwargs["silent_output"] = True
 

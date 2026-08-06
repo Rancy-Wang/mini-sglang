@@ -1,0 +1,128 @@
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import minisgl.moe.mxfp4 as mxfp4
+import torch
+from minisgl.moe.mxfp4 import GptOssMxfp4Experts, _route, _swizzle_mxfp4
+
+
+def test_route_uses_normalized_topk_and_builds_official_routing_objects():
+    sparse = SimpleNamespace(
+        vals=torch.tensor([[0.75, 0.25]]),
+        mask_metadata=SimpleNamespace(
+            row_sorted_indx=torch.tensor([1, 0]),
+            col_sorted_indx=torch.tensor([0, 1]),
+            col_sum=torch.tensor([1, 1]),
+        ),
+    )
+    abi = SimpleNamespace(
+        topk=MagicMock(return_value=sparse),
+        make_ragged_tensor_metadata=MagicMock(
+            return_value=SimpleNamespace(slice_sizes=torch.tensor([1, 1]))
+        ),
+        RoutingData=MagicMock(return_value=SimpleNamespace(gate_scal=sparse.vals.flatten())),
+        GatherIndx=MagicMock(return_value="gather"),
+        ScatterIndx=MagicMock(return_value="scatter"),
+    )
+
+    routing, gather, scatter = _route(torch.empty(1, 4), 2, abi)
+
+    assert gather == "gather"
+    assert scatter == "scatter"
+    assert routing.gate_scal.sum().item() == 1.0
+    assert abi.topk.call_args.kwargs == {
+        "apply_softmax": True,
+        "dim": 1,
+        "y_indx": None,
+        "n_rows": None,
+        "all_gather": False,
+    }
+
+
+def test_swizzle_uses_mxfp4_axis_one_layouts():
+    value_layout = object()
+    scale_layout = object()
+    wrapped_weight = object()
+    wrapped_scale = object()
+    converted_weight = object()
+    converted_scale = object()
+    abi = SimpleNamespace(
+        layout=SimpleNamespace(
+            make_default_matmul_mxfp4_w_layout=MagicMock(return_value=(value_layout, {})),
+            make_default_matmul_mxfp4_w_scale_layout=MagicMock(
+                return_value=(scale_layout, {})
+            ),
+        ),
+        wrap_torch_tensor=MagicMock(side_effect=[wrapped_weight, wrapped_scale]),
+        convert_layout=MagicMock(side_effect=[converted_weight, converted_scale]),
+        FP4=object(),
+        InFlexData=MagicMock(return_value="flex"),
+    )
+    weight = torch.empty(1, 8, 4, dtype=torch.uint8)
+    scale = torch.empty(1, 8, 1, dtype=torch.uint8)
+
+    result = _swizzle_mxfp4(weight, scale, abi)
+
+    assert result == (converted_weight, "flex", converted_scale)
+    abi.layout.make_default_matmul_mxfp4_w_layout.assert_called_once_with(mx_axis=1)
+    abi.layout.make_default_matmul_mxfp4_w_scale_layout.assert_called_once_with(
+        mx_axis=1,
+        num_warps=8,
+    )
+    assert abi.wrap_torch_tensor.call_args_list[0].kwargs["dtype"] is abi.FP4
+
+
+def test_forward_uses_swiglu_and_two_matmul_ogs_calls(monkeypatch):
+    routing = SimpleNamespace(gate_scal=torch.ones(2))
+    monkeypatch.setattr(mxfp4, "_route", lambda logits, top_k, abi: (routing, "g", "s"))
+    abi = SimpleNamespace(
+        FusedActivation=MagicMock(return_value="activation"),
+        FnSpecs=MagicMock(return_value="spec"),
+        swiglu_fn=object(),
+        matmul_ogs=MagicMock(),
+    )
+    experts = object.__new__(GptOssMxfp4Experts)
+    experts._loaded = True
+    experts._abi = abi
+    experts._w13 = object()
+    experts._w2 = object()
+    experts._w13_precision = object()
+    experts._w2_precision = object()
+    experts.w13_weight_bias = torch.empty(2, 8, dtype=torch.float32)
+    experts.w2_weight_bias = torch.empty(2, 4, dtype=torch.float32)
+    experts.top_k = 2
+    experts.local_intermediate_size = 4
+    experts.hidden_size = 4
+    experts.alpha = 1.702
+    experts.limit = 7.0
+    experts.tp_size = 1
+    experts._comm = MagicMock()
+
+    output = experts.forward(torch.empty(1, 4, dtype=torch.bfloat16), torch.empty(1, 2))
+
+    assert output.shape == (1, 4)
+    assert abi.matmul_ogs.call_count == 2
+    first, second = abi.matmul_ogs.call_args_list
+    assert first.kwargs["gather_indx"] == "g"
+    assert first.kwargs["fused_activation"] == "activation"
+    assert second.kwargs["scatter_indx"] == "s"
+    assert second.kwargs["gammas"] is routing.gate_scal
+    abi.FnSpecs.assert_called_once_with(
+        "swiglu",
+        abi.swiglu_fn,
+        ("alpha", "limit"),
+        reduction_n=2,
+    )
+    abi.FusedActivation.assert_called_once_with("spec", (1.702, 7.0))
+
+
+def test_constructor_fails_fast_below_sm80(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (7, 5))
+
+    try:
+        GptOssMxfp4Experts(2, 64, 64, 1)
+    except RuntimeError as exc:
+        assert "SM80" in str(exc)
+    else:
+        raise AssertionError("SM75 must be rejected before allocating packed weights")

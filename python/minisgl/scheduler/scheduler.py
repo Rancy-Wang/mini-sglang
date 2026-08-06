@@ -133,6 +133,26 @@ class Scheduler(SchedulerIOMixin):
         self.finished_reqs: Set[Req] = set()
         self.tokenizer = load_tokenizer(config.model_path)
         self.eos_token_id = self.tokenizer.eos_token_id
+        eos_values = (
+            self.eos_token_id
+            if isinstance(self.eos_token_id, (list, tuple, set))
+            else [self.eos_token_id]
+        )
+        self.eos_token_ids = {int(token_id) for token_id in eos_values if token_id is not None}
+        if config.model_config.is_gpt_oss:
+            try:
+                from openai_harmony import HarmonyEncodingName, load_harmony_encoding
+
+                self.eos_token_ids.update(
+                    int(token_id)
+                    for token_id in load_harmony_encoding(
+                        HarmonyEncodingName.HARMONY_GPT_OSS
+                    ).stop_tokens()
+                )
+            except ImportError as exc:
+                raise RuntimeError(
+                    "GPT-OSS scheduling requires openai-harmony>=0.0.8."
+                ) from exc
         self.token_pool = self.table_manager.token_pool
         self.prefill_budget = config.max_extend_tokens
         # self.config = config
@@ -229,7 +249,7 @@ class Scheduler(SchedulerIOMixin):
                     finished = not req.can_decode
                     finish_reason = "length" if finished else None
                     matched_stop: str | None = None
-                    if not req.sampling_params.ignore_eos and next_token == self.eos_token_id:
+                    if not req.sampling_params.ignore_eos and next_token in self.eos_token_ids:
                         finished = True
                         finish_reason = "stop"
                     stop_matched, matched_stop = req.match_stop()

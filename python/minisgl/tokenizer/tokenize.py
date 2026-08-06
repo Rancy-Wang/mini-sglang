@@ -48,6 +48,11 @@ class TokenizeManager:
             raise ValueError(f"Unsupported radix drop key mode: {radix_drop_key_mode}")
         self.tokenizer = tokenizer
         self.radix_drop_key_mode = radix_drop_key_mode
+        tokenizer_name = str(getattr(tokenizer, "name_or_path", "")).lower()
+        tokenizer_class = type(tokenizer).__name__.lower()
+        self.is_gpt_oss = "gpt-oss" in tokenizer_name or "gptoss" in tokenizer_class
+        self._reasoning_effort: str | None = None
+        self._harmony_encoding = None
         # Be optimistic: many tokenizers accept extra kwargs via **kwargs even
         # when the explicit signature does not list `enable_thinking`.
         self._supports_enable_thinking = True
@@ -63,6 +68,16 @@ class TokenizeManager:
         enable_thinking: bool | None,
         tools: List[Dict[str, Any]] | None,
     ) -> Any:
+        if self.is_gpt_oss:
+            tokens = self._render_harmony_tokens(
+                messages,
+                add_generation_prompt=add_generation_prompt,
+                enable_thinking=enable_thinking,
+                tools=tools,
+            )
+            if tokenize:
+                return tokens
+            return self._get_harmony_encoding().decode(tokens)
         kwargs = {
             "tokenize": tokenize,
             "add_generation_prompt": add_generation_prompt,
@@ -86,6 +101,152 @@ class TokenizeManager:
                     self._supports_tools = False
                     continue
                 raise
+
+    def _get_harmony_encoding(self):
+        if self._harmony_encoding is None:
+            try:
+                from openai_harmony import HarmonyEncodingName, load_harmony_encoding
+            except ImportError as exc:
+                raise RuntimeError(
+                    "GPT-OSS chat requests require openai-harmony>=0.0.8."
+                ) from exc
+            self._harmony_encoding = load_harmony_encoding(
+                HarmonyEncodingName.HARMONY_GPT_OSS
+            )
+        return self._harmony_encoding
+
+    def _render_harmony_tokens(
+        self,
+        messages: List[dict[str, Any]],
+        *,
+        add_generation_prompt: bool,
+        enable_thinking: bool | None,
+        tools: List[Dict[str, Any]] | None,
+    ) -> List[int]:
+        from openai_harmony import (
+            Author,
+            Conversation,
+            DeveloperContent,
+            ReasoningEffort,
+            Role,
+            SystemContent,
+            ToolDescription,
+        )
+        from openai_harmony import (
+            Message as HarmonyMessage,
+        )
+
+        effort_text = self._reasoning_effort
+        if effort_text is None and enable_thinking is False:
+            effort_text = "low"
+        effort = {
+            "low": ReasoningEffort.LOW,
+            "medium": ReasoningEffort.MEDIUM,
+            "high": ReasoningEffort.HIGH,
+        }.get(str(effort_text or "medium").lower())
+        if effort is None:
+            raise ValueError("reasoning_effort must be one of: low, medium, high")
+
+        harmony_messages = [
+            HarmonyMessage.from_role_and_content(
+                Role.SYSTEM,
+                SystemContent.new()
+                .with_reasoning_effort(effort)
+                .with_required_channels(["analysis", "commentary", "final"]),
+            )
+        ]
+
+        instructions = [
+            self._normalize_message_content(raw.get("content"))
+            for raw in messages
+            if str(raw.get("role", "")).lower() in {"system", "developer"}
+            and self._normalize_message_content(raw.get("content"))
+        ]
+        developer = DeveloperContent.new()
+        if instructions:
+            developer.with_instructions("\n\n".join(instructions))
+        descriptions = []
+        for tool in tools or []:
+            fn = tool.get("function", tool) if isinstance(tool, dict) else {}
+            if not isinstance(fn, dict) or not fn.get("name"):
+                continue
+            descriptions.append(
+                ToolDescription.new(
+                    str(fn["name"]),
+                    str(fn.get("description") or ""),
+                    parameters=fn.get("parameters"),
+                )
+            )
+        if descriptions:
+            developer.with_function_tools(descriptions)
+        if instructions or descriptions:
+            harmony_messages.append(
+                HarmonyMessage.from_role_and_content(Role.DEVELOPER, developer)
+            )
+
+        tool_names: dict[str, str] = {}
+        for raw in messages:
+            role = str(raw.get("role", "user")).lower()
+            if role in {"system", "developer"}:
+                continue
+            content = self._normalize_message_content(raw.get("content"))
+            if role == "user":
+                harmony_messages.append(
+                    HarmonyMessage.from_role_and_content(Role.USER, content)
+                )
+                continue
+            if role == "assistant":
+                reasoning = raw.get("reasoning_content")
+                if isinstance(reasoning, str) and reasoning:
+                    harmony_messages.append(
+                        HarmonyMessage.from_role_and_content(Role.ASSISTANT, reasoning).with_channel(
+                            "analysis"
+                        )
+                    )
+                if content:
+                    harmony_messages.append(
+                        HarmonyMessage.from_role_and_content(Role.ASSISTANT, content).with_channel(
+                            "final"
+                        )
+                    )
+                for call in raw.get("tool_calls") or []:
+                    if not isinstance(call, dict):
+                        continue
+                    fn = call.get("function")
+                    if not isinstance(fn, dict) or not fn.get("name"):
+                        continue
+                    name = str(fn["name"])
+                    if call.get("id") is not None:
+                        tool_names[str(call["id"])] = name
+                    arguments = fn.get("arguments", "{}")
+                    if not isinstance(arguments, str):
+                        arguments = self._json_dumps(arguments)
+                    harmony_messages.append(
+                        HarmonyMessage.from_role_and_content(Role.ASSISTANT, arguments)
+                        .with_channel("commentary")
+                        .with_recipient(f"functions.{name}")
+                        .with_content_type("<|constrain|>json")
+                    )
+                continue
+            if role in {"tool", "function"}:
+                name = raw.get("name") or tool_names.get(str(raw.get("tool_call_id", "")))
+                if not name:
+                    raise ValueError(
+                        "GPT-OSS tool results require name or a matching tool_call_id."
+                    )
+                harmony_messages.append(
+                    HarmonyMessage.from_author_and_content(
+                        Author.new(Role.TOOL, f"functions.{name}"), content
+                    )
+                )
+                continue
+            raise ValueError(f"Unsupported GPT-OSS Harmony role: {role}")
+
+        conversation = Conversation.from_messages(harmony_messages)
+        encoding = self._get_harmony_encoding()
+        if add_generation_prompt:
+            return encoding.render_conversation_for_completion(conversation, Role.ASSISTANT)
+        return encoding.render_conversation(conversation)
 
     def _apply_chat_template(
         self,
@@ -494,11 +655,9 @@ class TokenizeManager:
         return target_msg_id
 
     def _build_stop_token_seqs(self, stop: List[str] | None) -> List[List[int]] | None:
-        if not stop:
-            return None
         dedup: set[tuple[int, ...]] = set()
         result: List[List[int]] = []
-        for raw in stop:
+        for raw in stop or []:
             text = str(raw)
             if len(text) == 0:
                 continue
@@ -513,6 +672,12 @@ class TokenizeManager:
                 continue
             dedup.add(key)
             result.append(token_ids)
+        if self.is_gpt_oss:
+            for token_id in self._get_harmony_encoding().stop_tokens():
+                key = (int(token_id),)
+                if key not in dedup:
+                    dedup.add(key)
+                    result.append([int(token_id)])
         return result if len(result) > 0 else None
 
     @staticmethod
@@ -587,6 +752,19 @@ class TokenizeManager:
         query_epoch: List[int] = []
         unstable_rounds = 0
 
+        if self.is_gpt_oss:
+            # Harmony always injects model system metadata (and may inject a
+            # tool-bearing developer message). Keep that exact token prefix
+            # outside user message ownership so Drop never removes it.
+            assembled = self._apply_chat_template(
+                [],
+                add_generation_prompt=False,
+                enable_thinking=enable_thinking,
+                tools=tools,
+            )
+            owner = [-1] * len(assembled)
+            query_epoch = [0] * len(assembled)
+
         for i in range(len(messages)):
             curr = self._apply_chat_template(
                 messages[: i + 1],
@@ -594,7 +772,7 @@ class TokenizeManager:
                 enable_thinking=enable_thinking,
                 tools=tools,
             )
-            if i == 0:
+            if i == 0 and not assembled:
                 assembled = curr
                 owner = [0] * len(curr)
                 query_epoch = [0] * len(curr)
@@ -631,6 +809,7 @@ class TokenizeManager:
 
     def _chat_tokenize(self, msg: TokenizeMsg) -> TokenizedResult:
         assert isinstance(msg.text, list)
+        self._reasoning_effort = msg.reasoning_effort
         drop_message = self._normalize_drop_message(msg.drop_message)
         if drop_message and self.radix_drop_key_mode != "delta-marker":
             raise ValueError(
@@ -644,13 +823,17 @@ class TokenizeManager:
             forced_tool_name=forced_tool_name,
         )
 
-        messages, target_offset = self._build_template_messages(
-            msg.text,
-            selected_tools,
-            tool_choice_mode=tool_choice_mode,
-            forced_tool_name=forced_tool_name,
-            safe_mode=False,
-        )
+        if self.is_gpt_oss:
+            messages = [dict(message) for message in msg.text]
+            target_offset = 0
+        else:
+            messages, target_offset = self._build_template_messages(
+                msg.text,
+                selected_tools,
+                tool_choice_mode=tool_choice_mode,
+                forced_tool_name=forced_tool_name,
+                safe_mode=False,
+            )
         safe_mode = False
         effective_tools = selected_tools
         try:
@@ -667,6 +850,8 @@ class TokenizeManager:
                 tools=selected_tools,
             )
         except Exception:
+            if self.is_gpt_oss:
+                raise
             messages, target_offset = self._build_template_messages(
                 msg.text,
                 selected_tools,
@@ -722,7 +907,7 @@ class TokenizeManager:
         )
 
         cross_owner_tokens = 0
-        if drop_message:
+        if drop_message and not self.is_gpt_oss:
             canonical_no_gen = self._render_chat_template(
                 messages,
                 add_generation_prompt=False,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import glob
+import math
 import re
 from typing import Dict, Iterator, Tuple
 
@@ -29,6 +30,123 @@ _SLOT_NAMES = {
     ".up_proj": "up",
 }
 _EXPERT_PATTERN = re.compile(r"^(?P<prefix>.+\.experts)\.(?P<idx>\d+)\.(?P<name>.+)$")
+
+
+def _pad_tensor(tensor: torch.Tensor, dim: int, size: int) -> torch.Tensor:
+    if tensor.shape[dim] == size:
+        return tensor.contiguous()
+    shape = list(tensor.shape)
+    shape[dim] = size - tensor.shape[dim]
+    padding = torch.zeros(shape, dtype=tensor.dtype, device=tensor.device)
+    return torch.cat((tensor, padding), dim=dim).contiguous()
+
+
+def _shard_gpt_oss_mxfp4(
+    name: str,
+    value: torch.Tensor,
+    rank: int,
+    tp_size: int,
+    intermediate_size: int,
+) -> tuple[str, torch.Tensor]:
+    block_size = 32
+    if intermediate_size % block_size:
+        raise ValueError("GPT-OSS intermediate size must be divisible by the MXFP4 block size")
+    blocks_per_rank = math.ceil(intermediate_size / block_size / tp_size)
+    local_intermediate = blocks_per_rank * block_size
+    start = rank * local_intermediate
+    end = min(start + local_intermediate, intermediate_size)
+
+    replacements = {
+        "gate_up_proj_blocks": "w13_weight",
+        "gate_up_proj_scales": "w13_weight_scale",
+        "gate_up_proj_bias": "w13_weight_bias",
+        "down_proj_blocks": "w2_weight",
+        "down_proj_scales": "w2_weight_scale",
+        "down_proj_bias": "w2_weight_bias",
+    }
+    for source, target in replacements.items():
+        if source in name:
+            output_name = name.replace(source, target)
+            break
+    else:
+        raise ValueError(f"Unknown GPT-OSS MXFP4 tensor: {name}")
+
+    if "gate_up_proj_blocks" in name:
+        value = value.flatten(start_dim=2)
+        shard = value[:, 2 * start : 2 * end]
+        return output_name, _pad_tensor(shard, 1, 2 * local_intermediate)
+    if "gate_up_proj_scales" in name or "gate_up_proj_bias" in name:
+        shard = value[:, 2 * start : 2 * end]
+        return output_name, _pad_tensor(shard, 1, 2 * local_intermediate)
+    if "down_proj_blocks" in name:
+        value = value.flatten(start_dim=2)
+        block_start = start // 2
+        block_end = end // 2
+        return output_name, _pad_tensor(
+            value[:, :, block_start:block_end],
+            2,
+            local_intermediate // 2,
+        )
+    if "down_proj_scales" in name:
+        block_start = start // block_size
+        block_end = end // block_size
+        return output_name, _pad_tensor(
+            value[:, :, block_start:block_end],
+            2,
+            blocks_per_rank,
+        )
+    if "down_proj_bias" in name:
+        return output_name, value if rank == 0 else torch.zeros_like(value)
+    raise AssertionError("unreachable")
+
+
+def _map_gpt_oss_name(name: str) -> str:
+    if name == "embedding.weight":
+        return "model.embed_tokens.weight"
+    if name == "unembedding.weight":
+        return "lm_head.weight"
+    if name == "norm.scale":
+        return "model.norm.weight"
+    match = re.match(r"block\.(\d+)\.(.+)", name)
+    if match is None:
+        return name
+    layer, suffix = match.groups()
+    prefix = f"model.layers.{layer}."
+    if suffix.startswith("mlp.gate_up_proj"):
+        return prefix + "mlp.experts." + suffix.removeprefix("mlp.")
+    if suffix.startswith("mlp.down_proj"):
+        return prefix + "mlp.experts." + suffix.removeprefix("mlp.")
+    replacements = {
+        "attn.q_proj": "self_attn.q_proj",
+        "attn.k_proj": "self_attn.k_proj",
+        "attn.v_proj": "self_attn.v_proj",
+        "attn.out": "self_attn.o_proj",
+        "attn.sinks": "self_attn.sinks",
+        "attn.norm.scale": "input_layernorm.weight",
+        "mlp.gate": "mlp.router",
+        "mlp.norm.scale": "post_attention_layernorm.weight",
+        "mlp.experts.": "mlp.experts.",
+    }
+    for source, target in replacements.items():
+        if suffix == source or suffix.startswith(source + "."):
+            suffix = target + suffix[len(source) :]
+            break
+    return prefix + suffix
+
+
+def _shard_gpt_oss_dense(
+    name: str,
+    value: torch.Tensor,
+    rank: int,
+    tp_size: int,
+) -> torch.Tensor | None:
+    if name.endswith(".self_attn.sinks"):
+        if value.shape[0] % tp_size:
+            raise ValueError("GPT-OSS attention sinks must divide evenly across TP ranks")
+        return value.chunk(tp_size, dim=0)[rank].clone()
+    if name.endswith(".self_attn.o_proj.bias"):
+        return value
+    return None
 
 
 def _shard_tensor(key: str, value: torch.Tensor, r: int, n: int, num_kv_heads: int):
@@ -94,6 +212,37 @@ def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, to
                     continue
                 raw = f.get_tensor(name)
                 name = name.removeprefix("language_model.")
+                if config.is_gpt_oss:
+                    name = _map_gpt_oss_name(name)
+                    if any(
+                        marker in name
+                        for marker in (
+                            "gate_up_proj_blocks",
+                            "gate_up_proj_scales",
+                            "gate_up_proj_bias",
+                            "down_proj_blocks",
+                            "down_proj_scales",
+                            "down_proj_bias",
+                        )
+                    ):
+                        yield _shard_gpt_oss_mxfp4(
+                            name,
+                            raw,
+                            tp_info.rank,
+                            tp_info.size,
+                            config.intermediate_size,
+                        )
+                        continue
+                    if (
+                        dense_shard := _shard_gpt_oss_dense(
+                            name,
+                            raw,
+                            tp_info.rank,
+                            tp_info.size,
+                        )
+                    ) is not None:
+                        yield name, dense_shard
+                        continue
                 tensor = _shard_tensor(name, raw, tp_info.rank, tp_info.size, config.num_kv_heads)
                 del raw
 

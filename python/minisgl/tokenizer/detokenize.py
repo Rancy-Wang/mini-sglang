@@ -66,6 +66,27 @@ class DetokenizeManager:
         self.decode_map: Dict[int, DecodeStatus] = {}
         self.tokenizer = tokenizer
         self.eos_token_id = self.tokenizer.eos_token_id
+        eos_values = (
+            self.eos_token_id
+            if isinstance(self.eos_token_id, (list, tuple, set))
+            else [self.eos_token_id]
+        )
+        self.eos_token_ids = {int(token_id) for token_id in eos_values if token_id is not None}
+        tokenizer_name = str(getattr(tokenizer, "name_or_path", "")).lower()
+        if "gpt-oss" in tokenizer_name or "gptoss" in type(tokenizer).__name__.lower():
+            try:
+                from openai_harmony import HarmonyEncodingName, load_harmony_encoding
+
+                self.eos_token_ids.update(
+                    int(token_id)
+                    for token_id in load_harmony_encoding(
+                        HarmonyEncodingName.HARMONY_GPT_OSS
+                    ).stop_tokens()
+                )
+            except ImportError as exc:
+                raise RuntimeError(
+                    "GPT-OSS detokenization requires openai-harmony>=0.0.8."
+                ) from exc
 
     def detokenize(self, msgs: List[DetokenizeMsg]) -> List[str]:
         read_ids: List[List[int]] = []
@@ -80,7 +101,7 @@ class DetokenizeManager:
                     sent_offset=0,
                 )
             s = self.decode_map[msg.uid]
-            if not (msg.finished and msg.next_token == self.eos_token_id):
+            if not (msg.finished and msg.next_token in self.eos_token_ids):
                 s.decoded_ids.append(msg.next_token)
             read_ids.append(s.decoded_ids[s.surr_offset :])
             surr_ids.append(s.decoded_ids[s.surr_offset : s.read_offset])
