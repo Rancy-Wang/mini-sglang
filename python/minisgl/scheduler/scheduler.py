@@ -221,6 +221,12 @@ class Scheduler(SchedulerIOMixin):
             for i, req in enumerate(batch.reqs):
                 if isinstance(req, ChunkedReq):
                     continue
+                if req in self.finished_reqs:
+                    # An abort or an earlier overlapping batch already released
+                    # this request. Keep the tombstone until the stale GPU result
+                    # has drained, and never commit or unlock its cache twice.
+                    new_finished_reqs.add(req)
+                    continue
 
                 if req.is_warmup:
                     finished = not req.can_decode
@@ -377,6 +383,9 @@ class Scheduler(SchedulerIOMixin):
                     req_to_free.radix_marker_ids = ()
             elif req_to_free is not None:
                 self._free_req_resources(req_to_free)
+                # The request may still be present in an overlapping GPU batch.
+                # _process_last_data uses this tombstone to discard that stale result.
+                self.finished_reqs.add(req_to_free)
         else:
             logger.error(f"Unknown message type: {type(msg)}")
             raise NotImplementedError
