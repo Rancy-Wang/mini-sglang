@@ -15,35 +15,65 @@ whole conversation, so delimiters, role headers, generation prompts, and even
 earlier text may change when a new message is appended. Mini-SGLang therefore
 builds two tracks over the final token stream:
 
-- **Owner:** the public message that owns each rendered token. Drop removes tokens
-  by owner.
-- **Query epoch:** the newest message present when each token becomes part of the
-  conversation. A Drop event uses this track to determine its exact activation
-  position.
+- **Owner:** the public message, or synthetic next-assistant prompt, that owns each
+  rendered token. Drop removes message-owned tokens by owner ID.
+- **Query epoch:** the prefix-construction step at which each token enters the
+  conversation. Message `M_i` uses epoch `i`; the final generation prompt uses
+  epoch `N = len(messages)`. A Drop event uses this track to determine its exact
+  activation position.
 
 The general partitioning flow is:
 
 1. Keep the submitted messages in order and preserve their public IDs through
    request normalization.
-2. Render the complete conversation with the selected chat template. Do not
-   tokenize each message independently and concatenate the results.
-3. Assign every span in the final render to the message that produced it. Static
-   template text follows the renderer's deterministic boundary policy, while the
-   final generation prompt belongs to the next assistant epoch.
-4. Tokenize the canonical render once and project span ownership onto its tokens.
-   Comparing consecutive prefix renders supplies the query epochs: a stable prefix
-   keeps its earlier epoch, while a newly emitted or rewritten suffix enters the
-   current epoch.
+2. For each message index `i`, render the complete prefix `messages[:i+1]` with
+   the selected chat template and without a generation prompt. Never tokenize
+   messages independently and concatenate the results.
+3. Compare each prefix render with the previous one by exact token ID. The longest
+   common prefix identifies the part whose history is unchanged; a non-overlapping
+   longest common suffix is also recorded for conservative owner attribution.
+4. Render the complete message list again with the generation prompt. This is the
+   canonical full token stream, and the prompt uses the synthetic next-assistant
+   ID `N`, where `N = len(messages)`.
+5. Derive final message ownership from the canonical render when exact rendered
+   provenance is available, tokenize that render once, and project the rendered
+   ownership spans onto token offsets.
 
-Only tokens actually emitted by the chat renderer belong to a message. A raw JSON
-field omitted by the selected template contributes no tokens and therefore has
-nothing to Drop. A message may own multiple non-contiguous token ranges.
+### Detailed boundary rules
+
+The owner track and query-epoch track answer different questions and are built
+with different rules:
+
+- **Provisional owner track during prefix comparison:** exact stable prefix and
+  suffix tokens retain their previous owners. Tokens in the rewritten middle are
+  assigned to the newly appended message. This is a conservative fallback for a
+  template that rewrites earlier output.
+- **Query-epoch track:** only the exact stable prefix retains its earlier epoch.
+  Every token from the first changed position onward receives the new message
+  epoch, including a suffix whose token values happen to match again. This keeps
+  the epoch sequence monotonic.
+- **Canonical owner track:** rendered output traced to a message object uses that
+  message's public ID. Static text before the first traceable message belongs to
+  `M0`; unowned template text after that follows the preceding owner. The final
+  generation prompt belongs to synthetic owner `A_N`.
+- **Character-to-token projection:** the canonical render is tokenized once with
+  character offsets. If one token crosses an ownership boundary, its first
+  character decides the owner. A zero-width token inherits the previous token's
+  owner.
+- **Drop ranges:** consecutive tokens with the same owner form a half-open
+  `[start, end)` range. One message may own several non-contiguous ranges. Dropping
+  that message removes every one of those ranges.
+
+Only text emitted by the chat template enters either track. An omitted JSON field
+or an empty message that renders nothing owns no tokens. Ownership is based on
+rendered provenance rather than content matching, so repeated message text does
+not make the boundary ambiguous.
 
 ### Qwen example
 
-The no-thinking, no-tools path of Qwen's
+Qwen's
 [ChatML-style template](https://huggingface.co/Qwen/Qwen-tokenizer/blob/main/tokenizer_config.json)
-emits one complete block per message:
+emits this block for each message:
 
 ```text
 <|im_start|>{role}\n{content}<|im_end|>\n
@@ -55,33 +85,54 @@ With a generation prompt enabled, it then appends:
 <|im_start|>assistant\n
 ```
 
-For these two input messages:
+Consider this request:
 
-```text
-M0  system  Be concise.
-M1  user    What is KV cache?
+```json
+{
+  "messages": [
+    {"role": "system", "content": "You are a helpful assistant"},
+    {"role": "user", "content": "What is 12 + 30?"},
+    {"role": "assistant", "content": "42."},
+    {"role": "user", "content": "Then multiply it by 3."}
+  ]
+}
 ```
 
-the rendered ownership is:
+Using `\n` below to display each actual newline, the canonical render is divided
+as follows:
 
 ```text
-M0  <|im_start|>system\nBe concise.<|im_end|>\n
-M1  <|im_start|>user\nWhat is KV cache?<|im_end|>\n
+owner  epoch  rendered span
+M0     0      <|im_start|>system\nYou are a helpful assistant<|im_end|>\n
+M1     1      <|im_start|>user\nWhat is 12 + 30?<|im_end|>\n
+M2     2      <|im_start|>assistant\n42.<|im_end|>\n
+M3     3      <|im_start|>user\nThen multiply it by 3.<|im_end|>\n
+A4     4      <|im_start|>assistant\n
+```
+
+Each `M0`-`M3` range includes its role header, exact content, end marker, and
+trailing newline. `A4` contains only the final generation prompt and is not a
+submitted message.
+
+![Exact Qwen owner and query-epoch boundaries for four messages](assets/qwen-message-token-ownership.png)
+
+The append effect is easiest to see one step earlier. With only `M0` and `M1`, the
+render ends with generation prompt `A2`:
+
+```text
 A2  <|im_start|>assistant\n
 ```
 
-`A2` is the synthetic next-assistant epoch, not a third submitted message. If the
-assistant reply is later appended as public message `M2`, the same visible
-assistant header becomes the beginning of `M2`'s rendered block. Its numeric owner
-remains `2` by design. A following user message `M3` produces a new generation
-prompt owned by `A4`.
+When the assistant reply is appended as public message `M2`, the complete
+conversation is rendered again. The same visible assistant header is now the
+start of `M2`, followed by `42.<|im_end|>\n`, and a new `A3` generation prompt is
+added. `A2` and `M2` both use numeric owner ID `2` by design. Appending `M3` then
+produces the final `A4` prompt shown above.
 
-![Qwen message ownership before and after appending messages](assets/qwen-message-token-ownership.png)
-
-This is why adding a message cannot be modeled as appending that message's
-independently tokenized content. The complete conversation is rendered again;
-stable prefix regions retain their history, while any rewritten suffix is
-repartitioned from the new render.
+This is why a new message cannot be represented by independently tokenizing only
+its content and appending those tokens. The template may extend or rewrite its
+previous suffix, so Mini-SGLang re-renders the conversation and recomputes the
+boundary tracks from the resulting full stream.
 
 ## Drop semantics
 
