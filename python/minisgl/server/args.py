@@ -297,10 +297,14 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     del kwargs["model_source"]
 
     from minisgl.models.config import resolve_model_dtype
-    from minisgl.utils import cached_load_hf_config
 
-    hf_config = cached_load_hf_config(kwargs["model_path"])
-    kwargs["dtype"] = resolve_model_dtype(hf_config, kwargs["dtype"])
+    if kwargs["dtype"] == "auto":
+        from minisgl.utils import cached_load_hf_config
+
+        hf_config = cached_load_hf_config(kwargs["model_path"])
+        kwargs["dtype"] = resolve_model_dtype(hf_config, "auto")
+    else:
+        kwargs["dtype"] = resolve_model_dtype({}, kwargs["dtype"])
     kwargs["tp_info"] = DistributedInfo(0, kwargs["tensor_parallel_size"])
     del kwargs["tensor_parallel_size"]
 
