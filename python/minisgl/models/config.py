@@ -3,7 +3,76 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict
 
+import torch
 from transformers import PretrainedConfig
+
+
+_STR_DTYPE_TO_TORCH_DTYPE = {
+    "half": torch.float16,
+    "float16": torch.float16,
+    "float": torch.float32,
+    "float32": torch.float32,
+    "bfloat16": torch.bfloat16,
+}
+
+
+def _config_value(config: Any, name: str, default: Any = None) -> Any:
+    if isinstance(config, dict):
+        return config.get(name, default)
+    return getattr(config, name, default)
+
+
+def resolve_model_dtype(
+    config: PretrainedConfig | dict[str, Any],
+    requested_dtype: str | torch.dtype,
+) -> torch.dtype:
+    """Resolve a CLI/config dtype before any engine or communication setup."""
+    text_config = _config_value(config, "text_config") or config
+    architectures = list(
+        _config_value(config, "architectures")
+        or _config_value(text_config, "architectures")
+        or ()
+    )
+    model_type = _config_value(text_config, "model_type", "")
+    quantization_config = _config_value(config, "quantization_config") or _config_value(
+        text_config, "quantization_config"
+    )
+    quant_method = (
+        quantization_config.get("quant_method")
+        if isinstance(quantization_config, dict)
+        else None
+    )
+
+    is_gpt_oss = model_type == "gpt_oss" or "GptOssForCausalLM" in architectures
+    if is_gpt_oss and quant_method == "mxfp4":
+        # Match SGLang's model-specific override: the packed MXFP4 kernels use
+        # BF16 activations even though the official GPT-OSS config omits dtype.
+        return torch.bfloat16
+
+    config_dtype = _config_value(text_config, "dtype") or _config_value(
+        text_config, "torch_dtype"
+    )
+    if config_dtype is None and text_config is not config:
+        config_dtype = _config_value(config, "dtype") or _config_value(
+            config, "torch_dtype"
+        )
+    if isinstance(config_dtype, str):
+        config_dtype = _STR_DTYPE_TO_TORCH_DTYPE.get(config_dtype.lower())
+    if config_dtype is None:
+        config_dtype = torch.float32
+
+    if isinstance(requested_dtype, torch.dtype):
+        return requested_dtype
+    if not isinstance(requested_dtype, str):
+        raise ValueError(f"Unknown dtype: {requested_dtype!r}")
+
+    requested_dtype = requested_dtype.lower()
+    if requested_dtype == "auto":
+        return torch.float16 if config_dtype == torch.float32 else config_dtype
+    try:
+        return _STR_DTYPE_TO_TORCH_DTYPE[requested_dtype]
+    except KeyError as exc:
+        raise ValueError(f"Unknown dtype: {requested_dtype}") from exc
 
 
 @dataclass(frozen=True)

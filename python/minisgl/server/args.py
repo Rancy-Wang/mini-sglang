@@ -5,7 +5,6 @@ import os
 from dataclasses import dataclass
 from typing import List, Tuple
 
-import torch
 from minisgl.distributed import DistributedInfo
 from minisgl.scheduler import SchedulerConfig
 from minisgl.utils import init_logger
@@ -297,17 +296,11 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
             kwargs["model_path"] = model_path
     del kwargs["model_source"]
 
-    if (dtype_str := kwargs["dtype"]) == "auto":
-        from minisgl.utils import cached_load_hf_config
+    from minisgl.models.config import resolve_model_dtype
+    from minisgl.utils import cached_load_hf_config
 
-        dtype_str = cached_load_hf_config(kwargs["model_path"]).dtype
-
-    DTYPE_MAP = {
-        "float16": torch.float16,
-        "bfloat16": torch.bfloat16,
-        "float32": torch.float32,
-    }
-    kwargs["dtype"] = DTYPE_MAP[dtype_str] if isinstance(dtype_str, str) else dtype_str
+    hf_config = cached_load_hf_config(kwargs["model_path"])
+    kwargs["dtype"] = resolve_model_dtype(hf_config, kwargs["dtype"])
     kwargs["tp_info"] = DistributedInfo(0, kwargs["tensor_parallel_size"])
     del kwargs["tensor_parallel_size"]
 

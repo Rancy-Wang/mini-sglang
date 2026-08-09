@@ -60,6 +60,49 @@ def test_tp8_rank7_down_blocks_and_scales_pad_to_384_intermediate():
     assert torch.count_nonzero(scale_shard[:, :, 6:]) == 0
 
 
+def test_tp4_rank3_mxfp4_shards_use_23_blocks_and_tail_padding():
+    intermediate = 2880
+    packed = (
+        torch.arange(2 * intermediate, dtype=torch.int32)
+        .view(1, -1, 1, 1)
+        .to(torch.uint8)
+    )
+    blocks = torch.ones(1, 4, 90, 16, dtype=torch.uint8)
+    scales = torch.ones(1, 4, 90, dtype=torch.uint8)
+
+    _, gate_up = _shard_gpt_oss_mxfp4(
+        "model.layers.0.mlp.experts.gate_up_proj_blocks",
+        packed,
+        rank=3,
+        tp_size=4,
+        intermediate_size=intermediate,
+    )
+    _, down = _shard_gpt_oss_mxfp4(
+        "model.layers.0.mlp.experts.down_proj_blocks",
+        blocks,
+        rank=3,
+        tp_size=4,
+        intermediate_size=intermediate,
+    )
+    _, down_scales = _shard_gpt_oss_mxfp4(
+        "model.layers.0.mlp.experts.down_proj_scales",
+        scales,
+        rank=3,
+        tp_size=4,
+        intermediate_size=intermediate,
+    )
+
+    assert gate_up.shape == (1, 1472, 1)
+    assert torch.equal(gate_up[:, :1344], packed.flatten(start_dim=2)[:, 4416:5760])
+    assert torch.count_nonzero(gate_up[:, 1344:]) == 0
+    assert down.shape == (1, 4, 368)
+    assert torch.count_nonzero(down[:, :, :336]) == 1 * 4 * 336
+    assert torch.count_nonzero(down[:, :, 336:]) == 0
+    assert down_scales.shape == (1, 4, 23)
+    assert torch.count_nonzero(down_scales[:, :, :21]) == 1 * 4 * 21
+    assert torch.count_nonzero(down_scales[:, :, 21:]) == 0
+
+
 def test_down_bias_is_kept_only_on_tp_rank_zero():
     bias = torch.ones(2, 4, dtype=torch.bfloat16)
     key = "model.layers.0.mlp.experts.down_proj_bias"

@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
-from minisgl.models.config import ModelConfig
+import torch
+from minisgl.models.config import ModelConfig, resolve_model_dtype
 
 
 def _gpt_oss_hf_config(**overrides):
@@ -92,3 +93,23 @@ def test_model_type_name_does_not_make_dense_model_moe():
 
     assert not config.is_moe
     assert not config.is_gpt_oss
+
+
+def test_gpt_oss_mxfp4_missing_dtype_resolves_to_bfloat16():
+    hf_config = _gpt_oss_hf_config(dtype=None, torch_dtype=None)
+
+    assert resolve_model_dtype(hf_config, "auto") is torch.bfloat16
+    assert resolve_model_dtype(hf_config, "float16") is torch.bfloat16
+
+
+def test_auto_dtype_falls_back_without_propagating_none():
+    hf_config = _gpt_oss_hf_config(
+        model_type="dense",
+        architectures=["DenseForCausalLM"],
+        quantization_config=None,
+        dtype=None,
+        torch_dtype=None,
+    )
+
+    assert resolve_model_dtype(hf_config, "auto") is torch.float16
+    assert resolve_model_dtype(hf_config, "bfloat16") is torch.bfloat16

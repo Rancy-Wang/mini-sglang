@@ -3,6 +3,7 @@ from unittest.mock import MagicMock
 
 import minisgl.moe.mxfp4 as mxfp4
 import torch
+from minisgl.distributed import DistributedInfo
 from minisgl.moe.mxfp4 import GptOssMxfp4Experts, _route, _swizzle_mxfp4
 
 
@@ -112,3 +113,17 @@ def test_constructor_fails_fast_below_sm80(monkeypatch):
         assert "SM80" in str(exc)
     else:
         raise AssertionError("SM75 must be rejected before allocating packed weights")
+
+
+def test_tp4_constructor_allocates_23_mxfp4_blocks_per_rank(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (8, 0))
+    monkeypatch.setattr(mxfp4, "_load_triton_kernels_abi", lambda: SimpleNamespace())
+    monkeypatch.setattr(mxfp4, "get_tp_info", lambda: DistributedInfo(0, 4))
+    monkeypatch.setattr(mxfp4, "DistributedCommunicator", MagicMock)
+
+    experts = GptOssMxfp4Experts(1, 64, 2880, 1)
+
+    assert experts.local_intermediate_size == 736
+    assert experts.w13_weight.shape[1] == 1472
+    assert experts.w2_weight_scale.shape[2] == 23

@@ -29,6 +29,7 @@ class ForwardOutput(NamedTuple):
 class Engine:
     def __init__(self, config: EngineConfig):
         assert not torch.cuda.is_initialized()
+        _validate_runtime_config(config)
         set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
         _adjust_config(config)
 
@@ -46,10 +47,6 @@ class Engine:
         logger.info_rank0(f"Free memory before loading model: {mem_GB(init_free_memory)}")
 
         if config.model_config.is_gpt_oss:
-            if config.dtype != torch.bfloat16:
-                raise ValueError("GPT-OSS MXFP4 requires --dtype bfloat16.")
-            if config.model_config.num_experts >= 128 and config.tp_info.size != 8:
-                raise ValueError("GPT-OSS-120B requires --tp-size 8 (EP is not supported).")
             logger.info_rank0(
                 "GPT-OSS capability check passed: packed MXFP4, BF16 activations, "
                 f"TP={config.tp_info.size}, attention={config.attention_backend}."
@@ -243,6 +240,46 @@ class Engine:
 
 def _align_up_32(num: int) -> int:
     return (num + 31) // 32 * 32
+
+
+def _validate_runtime_config(config: EngineConfig) -> None:
+    if not isinstance(config.dtype, torch.dtype):
+        raise TypeError(
+            "EngineConfig.dtype must be a resolved torch.dtype before engine startup, "
+            f"got {config.dtype!r}."
+        )
+
+    model_config = config.model_config
+    if not model_config.is_gpt_oss:
+        return
+    if model_config.quant_method != "mxfp4":
+        raise ValueError("GPT-OSS requires quantization_config.quant_method='mxfp4'.")
+    if config.dtype != torch.bfloat16:
+        raise ValueError("GPT-OSS MXFP4 requires --dtype bfloat16.")
+
+    tp_size = config.tp_info.size
+    if model_config.num_qo_heads % tp_size:
+        raise ValueError(
+            "GPT-OSS query heads must divide evenly across TP ranks: "
+            f"num_qo_heads={model_config.num_qo_heads}, tp_size={tp_size}."
+        )
+    if model_config.num_kv_heads < tp_size:
+        if tp_size % model_config.num_kv_heads:
+            raise ValueError(
+                "GPT-OSS KV-head replication requires tp_size to be divisible by "
+                f"num_kv_heads: num_kv_heads={model_config.num_kv_heads}, "
+                f"tp_size={tp_size}."
+            )
+    elif model_config.num_kv_heads % tp_size:
+        raise ValueError(
+            "GPT-OSS KV heads must divide evenly across TP ranks: "
+            f"num_kv_heads={model_config.num_kv_heads}, tp_size={tp_size}."
+        )
+    if model_config.intermediate_size % 32:
+        raise ValueError(
+            "GPT-OSS intermediate size must be divisible by the MXFP4 block size 32: "
+            f"intermediate_size={model_config.intermediate_size}."
+        )
 
 
 def _adjust_config(config: EngineConfig):
