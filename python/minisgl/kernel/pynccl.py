@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import functools
+import importlib.metadata
+import importlib.util
+import os
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 from minisgl.env import ENV
@@ -25,9 +29,79 @@ else:
     PyNCCLCommunicator = Any
 
 
+_NCCL_LIBRARY_ENV = "MINISGL_NCCL_SO_PATH"
+_NCCL_LIBRARY_NAMES = ("libnccl.so.2", "libnccl.so")
+
+
+def _nccl_library_directories() -> list[Path]:
+    directories: list[Path] = []
+
+    try:
+        distribution = importlib.metadata.distribution("nvidia-nccl-cu12")
+    except importlib.metadata.PackageNotFoundError:
+        pass
+    else:
+        directories.append(Path(distribution.locate_file("nvidia/nccl/lib")))
+
+    try:
+        spec = importlib.util.find_spec("nvidia.nccl")
+    except ModuleNotFoundError:
+        spec = None
+    if spec is not None and spec.submodule_search_locations is not None:
+        directories.extend(Path(location) / "lib" for location in spec.submodule_search_locations)
+
+    for path in os.environ.get("LD_LIBRARY_PATH", "").split(os.pathsep):
+        if path:
+            directories.append(Path(path))
+
+    # Preserve the discovery order while avoiding repeated checks and noisy errors.
+    return list(dict.fromkeys(directories))
+
+
+def _find_nccl_library() -> Path:
+    override = os.environ.get(_NCCL_LIBRARY_ENV)
+    if override:
+        override_path = Path(override).expanduser()
+        if not override_path.is_file():
+            raise RuntimeError(
+                f"{_NCCL_LIBRARY_ENV} must point to an existing NCCL shared library, "
+                f"but got: {override_path}"
+            )
+        return override_path.resolve()
+
+    searched: list[Path] = []
+    for directory in _nccl_library_directories():
+        for name in _NCCL_LIBRARY_NAMES:
+            candidate = directory / name
+            searched.append(candidate)
+            if candidate.is_file():
+                return candidate.resolve()
+
+        # Some installations only retain the fully versioned file.
+        for candidate in sorted(directory.glob("libnccl.so.2.*"), reverse=True):
+            searched.append(candidate)
+            if candidate.is_file():
+                return candidate.resolve()
+
+    searched_text = ", ".join(str(path) for path in searched) or "no candidate directories"
+    raise RuntimeError(
+        "Unable to locate an NCCL shared library for the PyNCCL AOT module. "
+        "Install nvidia-nccl-cu12 or set MINISGL_NCCL_SO_PATH to libnccl.so.2. "
+        f"Searched: {searched_text}"
+    )
+
+
 @functools.cache
 def _load_nccl_module() -> Module:
-    return load_aot("pynccl", cuda_files=["pynccl.cu"], extra_ldflags=["-lnccl"])
+    nccl_library = _find_nccl_library()
+    return load_aot(
+        "pynccl",
+        cuda_files=["pynccl.cu"],
+        extra_ldflags=[
+            str(nccl_library),
+            f"-Wl,-rpath,{nccl_library.parent}",
+        ],
+    )
 
 
 @functools.cache
