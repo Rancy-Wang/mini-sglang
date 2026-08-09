@@ -23,24 +23,65 @@ builds two tracks over the final token stream:
 
 The general partitioning flow is:
 
-1. Normalize the request without changing its public message numbering.
-2. Render every conversation prefix with the model's complete chat template.
-   Stable prefix tokens keep their earlier epoch; rewritten tokens enter the new
-   message epoch.
-3. For standard Hugging Face Jinja templates, trace which message object emits
-   each character in the canonical full render, then project character ownership
-   to tokens with the fast tokenizer's offset mapping. This is based on rendered
-   provenance, not text matching, so repeated or empty content is unambiguous.
-4. Assign leading template text to the first message, inter-message template text
-   to the preceding message, and the generation prompt to the next assistant
-   epoch. A token crossing an ownership boundary uses its first character's owner.
-5. For GPT-OSS, build the same ownership and epoch tracks from Harmony prefix
-   renders. Harmony's model-injected system and tool metadata has owner `-1`, so
-   it is not removed by a user message ID.
+1. Keep the submitted messages in order and preserve their public IDs through
+   request normalization.
+2. Render the complete conversation with the selected chat template. Do not
+   tokenize each message independently and concatenate the results.
+3. Assign every span in the final render to the message that produced it. Static
+   template text follows the renderer's deterministic boundary policy, while the
+   final generation prompt belongs to the next assistant epoch.
+4. Tokenize the canonical render once and project span ownership onto its tokens.
+   Comparing consecutive prefix renders supplies the query epochs: a stable prefix
+   keeps its earlier epoch, while a newly emitted or rewritten suffix enters the
+   current epoch.
 
 Only tokens actually emitted by the chat renderer belong to a message. A raw JSON
 field omitted by the selected template contributes no tokens and therefore has
 nothing to Drop. A message may own multiple non-contiguous token ranges.
+
+### Qwen example
+
+The no-thinking, no-tools path of Qwen's
+[ChatML-style template](https://huggingface.co/Qwen/Qwen-tokenizer/blob/main/tokenizer_config.json)
+emits one complete block per message:
+
+```text
+<|im_start|>{role}\n{content}<|im_end|>\n
+```
+
+With a generation prompt enabled, it then appends:
+
+```text
+<|im_start|>assistant\n
+```
+
+For these two input messages:
+
+```text
+M0  system  Be concise.
+M1  user    What is KV cache?
+```
+
+the rendered ownership is:
+
+```text
+M0  <|im_start|>system\nBe concise.<|im_end|>\n
+M1  <|im_start|>user\nWhat is KV cache?<|im_end|>\n
+A2  <|im_start|>assistant\n
+```
+
+`A2` is the synthetic next-assistant epoch, not a third submitted message. If the
+assistant reply is later appended as public message `M2`, the same visible
+assistant header becomes the beginning of `M2`'s rendered block. Its numeric owner
+remains `2` by design. A following user message `M3` produces a new generation
+prompt owned by `A4`.
+
+![Qwen message ownership before and after appending messages](assets/qwen-message-token-ownership.png)
+
+This is why adding a message cannot be modeled as appending that message's
+independently tokenized content. The complete conversation is rendered again;
+stable prefix regions retain their history, while any rewritten suffix is
+repartitioned from the new render.
 
 ## Drop semantics
 
