@@ -9,6 +9,7 @@ from minisgl.scheduler.radix_delta import (
     canonicalize_delta,
     canonicalize_delta_ranges,
     inject_delta_markers,
+    select_effective_delta_events,
 )
 
 
@@ -69,6 +70,23 @@ def test_different_position_deltas_branch_at_the_marker_scalar():
     registry.release_request_refs(first.marker_ids)
     registry.release_request_refs(second.marker_ids)
     assert registry.size == 0
+
+
+def test_future_delta_events_are_filtered_by_target_specific_keep_state():
+    events, offsets, ranges = _wire([5, 8], [0, 1, 2], [[1, 3], [4, 7]])
+    early_keep = torch.ones(10, dtype=torch.int32)
+    early_keep[1:3] = 0
+    selected = select_effective_delta_events(events, offsets, ranges, early_keep)
+    assert selected[0].tolist() == [5]
+    assert selected[1].tolist() == [0, 1]
+    assert selected[2].tolist() == [1, 3]
+
+    final_keep = early_keep.clone()
+    final_keep[4:7] = 0
+    selected = select_effective_delta_events(events, offsets, ranges, final_keep)
+    assert selected[0].tolist() == [5, 8]
+    assert selected[1].tolist() == [0, 1, 2]
+    assert selected[2].tolist() == [1, 3, 4, 7]
 
 
 def test_registry_entries_follow_request_and_radix_tree_lifetimes():

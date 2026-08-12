@@ -95,7 +95,7 @@ def _payload(case_idx: int, generation: int, *, stream: bool) -> dict[str, Any]:
             ),
         },
     ]
-    second_drop = [4] if case_idx % 2 == 0 else [5, 6]
+    second_drop = [2, 3] if case_idx % 2 == 0 else [4]
     return {
         "model": os.environ.get("MINISGL_STRESS_MODEL", "gpt-oss-120b"),
         "messages": messages,
@@ -114,7 +114,7 @@ def _payload(case_idx: int, generation: int, *, stream: bool) -> dict[str, Any]:
             }
         ],
         "tool_choice": "none",
-        "drop_message": {"4": [1, 2, 3], "7": second_drop},
+        "drop_message": {"4": [1], "7": second_drop},
         "temperature": 0.0,
         "top_k": 1,
         "max_tokens": int(os.environ.get("MINISGL_EVICT_STRESS_OUTPUT", "48")),

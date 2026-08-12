@@ -156,6 +156,70 @@ class DeltaRadixLayout:
     marker_ids: tuple[int, ...]
 
 
+def select_effective_delta_events(
+    event_positions: torch.Tensor,
+    range_offsets: torch.Tensor,
+    position_ranges: torch.Tensor,
+    final_keep_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Keep only Drop events that are effective for this request target.
+
+    Context warmups may carry future Drop events for the same full message stream.
+    Those events must not become Radix markers until their position ranges are
+    hidden by the request's target-specific final keep mask.
+    """
+
+    if (
+        final_keep_mask.device.type != "cpu"
+        or final_keep_mask.ndim != 1
+        or final_keep_mask.dtype not in (torch.bool, torch.int32, torch.int64)
+    ):
+        raise ValueError("final_keep_mask must be a CPU 1D bool/integer tensor.")
+    _validate_position_wire(
+        len(final_keep_mask), event_positions, range_offsets, position_ranges
+    )
+    keep_mask = final_keep_mask != 0
+    selected_positions: list[int] = []
+    selected_ranges: list[tuple[int, int]] = []
+    selected_offsets: list[int] = [0]
+    ranges = position_ranges.view(-1, 2)
+    for event_idx, raw_event_position in enumerate(event_positions.tolist()):
+        range_start = int(range_offsets[event_idx].item())
+        range_end = int(range_offsets[event_idx + 1].item())
+        event_ranges = [
+            (int(start), int(end))
+            for start, end in ranges[range_start:range_end].tolist()
+        ]
+        effective: list[bool] = []
+        for start, end in event_ranges:
+            segment = keep_mask[start:end]
+            all_kept = bool(torch.all(segment).item())
+            all_dropped = bool(torch.all(~segment).item())
+            if not (all_kept or all_dropped):
+                raise ValueError(
+                    "A target-specific keep mask partially cuts a Drop delta range: "
+                    f"event={raw_event_position}, range=[{start}, {end})"
+                )
+            effective.append(all_dropped)
+        if effective and any(state != effective[0] for state in effective[1:]):
+            raise ValueError(
+                "One Drop event has inconsistent target-specific range visibility: "
+                f"event={raw_event_position}, effective={effective}"
+            )
+        if effective and effective[0]:
+            selected_positions.append(int(raw_event_position))
+            selected_ranges.extend(event_ranges)
+            selected_offsets.append(len(selected_ranges))
+
+    return (
+        torch.tensor(selected_positions, dtype=event_positions.dtype, device="cpu"),
+        torch.tensor(selected_offsets, dtype=range_offsets.dtype, device="cpu"),
+        torch.tensor(
+            selected_ranges, dtype=position_ranges.dtype, device="cpu"
+        ).reshape(-1),
+    )
+
+
 def key_prefix_len_for_token_boundary(layout: DeltaRadixLayout, token_boundary: int) -> int:
     """Map a full-token boundary to a key prefix, including markers at the boundary."""
 
