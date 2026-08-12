@@ -329,7 +329,12 @@ class Scheduler(SchedulerIOMixin):
                     assert event_positions is not None
                     assert range_offsets is not None
                     assert position_ranges is not None
-                    if self.cache_manager.drop_aware_eviction:
+                    drop_aware_eviction = getattr(
+                        getattr(self, "cache_manager", None),
+                        "drop_aware_eviction",
+                        False,
+                    )
+                    if drop_aware_eviction:
                         if msg.full_keep_mask is None:
                             raise ValueError(
                                 "Drop-aware delta markers require a target-specific "
