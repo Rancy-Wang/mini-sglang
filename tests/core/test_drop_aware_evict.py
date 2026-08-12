@@ -507,7 +507,9 @@ def test_finished_commit_adopts_resident_slots_after_first_kept_hole():
     manager._free(transient)
 
     match_b = cache.match_prefix(branch_b.keys, branch_b.virtual_mask).cuda_handle
-    matched_values = _real_values(branch_b, match_b.get_matched_indices())
+    matched_values = match_b.get_matched_indices()[
+        ~match_b.get_matched_virtual_mask()
+    ]
     assert len(matched_values) == 7
     assert int(matched_values[2].item()) == -1
     kept_match = matched_values[keep_b[: len(matched_values)]]
