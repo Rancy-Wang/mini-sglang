@@ -236,10 +236,12 @@ def test_all_slots_pressure_prefers_referenced_drop_block_preserves_tree_and_ref
     assert common_owner.ref_count == len(branches)
 
     for branch in branches:
-        rematched = cache.match_prefix(branch.layout.keys, branch.layout.virtual_mask)
+        rematched = cache.match_prefix(
+            branch.layout.keys, branch.layout.virtual_mask
+        ).cuda_handle
         assert rematched.cached_len == len(branch.layout.keys)
         rematched_real = _real_values(
-            branch.layout, rematched.cuda_handle.get_matched_indices()
+            branch.layout, rematched.get_matched_indices()
         )
         assert torch.all(rematched_real[8:24] == -1)
         assert torch.equal(rematched_real[:8], branch.real_values[:8])
@@ -324,12 +326,12 @@ def test_full_slot_churn_repeatedly_preserves_slot_partition_and_radix_integrity
         manager.unlock(handle)
         manager.check_integrity()
 
-        rematched = cache.match_prefix(branch.layout.keys, branch.layout.virtual_mask)
+        rematched = cache.match_prefix(
+            branch.layout.keys, branch.layout.virtual_mask
+        ).cuda_handle
         assert rematched.cached_len > 0
         assert torch.equal(
-            rematched.cuda_handle.get_matched_indices()[
-                rematched.cuda_handle.get_matched_virtual_mask()
-            ],
+            rematched.get_matched_indices()[rematched.get_matched_virtual_mask()],
             torch.full(
                 (int(torch.count_nonzero(branch.layout.virtual_mask).item()),),
                 -1,
