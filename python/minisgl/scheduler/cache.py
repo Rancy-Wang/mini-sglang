@@ -344,14 +344,16 @@ class CacheManager:
                     raise RuntimeError("Matched Drop-aware tokens use different KV slots.")
             full_indices[active_positions_device] = active_indices
 
+            keep_mask = torch.ones(
+                full_token_prefix_len, dtype=torch.bool, device="cpu"
+            )
             if req.full_keep_mask is not None:
-                keep_mask = req.full_keep_mask[:full_token_prefix_len].to(
-                    device="cpu", dtype=torch.bool
-                )
+                # Context metadata describes the original prompt only. Decode
+                # appends generated tokens to the Radix/token axes, and those
+                # positions are always visible for the finished request.
+                keep_len = min(len(req.full_keep_mask), full_token_prefix_len)
+                keep_mask[:keep_len] = req.full_keep_mask[:keep_len] != 0
             else:
-                keep_mask = torch.ones(
-                    full_token_prefix_len, dtype=torch.bool, device="cpu"
-                )
                 if req.prefix_keep_mask is not None:
                     keep_len = min(len(req.prefix_keep_mask), full_token_prefix_len)
                     keep_mask[:keep_len] = req.prefix_keep_mask[:keep_len] != 0
