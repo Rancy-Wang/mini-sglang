@@ -27,6 +27,7 @@ from .radix_delta import (
     DeltaMarkerRegistry,
     inject_delta_markers,
     key_prefix_len_for_token_boundary,
+    select_effective_delta_events,
 )
 from .radix_symbol import RadixSymbolRegistry, inject_radix_symbols
 from .table import TableManager
@@ -328,6 +329,20 @@ class Scheduler(SchedulerIOMixin):
                     assert event_positions is not None
                     assert range_offsets is not None
                     assert position_ranges is not None
+                    if self.cache_manager.drop_aware_eviction:
+                        if msg.full_keep_mask is None:
+                            raise ValueError(
+                                "Drop-aware delta markers require a target-specific "
+                                "full_keep_mask."
+                            )
+                        event_positions, range_offsets, position_ranges = (
+                            select_effective_delta_events(
+                                event_positions,
+                                range_offsets,
+                                position_ranges,
+                                msg.full_keep_mask,
+                            )
+                        )
                     marker_ids: tuple[int, ...] = ()
                     try:
                         layout = inject_delta_markers(
