@@ -115,6 +115,7 @@ def _payload(case_idx: int, generation: int, *, stream: bool) -> dict[str, Any]:
         ],
         "tool_choice": "none",
         "drop_message": {"4": [1], "7": second_drop},
+        "reasoning_effort": "low",
         "temperature": 0.0,
         "top_k": 1,
         "max_tokens": int(os.environ.get("MINISGL_EVICT_STRESS_OUTPUT", "48")),
