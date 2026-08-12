@@ -54,6 +54,14 @@ ForwardData: TypeAlias = "Tuple[ForwardInput, ForwardOutput]"
 
 class Scheduler(SchedulerIOMixin):
     def __init__(self, config: SchedulerConfig):
+        if config.drop_aware_eviction and config.cache_type != "radix":
+            raise ValueError("--enable-drop-aware-eviction requires --cache-type radix.")
+        if config.drop_aware_eviction and config.radix_drop_key_mode != "delta-marker":
+            raise ValueError(
+                "--enable-drop-aware-eviction requires --radix-drop-key-mode delta-marker."
+            )
+        if config.drop_aware_eviction and config.page_size != 1:
+            raise ValueError("--enable-drop-aware-eviction requires --page-size 1.")
         if config.radix_drop_key_mode == "delta-marker" and config.page_size != 1:
             raise ValueError("Delta-marker Radix mode requires --page-size 1.")
         if config.radix_drop_key_mode == "delta-marker" and "trtllm" in config.attention_backend:
@@ -93,7 +101,11 @@ class Scheduler(SchedulerIOMixin):
             DeltaMarkerRegistry() if self.radix_drop_key_mode == "delta-marker" else None
         )
         self.cache_manager = CacheManager(
-            self.engine.num_pages, config.page_size, self.engine.page_table, config.cache_type
+            self.engine.num_pages,
+            config.page_size,
+            self.engine.page_table,
+            config.cache_type,
+            drop_aware_eviction=config.drop_aware_eviction,
         )
         if self.delta_marker_registry is not None:
             self.cache_manager.bind_delta_marker_registry(self.delta_marker_registry)
