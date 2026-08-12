@@ -358,6 +358,11 @@ class CacheManager:
                     keep_len = min(len(req.prefix_keep_mask), full_token_prefix_len)
                     keep_mask[:keep_len] = req.prefix_keep_mask[:keep_len] != 0
             kept_device = keep_mask.to(device=full_indices.device, non_blocking=True)
+            # Dropped slots are deliberately not pinned and may have been evicted
+            # and reassigned after the initial structural match. Never reuse that
+            # stale snapshot during the finished commit. Existing resident nodes
+            # remain canonical inside commit_drop_prefix; holes stay holes.
+            full_indices[~kept_device] = -1
             missing_kept = torch.nonzero(
                 kept_device & (full_indices < 0), as_tuple=False
             ).view(-1)
