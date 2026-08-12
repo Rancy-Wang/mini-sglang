@@ -233,6 +233,17 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     )
 
     parser.add_argument(
+        "--enable-drop-aware-eviction",
+        action="store_true",
+        dest="drop_aware_eviction",
+        help=(
+            "Opt in to token-granular Drop-aware Radix eviction. It preserves matched "
+            "Radix keys, reclaims Drop-safe KV blocks as holes, and requires radix cache, "
+            "delta-marker Drop keys, and page size 1. The default keeps legacy leaf LRU."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-backend",
         default=ServerArgs.moe_backend,
         choices=["auto"] + SUPPORTED_MOE_BACKENDS.supported_names(),
