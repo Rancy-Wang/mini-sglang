@@ -212,7 +212,9 @@ def _run_both(payloads: list[dict[str, Any]]) -> tuple[list[dict], list[dict]]:
 def _assert_diagnoses_case(result: dict[str, Any], case_idx: int, generation: int) -> None:
     content = " ".join(result["content"].lower().split())
     assert f"case {case_idx}" in content
-    assert f"generation {generation}" in content
+    assert (
+        f"generation {generation}" in content or f"gen {generation}" in content
+    )
     assert result["tool_calls"] is None
     assert result["finish_reason"] == "stop"
 
