@@ -102,7 +102,7 @@ def test_default_mode_keeps_original_protected_leaf_lru_behavior():
     manager.unlock(inserted.handle)
     released = manager.prefix_cache.evict(len(token_ids))
     manager._free(released)
-    assert manager.prefix_cache.match_prefix(token_ids).cached_len == 0
+    assert manager.prefix_cache.match_prefix(token_ids).cuda_handle.cached_len == 0
     manager.check_integrity()
 
 
@@ -177,8 +177,11 @@ def _commit_shared_branch(
         ranges=[(8, 24), (32 + branch_idx, 33 + branch_idx)],
     )
     matched = cache.match_prefix(layout.keys, layout.virtual_mask).cuda_handle
-    matched_values = matched.get_matched_indices()
-    matched_real = matched_values[~matched.get_matched_virtual_mask()]
+    if matched.cached_len == 0:
+        matched_real = torch.empty(0, dtype=torch.int32)
+    else:
+        matched_values = matched.get_matched_indices()
+        matched_real = matched_values[~matched.get_matched_virtual_mask()]
     assert len(matched_real) in (0, 48)
     suffix = manager._allocate(len(full_ids) - len(matched_real))
     result = _commit_layout(
