@@ -205,37 +205,74 @@ def _run_both(payloads: list[dict[str, Any]]) -> tuple[list[dict], list[dict]]:
     # which can change greedy ties even when the cache semantics are identical.
     default = run_one(DEFAULT_URL)
     drop = run_one(DROP_EVICT_URL)
-    assert default == drop
     return default, drop
 
 
-def test_high_utilization_multi_request_drop_evict_matches_default_across_reuse_and_churn():
+def _assert_diagnoses_case(result: dict[str, Any], case_idx: int, generation: int) -> None:
+    content = " ".join(result["content"].lower().split())
+    assert f"case {case_idx}" in content
+    assert f"generation {generation}" in content
+    assert result["tool_calls"] is None
+    assert result["finish_reason"] == "stop"
+
+
+def _answer_signature(result: dict[str, Any]) -> tuple[Any, Any, Any]:
+    return result["content"], result["tool_calls"], result["finish_reason"]
+
+
+def _assert_same_answers(left: list[dict], right: list[dict]) -> None:
+    assert [_answer_signature(result) for result in left] == [
+        _answer_signature(result) for result in right
+    ]
+
+
+def _assert_phase(results: list[dict], generation: int) -> None:
+    for case_idx, result in enumerate(results):
+        _assert_diagnoses_case(result, case_idx, generation)
+
+
+def test_high_utilization_multi_request_drop_evict_preserves_answers_across_reuse_and_churn():
     case_count = int(os.environ.get("MINISGL_EVICT_STRESS_CASES", "8"))
     churn_rounds = int(os.environ.get("MINISGL_EVICT_STRESS_CHURN_ROUNDS", "3"))
     assert case_count >= 6
     assert churn_rounds >= 2
 
+    # Before either cache is populated, a sequential deterministic request must be
+    # byte-identical across the default and opt-in strategies.
+    probe = _payload(97, 911, stream=False)
+    assert DEFAULT_URL is not None and DROP_EVICT_URL is not None
+    assert _post(DEFAULT_URL, copy.deepcopy(probe)) == _post(
+        DROP_EVICT_URL, copy.deepcopy(probe)
+    )
+
     cold_payloads = [
         _payload(case_idx, 0, stream=case_idx % 2 == 0)
         for case_idx in range(case_count)
     ]
-    cold_default, _ = _run_both(cold_payloads)
+    cold_default, cold_drop = _run_both(cold_payloads)
+    _assert_phase(cold_default, 0)
+    _assert_phase(cold_drop, 0)
 
-    reuse_default, _ = _run_both(cold_payloads)
-    assert reuse_default == cold_default
+    reuse_default, reuse_drop = _run_both(cold_payloads)
+    _assert_same_answers(reuse_default, cold_default)
+    _assert_same_answers(reuse_drop, cold_drop)
 
     opposite_transport = [copy.deepcopy(payload) for payload in cold_payloads]
     for payload in opposite_transport:
         payload["stream"] = not payload["stream"]
-    opposite_default, _ = _run_both(opposite_transport)
-    assert opposite_default == cold_default
+    opposite_default, opposite_drop = _run_both(opposite_transport)
+    _assert_same_answers(opposite_default, cold_default)
+    _assert_same_answers(opposite_drop, cold_drop)
 
     for generation in range(1, churn_rounds + 1):
         churn_payloads = [
             _payload(case_idx, generation, stream=(case_idx + generation) % 2 == 0)
             for case_idx in range(case_count)
         ]
-        _run_both(churn_payloads)
+        churn_default, churn_drop = _run_both(churn_payloads)
+        _assert_phase(churn_default, generation)
+        _assert_phase(churn_drop, generation)
 
-    replay_default, _ = _run_both(cold_payloads)
-    assert replay_default == cold_default
+    replay_default, replay_drop = _run_both(cold_payloads)
+    _assert_same_answers(replay_default, cold_default)
+    _assert_same_answers(replay_drop, cold_drop)
