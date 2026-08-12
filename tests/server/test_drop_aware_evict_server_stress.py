@@ -188,18 +188,23 @@ def _post(base_url: str, payload: dict[str, Any]) -> dict[str, Any]:
 def _run_both(payloads: list[dict[str, Any]]) -> tuple[list[dict], list[dict]]:
     assert DEFAULT_URL is not None and DROP_EVICT_URL is not None
     workers = int(os.environ.get("MINISGL_EVICT_STRESS_WORKERS", "8"))
-    results: dict[tuple[str, int], dict[str, Any]] = {}
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {
-            executor.submit(_post, url, copy.deepcopy(payload)): (label, idx)
-            for label, url in (("default", DEFAULT_URL), ("drop", DROP_EVICT_URL))
-            for idx, payload in enumerate(payloads)
-        }
-        for future in as_completed(futures):
-            results[futures[future]] = future.result()
 
-    default = [results[("default", idx)] for idx in range(len(payloads))]
-    drop = [results[("drop", idx)] for idx in range(len(payloads))]
+    def run_one(url: str) -> list[dict[str, Any]]:
+        results: dict[int, dict[str, Any]] = {}
+        with ThreadPoolExecutor(max_workers=min(workers, len(payloads))) as executor:
+            futures = {
+                executor.submit(_post, url, copy.deepcopy(payload)): idx
+                for idx, payload in enumerate(payloads)
+            }
+            for future in as_completed(futures):
+                results[futures[future]] = future.result()
+        return [results[idx] for idx in range(len(payloads))]
+
+    # Give each server the same request order and concurrency topology. Mixing both
+    # URLs in one executor makes the first server receive a larger initial batch,
+    # which can change greedy ties even when the cache semantics are identical.
+    default = run_one(DEFAULT_URL)
+    drop = run_one(DROP_EVICT_URL)
     assert default == drop
     return default, drop
 
