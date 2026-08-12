@@ -397,3 +397,63 @@ def test_finished_drop_commit_keeps_generated_tokens_beyond_prompt_mask():
     assert torch.all(real_values[torch.tensor([0, 3, 4, 5, 6, 7])] >= 0)
     registry.release_request_refs(layout.marker_ids)
     manager.check_integrity()
+
+
+def test_finished_commit_discards_stale_dropped_slots_after_reassignment():
+    manager, registry = _drop_cache(24)
+    cache = manager.prefix_cache
+    assert isinstance(cache, RadixPrefixCache)
+    prompt_ids = torch.arange(5000, 5008, dtype=torch.int64)
+    layout, keep_mask = _layout(
+        prompt_ids, registry, event=6, ranges=[(2, 4)]
+    )
+    initial_slots = manager._allocate(len(prompt_ids))
+    committed = _commit_layout(cache, layout, keep_mask, initial_slots)
+    initial_values = _real_values(layout, committed.canonical_indices)
+    handle = cache.with_pinned_slots(committed.handle, initial_values[keep_mask])
+    manager.lock(handle)
+
+    transient = manager._allocate(len(manager.free_slots))
+    reassigned = manager._allocate(2)
+    assert set(reassigned.tolist()) == set(initial_values[2:4].tolist())
+    other_ids = torch.tensor([9000, 9001], dtype=torch.int64)
+    other_mask = torch.zeros(2, dtype=torch.bool)
+    other_key_to_token = torch.arange(2, dtype=torch.int64)
+    other_keep = torch.ones(2, dtype=torch.bool)
+    cache.commit_drop_prefix(
+        other_ids,
+        reassigned,
+        other_mask,
+        other_key_to_token,
+        other_keep,
+    )
+
+    active_positions = torch.nonzero(keep_mask, as_tuple=False).view(-1).to(torch.int32)
+    active_values = initial_values[keep_mask]
+    manager.page_table[0, : len(active_values)] = active_values
+    req = SimpleNamespace(
+        radix_key_virtual_mask=layout.virtual_mask,
+        radix_key_to_token=layout.key_to_token,
+        radix_token_to_key=layout.token_to_key,
+        radix_match_ids=layout.keys,
+        radix_commit_key_len=None,
+        cache_handle=handle,
+        table_idx=0,
+        cached_len=len(active_values),
+        input_ids=prompt_ids[keep_mask],
+        true_positions=active_positions,
+        initial_active_cached_len=len(active_values),
+        initial_full_match_indices=initial_values.clone(),
+        full_keep_mask=keep_mask.to(dtype=torch.int32),
+        prefix_keep_mask=None,
+    )
+
+    manager._cache_finished_drop_aware_delta_req(req)
+
+    rematched = cache.match_prefix(layout.keys, layout.virtual_mask).cuda_handle
+    rematched_values = _real_values(layout, rematched.get_matched_indices())
+    assert torch.all(rematched_values[2:4] == -1)
+    assert all(cache._slot_owner[int(slot)] is not None for slot in reassigned.tolist())
+    manager._free(transient)
+    registry.release_request_refs(layout.marker_ids)
+    manager.check_integrity()
