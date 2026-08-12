@@ -232,6 +232,18 @@ def _assert_phase(results: list[dict], generation: int) -> None:
         _assert_diagnoses_case(result, case_idx, generation)
 
 
+def _stable_reuse_probe(url: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    payload = _payload(96, 910, stream=False)
+    cold = _post(url, copy.deepcopy(payload))
+    reused = _post(url, copy.deepcopy(payload))
+    _assert_diagnoses_case(cold, 96, 910)
+    _assert_same_answers([reused], [cold])
+    payload["stream"] = True
+    streamed = _post(url, copy.deepcopy(payload))
+    _assert_same_answers([streamed], [cold])
+    return payload, cold
+
+
 def test_high_utilization_multi_request_drop_evict_preserves_answers_across_reuse_and_churn():
     case_count = int(os.environ.get("MINISGL_EVICT_STRESS_CASES", "8"))
     churn_rounds = int(os.environ.get("MINISGL_EVICT_STRESS_CHURN_ROUNDS", "3"))
@@ -247,6 +259,8 @@ def test_high_utilization_multi_request_drop_evict_preserves_answers_across_reus
     probe_drop = _post(DROP_EVICT_URL, copy.deepcopy(probe))
     _assert_diagnoses_case(probe_default, 97, 911)
     _assert_diagnoses_case(probe_drop, 97, 911)
+    stable_default_payload, stable_default = _stable_reuse_probe(DEFAULT_URL)
+    stable_drop_payload, stable_drop = _stable_reuse_probe(DROP_EVICT_URL)
 
     cold_payloads = [
         _payload(case_idx, 0, stream=case_idx % 2 == 0)
@@ -257,15 +271,15 @@ def test_high_utilization_multi_request_drop_evict_preserves_answers_across_reus
     _assert_phase(cold_drop, 0)
 
     reuse_default, reuse_drop = _run_both(cold_payloads)
-    _assert_same_answers(reuse_default, cold_default)
-    _assert_same_answers(reuse_drop, cold_drop)
+    _assert_phase(reuse_default, 0)
+    _assert_phase(reuse_drop, 0)
 
     opposite_transport = [copy.deepcopy(payload) for payload in cold_payloads]
     for payload in opposite_transport:
         payload["stream"] = not payload["stream"]
     opposite_default, opposite_drop = _run_both(opposite_transport)
-    _assert_same_answers(opposite_default, cold_default)
-    _assert_same_answers(opposite_drop, cold_drop)
+    _assert_phase(opposite_default, 0)
+    _assert_phase(opposite_drop, 0)
 
     for generation in range(1, churn_rounds + 1):
         churn_payloads = [
@@ -277,5 +291,16 @@ def test_high_utilization_multi_request_drop_evict_preserves_answers_across_reus
         _assert_phase(churn_drop, generation)
 
     replay_default, replay_drop = _run_both(cold_payloads)
-    _assert_same_answers(replay_default, cold_default)
-    _assert_same_answers(replay_drop, cold_drop)
+    _assert_phase(replay_default, 0)
+    _assert_phase(replay_drop, 0)
+
+    # The sequential probes must survive all multi-request churn byte-for-byte,
+    # demonstrating that eviction/re-Prefill does not change a stable answer.
+    stable_default_payload["stream"] = False
+    stable_drop_payload["stream"] = False
+    _assert_same_answers(
+        [_post(DEFAULT_URL, copy.deepcopy(stable_default_payload))], [stable_default]
+    )
+    _assert_same_answers(
+        [_post(DROP_EVICT_URL, copy.deepcopy(stable_drop_payload))], [stable_drop]
+    )
