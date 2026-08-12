@@ -328,21 +328,24 @@ class CacheManager:
             active_positions_device = active_positions.to(
                 device=active_indices.device, non_blocking=True
             )
-            overlaps = active_positions < initial_full_len
-            if bool(torch.any(overlaps).item()):
-                overlap_positions = active_positions_device[
-                    overlaps.to(device=active_indices.device, non_blocking=True)
-                ]
-                previous = full_indices[overlap_positions]
-                current = active_indices[
-                    overlaps.to(device=active_indices.device, non_blocking=True)
-                ]
-                resident_overlap = previous >= 0
-                if bool(torch.any(resident_overlap).item()) and not torch.equal(
-                    previous[resident_overlap], current[resident_overlap]
+            active_slots = torch.arange(
+                len(active_indices), dtype=torch.int64, device=active_indices.device
+            )
+            initially_matched = active_slots < req.initial_active_cached_len
+            if bool(torch.any(initially_matched).item()):
+                matched_positions = active_positions_device[initially_matched]
+                previous = full_indices[matched_positions]
+                current = active_indices[initially_matched]
+                if bool(torch.any(previous < 0).item()) or not torch.equal(
+                    previous, current
                 ):
                     raise RuntimeError("Matched Drop-aware tokens use different KV slots.")
-            full_indices[active_positions_device] = active_indices
+            newly_computed = ~initially_matched
+            if bool(torch.any(newly_computed).item()):
+                computed_positions = active_positions_device[newly_computed]
+                computed_indices = active_indices[newly_computed]
+                missing = full_indices[computed_positions] < 0
+                full_indices[computed_positions[missing]] = computed_indices[missing]
 
             keep_mask = torch.ones(
                 full_token_prefix_len, dtype=torch.bool, device="cpu"
@@ -388,9 +391,6 @@ class CacheManager:
                 keep_mask,
             )
 
-            active_slots = torch.arange(
-                len(active_indices), dtype=torch.int64, device=active_indices.device
-            )
             newly_allocated = active_slots >= req.initial_active_cached_len
             active_key_positions = req.radix_token_to_key[active_positions]
             canonical_active = result.canonical_indices[
