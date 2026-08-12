@@ -294,6 +294,13 @@ class BaseAttnMetadata(ABC):
 
 
 class BaseAttnBackend(ABC):
+    def validate_context_mask_prefill(self, device: torch.device | int | None = None) -> None:
+        raise ValueError(
+            f"Context-mask Prefill is not supported by {type(self).__name__}. "
+            "Select a FlashInfer or FlashAttention Prefill backend, or use "
+            "--contextual-prefill-mode staged."
+        )
+
     @property
     def supports_multi_context_mask_prefill(self) -> bool:
         return False
@@ -336,6 +343,9 @@ class HybridBackend(BaseAttnBackend):
     @property
     def supports_multi_context_mask_prefill(self) -> bool:
         return self.prefill_backend.supports_multi_context_mask_prefill
+
+    def validate_context_mask_prefill(self, device: torch.device | int | None = None) -> None:
+        self.prefill_backend.validate_context_mask_prefill(device)
 
     def forward(
         self,

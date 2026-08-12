@@ -5,6 +5,7 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 from minisgl.attention.base import (
+    BaseAttnBackend,
     HybridBackend,
     build_context_attention_batch,
     build_context_attention_segments,
@@ -426,6 +427,34 @@ def test_hybrid_ordinary_forward_does_not_expand_legacy_backend_call():
 
     prefill_backend.forward.assert_called_once_with(q, k, v, 2, batch)
     decode_backend.forward.assert_not_called()
+
+
+def test_context_mask_capability_dispatches_to_selected_prefill_backend(monkeypatch):
+    device = torch.device("cpu")
+    flashinfer = object.__new__(FlashInferBackend)
+    flashinfer.validate_context_mask_prefill(device)
+
+    fa_validator = MagicMock()
+    monkeypatch.setattr(
+        "minisgl.attention.fa.validate_fa_context_mask_support", fa_validator
+    )
+    flash_attention = object.__new__(FlashAttentionBackend)
+    flash_attention.validate_context_mask_prefill(device)
+    fa_validator.assert_called_once_with(device)
+
+    prefill_backend = MagicMock()
+    decode_backend = MagicMock()
+    hybrid = HybridBackend(prefill_backend, decode_backend)
+    hybrid.validate_context_mask_prefill(device)
+    prefill_backend.validate_context_mask_prefill.assert_called_once_with(device)
+    decode_backend.validate_context_mask_prefill.assert_not_called()
+
+
+def test_unsupported_attention_backend_rejects_context_mask_prefill():
+    with pytest.raises(ValueError, match="not supported"):
+        BaseAttnBackend.validate_context_mask_prefill(
+            SimpleNamespace(), torch.device("cpu")
+        )
 
 
 def test_attention_layer_forwards_gpt_oss_parameters(monkeypatch):

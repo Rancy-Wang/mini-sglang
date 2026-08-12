@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import warnings
 from dataclasses import dataclass
 from typing import List, Tuple
 
@@ -254,13 +255,13 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     parser.add_argument(
         "--contextual-prefill-mode",
         type=str,
-        choices=["staged", "flashinfer-mask", "flashattention-mask"],
+        choices=["staged", "mask", "flashinfer-mask", "flashattention-mask"],
         default=ServerArgs.contextual_prefill_mode,
         help=(
-            "How a low-hit contextual warmup is Prefilled. 'staged' keeps the "
-            "legacy per-message fallback; 'flashinfer-mask' uses exact active-KV "
-            "segments with FlashInfer; 'flashattention-mask' uses FA3 segments on "
-            "SM80/SM90 or an FA4 CuTe GPU mask on SM100/SM110."
+            "How contextual warmup is Prefilled. 'mask' is the default and lets "
+            "the selected Prefill attention backend compile its native exact mask; "
+            "'staged' keeps the legacy cache-hit and per-message fallback. The "
+            "backend-specific mask names are deprecated aliases for 'mask'."
         ),
     )
 
@@ -272,6 +273,17 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
 
     # Parse arguments
     kwargs = parser.parse_args(args).__dict__.copy()
+
+    legacy_contextual_mode = kwargs["contextual_prefill_mode"]
+    if legacy_contextual_mode in {"flashinfer-mask", "flashattention-mask"}:
+        warnings.warn(
+            f"--contextual-prefill-mode {legacy_contextual_mode} is deprecated; "
+            "use --contextual-prefill-mode mask and select the Prefill attention "
+            "backend with --attention-backend.",
+            FutureWarning,
+            stacklevel=2,
+        )
+        kwargs["contextual_prefill_mode"] = "mask"
 
     # resolve some arguments
     run_shell |= kwargs.pop("shell_mode")

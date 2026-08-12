@@ -17,9 +17,7 @@ class SchedulerConfig(EngineConfig):
     max_extend_tokens: int = 8192
     cache_type: str = "radix"
     radix_drop_key_mode: Literal["bitmask", "symbol", "delta-marker"] = "delta-marker"
-    contextual_prefill_mode: Literal[
-        "staged", "flashinfer-mask", "flashattention-mask"
-    ] = "staged"
+    contextual_prefill_mode: Literal["staged", "mask"] = "mask"
     offline_mode: bool = False
 
     # networking config

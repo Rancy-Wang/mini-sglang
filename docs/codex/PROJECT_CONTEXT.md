@@ -1,10 +1,10 @@
 # mini-sglang Context System 项目上下文
 
-本文解释 2026-08-05 当前 working tree 中的 Context System。它是机制导航，不是修改
+本文解释 2026-08-12 当前 working tree 中的 Context System。它是机制导航，不是修改
 授权；源码继续变化时，必须重新检查路径、符号和行号。当前默认组合是
-`radix_drop_key_mode="delta-marker"` 与 `contextual_prefill_mode="staged"`，而旧会话中
+`radix_drop_key_mode="delta-marker"` 与 `contextual_prefill_mode="mask"`，而旧会话中
 把 message 文本或 `symbol` 当默认 Radix 状态的 pasted-text 说明已经过时
-（`python/minisgl/scheduler/config.py:15-22`，`SchedulerConfig`）。
+（`python/minisgl/scheduler/config.py:15-21`，`SchedulerConfig`）。
 
 ## 一、输入、完整模板与 token provenance
 
@@ -88,25 +88,37 @@ Radix 先在完整 key 轴匹配，再删除 virtual marker 的 `-1` value，得
 `python/minisgl/kvcache/radix_cache.py:287-342`，`prune_suffix`、`evict`；
 `python/minisgl/kvcache/radix_cache.py:354-386`，`check_integrity`）。
 
-## 五、默认 staged warmup 与可选 mask 路径
+## 五、默认 mask warmup 与可选 staged 回退
 
-有已生效 Drop 的请求先发送一次 warmup。默认 `staged` 下，如果首次 warmup
-`hit_ratio >= 0.95` 就结束；严格低于 `0.95` 才依次发送 `messages[:end]` 的 prefix
-warmup（`python/minisgl/server/api_server.py:721-777`，
-`FrontendManager.run_contextual_warmup`）。命中率公式是
+有已生效 Drop 的请求默认发送一次 `mask` warmup。前端只设置
+`use_context_mask=True`，并携带 tokenizer 生成的完整 token 轴与
+`full_token_visible_until`；它不再指定 FlashInfer 或 FlashAttention 的私有格式
+（`python/minisgl/server/api_server.py:721-755`，
+`FrontendManager.run_contextual_warmup`）。Scheduler 根据实际 Prefill attention backend
+调用统一能力校验，不支持的 backend 在启动期失败，不能静默退化为普通 causal attention
+（`python/minisgl/scheduler/scheduler.py:104-112`，`Scheduler.__init__`；
+`python/minisgl/attention/base.py:296-348`，`BaseAttnBackend`、`HybridBackend`）。
+
+后端从同一可见性语义生成原生执行布局。FlashInfer 将请求编译成 active-KV segments；
+FlashAttention 在 SM80/SM90 使用 FA3 segmented adapter，在 SM100/SM110 使用 FA4
+`mask_mod` adapter（`python/minisgl/attention/base.py:102-230`，
+`build_context_attention_segments`、`build_context_attention_batch`；
+`python/minisgl/attention/fi.py:330-409`，`FlashInferBackend.prepare_metadata`；
+`python/minisgl/attention/fa.py:56-138`，`validate_fa_context_mask_support`、
+`FlashAttentionBackend.validate_context_mask_prefill`；
+`python/minisgl/attention/fa.py:195-292`，`FlashAttentionBackend.prepare_metadata`）。
+FA4 仍限制每批一个 mask 请求，且尚未启用 GPT-OSS sinks/sliding-window 与 Context mask
+的组合。
+
+`staged` 保留为兼容和排障路径。首次 warmup 若 `hit_ratio >= 0.95` 就结束；严格低于
+`0.95` 才依次发送 `messages[:end]` 的 prefix warmup
+（`python/minisgl/server/api_server.py:753-777`，
+`FrontendManager.run_contextual_warmup`）。命中率公式仍是
 `cached_active_len / matchable_active_prefix_len`，空分母取 `1.0`
-（`python/minisgl/scheduler/prefill.py:39-63`，`PrefillAdder._try_allocate_one`）。每个 staged
-warmup 的 commit boundary 被映射到包含边界 marker 的 key prefix，避免把未来状态提前
-提交（`python/minisgl/tokenizer/tokenize.py:936-945`，`_chat_tokenize`；
+（`python/minisgl/scheduler/prefill.py:39-63`，`PrefillAdder._try_allocate_one`）。每个
+staged warmup 的 commit boundary 被映射到包含边界 marker 的 key prefix，避免把未来状态
+提前提交（`python/minisgl/tokenizer/tokenize.py:936-945`，`_chat_tokenize`；
 `python/minisgl/scheduler/radix_delta.py:159-168`，`key_prefix_len_for_token_boundary`）。
-
-`flashinfer-mask` 和 `flashattention-mask` 是显式非默认实验路径：它们以
-`full_token_visible_until` 对完整 token stream 做单请求 warmup。当前 FlashAttention custom
-mask 实现要求暴露 FA4 `mask_mod` 接口；FA3 只覆盖普通 causal/window/sinks 调用，并未实现
-Context System 的 full-context custom mask，后续说明和测试不得声称 FA3 mask 已支持
-（`python/minisgl/attention/fa.py:38-89`，`is_fa_context_mask_supported`、
-`validate_fa_context_mask_support`、`_get_context_visibility_mask_mod`；`python/minisgl/attention/fa.py:134-190`，
-`FlashAttentionBackend.prepare_metadata`）。
 
 ## 六、操作不变量与远端验证
 

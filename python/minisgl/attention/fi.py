@@ -140,6 +140,9 @@ class FlashInferBackend(BaseAttnBackend):
         self.last_event = torch.cuda.Event()
         self.last_event.record()
 
+    def validate_context_mask_prefill(self, device: torch.device | int | None = None) -> None:
+        return None
+
     @property
     def supports_multi_context_mask_prefill(self) -> bool:
         return True

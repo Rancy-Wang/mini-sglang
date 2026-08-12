@@ -101,34 +101,15 @@ class Scheduler(SchedulerIOMixin):
         self.prefill_manager = PrefillManager(
             self.cache_manager, self.table_manager, self.decode_manager
         )
-        if config.contextual_prefill_mode != "staged":
+        if config.contextual_prefill_mode not in {"staged", "mask"}:
+            raise ValueError(
+                "contextual_prefill_mode must be 'mask' or 'staged', got "
+                f"{config.contextual_prefill_mode!r}."
+            )
+        if config.contextual_prefill_mode == "mask":
             if config.page_size != 1:
                 raise ValueError("Context-mask Prefill currently requires --page-size 1.")
-            from minisgl.attention.base import HybridBackend
-
-            prefill_backend = self.engine.attn_backend
-            if isinstance(prefill_backend, HybridBackend):
-                prefill_backend = prefill_backend.prefill_backend
-            if config.contextual_prefill_mode == "flashinfer-mask":
-                from minisgl.attention.fi import FlashInferBackend
-
-                if not isinstance(prefill_backend, FlashInferBackend):
-                    raise ValueError(
-                        "--contextual-prefill-mode flashinfer-mask requires FlashInfer "
-                        "as the Prefill attention backend."
-                    )
-            elif config.contextual_prefill_mode == "flashattention-mask":
-                from minisgl.attention.fa import (
-                    FlashAttentionBackend,
-                    validate_fa_context_mask_support,
-                )
-
-                if not isinstance(prefill_backend, FlashAttentionBackend):
-                    raise ValueError(
-                        "--contextual-prefill-mode flashattention-mask requires "
-                        "FlashAttention as the Prefill attention backend."
-                    )
-                validate_fa_context_mask_support(self.device)
+            self.engine.attn_backend.validate_context_mask_prefill(self.device)
 
         # some alias for easy access
         self.finished_reqs: Set[Req] = set()

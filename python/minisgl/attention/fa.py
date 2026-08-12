@@ -66,7 +66,7 @@ def validate_fa_context_mask_support(device: torch.device | int | None = None) -
     if not is_fa_context_mask_supported(device):
         capability = torch.cuda.get_device_capability(device) if torch.cuda.is_available() else None
         raise ValueError(
-            "--contextual-prefill-mode flashattention-mask requires the FA3 segmented "
+            "--contextual-prefill-mode mask with FlashAttention requires the FA3 segmented "
             "adapter on SM80/SM90 or the FA4 CuTe custom-mask adapter on SM100/SM110; "
             f"current CUDA capability is {capability}."
         )
@@ -129,6 +129,9 @@ class FlashAttentionBackend(BaseAttnBackend):
         self.capture_bs: List[int] = []
         self.scale = config.head_dim**-0.5
         self.version = 4 if is_sm100_supported() else 3
+
+    def validate_context_mask_prefill(self, device: torch.device | int | None = None) -> None:
+        validate_fa_context_mask_support(device)
 
     @property
     def supports_multi_context_mask_prefill(self) -> bool:

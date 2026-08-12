@@ -733,7 +733,7 @@ class FrontendManager:
             return
         warmup_target = max(len(messages) - 1, 0)
         warmup_uid = self.new_user()
-        use_context_mask = self.config.contextual_prefill_mode != "staged"
+        use_context_mask = self.config.contextual_prefill_mode == "mask"
         await self.send_one(
             TokenizeMsg(
                 uid=warmup_uid,

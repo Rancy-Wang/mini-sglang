@@ -198,7 +198,7 @@ context length. Later message tokens are prefilled under the new visibility.
 
 ## Starting the server
 
-A conservative Drop-enabled configuration is:
+A Drop-enabled configuration with an explicit FlashInfer backend is:
 
 ```bash
 python -m minisgl \
@@ -206,8 +206,8 @@ python -m minisgl \
   --cache-type radix \
   --page-size 1 \
   --radix-drop-key-mode delta-marker \
-  --contextual-prefill-mode staged \
-  --attn fa \
+  --contextual-prefill-mode mask \
+  --attn fi \
   --port 1919
 ```
 
@@ -217,14 +217,26 @@ Relevant options:
 | --- | --- |
 | `--radix-drop-key-mode` | `delta-marker` is the default and the only mode that accepts a non-empty `drop_message`. `bitmask` and `symbol` are legacy no-Drop modes. |
 | `--page-size` | Must be `1` with `delta-marker`. TRTLLM attention is incompatible because it requires non-unit pages. |
-| `--contextual-prefill-mode` | `staged` (default), `flashinfer-mask`, or `flashattention-mask`. |
-| `--attn` / `--attention-backend` | Mask modes require the matching prefill backend. FlashAttention mask prefill supports FA3 on SM80/SM90 and FA4 on SM100/SM110. |
+| `--contextual-prefill-mode` | `mask` (default) or `staged`. The old `flashinfer-mask` and `flashattention-mask` names are deprecated CLI aliases for `mask`. |
+| `--attn` / `--attention-backend` | In `mask` mode, the selected Prefill backend compiles its native exact representation. FlashInfer and FlashAttention are supported; unsupported backends fail during startup. |
 | `--cache-type` | Use `radix` to reuse full token and Drop-history prefixes. |
 | `--request-timeout` | Seconds without a reply before timeout; default `300`, or `0` to disable. |
 
-`staged` first measures the active-prefix cache hit. If it is below `0.95`, the
-server warms the conversation by message prefixes. The two mask modes instead
-prefill the full token timeline under the exact Drop visibility mask.
+`mask` sends one full-token-timeline warmup carrying the backend-neutral
+`full_token_visible_until` metadata. FlashInfer compiles it into exact active-KV
+segments. FlashAttention uses the FA3 segmented adapter on SM80/SM90 or the FA4
+`mask_mod` adapter on SM100/SM110. The Scheduler validates the actual Prefill
+backend instead of requiring the frontend mode to name that backend.
+
+`staged` remains available for compatibility and diagnosis. It first measures the
+active-prefix cache hit. A hit ratio greater than or equal to `0.95` ends warmup;
+only a strictly lower ratio triggers per-message prefix warmups.
+
+Known limitations remain backend-specific. Context-mask Prefill requires
+`page_size=1`. FA4 mask Prefill is restricted to one request per batch, and its
+GPT-OSS sinks/sliding-window combination is not enabled. A backend or GPU build
+without the required adapter is rejected instead of silently running ordinary
+causal attention.
 
 ## Chat API
 
