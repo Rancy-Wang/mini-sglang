@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -341,4 +342,58 @@ def test_full_slot_churn_repeatedly_preserves_slot_partition_and_radix_integrity
 
     for branch in branches:
         registry.release_request_refs(branch.layout.marker_ids)
+    manager.check_integrity()
+
+
+def test_finished_drop_commit_keeps_generated_tokens_beyond_prompt_mask():
+    manager, registry = _drop_cache(32)
+    cache = manager.prefix_cache
+    assert isinstance(cache, RadixPrefixCache)
+    prompt_ids = torch.arange(3000, 3006, dtype=torch.int64)
+    layout, prompt_keep = _layout(
+        prompt_ids, registry, event=4, ranges=[(1, 3)]
+    )
+    generated_ids = torch.tensor([4000, 4001], dtype=torch.int64)
+    keys = torch.cat([layout.keys, generated_ids])
+    virtual_mask = torch.cat(
+        [layout.virtual_mask, torch.zeros(2, dtype=torch.bool)]
+    )
+    key_to_token = torch.cat(
+        [layout.key_to_token, torch.tensor([6, 7], dtype=torch.int64)]
+    )
+    token_to_key = torch.cat(
+        [
+            layout.token_to_key,
+            torch.tensor([len(layout.keys), len(layout.keys) + 1], dtype=torch.int64),
+        ]
+    )
+    active_positions = torch.tensor([0, 3, 4, 5, 6, 7], dtype=torch.int32)
+    active_slots = manager._allocate(len(active_positions))
+    manager.page_table[0, : len(active_positions)] = active_slots
+    old_handle = cache.match_prefix(keys, virtual_mask).cuda_handle
+    manager.lock(old_handle)
+    req = SimpleNamespace(
+        radix_key_virtual_mask=virtual_mask,
+        radix_key_to_token=key_to_token,
+        radix_token_to_key=token_to_key,
+        radix_match_ids=keys,
+        radix_commit_key_len=None,
+        cache_handle=old_handle,
+        table_idx=0,
+        cached_len=len(active_positions),
+        input_ids=torch.cat([prompt_ids[prompt_keep], generated_ids]),
+        true_positions=active_positions,
+        initial_active_cached_len=0,
+        initial_full_match_indices=torch.empty(0, dtype=torch.int32),
+        full_keep_mask=prompt_keep.to(dtype=torch.int32),
+        prefix_keep_mask=None,
+    )
+
+    manager._cache_finished_drop_aware_delta_req(req)
+
+    committed = cache.match_prefix(keys, virtual_mask).cuda_handle
+    real_values = committed.get_matched_indices()[~virtual_mask]
+    assert torch.all(real_values[1:3] == -1)
+    assert torch.all(real_values[torch.tensor([0, 3, 4, 5, 6, 7])] >= 0)
+    registry.release_request_refs(layout.marker_ids)
     manager.check_integrity()
