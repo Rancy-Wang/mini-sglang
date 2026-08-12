@@ -34,6 +34,21 @@ def _wire(event: int, ranges: list[tuple[int, int]]):
     )
 
 
+def _multi_wire(events: list[tuple[int, list[tuple[int, int]]]]):
+    positions: list[int] = []
+    offsets = [0]
+    ranges: list[tuple[int, int]] = []
+    for event, event_ranges in events:
+        positions.append(event)
+        ranges.extend(event_ranges)
+        offsets.append(len(ranges))
+    return (
+        torch.tensor(positions, dtype=torch.int32),
+        torch.tensor(offsets, dtype=torch.int32),
+        torch.tensor(ranges, dtype=torch.int32).reshape(-1),
+    )
+
+
 def _layout(
     full_ids: torch.Tensor,
     registry: DeltaMarkerRegistry,
@@ -456,4 +471,81 @@ def test_finished_commit_discards_stale_dropped_slots_after_reassignment():
     assert all(cache._slot_owner[int(slot)] is not None for slot in reassigned.tolist())
     manager._free(transient)
     registry.release_request_refs(layout.marker_ids)
+    manager.check_integrity()
+
+
+def test_finished_commit_adopts_resident_slots_after_first_kept_hole():
+    manager, registry = _drop_cache(32)
+    cache = manager.prefix_cache
+    assert isinstance(cache, RadixPrefixCache)
+    full_ids = torch.arange(10000, 10008, dtype=torch.int64)
+    branch_a = inject_delta_markers(
+        full_ids,
+        *_multi_wire([(4, [(0, 1)]), (7, [(2, 3)])]),
+        registry,
+    )
+    branch_b = inject_delta_markers(
+        full_ids,
+        *_multi_wire([(4, [(0, 1)]), (7, [(4, 5)])]),
+        registry,
+    )
+    assert branch_a is not None and branch_b is not None
+    keep_a = torch.ones(8, dtype=torch.bool)
+    keep_a[torch.tensor([0, 2])] = False
+    keep_b = torch.ones(8, dtype=torch.bool)
+    keep_b[torch.tensor([0, 4])] = False
+    initial_slots = manager._allocate(8)
+    committed_a = _commit_layout(cache, branch_a, keep_a, initial_slots)
+    initial_a = _real_values(branch_a, committed_a.canonical_indices)
+    handle_a = cache.with_pinned_slots(committed_a.handle, initial_a[keep_a])
+    manager.lock(handle_a)
+
+    transient = manager._allocate(len(manager.free_slots))
+    recycled = manager._allocate(2)
+    assert set(recycled.tolist()) == set(initial_a[torch.tensor([0, 2])].tolist())
+    manager._free(recycled)
+    manager._free(transient)
+
+    match_b = cache.match_prefix(branch_b.keys, branch_b.virtual_mask).cuda_handle
+    matched_values = _real_values(branch_b, match_b.get_matched_indices())
+    assert len(matched_values) == 7
+    assert int(matched_values[2].item()) == -1
+    kept_match = matched_values[keep_b[: len(matched_values)]]
+    first_hole = int(torch.nonzero(kept_match < 0, as_tuple=False)[0].item())
+    active_cached_len = first_hole
+    handle_b = cache.with_pinned_slots(match_b, kept_match[:active_cached_len])
+    manager.lock(handle_b)
+
+    active_positions = torch.nonzero(keep_b, as_tuple=False).view(-1).to(torch.int32)
+    allocated = manager._allocate(len(active_positions) - active_cached_len)
+    active_values = torch.cat([kept_match[:active_cached_len], allocated])
+    manager.page_table[0, : len(active_values)] = active_values
+    req = SimpleNamespace(
+        radix_key_virtual_mask=branch_b.virtual_mask,
+        radix_key_to_token=branch_b.key_to_token,
+        radix_token_to_key=branch_b.token_to_key,
+        radix_match_ids=branch_b.keys,
+        radix_commit_key_len=None,
+        cache_handle=handle_b,
+        table_idx=0,
+        cached_len=len(active_values),
+        input_ids=full_ids[keep_b],
+        true_positions=active_positions,
+        initial_active_cached_len=active_cached_len,
+        initial_full_match_indices=matched_values.clone(),
+        full_keep_mask=keep_b.to(dtype=torch.int32),
+        prefix_keep_mask=None,
+    )
+
+    manager._cache_finished_drop_aware_delta_req(req)
+
+    rematched = cache.match_prefix(branch_b.keys, branch_b.virtual_mask).cuda_handle
+    canonical_b = _real_values(branch_b, rematched.get_matched_indices())
+    stable_positions = torch.tensor([1, 3, 5, 6])
+    assert torch.equal(canonical_b[stable_positions], initial_a[stable_positions])
+    assert canonical_b[2] >= 0
+    assert canonical_b[4] == initial_a[4]
+    manager.unlock(handle_a)
+    registry.release_request_refs(branch_a.marker_ids)
+    registry.release_request_refs(branch_b.marker_ids)
     manager.check_integrity()
