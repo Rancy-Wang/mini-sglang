@@ -93,6 +93,7 @@ class Req:
     radix_token_to_key: torch.Tensor | None = None
     radix_commit_key_len: int | None = None
     radix_marker_ids: tuple[int, ...] = ()
+    compact_cached_prefix: bool = False
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu

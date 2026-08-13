@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, List, Tuple
 
 import torch
 from minisgl.core import Batch, Req, get_global_ctx
-from minisgl.utils import init_logger
+from minisgl.utils import init_logger, page_count
 
 from .utils import PendingReq
 
@@ -44,9 +44,24 @@ class PrefillAdder:
     cache_manager: CacheManager
     table_manager: TableManager
 
+    def _estimate_tokens_to_reserve(
+        self,
+        *,
+        input_len: int,
+        output_len: int,
+        cached_len: int,
+        compact_cached_prefix: bool,
+    ) -> int:
+        page_size = self.cache_manager.page_size
+        effective_cached_len = 0 if compact_cached_prefix else cached_len
+        return (
+            page_count(input_len + output_len, page_size)
+            - page_count(effective_cached_len, page_size)
+        ) * page_size
+
     def _try_allocate_one(
         self, req: PendingReq
-    ) -> Tuple[BaseCacheHandle, int, float, torch.Tensor, int] | None:
+    ) -> Tuple[BaseCacheHandle, int, float, torch.Tensor, int, bool, int] | None:
         if self.table_manager.available_size == 0:
             return None
 
@@ -58,6 +73,7 @@ class PrefillAdder:
             cached_len = match.safe_cached_len
             cached_indices = match.safe_match_indices
             initial_full_match_indices = match.full_match_indices
+            requires_compaction = False
         else:
             match = self.cache_manager.match_req(req)
             if match is None:
@@ -66,11 +82,15 @@ class PrefillAdder:
             cached_len = match.active_cached_len
             cached_indices = match.active_match_indices
             initial_full_match_indices = match.full_match_indices[: match.full_cached_len]
+            requires_compaction = match.requires_compaction
         effective_prefix_len = self.cache_manager.matchable_active_prefix_len(req)
         hit_ratio = 1.0 if effective_prefix_len == 0 else cached_len / effective_prefix_len
-        # TODO: better estimate policy
-        extend_len = req.input_len - cached_len
-        estimated_len = extend_len + req.output_len
+        estimated_len = self._estimate_tokens_to_reserve(
+            input_len=req.input_len,
+            output_len=req.output_len,
+            cached_len=cached_len,
+            compact_cached_prefix=requires_compaction,
+        )
 
         if estimated_len + self.reserved_size > self.cache_manager.available_size:
             return None
@@ -97,6 +117,8 @@ class PrefillAdder:
             hit_ratio,
             initial_full_match_indices.clone(),
             cached_len,
+            requires_compaction,
+            estimated_len,
         )
 
     def _add_one_req(
@@ -108,13 +130,15 @@ class PrefillAdder:
         cache_hit_ratio: float,
         initial_full_match_indices: torch.Tensor,
         initial_active_cached_len: int,
+        compact_cached_prefix: bool,
+        estimated_len: int,
     ) -> Req:
         remain_len = pending_req.input_len - cached_len
         chunk_size = min(self.token_budget, remain_len)
         is_chunked = chunk_size < remain_len
         CLS = ChunkedReq if is_chunked else Req
         self.token_budget -= chunk_size
-        self.reserved_size += remain_len + pending_req.output_len
+        self.reserved_size += estimated_len
         # NOTE: update the tokens ids only; new pages will be allocated in the scheduler
         _slice = slice(cached_len, cached_len + chunk_size)
         device_ids = self.table_manager.token_pool[table_idx, _slice]
@@ -151,6 +175,7 @@ class PrefillAdder:
             radix_token_to_key=pending_req.radix_token_to_key,
             radix_commit_key_len=pending_req.radix_commit_key_len,
             radix_marker_ids=pending_req.radix_marker_ids,
+            compact_cached_prefix=compact_cached_prefix,
         )
 
     def try_add_one(self, pending_req: PendingReq) -> Req | None:
@@ -166,6 +191,13 @@ class PrefillAdder:
                 cache_hit_ratio=chunked_req.cache_hit_ratio,
                 initial_full_match_indices=chunked_req.initial_full_match_indices,
                 initial_active_cached_len=chunked_req.initial_active_cached_len,
+                compact_cached_prefix=chunked_req.compact_cached_prefix,
+                estimated_len=self._estimate_tokens_to_reserve(
+                    input_len=pending_req.input_len,
+                    output_len=pending_req.output_len,
+                    cached_len=chunked_req.cached_len,
+                    compact_cached_prefix=chunked_req.compact_cached_prefix,
+                ),
             )
 
         if resource := self._try_allocate_one(pending_req):
@@ -175,6 +207,8 @@ class PrefillAdder:
                 cache_hit_ratio,
                 initial_full_match_indices,
                 initial_active_cached_len,
+                compact_cached_prefix,
+                estimated_len,
             ) = resource
             return self._add_one_req(
                 pending_req=pending_req,
@@ -184,6 +218,8 @@ class PrefillAdder:
                 cache_hit_ratio=cache_hit_ratio,
                 initial_full_match_indices=initial_full_match_indices,
                 initial_active_cached_len=initial_active_cached_len,
+                compact_cached_prefix=compact_cached_prefix,
+                estimated_len=estimated_len,
             )
 
         return None

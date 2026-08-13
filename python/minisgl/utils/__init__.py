@@ -1,7 +1,17 @@
 from .arch import is_arch_supported, is_sm90_supported, is_sm100_supported
 from .hf import cached_load_hf_config, download_hf_weight, load_tokenizer
 from .logger import init_logger
-from .misc import UNSET, Unset, align_ceil, align_down, call_if_main, div_ceil, div_even
+from .misc import (
+    UNSET,
+    Unset,
+    align_ceil,
+    align_down,
+    call_if_main,
+    div_ceil,
+    div_even,
+    last_page_len,
+    page_count,
+)
 from .mp import (
     ZmqAsyncPullQueue,
     ZmqAsyncPushQueue,
@@ -24,6 +34,8 @@ __all__ = [
     "call_if_main",
     "div_even",
     "div_ceil",
+    "page_count",
+    "last_page_len",
     "align_ceil",
     "align_down",
     "UNSET",

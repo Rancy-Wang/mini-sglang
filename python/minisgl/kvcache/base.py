@@ -24,6 +24,9 @@ class BaseKVCachePool(ABC):
         self, k: torch.Tensor, v: torch.Tensor, out_loc: torch.Tensor, layer_id: int
     ) -> None: ...
 
+    @abstractmethod
+    def copy_slots(self, src: torch.Tensor, dst: torch.Tensor) -> None: ...
+
     @property
     @abstractmethod
     def device(self) -> torch.device: ...

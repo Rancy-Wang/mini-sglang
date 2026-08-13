@@ -31,6 +31,27 @@ def div_ceil(a: int, b: int) -> int:
     return (a + b - 1) // b
 
 
+def page_count(num_tokens: int, page_size: int) -> int:
+    """Return the number of pages needed for a token length."""
+    if num_tokens < 0:
+        raise ValueError("num_tokens must be non-negative.")
+    if page_size <= 0:
+        raise ValueError("page_size must be positive.")
+    return div_ceil(num_tokens, page_size)
+
+
+def last_page_len(num_tokens: int, page_size: int) -> int:
+    """Return the valid token count in the final page."""
+    if num_tokens < 0:
+        raise ValueError("num_tokens must be non-negative.")
+    if page_size <= 0:
+        raise ValueError("page_size must be positive.")
+    if num_tokens == 0:
+        return 0
+    remainder = num_tokens % page_size
+    return page_size if remainder == 0 else remainder
+
+
 def align_ceil(a: int, b: int) -> int:
     """Aligns a to the next multiple of b"""
     return div_ceil(a, b) * b

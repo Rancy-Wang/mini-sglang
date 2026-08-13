@@ -3,13 +3,13 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from functools import cached_property
-from typing import TYPE_CHECKING, Any, Dict, List, Literal
+from typing import TYPE_CHECKING, Any, Dict, List
 
 import torch
 from minisgl.core import Batch, get_global_ctx
 from minisgl.distributed import get_tp_info
 from minisgl.env import ENV
-from minisgl.utils import div_even, init_logger
+from minisgl.utils import div_even, init_logger, page_count
 
 from .base import (
     BaseAttnBackend,
@@ -17,7 +17,12 @@ from .base import (
     build_context_attention_batch,
     compile_context_page_tables,
 )
-from .utils import BaseCaptureData
+from .utils import (
+    BaseCaptureData,
+    make_last_page_len_cpu,
+    make_page_indptr_cpu,
+    make_paged_kv_indices,
+)
 
 if TYPE_CHECKING:
     from flashinfer import (
@@ -73,7 +78,7 @@ class FIMetadata(BaseAttnMetadata):
     num_qo_heads:       int
     num_kv_heads:       int
     head_dim:           int
-    page_size:          Literal[1] # currently only support page_size=1
+    page_size:          int
     pos_encoding_mode:  str
     seq_lens_cpu:       torch.Tensor  # on cpu
     dtype:              torch.dtype
@@ -85,7 +90,6 @@ class FIMetadata(BaseAttnMetadata):
     # fmt: on
 
     def __post_init__(self) -> None:
-        assert self.page_size == 1, "Currently only page_size=1 is supported."
         assert (
             self.cu_seqlens_k_cpu.is_cpu
             and self.cu_seqlens_q_cpu.is_cpu
@@ -256,14 +260,10 @@ class FlashInferBackend(BaseAttnBackend):
         sinks: torch.Tensor | None = None,
         sliding_window: int | None = None,
     ) -> torch.Tensor:
-        def _flatten_cache(cache: torch.Tensor) -> torch.Tensor:  # treat page = 1
-            return cache.view(-1, 1, cache.shape[2], cache.shape[3])
-
         metadata = batch.attn_metadata
         assert isinstance(metadata, FIMetadata)
         self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
         kv_cache = (self.kvcache.k_cache(layer_id), self.kvcache.v_cache(layer_id))
-        kv_cache = (_flatten_cache(kv_cache[0]), _flatten_cache(kv_cache[1]))
         window_left = self._window_left(sliding_window)
 
         def _run(wrapper, query: torch.Tensor, run_window_left: int) -> torch.Tensor:
@@ -345,7 +345,7 @@ class FlashInferBackend(BaseAttnBackend):
 
         device = self.device
         seq_len_cpu = torch.tensor(seqlens_k, **CPU_KWARGS)
-        cu_seqlens_k_cpu = torch.tensor([0] + seqlens_k, **CPU_KWARGS).cumsum_(dim=0)
+        cu_seqlens_k_cpu = make_page_indptr_cpu(seqlens_k, get_global_ctx().page_size)
         if max_seqlen_q == 1:  # decode with all extend_len = 1
             cu_seqlens_q_cpu = torch.arange(0, padded_size + 1, **CPU_KWARGS)
         elif all(l == 0 for l in cached_lens):  # prefill with no cache hit
@@ -354,6 +354,7 @@ class FlashInferBackend(BaseAttnBackend):
             cu_seqlens_q_cpu = torch.tensor([0] + seqlens_q, **CPU_KWARGS).cumsum_(dim=0)
 
         page_table = get_global_ctx().page_table
+        page_size = get_global_ctx().page_size
         context_segments = None
         sliding_context_segments = None
         if masked_reqs:
@@ -376,7 +377,10 @@ class FlashInferBackend(BaseAttnBackend):
                     cu_seqlens_k_cpu=context_cu_k_cpu,
                     cu_seqlens_q_gpu=context_cu_q_cpu.to(device, non_blocking=True),
                     indices=compiled.flat_indices,
-                    last_page_len_cpu=self._get_ones_cpu(context_batch.num_segments),
+                    last_page_len_cpu=make_last_page_len_cpu(
+                        (context_batch.cu_seqlens_k[1:] - context_batch.cu_seqlens_k[:-1]).tolist(),
+                        page_size,
+                    ),
                     seq_lens_cpu=context_seq_lens_cpu,
                 )
 
@@ -387,19 +391,17 @@ class FlashInferBackend(BaseAttnBackend):
                 )
             flat_indices = context_segments.indices
         else:
-            flat_indices = torch.cat(
-                [page_table[req.table_idx, : req.device_len] for req in reqs]
-            )
+            flat_indices = make_paged_kv_indices(page_table, reqs, page_size=page_size)
         batch.attn_metadata = FIMetadata(
             cu_seqlens_q_cpu=cu_seqlens_q_cpu,
             cu_seqlens_k_cpu=cu_seqlens_k_cpu,
             cu_seqlens_q_gpu=cu_seqlens_q_cpu.to(device, non_blocking=True),
             indices=flat_indices,
-            last_page_len_cpu=self._get_ones_cpu(padded_size),
+            last_page_len_cpu=make_last_page_len_cpu(seqlens_k, page_size),
             num_qo_heads=self.qo_head_local,
             num_kv_heads=self.kv_head_local,
             head_dim=self.config.head_dim,
-            page_size=1,
+            page_size=page_size,
             pos_encoding_mode="NONE",
             seq_lens_cpu=seq_len_cpu,
             dtype=self.kvcache.dtype,
@@ -411,7 +413,7 @@ class FlashInferBackend(BaseAttnBackend):
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
         assert self.capture is None, "Capture already initialized."
         max_bs = max(bs_list)
-        capture = FICaptureData.create(max_bs, max_seq_len, self.kvcache.device)
+        capture = FICaptureData.create(max_bs, page_count(max_seq_len, get_global_ctx().page_size), self.kvcache.device)
         capture.page_table = capture.page_table.view(-1)  # use 1D as ragged indices
         self.max_graph_bs = max_bs
         self.capture = capture
@@ -464,6 +466,9 @@ class FlashInferBackend(BaseAttnBackend):
         assert isinstance(metadata, FIMetadata)
         assert self.capture is not None and bs in self.capture_bs
         metadata.graph_bs = bs
+        self.capture.cu_seqlens_k[: bs + 1].copy_(metadata.cu_seqlens_k_cpu.to(self.capture.cu_seqlens_k.device))
+        self.capture.indices[: len(metadata.indices)].copy_(metadata.indices)
+        self.capture.one_tensor[:bs].copy_(metadata.last_page_len_cpu.to(self.capture.one_tensor.device))
         windows = {-1}
         if self.config.sliding_window is not None:
             windows.add(self.config.sliding_window - 1)

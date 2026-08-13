@@ -55,6 +55,21 @@ class MHAKVCache(BaseKVCachePool):
             v=v,
         )
 
+    def copy_slots(self, src: torch.Tensor, dst: torch.Tensor) -> None:
+        if len(src) != len(dst):
+            raise ValueError("src and dst must have the same length.")
+        if len(src) == 0:
+            return
+        src = src.to(device=self._device, dtype=torch.int64, non_blocking=True)
+        dst = dst.to(device=self._device, dtype=torch.int64, non_blocking=True)
+        k_flat = self._k_buffer.view((self._num_layers,) + self._storage_shape)
+        v_flat = self._v_buffer.view((self._num_layers,) + self._storage_shape)
+        for layer_id in range(self._num_layers):
+            k_values = k_flat[layer_id].index_select(0, src)
+            v_values = v_flat[layer_id].index_select(0, src)
+            k_flat[layer_id].index_copy_(0, dst, k_values)
+            v_flat[layer_id].index_copy_(0, dst, v_values)
+
     @property
     def device(self) -> torch.device:
         return self._device

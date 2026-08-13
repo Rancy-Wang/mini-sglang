@@ -63,8 +63,6 @@ class Scheduler(SchedulerIOMixin):
             )
         if config.drop_aware_eviction and config.page_size != 1:
             raise ValueError("--enable-drop-aware-eviction requires --page-size 1.")
-        if config.radix_drop_key_mode == "delta-marker" and config.page_size != 1:
-            raise ValueError("Delta-marker Radix mode requires --page-size 1.")
         if config.radix_drop_key_mode == "delta-marker" and "trtllm" in config.attention_backend:
             raise ValueError(
                 "Delta-marker Radix mode is incompatible with TRTLLM because "
@@ -73,19 +71,6 @@ class Scheduler(SchedulerIOMixin):
         from minisgl.engine import Engine
 
         self.engine = Engine(config)
-        if config.radix_drop_key_mode == "delta-marker" and config.page_size != 1:
-            final_page_size = config.page_size
-            try:
-                self.engine.shutdown()
-            except Exception:
-                logger.exception(
-                    "Failed to shut down Engine after an incompatible page-size adjustment."
-                )
-            raise ValueError(
-                "Delta-marker Radix mode requires final --page-size 1, but Engine "
-                f"selected {final_page_size}."
-            )
-
         # use another stream to overlap metadata processing with computation
         self.device = self.engine.device
         self.stream = torch.cuda.Stream(device=self.device)
@@ -120,8 +105,6 @@ class Scheduler(SchedulerIOMixin):
                 f"{config.contextual_prefill_mode!r}."
             )
         if config.contextual_prefill_mode == "mask":
-            if config.page_size != 1:
-                raise ValueError("Context-mask Prefill currently requires --page-size 1.")
             self.engine.attn_backend.validate_context_mask_prefill(self.device)
 
         # some alias for easy access

@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, List, Tuple
 
 import torch
 from minisgl.core import Batch, get_global_ctx
-from minisgl.utils import is_sm100_supported
+from minisgl.utils import is_sm100_supported, page_count
 
 from .base import (
     BaseAttnBackend,
@@ -14,7 +14,7 @@ from .base import (
     build_context_attention_batch,
     compile_context_page_tables,
 )
-from .utils import BaseCaptureData
+from .utils import BaseCaptureData, make_backend_page_table
 
 if TYPE_CHECKING:
     from minisgl.models import ModelConfig
@@ -228,20 +228,14 @@ class FlashAttentionBackend(BaseAttnBackend):
             cu_seqlens_q = cu_seqlens_q.to(self.kvcache.device, non_blocking=True)
 
         page_table = get_global_ctx().page_table
-        new_page_table = torch.stack(
-            [page_table[req.table_idx, : max_seqlen_k : self.page_size] for req in reqs]
+        new_page_table = make_backend_page_table(
+            page_table, reqs, max_seqlen_k=max_seqlen_k, page_size=self.page_size
         )
-        if self.page_size > 1:
-            new_page_table.div_(self.page_size, rounding_mode="floor")
 
         context_mask_aux = None
         context_segments = None
         sliding_context_segments = None
         if masked_reqs:
-            if self.page_size != 1:
-                raise RuntimeError(
-                    "FlashAttention context-mask Prefill currently requires page_size=1."
-                )
             if self.version == 3:
 
                 def _compile_fa_context(sliding_window: int | None):
@@ -297,7 +291,7 @@ class FlashAttentionBackend(BaseAttnBackend):
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
         assert self.capture is None, "Capture already initialized."
         max_bs = max(bs_list)
-        capture = FACaptureData.create(max_bs, max_seq_len // self.page_size, self.kvcache.device)
+        capture = FACaptureData.create(max_bs, page_count(max_seq_len, self.page_size), self.kvcache.device)
         self.max_graph_bs = max_bs
         self.capture = capture
         self.capture_bs = sorted(bs_list)
@@ -380,6 +374,7 @@ def _fa4_context_mask_impl(
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
     page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
     context_mask_aux: tuple[torch.Tensor, torch.Tensor],
     softmax_scale: float,
     softcap: float,
@@ -387,15 +382,16 @@ def _fa4_context_mask_impl(
 ) -> torch.Tensor:
     if q.ndim != 3 or page_table.ndim != 2 or page_table.size(0) != 1:
         raise RuntimeError("FA4 context-mask adapter expects flattened Q and one page-table row.")
-    if k_cache.ndim != 4 or k_cache.size(1) != 1 or v_cache.shape != k_cache.shape:
-        raise RuntimeError("FA4 context-mask adapter requires page_size=1 MHA KV cache.")
+    if k_cache.ndim != 4 or v_cache.shape != k_cache.shape:
+        raise RuntimeError("FA4 context-mask adapter requires MHA paged KV cache.")
 
-    # FA4 on Hopper does not accept this engine's page_size=1 MHA page table.
+    # FA4 does not accept this engine's MHA page table directly.
     # Gather the logical sequence on GPU; the CuTe attention/mask kernel then sees
     # fixed-shape [batch=1, sequence, heads, dim] tensors with no varlen metadata.
     page_indices = page_table[0].to(dtype=torch.int64)
-    dense_k = k_cache.index_select(0, page_indices).squeeze(1).unsqueeze(0)
-    dense_v = v_cache.index_select(0, page_indices).squeeze(1).unsqueeze(0)
+    key_len = int(cache_seqlens[0].item())
+    dense_k = k_cache.index_select(0, page_indices).flatten(0, 1)[:key_len].unsqueeze(0)
+    dense_v = v_cache.index_select(0, page_indices).flatten(0, 1)[:key_len].unsqueeze(0)
     q_batched = q.unsqueeze(0)
 
     runner, is_public = _get_fa4_context_mask_runner()
@@ -450,6 +446,7 @@ def _fa_sgl_impl(
             k_cache=k_cache,
             v_cache=v_cache,
             page_table=page_table,
+            cache_seqlens=cache_seqlens,
             context_mask_aux=context_mask_aux,
             softmax_scale=softmax_scale,
             softcap=softcap,

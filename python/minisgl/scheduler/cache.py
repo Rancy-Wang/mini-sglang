@@ -5,9 +5,9 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Tuple
 
 import torch
-from minisgl.core import Req
+from minisgl.core import Req, get_global_ctx
 from minisgl.kvcache import BaseCacheHandle, create_prefix_cache
-from minisgl.utils import div_ceil
+from minisgl.utils import align_down, div_ceil
 
 if TYPE_CHECKING:
     from .utils import PendingReq
@@ -20,6 +20,7 @@ class ContextMatchResult:
     full_cached_len: int
     active_match_indices: torch.Tensor
     active_cached_len: int
+    requires_compaction: bool = False
 
 
 @dataclass(frozen=True)
@@ -147,6 +148,20 @@ class CacheManager:
         full_token_prefix_len = int(torch.count_nonzero(~query_virtual_mask).item())
         return int(torch.count_nonzero(req.true_positions < full_token_prefix_len).item())
 
+    def _is_page_representable_active_prefix(self, indices: torch.Tensor) -> bool:
+        if self.page_size == 1 or len(indices) == 0:
+            return True
+        if len(indices) % self.page_size != 0:
+            return False
+        values = indices.to(dtype=torch.int64, device="cpu")
+        for start in range(0, len(values), self.page_size):
+            page = values[start : start + self.page_size]
+            base = int(page[0].item())
+            expected = torch.arange(base, base + self.page_size, dtype=torch.int64)
+            if base % self.page_size != 0 or not torch.equal(page, expected):
+                return False
+        return True
+
     def match_req(self, req: PendingReq) -> ContextMatchResult | None:
         assert req.input_len > 0, "Input length must be greater than 0."
         radix_query, query_virtual_mask = self._radix_query_prefix(req)
@@ -158,6 +173,7 @@ class CacheManager:
             (~matched_virtual_mask).to(device=key_match_indices.device, non_blocking=True)
         ]
         active_match_indices = full_match_indices
+        requires_compaction = False
         if req.prefix_keep_mask is not None and len(full_match_indices) > 0:
             if len(req.prefix_keep_mask) < len(full_match_indices):
                 raise RuntimeError(
@@ -178,6 +194,9 @@ class CacheManager:
                 active_match_indices = kept_indices[:active_cached_len]
             else:
                 active_match_indices = full_match_indices[keep_mask]
+                requires_compaction = not self._is_page_representable_active_prefix(
+                    active_match_indices
+                )
         elif self.drop_aware_eviction and len(full_match_indices) > 0:
             holes = torch.nonzero(full_match_indices < 0, as_tuple=False).view(-1)
             active_cached_len = int(holes[0].item()) if len(holes) > 0 else len(full_match_indices)
@@ -193,6 +212,7 @@ class CacheManager:
             full_cached_len=len(full_match_indices),
             active_match_indices=active_match_indices,
             active_cached_len=len(active_match_indices),
+            requires_compaction=requires_compaction,
         )
 
     def match_full_req(self, req: PendingReq) -> FullMatchResult | None:
@@ -233,6 +253,7 @@ class CacheManager:
         self.prefix_cache.lock_handle(handle, unlock=True)
 
     def allocate_paged(self, reqs: List[Req]) -> None:
+        self._compact_cached_prefixes(reqs)
         needed_pages = 0
         allocation_info: List[Tuple[int, int, int]] = []
         for req in reqs:
@@ -244,6 +265,41 @@ class CacheManager:
         if needed_pages > 0:
             allocated = self._page_to_token(self._allocate(needed_pages))
             _write_page_table(self.page_table, allocated, allocation_info, self.page_size)
+
+    def _compact_cached_prefixes(self, reqs: List[Req]) -> None:
+        compact_reqs = [
+            req
+            for req in reqs
+            if req.compact_cached_prefix and req.cached_len > 0
+        ]
+        if not compact_reqs:
+            return
+
+        total_pages = sum(div_ceil(req.cached_len, self.page_size) for req in compact_reqs)
+        allocated_tokens = self._page_to_token(self._allocate(total_pages))
+        offset = 0
+        for req in compact_reqs:
+            old_handle = req.cache_handle
+            cached_len = req.cached_len
+            needed_pages = div_ceil(cached_len, self.page_size)
+            token_count = needed_pages * self.page_size
+            dst = allocated_tokens[offset : offset + token_count]
+            offset += token_count
+            src = self.page_table[req.table_idx, :cached_len].clone()
+            get_global_ctx().kv_cache.copy_slots(src, dst[:cached_len])
+            _write_page_table(
+                self.page_table,
+                dst,
+                [(req.table_idx, 0, needed_pages)],
+                self.page_size,
+            )
+            self.unlock(old_handle)
+            empty = self.prefix_cache.match_prefix(torch.empty(0, dtype=torch.int64)).cuda_handle
+            req.cache_handle = empty
+            self.lock(empty)
+            req.cached_len = cached_len
+            req.initial_active_cached_len = 0
+            req.compact_cached_prefix = False
 
     def cache_req(self, req: Req, *, finished: bool) -> None:
         if self.drop_aware_eviction:
@@ -467,8 +523,6 @@ class CacheManager:
         return key_prefix_len
 
     def _cache_finished_delta_req(self, req: Req) -> None:
-        if self.page_size != 1:
-            raise RuntimeError("Delta-marker caching requires page_size=1.")
         assert req.radix_key_virtual_mask is not None
         assert req.radix_key_to_token is not None
         assert req.radix_token_to_key is not None
@@ -554,6 +608,7 @@ class CacheManager:
                 if len(missing_positions) > 0
                 else full_token_prefix_len
             )
+            cacheable_full_len = align_down(cacheable_full_len, self.page_size)
             if cacheable_full_len < old_full_cached_len:
                 raise RuntimeError("A new real-token hole overlaps the matched Radix prefix.")
             cacheable_key_len = (
@@ -619,8 +674,6 @@ class CacheManager:
             self.lock(new_handle)
 
     def _cache_finished_sparse_req(self, req: Req) -> None:
-        if self.page_size != 1:
-            raise RuntimeError("Drop-message sparse caching currently requires page_size=1.")
         old_handle = req.cache_handle
         active_indices = self.page_table[req.table_idx, : req.cached_len]
         active_positions = req.true_positions[: req.cached_len]
@@ -673,6 +726,7 @@ class CacheManager:
 
             holes = torch.nonzero(full_indices < 0, as_tuple=False).view(-1)
             cacheable_len = int(holes[0].item()) if len(holes) > 0 else full_cached_len
+            cacheable_len = align_down(cacheable_len, self.page_size)
             if cacheable_len < old_full_cached_len:
                 raise RuntimeError("A new sparse hole overlaps the matched safe prefix.")
 
@@ -691,15 +745,14 @@ class CacheManager:
             self.unlock(old_handle)
 
     def _cache_finished_full_req(self, req: Req) -> None:
-        if self.page_size != 1:
-            raise RuntimeError("Context-mask full-stream caching currently requires page_size=1.")
         old_handle = req.cache_handle
         full_indices = self.page_table[req.table_idx, : req.cached_len]
         try:
             if len(full_indices) == 0 or bool(torch.any(full_indices < 0).item()):
                 raise RuntimeError("Full-stream Prefill produced invalid KV slots.")
+            cacheable_len = align_down(req.cached_len, self.page_size)
             insert_result = self.prefix_cache.insert_prefix(
-                req.radix_match_ids[: req.cached_len], full_indices
+                req.radix_match_ids[:cacheable_len], full_indices[:cacheable_len]
             )
             if insert_result.cached_len < req.initial_active_cached_len:
                 raise RuntimeError("Full-stream Radix prefix regressed during commit.")
@@ -707,7 +760,8 @@ class CacheManager:
             duplicates = (slots >= req.initial_active_cached_len) & (
                 slots < insert_result.cached_len
             )
-            self._free(full_indices[duplicates])
+            unadopted = slots >= insert_result.handle.cached_len
+            self._free(full_indices[duplicates | unadopted])
         finally:
             self.unlock(old_handle)
 

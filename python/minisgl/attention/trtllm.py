@@ -5,9 +5,10 @@ from typing import TYPE_CHECKING, List
 
 import torch
 from minisgl.core import Batch, get_global_ctx
+from minisgl.utils import page_count
 
 from .base import BaseAttnBackend, BaseAttnMetadata
-from .utils import BaseCaptureData
+from .utils import BaseCaptureData, make_backend_page_table
 
 if TYPE_CHECKING:
     from minisgl.models import ModelConfig
@@ -114,11 +115,9 @@ class TensorRTLLMBackend(BaseAttnBackend):
             cu_seqlens_q = cu_seqlens_q.to(self.kvcache.device, non_blocking=True)
 
         page_table = get_global_ctx().page_table
-        new_page_table = torch.stack(  # NOTE: global page table treat page_size = 1, we need slice
-            [page_table[req.table_idx, : max_seqlen_k : self.page_size] for req in reqs]
+        new_page_table = make_backend_page_table(
+            page_table, reqs, max_seqlen_k=max_seqlen_k, page_size=self.page_size
         )
-        if self.page_size > 1:
-            new_page_table.div_(self.page_size, rounding_mode="floor")
         batch.attn_metadata = TRTLLMMetadata(
             cu_seqlens_k=cu_seqlens_k,
             cu_seqlens_q=cu_seqlens_q,
@@ -132,7 +131,7 @@ class TensorRTLLMBackend(BaseAttnBackend):
         assert self.capture is None, "Capture already initialized."
         max_bs = max(bs_list)
         capture = TRTLLMCaptureData.create(
-            max_bs, max_seq_len // self.page_size, self.kvcache.device
+            max_bs, page_count(max_seq_len, self.page_size), self.kvcache.device
         )
         self.max_graph_bs = max_bs
         self.capture = capture

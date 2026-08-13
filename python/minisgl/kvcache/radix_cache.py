@@ -609,8 +609,10 @@ class RadixPrefixCache(BasePrefixCache):
             raise ValueError("Virtual Radix keys must use page value -1.")
         if bool(torch.any(indices[~value_virtual_mask] < 0).item()):
             raise ValueError("Real Radix keys must not contain negative page holes.")
-        if self.page_size != 1 and bool(torch.any(virtual_mask).item()):
-            raise ValueError("Virtual Radix keys require page_size=1.")
+        if self.page_size != 1:
+            real_len = int(torch.count_nonzero(~virtual_mask).item())
+            if real_len % self.page_size != 0:
+                raise ValueError("Real Radix keys require page alignment for page_size > 1.")
 
         insert_len = (
             len(input_ids)
