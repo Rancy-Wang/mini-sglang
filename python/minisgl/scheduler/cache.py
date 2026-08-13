@@ -162,6 +162,31 @@ class CacheManager:
                 return False
         return True
 
+    def _page_granular_active_prefix(
+        self, full_match_indices: torch.Tensor, keep_mask: torch.Tensor
+    ) -> tuple[torch.Tensor, int]:
+        if self.page_size == 1:
+            return full_match_indices[keep_mask], len(full_match_indices)
+        safe_len = 0
+        full_len = len(full_match_indices)
+        for start in range(0, full_len, self.page_size):
+            end = start + self.page_size
+            if end > full_len:
+                break
+            page_keep = keep_mask[start:end]
+            if bool(torch.all(page_keep).item()):
+                page = full_match_indices[start:end]
+                if not self._is_page_representable_active_prefix(page):
+                    break
+                safe_len = end
+                continue
+            if bool(torch.all(~page_keep).item()):
+                continue
+            break
+        if safe_len == 0:
+            return full_match_indices[:0], 0
+        return full_match_indices[:safe_len][keep_mask[:safe_len]], safe_len
+
     def match_req(self, req: PendingReq) -> ContextMatchResult | None:
         assert req.input_len > 0, "Input length must be greater than 0."
         radix_query, query_virtual_mask = self._radix_query_prefix(req)
@@ -173,6 +198,7 @@ class CacheManager:
             (~matched_virtual_mask).to(device=key_match_indices.device, non_blocking=True)
         ]
         active_match_indices = full_match_indices
+        full_cached_len = len(full_match_indices)
         requires_compaction = False
         if req.prefix_keep_mask is not None and len(full_match_indices) > 0:
             if len(req.prefix_keep_mask) < len(full_match_indices):
@@ -193,9 +219,8 @@ class CacheManager:
                 )
                 active_match_indices = kept_indices[:active_cached_len]
             else:
-                active_match_indices = full_match_indices[keep_mask]
-                requires_compaction = not self._is_page_representable_active_prefix(
-                    active_match_indices
+                active_match_indices, full_cached_len = self._page_granular_active_prefix(
+                    full_match_indices, keep_mask
                 )
         elif self.drop_aware_eviction and len(full_match_indices) > 0:
             holes = torch.nonzero(full_match_indices < 0, as_tuple=False).view(-1)
@@ -209,7 +234,7 @@ class CacheManager:
         return ContextMatchResult(
             handle=handle,
             full_match_indices=full_match_indices,
-            full_cached_len=len(full_match_indices),
+            full_cached_len=full_cached_len,
             active_match_indices=active_match_indices,
             active_cached_len=len(active_match_indices),
             requires_compaction=requires_compaction,
@@ -677,13 +702,17 @@ class CacheManager:
         old_handle = req.cache_handle
         active_indices = self.page_table[req.table_idx, : req.cached_len]
         active_positions = req.true_positions[: req.cached_len]
-        old_full_cached_len = old_handle.cached_len
         try:
             if len(active_indices) != len(active_positions):
                 raise RuntimeError(
                     "Active cache indices and true positions have different lengths."
                 )
             full_cached_len = int(active_positions[-1].item()) + 1
+            old_full_cached_len = min(
+                old_handle.cached_len,
+                len(req.initial_full_match_indices),
+                full_cached_len,
+            )
             if full_cached_len > len(req.radix_match_ids):
                 raise RuntimeError("Full cached length exceeds Radix key length.")
 

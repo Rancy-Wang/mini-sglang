@@ -66,7 +66,7 @@ def test_attention_page_helpers_convert_token_table_to_pages():
     assert last_page_len.tolist() == [3, 1, 4]
 
 
-def test_sparse_match_keeps_later_cached_tokens_and_marks_compaction():
+def test_sparse_match_truncates_at_mixed_page_for_page_granular_scheme():
     page_size = 4
     cm = _make_cache_manager(page_size=page_size)
     input_ids = torch.arange(page_size * 4, dtype=torch.int64)
@@ -90,11 +90,11 @@ def test_sparse_match_keeps_later_cached_tokens_and_marks_compaction():
     match = cm.match_req(pending)
 
     assert match is not None
-    assert match.full_cached_len == 16
+    assert match.full_cached_len == page_size
     assert match.handle.cached_len == 16
-    assert match.active_cached_len == 11
-    assert match.active_match_indices.tolist() == [0, 1, 2, 3, 8, 10, 11, 12, 13, 14, 15]
-    assert match.requires_compaction
+    assert match.active_cached_len == page_size
+    assert match.active_match_indices.tolist() == [0, 1, 2, 3]
+    assert not match.requires_compaction
 
 
 def test_radix_virtual_markers_allow_page_aligned_real_tokens():
@@ -124,7 +124,7 @@ def test_radix_virtual_markers_reject_unaligned_real_tokens():
         cm.prefix_cache.insert_prefix(input_ids, indices, virtual_mask)
 
 
-def test_sparse_cached_prefix_compaction_copies_kept_kv_slots():
+def test_sparse_cached_prefix_page_granular_recomputes_after_mixed_page():
     page_size = 4
     cm = _make_cache_manager(num_pages=8, page_size=page_size)
     fake_kv_cache = _FakeKVCache()
@@ -161,18 +161,18 @@ def test_sparse_cached_prefix_compaction_copies_kept_kv_slots():
 
     req = adder.try_add_one(pending)
     assert req is not None
-    assert req.compact_cached_prefix
+    assert not req.compact_cached_prefix
 
     cm.allocate_paged([req])
 
     assert not req.compact_cached_prefix
-    assert req.cache_handle.cached_len == 0
-    assert req.initial_active_cached_len == 0
-    copied_src, copied_dst = fake_kv_cache.copies[0]
-    assert copied_src.tolist() == [0, 1, 2, 3, 8, 10, 11, 12, 13, 14, 15]
-    assert copied_dst.tolist() == list(range(16, 27))
-    assert cm.page_table[req.table_idx, :12].tolist() == list(range(16, 28))
+    assert req.cache_handle.cached_len == 16
+    assert req.cached_len == page_size
+    assert req.initial_active_cached_len == page_size
+    assert fake_kv_cache.copies == []
+    assert cm.page_table[req.table_idx, :4].tolist() == [0, 1, 2, 3]
 
+    req.cached_len = req.device_len
     cm._cache_finished_sparse_req(req)
     cm.check_integrity()
 
