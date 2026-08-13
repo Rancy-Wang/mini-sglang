@@ -20,6 +20,20 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _page_granular_keep_mask(keep_mask: torch.Tensor, page_size: int) -> torch.Tensor:
+    if keep_mask.ndim != 1:
+        raise ValueError("page-granular keep_mask must be one-dimensional.")
+    if page_size <= 1:
+        return keep_mask
+    result = keep_mask.to(dtype=torch.bool, device="cpu").clone()
+    for start in range(0, len(result), page_size):
+        end = min(start + page_size, len(result))
+        page = result[start:end]
+        if bool(torch.any(page).item()) and not bool(torch.all(page).item()):
+            result[start:end] = True
+    return result.to(dtype=keep_mask.dtype)
+
+
 def _supports_multi_context_mask_prefill() -> bool:
     try:
         backend = get_global_ctx().attn_backend
@@ -236,6 +250,25 @@ class PrefillManager:
         input_ids = req.input_ids
         true_positions = req.true_positions
         radix_input_ids = req.radix_input_ids
+        prefix_keep_mask = req.prefix_keep_mask
+        full_keep_mask = req.full_keep_mask
+        if prefix_keep_mask is not None and req.radix_match_ids is not None:
+            page_size = self.cache_manager.page_size
+            prefix_keep_mask = _page_granular_keep_mask(prefix_keep_mask, page_size)
+            full_mask = torch.ones(len(req.radix_match_ids), dtype=torch.int32, device="cpu")
+            full_mask[: len(prefix_keep_mask)] = prefix_keep_mask.to(dtype=torch.int32)
+            if full_keep_mask is not None:
+                full_mask[: len(full_keep_mask)] = _page_granular_keep_mask(
+                    full_keep_mask, page_size
+                ).to(dtype=torch.int32)
+            active_mask = full_mask.to(dtype=torch.bool)
+            full_ids = req.full_input_ids if req.full_input_ids is not None else req.radix_match_ids
+            input_ids = full_ids.to(dtype=req.input_ids.dtype)[active_mask].contiguous()
+            true_positions = torch.arange(len(full_ids), dtype=torch.int32, device="cpu")[
+                active_mask
+            ]
+            radix_input_ids = req.radix_match_ids[active_mask].contiguous()
+            full_keep_mask = full_mask
         if req.use_context_mask:
             if not req.is_warmup:
                 raise ValueError("Context-mask Prefill is restricted to warmup requests.")
@@ -262,10 +295,10 @@ class PrefillManager:
                 stop_token_seqs=req.stop_token_seqs,
                 is_warmup=req.is_warmup,
                 internal_uid=req.internal_uid,
-                prefix_keep_mask=req.prefix_keep_mask,
+                prefix_keep_mask=prefix_keep_mask,
                 full_input_ids=req.full_input_ids,
                 full_token_visible_until=req.full_token_visible_until,
-                full_keep_mask=req.full_keep_mask,
+                full_keep_mask=full_keep_mask,
                 use_context_mask=req.use_context_mask,
                 radix_key_virtual_mask=req.radix_key_virtual_mask,
                 radix_key_to_token=req.radix_key_to_token,

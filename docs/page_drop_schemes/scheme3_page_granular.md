@@ -2,14 +2,14 @@
 
 ## Goal
 
-Support `page_size > 1` with the simplest page ownership model: KV is dropped and
-cached only at complete-page granularity. Mixed pages are not compacted or
-partially reclaimed.
+Support `page_size > 1` with the simplest page ownership model: Drop itself is
+rounded to complete-page granularity. A partial-page Drop is ignored for that
+page; only a fully dropped page is removed from the active stream.
 
 ## Design
 
 Radix matching still happens on the full token and delta-marker key axis, but the
-usable active KV prefix is truncated to page-safe boundaries.
+active token stream is page-normalized before scheduling.
 
 For:
 
@@ -21,14 +21,14 @@ full page2: [8, 9, 10, 11]
 keep:       [0, 1, 2, 3, 4, 7, 8, 9, 10, 11]
 ```
 
-Page1 is mixed. Scheme 3 reuses only:
+The requested Drop only cuts through page1. Scheme 3 does not create a mixed
+page; it keeps page1 unchanged:
 
 ```text
-[0, 1, 2, 3]
+[0, 1, 2, 3] [4, 5, 6, 7] [8, 9, 10, 11]
 ```
 
-The request recomputes from the next active token. If a full page is dropped and
-safe to evict:
+If a full page is dropped and safe to evict:
 
 ```text
 [4, 5, 6, 7] all dropped -> [-1, -1, -1, -1]
@@ -40,8 +40,10 @@ the page start can return to the free list.
 
 - Keep free list and cache ownership strictly page-aligned.
 - Remove non-unit page guards only where page-granular safety is enforced.
-- During match, stop reuse at the first mixed page, real-token hole, or
-  non-page-representable active view.
+- Before scheduling, rewrite Drop masks so partial-page drops are ignored and
+  only all-dropped pages remain dropped.
+- During match, ordinary paged KV metadata remains page-representable because
+  mixed pages are never produced by this scheme.
 - During commit, insert only complete pages into Radix.
 - Drop-aware eviction reclaims only all-dropped, unpinned full pages.
 
@@ -49,12 +51,13 @@ the page start can return to the free list.
 
 - Minimal KV movement.
 - Lowest ownership risk.
-- Lower hit ratio when Drop boundaries cut through pages.
+- Coarser Drop semantics when Drop boundaries cut through pages.
 - No special backend support beyond ordinary paged KV metadata.
 
 ## Tests
 
-- Mixed page truncates active cached prefix to previous safe boundary.
+- Partial-page Drop is ignored.
+- Fully dropped page is removed from the active stream.
 - Fully dropped page becomes hole and returns its page start to free list.
 - Partial final page is not adopted by Radix.
 - No-Drop `page_size=4` remains cacheable.
@@ -62,6 +65,7 @@ the page start can return to the free list.
 
 ## Risks
 
-- Can recompute large suffixes when Drop boundaries are not page-aligned.
-- Poor cache reuse for short messages or frequent small drops.
+- Drop semantics are approximate: a token/message inside a partially kept page
+  remains visible.
+- Poor deletion precision for short messages or frequent small drops.
 - This is a conservative baseline, not maximum reuse.

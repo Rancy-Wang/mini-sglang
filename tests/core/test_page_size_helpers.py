@@ -7,6 +7,7 @@ import torch
 
 import minisgl.core as core
 from minisgl.core import Req, SamplingParams
+from minisgl.message import UserMsg
 from minisgl.attention.utils import (
     make_backend_page_table,
     make_last_page_len_cpu,
@@ -14,7 +15,9 @@ from minisgl.attention.utils import (
     make_paged_kv_indices,
 )
 from minisgl.scheduler.cache import CacheManager
+from minisgl.scheduler.decode import DecodeManager
 from minisgl.scheduler.prefill import PrefillAdder
+from minisgl.scheduler.prefill import PrefillManager
 from minisgl.scheduler.table import TableManager
 from minisgl.scheduler.utils import PendingReq
 
@@ -66,35 +69,66 @@ def test_attention_page_helpers_convert_token_table_to_pages():
     assert last_page_len.tolist() == [3, 1, 4]
 
 
-def test_sparse_match_truncates_at_mixed_page_for_page_granular_scheme():
+def test_page_granular_drop_ignores_partial_page_drops():
     page_size = 4
-    cm = _make_cache_manager(page_size=page_size)
-    input_ids = torch.arange(page_size * 4, dtype=torch.int64)
-    indices = torch.arange(page_size * 4, dtype=torch.int32)
-    cm.prefix_cache.insert_prefix(input_ids, indices)
-
-    keep_mask = torch.tensor(
-        [1, 1, 1, 1, 0, 0, 0, 0, 1, 0, 1, 1, 1, 1, 1, 1],
-        dtype=torch.int32,
+    cm = _make_cache_manager(num_pages=8, page_size=page_size)
+    manager = PrefillManager(
+        cache_manager=cm,
+        table_manager=TableManager(max_running_reqs=1, page_table=cm.page_table),
+        decode_manager=DecodeManager(page_size=page_size),
     )
-    pending = PendingReq(
+    full_ids = torch.arange(12, dtype=torch.int32)
+    keep_mask = torch.tensor([1, 1, 1, 1, 1, 0, 0, 1, 1, 1, 1], dtype=torch.int32)
+    msg = UserMsg(
         uid=1,
-        input_ids=torch.arange(11, dtype=torch.int32),
-        true_positions=torch.tensor([0, 1, 2, 3, 8, 10, 11, 12, 13, 14, 15], dtype=torch.int32),
-        radix_input_ids=torch.arange(11, dtype=torch.int64),
-        radix_match_ids=torch.arange(page_size * 4 + 1, dtype=torch.int64),
+        input_ids=full_ids[torch.tensor([0, 1, 2, 3, 4, 7, 8, 9, 10])],
+        true_positions=torch.tensor([0, 1, 2, 3, 4, 7, 8, 9, 10], dtype=torch.int32),
+        radix_input_ids=full_ids[:11].to(torch.int64)[keep_mask.to(torch.bool)],
+        radix_match_ids=full_ids.to(torch.int64),
         sampling_params=SamplingParams(max_tokens=1),
+        full_input_ids=full_ids,
         prefix_keep_mask=keep_mask,
+        full_keep_mask=torch.tensor([1, 1, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1], dtype=torch.int32),
     )
 
-    match = cm.match_req(pending)
+    manager.add_one_req(msg)
+    pending = manager.pending_list[0]
 
-    assert match is not None
-    assert match.full_cached_len == page_size
-    assert match.handle.cached_len == 16
-    assert match.active_cached_len == page_size
-    assert match.active_match_indices.tolist() == [0, 1, 2, 3]
-    assert not match.requires_compaction
+    assert pending.input_ids.tolist() == list(range(12))
+    assert pending.true_positions.tolist() == list(range(12))
+    assert pending.prefix_keep_mask.tolist() == [1] * 11
+    assert pending.full_keep_mask.tolist() == [1] * 12
+
+
+def test_page_granular_drop_keeps_only_complete_page_drops():
+    page_size = 4
+    cm = _make_cache_manager(num_pages=8, page_size=page_size)
+    manager = PrefillManager(
+        cache_manager=cm,
+        table_manager=TableManager(max_running_reqs=1, page_table=cm.page_table),
+        decode_manager=DecodeManager(page_size=page_size),
+    )
+    full_ids = torch.arange(12, dtype=torch.int32)
+    keep_mask = torch.tensor([1, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1], dtype=torch.int32)
+    msg = UserMsg(
+        uid=1,
+        input_ids=full_ids[torch.tensor([0, 1, 2, 3, 8, 9, 10])],
+        true_positions=torch.tensor([0, 1, 2, 3, 8, 9, 10], dtype=torch.int32),
+        radix_input_ids=full_ids[:11].to(torch.int64)[keep_mask.to(torch.bool)],
+        radix_match_ids=full_ids.to(torch.int64),
+        sampling_params=SamplingParams(max_tokens=1),
+        full_input_ids=full_ids,
+        prefix_keep_mask=keep_mask,
+        full_keep_mask=torch.tensor([1, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1], dtype=torch.int32),
+    )
+
+    manager.add_one_req(msg)
+    pending = manager.pending_list[0]
+
+    assert pending.input_ids.tolist() == [0, 1, 2, 3, 8, 9, 10, 11]
+    assert pending.true_positions.tolist() == [0, 1, 2, 3, 8, 9, 10, 11]
+    assert pending.prefix_keep_mask.tolist() == keep_mask.tolist()
+    assert pending.full_keep_mask.tolist() == [1, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1]
 
 
 def test_radix_virtual_markers_allow_page_aligned_real_tokens():
