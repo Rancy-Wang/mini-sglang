@@ -1,0 +1,4 @@
+interface:
+  display_name: "System-test Checkpoint"
+  short_description: "Push, sync, test, and report a System-test checkpoint"
+  default_prompt: "Use $system-test-checkpoint to publish and remotely verify this conversation checkpoint."

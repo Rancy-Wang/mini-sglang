@@ -1,0 +1,4 @@
+interface:
+  display_name: "Context System Validation"
+  short_description: "Validate Context System changes and classify failures"
+  default_prompt: "Use $context-system-validation to verify a Context System checkpoint independently."
