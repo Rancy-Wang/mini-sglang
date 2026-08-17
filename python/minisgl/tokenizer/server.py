@@ -105,14 +105,9 @@ def tokenize_worker(
             reject_msg = [m for m in pending_msg if isinstance(m, RequestRejectMsg)]
             tokenize_msg = [m for m in pending_msg if isinstance(m, TokenizeMsg)]
             abort_msg = [m for m in pending_msg if isinstance(m, AbortMsg)]
-            assert (
-                len(detokenize_msg)
-                + len(tokenize_msg)
-                + len(warmup_msg)
-                + len(reject_msg)
-                + len(abort_msg)
-                == len(pending_msg)
-            )
+            assert len(detokenize_msg) + len(tokenize_msg) + len(warmup_msg) + len(
+                reject_msg
+            ) + len(abort_msg) == len(pending_msg)
             if len(detokenize_msg) > 0:
                 replies = detokenize_manager.detokenize(detokenize_msg)
                 batch_output = BatchFrontendMsg(
@@ -179,8 +174,10 @@ def tokenize_worker(
                                 radix_input_ids=t.radix_input_ids,
                                 radix_match_ids=t.radix_match_ids,
                                 sampling_params=msg.sampling_params,
-                                target_msg_id=msg.target_msg_id,
-                                drop_message=msg.drop_message,
+                                drop_event_positions=t.drop_event_positions,
+                                drop_range_offsets=t.drop_range_offsets,
+                                drop_position_ranges=t.drop_position_ranges,
+                                radix_commit_token_len=t.radix_commit_token_len,
                                 enable_thinking=msg.enable_thinking,
                                 stop=msg.stop,
                                 stop_token_seqs=t.stop_token_seqs,
@@ -189,9 +186,7 @@ def tokenize_worker(
                                 internal_uid=msg.internal_uid,
                                 prefix_keep_mask=t.prefix_keep_mask,
                                 full_input_ids=t.full_input_ids,
-                                full_kv_owner=t.full_kv_owner,
-                                full_query_epoch=t.full_query_epoch,
-                                drop_visible_until=t.drop_visible_until,
+                                full_token_visible_until=t.full_token_visible_until,
                                 full_keep_mask=t.full_keep_mask,
                                 use_context_mask=msg.use_context_mask,
                             )

@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from typing import Dict, List
 
 from minisgl.message import DetokenizeMsg
+from minisgl.message.tokenizer import get_gpt_oss_terminal_stop_token_ids
 from transformers import PreTrainedTokenizerBase
 
 # Borrowed from sglang
@@ -66,6 +67,15 @@ class DetokenizeManager:
         self.decode_map: Dict[int, DecodeStatus] = {}
         self.tokenizer = tokenizer
         self.eos_token_id = self.tokenizer.eos_token_id
+        eos_values = (
+            self.eos_token_id
+            if isinstance(self.eos_token_id, (list, tuple, set))
+            else [self.eos_token_id]
+        )
+        self.eos_token_ids = {int(token_id) for token_id in eos_values if token_id is not None}
+        tokenizer_name = str(getattr(tokenizer, "name_or_path", "")).lower()
+        if "gpt-oss" in tokenizer_name or "gptoss" in type(tokenizer).__name__.lower():
+            self.eos_token_ids.update(get_gpt_oss_terminal_stop_token_ids())
 
     def detokenize(self, msgs: List[DetokenizeMsg]) -> List[str]:
         read_ids: List[List[int]] = []
@@ -80,7 +90,7 @@ class DetokenizeManager:
                     sent_offset=0,
                 )
             s = self.decode_map[msg.uid]
-            if not (msg.finished and msg.next_token == self.eos_token_id):
+            if not (msg.finished and msg.next_token in self.eos_token_ids):
                 s.decoded_ids.append(msg.next_token)
             read_ids.append(s.decoded_ids[s.surr_offset :])
             surr_ids.append(s.decoded_ids[s.surr_offset : s.read_offset])

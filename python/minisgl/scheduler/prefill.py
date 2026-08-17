@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Tuple
 
 import torch
-from minisgl.core import Batch, Req
+from minisgl.core import Batch, Req, get_global_ctx
 from minisgl.utils import init_logger
 
 from .utils import PendingReq
@@ -18,6 +18,14 @@ if TYPE_CHECKING:
     from .table import TableManager
 
 logger = init_logger(__name__)
+
+
+def _supports_multi_context_mask_prefill() -> bool:
+    try:
+        backend = get_global_ctx().attn_backend
+    except AssertionError:
+        return False
+    return backend.supports_multi_context_mask_prefill
 
 
 class ChunkedReq(Req):
@@ -135,15 +143,14 @@ class PrefillAdder:
             is_warmup=pending_req.is_warmup,
             cache_hit_ratio=cache_hit_ratio,
             full_input_ids=pending_req.full_input_ids,
-            full_kv_owner=pending_req.full_kv_owner,
-            full_query_epoch=pending_req.full_query_epoch,
-            drop_visible_until=pending_req.drop_visible_until,
+            full_token_visible_until=pending_req.full_token_visible_until,
             full_keep_mask=pending_req.full_keep_mask,
             use_context_mask=pending_req.use_context_mask,
             radix_key_virtual_mask=pending_req.radix_key_virtual_mask,
             radix_key_to_token=pending_req.radix_key_to_token,
             radix_token_to_key=pending_req.radix_token_to_key,
             radix_commit_key_len=pending_req.radix_commit_key_len,
+            radix_marker_ids=pending_req.radix_marker_ids,
         )
 
     def try_add_one(self, pending_req: PendingReq) -> Req | None:
@@ -197,7 +204,9 @@ class PrefillManager:
             if not req.is_warmup:
                 raise ValueError("Context-mask Prefill is restricted to warmup requests.")
             if req.full_input_ids is None or req.radix_match_ids is None:
-                raise ValueError("Context-mask Prefill requires a full token stream and Radix keys.")
+                raise ValueError(
+                    "Context-mask Prefill requires a full token stream and Radix keys."
+                )
             input_ids = req.full_input_ids
             true_positions = torch.arange(len(input_ids), dtype=torch.int32, device="cpu")
             radix_input_ids = (
@@ -219,15 +228,14 @@ class PrefillManager:
                 internal_uid=req.internal_uid,
                 prefix_keep_mask=req.prefix_keep_mask,
                 full_input_ids=req.full_input_ids,
-                full_kv_owner=req.full_kv_owner,
-                full_query_epoch=req.full_query_epoch,
-                drop_visible_until=req.drop_visible_until,
+                full_token_visible_until=req.full_token_visible_until,
                 full_keep_mask=req.full_keep_mask,
                 use_context_mask=req.use_context_mask,
                 radix_key_virtual_mask=req.radix_key_virtual_mask,
                 radix_key_to_token=req.radix_key_to_token,
                 radix_token_to_key=req.radix_token_to_key,
                 radix_commit_key_len=req.radix_commit_key_len,
+                radix_marker_ids=tuple(req.radix_marker_ids or ()),
             )
         )
 
@@ -244,16 +252,21 @@ class PrefillManager:
         )
         reqs: List[Req] = []
         chunked_list: List[PendingReq] = []
+        supports_multi_context_mask = _supports_multi_context_mask_prefill()
         for pending_req in self.pending_list:
-            if len(reqs) > 0 and (pending_req.use_context_mask or reqs[0].use_context_mask):
-                break
+            if len(reqs) > 0:
+                first_uses_context_mask = reqs[0].use_context_mask
+                if pending_req.use_context_mask != first_uses_context_mask:
+                    break
+                if pending_req.use_context_mask and not supports_multi_context_mask:
+                    break
             if req := adder.try_add_one(pending_req):
                 pending_req.chunked_req = None
                 if isinstance(req, ChunkedReq):
                     pending_req.chunked_req = req
                     chunked_list.append(pending_req)
                 reqs.append(req)
-                if pending_req.use_context_mask:
+                if pending_req.use_context_mask and not supports_multi_context_mask:
                     break
             else:
                 break  # We cannot add more requests
@@ -262,11 +275,11 @@ class PrefillManager:
         self.pending_list = chunked_list + self.pending_list[len(reqs) :]
         return Batch(reqs=reqs, phase="prefill")
 
-    def abort_req(self, uid: int) -> Req | None:
+    def abort_req(self, uid: int) -> Req | PendingReq | None:
         for i, req in enumerate(self.pending_list):
             if req.uid == uid:
                 self.pending_list.pop(i)
-                return req.chunked_req
+                return req.chunked_req or req
         return None
 
     @property

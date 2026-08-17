@@ -15,6 +15,7 @@ from minisgl.message import (
     UserMsg,
     WarmupAckMsg,
 )
+from minisgl.message.tokenizer import get_gpt_oss_terminal_stop_token_ids
 from minisgl.utils import init_logger, load_tokenizer
 
 from .cache import CacheManager
@@ -29,6 +30,7 @@ from .radix_delta import (
 )
 from .radix_symbol import RadixSymbolRegistry, inject_radix_symbols
 from .table import TableManager
+from .utils import PendingReq
 
 if TYPE_CHECKING:
     from minisgl.engine import BatchSamplingArgs, ForwardOutput
@@ -54,10 +56,7 @@ class Scheduler(SchedulerIOMixin):
     def __init__(self, config: SchedulerConfig):
         if config.radix_drop_key_mode == "delta-marker" and config.page_size != 1:
             raise ValueError("Delta-marker Radix mode requires --page-size 1.")
-        if (
-            config.radix_drop_key_mode == "delta-marker"
-            and "trtllm" in config.attention_backend
-        ):
+        if config.radix_drop_key_mode == "delta-marker" and "trtllm" in config.attention_backend:
             raise ValueError(
                 "Delta-marker Radix mode is incompatible with TRTLLM because "
                 "TRTLLM requires a non-unit page size."
@@ -86,13 +85,6 @@ class Scheduler(SchedulerIOMixin):
 
         # initialize other managers
         self.table_manager = TableManager(config.max_running_req, self.engine.page_table)
-        self.cache_manager = CacheManager(
-            self.engine.num_pages, config.page_size, self.engine.page_table, config.cache_type
-        )
-        self.decode_manager = DecodeManager(config.page_size)
-        self.prefill_manager = PrefillManager(
-            self.cache_manager, self.table_manager, self.decode_manager
-        )
         self.radix_drop_key_mode = config.radix_drop_key_mode
         self.radix_symbol_registry = (
             RadixSymbolRegistry() if self.radix_drop_key_mode == "symbol" else None
@@ -100,39 +92,37 @@ class Scheduler(SchedulerIOMixin):
         self.delta_marker_registry = (
             DeltaMarkerRegistry() if self.radix_drop_key_mode == "delta-marker" else None
         )
-        if config.contextual_prefill_mode != "staged":
+        self.cache_manager = CacheManager(
+            self.engine.num_pages, config.page_size, self.engine.page_table, config.cache_type
+        )
+        if self.delta_marker_registry is not None:
+            self.cache_manager.bind_delta_marker_registry(self.delta_marker_registry)
+        self.decode_manager = DecodeManager(config.page_size)
+        self.prefill_manager = PrefillManager(
+            self.cache_manager, self.table_manager, self.decode_manager
+        )
+        if config.contextual_prefill_mode not in {"staged", "mask"}:
+            raise ValueError(
+                "contextual_prefill_mode must be 'mask' or 'staged', got "
+                f"{config.contextual_prefill_mode!r}."
+            )
+        if config.contextual_prefill_mode == "mask":
             if config.page_size != 1:
                 raise ValueError("Context-mask Prefill currently requires --page-size 1.")
-            from minisgl.attention.base import HybridBackend
-
-            prefill_backend = self.engine.attn_backend
-            if isinstance(prefill_backend, HybridBackend):
-                prefill_backend = prefill_backend.prefill_backend
-            if config.contextual_prefill_mode == "flashinfer-mask":
-                from minisgl.attention.fi import FlashInferBackend
-
-                if not isinstance(prefill_backend, FlashInferBackend):
-                    raise ValueError(
-                        "--contextual-prefill-mode flashinfer-mask requires FlashInfer "
-                        "as the Prefill attention backend."
-                    )
-            elif config.contextual_prefill_mode == "flashattention-mask":
-                from minisgl.attention.fa import (
-                    FlashAttentionBackend,
-                    validate_fa_context_mask_support,
-                )
-
-                if not isinstance(prefill_backend, FlashAttentionBackend):
-                    raise ValueError(
-                        "--contextual-prefill-mode flashattention-mask requires "
-                        "FlashAttention as the Prefill attention backend."
-                    )
-                validate_fa_context_mask_support(self.device)
+            self.engine.attn_backend.validate_context_mask_prefill(self.device)
 
         # some alias for easy access
         self.finished_reqs: Set[Req] = set()
         self.tokenizer = load_tokenizer(config.model_path)
         self.eos_token_id = self.tokenizer.eos_token_id
+        eos_values = (
+            self.eos_token_id
+            if isinstance(self.eos_token_id, (list, tuple, set))
+            else [self.eos_token_id]
+        )
+        self.eos_token_ids = {int(token_id) for token_id in eos_values if token_id is not None}
+        if config.model_config.is_gpt_oss:
+            self.eos_token_ids.update(get_gpt_oss_terminal_stop_token_ids())
         self.token_pool = self.table_manager.token_pool
         self.prefill_budget = config.max_extend_tokens
         # self.config = config
@@ -212,6 +202,12 @@ class Scheduler(SchedulerIOMixin):
             for i, req in enumerate(batch.reqs):
                 if isinstance(req, ChunkedReq):
                     continue
+                if req in self.finished_reqs:
+                    # An abort or an earlier overlapping batch already released
+                    # this request. Keep the tombstone until the stale GPU result
+                    # has drained, and never commit or unlock its cache twice.
+                    new_finished_reqs.add(req)
+                    continue
 
                 if req.is_warmup:
                     finished = not req.can_decode
@@ -229,7 +225,7 @@ class Scheduler(SchedulerIOMixin):
                     finished = not req.can_decode
                     finish_reason = "length" if finished else None
                     matched_stop: str | None = None
-                    if not req.sampling_params.ignore_eos and next_token == self.eos_token_id:
+                    if not req.sampling_params.ignore_eos and next_token in self.eos_token_ids:
                         finished = True
                         finish_reason = "stop"
                     stop_matched, matched_stop = req.match_stop()
@@ -267,9 +263,7 @@ class Scheduler(SchedulerIOMixin):
             true_input_len = (
                 len(msg.full_input_ids)
                 if msg.use_context_mask and msg.full_input_ids is not None
-                else int(msg.true_positions[-1].item()) + 1
-                if len(msg.true_positions) > 0
-                else 0
+                else int(msg.true_positions[-1].item()) + 1 if len(msg.true_positions) > 0 else 0
             )
             max_seq_len = self.engine.max_seq_len
             max_output_len = max_seq_len - true_input_len
@@ -305,44 +299,74 @@ class Scheduler(SchedulerIOMixin):
                     state_starts,
                     self.radix_symbol_registry,
                 )
-            elif self.delta_marker_registry is not None and msg.message_meta is not None:
+            elif self.delta_marker_registry is not None:
                 if msg.radix_match_ids is None:
                     raise ValueError("Delta-marker Radix mode requires full radix_match_ids.")
-                marker_meta = msg.message_meta.get("delta_markers", [])
-                if not isinstance(marker_meta, list):
-                    raise ValueError("message_meta.delta_markers must be a list.")
-                layout = inject_delta_markers(
-                    msg.radix_match_ids,
-                    marker_meta,
-                    self.delta_marker_registry,
+                drop_wire = (
+                    msg.drop_event_positions,
+                    msg.drop_range_offsets,
+                    msg.drop_position_ranges,
                 )
-                if layout is not None:
-                    msg.radix_match_ids = layout.keys
-                    msg.radix_key_virtual_mask = layout.virtual_mask
-                    msg.radix_key_to_token = layout.key_to_token
-                    msg.radix_token_to_key = layout.token_to_key
-                    commit_token_len = msg.message_meta.get(
-                        "warmup_commit_token_len"
-                    )
-                    if commit_token_len is not None:
-                        msg.radix_commit_key_len = (
-                            key_prefix_len_for_token_boundary(
-                                layout, commit_token_len
-                            )
+                if any(tensor is not None for tensor in drop_wire):
+                    if not all(tensor is not None for tensor in drop_wire):
+                        raise ValueError(
+                            "Token-position Drop metadata must be provided as one complete set."
                         )
+                    event_positions, range_offsets, position_ranges = drop_wire
+                    assert event_positions is not None
+                    assert range_offsets is not None
+                    assert position_ranges is not None
+                    marker_ids: tuple[int, ...] = ()
+                    try:
+                        layout = inject_delta_markers(
+                            msg.radix_match_ids,
+                            event_positions,
+                            range_offsets,
+                            position_ranges,
+                            self.delta_marker_registry,
+                        )
+                        if layout is not None:
+                            marker_ids = layout.marker_ids
+                            msg.radix_match_ids = layout.keys
+                            msg.radix_key_virtual_mask = layout.virtual_mask
+                            msg.radix_key_to_token = layout.key_to_token
+                            msg.radix_token_to_key = layout.token_to_key
+                            msg.radix_marker_ids = list(marker_ids)
+                        if layout is not None and msg.radix_commit_token_len is not None:
+                            msg.radix_commit_key_len = key_prefix_len_for_token_boundary(
+                                layout, msg.radix_commit_token_len
+                            )
+                    except Exception:
+                        if marker_ids:
+                            self.delta_marker_registry.release_request_refs(marker_ids)
+                            msg.radix_marker_ids = None
+                        raise
 
             if msg.sampling_params.max_tokens > max_output_len:
                 msg.sampling_params.max_tokens = max_output_len
                 logger.warning_rank0(
                     f"Adjust max_tokens to {max_output_len} for request {msg.uid}."
                 )
-            self.prefill_manager.add_one_req(msg)
+            try:
+                self.prefill_manager.add_one_req(msg)
+            except Exception:
+                if self.delta_marker_registry is not None and msg.radix_marker_ids:
+                    self.delta_marker_registry.release_request_refs(msg.radix_marker_ids)
+                    msg.radix_marker_ids = None
+                raise
         elif isinstance(msg, AbortBackendMsg):
             logger.debug_rank0("Aborting request %d", msg.uid)
             req_to_free = self.prefill_manager.abort_req(msg.uid)
             req_to_free = req_to_free or self.decode_manager.abort_req(msg.uid)
-            if req_to_free is not None:
+            if isinstance(req_to_free, PendingReq):
+                if self.delta_marker_registry is not None and req_to_free.radix_marker_ids:
+                    self.delta_marker_registry.release_request_refs(req_to_free.radix_marker_ids)
+                    req_to_free.radix_marker_ids = ()
+            elif req_to_free is not None:
                 self._free_req_resources(req_to_free)
+                # The request may still be present in an overlapping GPU batch.
+                # _process_last_data uses this tombstone to discard that stale result.
+                self.finished_reqs.add(req_to_free)
         else:
             logger.error(f"Unknown message type: {type(msg)}")
             raise NotImplementedError
@@ -351,7 +375,12 @@ class Scheduler(SchedulerIOMixin):
         try:
             self.cache_manager.cache_req(req, finished=True)
         finally:
-            self.table_manager.free(req.table_idx)
+            try:
+                self.table_manager.free(req.table_idx)
+            finally:
+                if self.delta_marker_registry is not None and req.radix_marker_ids:
+                    self.delta_marker_registry.release_request_refs(req.radix_marker_ids)
+                    req.radix_marker_ids = ()
 
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
         self.engine.graph_runner.pad_batch(batch)

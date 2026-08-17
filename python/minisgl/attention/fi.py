@@ -1,18 +1,22 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
-from typing import TYPE_CHECKING, Dict, List, Literal
+from typing import TYPE_CHECKING, Any, Dict, List, Literal
 
 import torch
 from minisgl.core import Batch, get_global_ctx
 from minisgl.distributed import get_tp_info
 from minisgl.env import ENV
-from minisgl.kernel import build_context_visibility_mask
 from minisgl.utils import div_even, init_logger
 
-from .base import BaseAttnBackend, BaseAttnMetadata
+from .base import (
+    BaseAttnBackend,
+    BaseAttnMetadata,
+    build_context_attention_batch,
+    compile_context_page_tables,
+)
 from .utils import BaseCaptureData
 
 if TYPE_CHECKING:
@@ -45,6 +49,20 @@ class FICaptureData(BaseCaptureData):
 
 
 @dataclass
+class FIContextSegmentMetadata:
+    query_start: int
+    query_end: int
+    cu_seqlens_q_cpu: torch.Tensor
+    cu_seqlens_k_cpu: torch.Tensor
+    cu_seqlens_q_gpu: torch.Tensor
+    indices: torch.Tensor
+    last_page_len_cpu: torch.Tensor
+    seq_lens_cpu: torch.Tensor
+    initialized_wrappers: set[int] = field(default_factory=set)
+    wrappers: Dict[int, Any] = field(default_factory=dict)
+
+
+@dataclass
 class FIMetadata(BaseAttnMetadata):
     # fmt: off
     cu_seqlens_q_cpu:   torch.Tensor  # on cpu
@@ -59,9 +77,11 @@ class FIMetadata(BaseAttnMetadata):
     pos_encoding_mode:  str
     seq_lens_cpu:       torch.Tensor  # on cpu
     dtype:              torch.dtype
-    wrapper:            BatchPrefillWithPagedKVCacheWrapper | BatchDecodeWithPagedKVCacheWrapper
-    custom_mask: torch.Tensor | None
-    initialized:        bool = False
+    is_decode:          bool
+    context_segments:  FIContextSegmentMetadata | None = None
+    sliding_context_segments: FIContextSegmentMetadata | None = None
+    graph_bs:           int | None = None
+    initialized_wrappers: set[int] = field(default_factory=set)
     # fmt: on
 
     def __post_init__(self) -> None:
@@ -74,10 +94,6 @@ class FIMetadata(BaseAttnMetadata):
             and self.last_page_len_cpu.is_cpu
             and self.seq_lens_cpu.is_cpu
         )
-        if self.custom_mask is not None:
-            assert self.custom_mask.is_cuda
-            assert self.custom_mask.dtype == torch.uint8
-
     def get_last_indices(self, bs: int) -> torch.Tensor:
         return self.cu_seqlens_q_gpu[1 : 1 + bs] - 1
 
@@ -95,21 +111,18 @@ class FlashInferBackend(BaseAttnBackend):
         self.float_workspace_buffer = torch.empty(
             128 * 1024 * 1024, dtype=torch.uint8, device=self.device
         )
-        self.prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(
-            self.float_workspace_buffer,
-            kv_layout="NHD",
-            backend="fa2",  # flashinfer fa3 is slow, use fa2 instead
-        )
-        self.decode_wrappers = BatchDecodeWithPagedKVCacheWrapper(
-            self.float_workspace_buffer,
-            use_tensor_cores=self.use_tensor_cores,
-            kv_layout="NHD",
-            backend="fa2",  # flashinfer fa3 is slow, use fa2 instead
-        )
-
-        # NOTE: some hack to reuse the int_workspace_buffer
-        self.int_workspace_buffer = self.prefill_wrapper._int_workspace_buffer
-        self.decode_wrappers._int_workspace_buffer = self.int_workspace_buffer
+        self._prefill_wrapper_cls = BatchPrefillWithPagedKVCacheWrapper
+        self._decode_wrapper_cls = BatchDecodeWithPagedKVCacheWrapper
+        self.prefill_wrappers: Dict[int, BatchPrefillWithPagedKVCacheWrapper] = {
+            -1: self._new_prefill_wrapper()
+        }
+        self.decode_wrappers: Dict[int, BatchDecodeWithPagedKVCacheWrapper] = {
+            -1: self._new_decode_wrapper()
+        }
+        if config.sliding_window is not None:
+            window_left = config.sliding_window - 1
+            self.prefill_wrappers[window_left] = self._new_prefill_wrapper()
+            self.decode_wrappers[window_left] = self._new_decode_wrapper()
 
         # initialize some data members
         tp_size = get_tp_info().size
@@ -120,69 +133,109 @@ class FlashInferBackend(BaseAttnBackend):
         # for cuda graph
         self.capture_bs: List[int] = []
         self.max_graph_bs = 0
-        self.graph_wrappers: Dict[int, CUDAGraphBatchDecodeWithPagedKVCacheWrapper] = {}
+        self.graph_wrappers: Dict[
+            tuple[int, int], CUDAGraphBatchDecodeWithPagedKVCacheWrapper
+        ] = {}
         self.capture: FICaptureData | None = None
         self.last_event = torch.cuda.Event()
         self.last_event.record()
 
-    def _initialize_metadata_once(self, metadata: FIMetadata) -> None:
-        if metadata.initialized:
+    def validate_context_mask_prefill(self, device: torch.device | int | None = None) -> None:
+        return None
+
+    @property
+    def supports_multi_context_mask_prefill(self) -> bool:
+        return True
+
+    def _new_prefill_wrapper(self):
+        return self._prefill_wrapper_cls(
+            self.float_workspace_buffer,
+            kv_layout="NHD",
+            backend="fa2",  # FlashInfer FA3 is slow; use its FA2 backend.
+        )
+
+    def _new_decode_wrapper(self):
+        return self._decode_wrapper_cls(
+            self.float_workspace_buffer,
+            use_tensor_cores=self.use_tensor_cores,
+            kv_layout="NHD",
+            backend="fa2",  # FlashInfer FA3 is slow; use its FA2 backend.
+        )
+
+    @staticmethod
+    def _window_left(sliding_window: int | None) -> int:
+        return -1 if sliding_window is None else sliding_window
+
+    def _initialize_metadata_once(
+        self,
+        metadata: FIMetadata | FIContextSegmentMetadata,
+        wrapper,
+        *,
+        is_decode: bool,
+        window_left: int,
+    ) -> None:
+        wrapper_id = id(wrapper)
+        if wrapper_id in metadata.initialized_wrappers:
             return
-
-        from flashinfer import BatchDecodeWithPagedKVCacheWrapper
-
-        metadata.initialized = True
+        num_qo_heads = getattr(metadata, "num_qo_heads", self.qo_head_local)
+        num_kv_heads = getattr(metadata, "num_kv_heads", self.kv_head_local)
+        head_dim = getattr(metadata, "head_dim", self.config.head_dim)
+        page_size = getattr(metadata, "page_size", 1)
+        pos_encoding_mode = getattr(metadata, "pos_encoding_mode", "NONE")
+        dtype = getattr(metadata, "dtype", self.kvcache.dtype)
         # FlashInfer planning reuses a pinned host staging buffer and launches an
         # async H2D copy. Wait here before the next plan mutates that host buffer.
         self.last_event.synchronize()
-        if isinstance(metadata.wrapper, BatchDecodeWithPagedKVCacheWrapper):
-            metadata.wrapper.plan(
+        if is_decode:
+            wrapper.plan(
                 indptr=metadata.cu_seqlens_k_cpu,
                 indices=metadata.indices,
                 last_page_len=metadata.last_page_len_cpu,
-                num_qo_heads=metadata.num_qo_heads,
-                num_kv_heads=metadata.num_kv_heads,
-                head_dim=metadata.head_dim,
-                page_size=metadata.page_size,
-                pos_encoding_mode=metadata.pos_encoding_mode,
+                num_qo_heads=num_qo_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                page_size=page_size,
+                pos_encoding_mode=pos_encoding_mode,
+                window_left=window_left,
                 seq_lens=metadata.seq_lens_cpu,
-                data_type=metadata.dtype,
-                q_data_type=metadata.dtype,
-                kv_data_type=metadata.dtype,
+                data_type=dtype,
+                q_data_type=dtype,
+                kv_data_type=dtype,
                 non_blocking=True,
             )
         else:
-            custom_mask_kwargs = {}
             qo_indptr = metadata.cu_seqlens_q_cpu
             kv_indptr = metadata.cu_seqlens_k_cpu
             last_page_len = metadata.last_page_len_cpu
-            if metadata.custom_mask is not None:
-                custom_mask_kwargs["custom_mask"] = metadata.custom_mask
-                # FlashInfer 0.5.x runs segment_packbits on GPU for the public
-                # custom_mask path, so all mask-shape indptr inputs must be on
-                # the same CUDA device. Ordinary planning keeps the faster
-                # upstream CPU-indptr path.
-                qo_indptr = metadata.cu_seqlens_q_gpu
-                kv_indptr = metadata.cu_seqlens_k_cpu.to(self.device, non_blocking=True)
-                last_page_len = metadata.last_page_len_cpu.to(self.device, non_blocking=True)
-            metadata.wrapper.plan(
+            wrapper.plan(
                 qo_indptr=qo_indptr,
                 paged_kv_indptr=kv_indptr,
                 paged_kv_indices=metadata.indices,
                 paged_kv_last_page_len=last_page_len,
-                num_qo_heads=metadata.num_qo_heads,
-                num_kv_heads=metadata.num_kv_heads,
-                head_dim_qk=metadata.head_dim,
-                page_size=metadata.page_size,
-                pos_encoding_mode=metadata.pos_encoding_mode,
+                num_qo_heads=num_qo_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim_qk=head_dim,
+                page_size=page_size,
+                pos_encoding_mode=pos_encoding_mode,
+                window_left=window_left,
                 seq_lens=metadata.seq_lens_cpu,
-                q_data_type=metadata.dtype,
-                kv_data_type=metadata.dtype,
+                q_data_type=dtype,
+                kv_data_type=dtype,
                 non_blocking=True,
-                causal=metadata.custom_mask is None,
-                **custom_mask_kwargs,
+                causal=True,
             )
+        metadata.initialized_wrappers.add(wrapper_id)
         self.last_event.record()
+
+    def _ordinary_wrapper(self, metadata: FIMetadata, window_left: int):
+        if metadata.graph_bs is not None:
+            return self.graph_wrappers[(metadata.graph_bs, window_left)]
+        wrappers = self.decode_wrappers if metadata.is_decode else self.prefill_wrappers
+        if window_left not in wrappers:
+            wrappers[window_left] = (
+                self._new_decode_wrapper() if metadata.is_decode else self._new_prefill_wrapper()
+            )
+        return wrappers[window_left]
 
     def _get_ones_cpu(self, bs: int) -> torch.Tensor:
         if bs <= len(self.cached_ones_cpu):
@@ -193,29 +246,95 @@ class FlashInferBackend(BaseAttnBackend):
         return self.cached_ones_cpu[:bs]
 
     def forward(
-        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer_id: int, batch: Batch
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer_id: int,
+        batch: Batch,
+        *,
+        sinks: torch.Tensor | None = None,
+        sliding_window: int | None = None,
     ) -> torch.Tensor:
         def _flatten_cache(cache: torch.Tensor) -> torch.Tensor:  # treat page = 1
             return cache.view(-1, 1, cache.shape[2], cache.shape[3])
 
         metadata = batch.attn_metadata
         assert isinstance(metadata, FIMetadata)
-        self._initialize_metadata_once(metadata)
         self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
         kv_cache = (self.kvcache.k_cache(layer_id), self.kvcache.v_cache(layer_id))
         kv_cache = (_flatten_cache(kv_cache[0]), _flatten_cache(kv_cache[1]))
-        return metadata.wrapper.run(q=q, paged_kv_cache=kv_cache)
+        window_left = self._window_left(sliding_window)
+
+        def _run(wrapper, query: torch.Tensor, run_window_left: int) -> torch.Tensor:
+            run_kwargs = {"window_left": run_window_left}
+            if sinks is None:
+                return wrapper.run(q=query, paged_kv_cache=kv_cache, **run_kwargs)
+
+            # FlashInfer FA2 exposes a sinks argument but does not apply it.
+            # Its returned LSE is base-2, so convert it to a natural logarithm
+            # before adding the GPT-OSS sink as an extra softmax denominator
+            # term. This also works inside an ordinary fixed CUDA Graph.
+            out, lse = wrapper.run(
+                q=query,
+                paged_kv_cache=kv_cache,
+                return_lse=True,
+                **run_kwargs,
+            )
+            if lse.shape != out.shape[:2]:
+                raise RuntimeError(
+                    "Unexpected FlashInfer LSE shape while applying GPT-OSS attention "
+                    f"sinks: output={tuple(out.shape)}, lse={tuple(lse.shape)}."
+                )
+            sink_scale = torch.sigmoid(
+                lse.float() * math.log(2.0) - sinks.float().reshape(1, -1)
+            )
+            return (out.float() * sink_scale.unsqueeze(-1)).to(out.dtype)
+
+        if metadata.context_segments is not None:
+            segment = metadata.context_segments
+            segment_window_left = window_left
+            if sliding_window is not None:
+                if metadata.sliding_context_segments is None:
+                    raise RuntimeError(
+                        "FlashInfer context-mask metadata is missing absolute-position "
+                        "sliding segments."
+                    )
+                segment = metadata.sliding_context_segments
+                segment_window_left = -1
+            wrapper = segment.wrappers.get(segment_window_left)
+            if wrapper is None:
+                wrapper = self._new_prefill_wrapper()
+                segment.wrappers[segment_window_left] = wrapper
+            self._initialize_metadata_once(
+                segment,
+                wrapper,
+                is_decode=False,
+                window_left=segment_window_left,
+            )
+            return _run(
+                wrapper,
+                q[segment.query_start : segment.query_end],
+                segment_window_left,
+            )
+
+        wrapper = self._ordinary_wrapper(metadata, window_left)
+        self._initialize_metadata_once(
+            metadata,
+            wrapper,
+            is_decode=metadata.is_decode,
+            window_left=window_left,
+        )
+        return _run(wrapper, q, window_left)
 
     def prepare_metadata(self, batch: Batch) -> None:
         reqs = batch.padded_reqs
         masked_reqs = [req for req in reqs if req.use_context_mask]
         if masked_reqs:
-            if not batch.is_prefill or batch.size != 1 or len(reqs) != 1:
+            if not batch.is_prefill or len(masked_reqs) != len(reqs):
                 raise RuntimeError(
-                    "FlashInfer context-mask Prefill must be an unpadded, single-request batch."
+                    "FlashInfer context-mask Prefill cannot mix masked and ordinary requests."
                 )
-            if len(masked_reqs) != 1:
-                raise RuntimeError("Mixed masked and ordinary FlashInfer requests are unsupported.")
 
         padded_size = len(reqs)
         seqlens_q = [req.extend_len for req in reqs]
@@ -234,39 +353,48 @@ class FlashInferBackend(BaseAttnBackend):
         else:  # normal extend prefill, with partial cache hit
             cu_seqlens_q_cpu = torch.tensor([0] + seqlens_q, **CPU_KWARGS).cumsum_(dim=0)
 
-        custom_mask = None
-        if masked_reqs:
-            req = masked_reqs[0]
-            if (
-                req.full_kv_owner is None
-                or req.full_query_epoch is None
-                or req.drop_visible_until is None
-            ):
-                raise RuntimeError("Context-mask Prefill request is missing visibility metadata.")
-            full_kv_owner = req.full_kv_owner.to(
-                device=device, dtype=torch.int32, non_blocking=True
-            )
-            full_query_epoch = req.full_query_epoch.to(
-                device=device, dtype=torch.int32, non_blocking=True
-            )
-            drop_visible_until = req.drop_visible_until.to(
-                device=device, dtype=torch.int32, non_blocking=True
-            )
-            custom_mask = build_context_visibility_mask(
-                full_kv_owner,
-                full_query_epoch,
-                drop_visible_until,
-                query_start=req.cached_len,
-                query_length=req.extend_len,
-                key_length=req.device_len,
-            )
-
         page_table = get_global_ctx().page_table
+        context_segments = None
+        sliding_context_segments = None
+        if masked_reqs:
+
+            def _compile_fi_context(sliding_window: int | None):
+                context_batch = build_context_attention_batch(
+                    masked_reqs, sliding_window=sliding_window
+                )
+                compiled = compile_context_page_tables(page_table, context_batch)
+                context_cu_q_cpu = context_batch.cu_seqlens_q.pin_memory()
+                context_cu_k_cpu = context_batch.cu_seqlens_k.pin_memory()
+                context_seq_lens_cpu = (
+                    context_batch.cu_seqlens_k[1:]
+                    - context_batch.cu_seqlens_k[:-1]
+                ).pin_memory()
+                return FIContextSegmentMetadata(
+                    query_start=0,
+                    query_end=context_batch.num_queries,
+                    cu_seqlens_q_cpu=context_cu_q_cpu,
+                    cu_seqlens_k_cpu=context_cu_k_cpu,
+                    cu_seqlens_q_gpu=context_cu_q_cpu.to(device, non_blocking=True),
+                    indices=compiled.flat_indices,
+                    last_page_len_cpu=self._get_ones_cpu(context_batch.num_segments),
+                    seq_lens_cpu=context_seq_lens_cpu,
+                )
+
+            context_segments = _compile_fi_context(None)
+            if self.config.sliding_window is not None:
+                sliding_context_segments = _compile_fi_context(
+                    self.config.sliding_window - 1
+                )
+            flat_indices = context_segments.indices
+        else:
+            flat_indices = torch.cat(
+                [page_table[req.table_idx, : req.device_len] for req in reqs]
+            )
         batch.attn_metadata = FIMetadata(
             cu_seqlens_q_cpu=cu_seqlens_q_cpu,
             cu_seqlens_k_cpu=cu_seqlens_k_cpu,
             cu_seqlens_q_gpu=cu_seqlens_q_cpu.to(device, non_blocking=True),
-            indices=torch.cat([page_table[req.table_idx, : req.device_len] for req in reqs]),
+            indices=flat_indices,
             last_page_len_cpu=self._get_ones_cpu(padded_size),
             num_qo_heads=self.qo_head_local,
             num_kv_heads=self.kv_head_local,
@@ -275,8 +403,9 @@ class FlashInferBackend(BaseAttnBackend):
             pos_encoding_mode="NONE",
             seq_lens_cpu=seq_len_cpu,
             dtype=self.kvcache.dtype,
-            wrapper=self.decode_wrappers if batch.is_decode else self.prefill_wrapper,
-            custom_mask=custom_mask,
+            is_decode=batch.is_decode,
+            context_segments=context_segments,
+            sliding_context_segments=sliding_context_segments,
         )
 
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
@@ -300,27 +429,48 @@ class FlashInferBackend(BaseAttnBackend):
         from flashinfer import CUDAGraphBatchDecodeWithPagedKVCacheWrapper
 
         bs = batch.size
-        assert bs in self.capture_bs and bs not in self.graph_wrappers and self.capture
+        assert bs in self.capture_bs and self.capture
         capture = self.capture
-        self.graph_wrappers[bs] = CUDAGraphBatchDecodeWithPagedKVCacheWrapper(
-            self.float_workspace_buffer,
-            kv_layout="NHD",
-            use_tensor_cores=self.use_tensor_cores,
-            indptr_buffer=capture.cu_seqlens_k[: bs + 1],
-            indices_buffer=capture.indices,
-            last_page_len_buffer=capture.one_tensor[:bs],
-        )
-        self.graph_wrappers[bs]._backend = "fa2"
-        self.graph_wrappers[bs]._int_workspace_buffer = self.int_workspace_buffer
+        windows = {-1}
+        if self.config.sliding_window is not None:
+            windows.add(self.config.sliding_window - 1)
+        for window_left in windows:
+            key = (bs, window_left)
+            assert key not in self.graph_wrappers
+            wrapper = CUDAGraphBatchDecodeWithPagedKVCacheWrapper(
+                self.float_workspace_buffer,
+                kv_layout="NHD",
+                use_tensor_cores=self.use_tensor_cores,
+                indptr_buffer=capture.cu_seqlens_k[: bs + 1],
+                indices_buffer=capture.indices,
+                last_page_len_buffer=capture.one_tensor[:bs],
+            )
+            wrapper._backend = "fa2"
+            self.graph_wrappers[key] = wrapper
         self.prepare_metadata(batch)
         metadata = batch.attn_metadata
         assert isinstance(metadata, FIMetadata)
-        metadata.wrapper = self.graph_wrappers[bs]
-        self._initialize_metadata_once(metadata)
+        metadata.graph_bs = bs
+        for window_left in windows:
+            self._initialize_metadata_once(
+                metadata,
+                self.graph_wrappers[(bs, window_left)],
+                is_decode=True,
+                window_left=window_left,
+            )
 
     def prepare_for_replay(self, batch: Batch) -> None:
         metadata, bs = batch.attn_metadata, batch.padded_size
-        assert isinstance(metadata, FIMetadata) and not metadata.initialized
+        assert isinstance(metadata, FIMetadata)
         assert self.capture is not None and bs in self.capture_bs
-        metadata.wrapper = self.graph_wrappers[bs]
-        self._initialize_metadata_once(metadata)
+        metadata.graph_bs = bs
+        windows = {-1}
+        if self.config.sliding_window is not None:
+            windows.add(self.config.sliding_window - 1)
+        for window_left in windows:
+            self._initialize_metadata_once(
+                metadata,
+                self.graph_wrappers[(bs, window_left)],
+                is_decode=True,
+                window_left=window_left,
+            )

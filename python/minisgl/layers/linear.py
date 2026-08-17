@@ -51,8 +51,6 @@ class LinearReplicated(_LinearTPImpl):
             local_osize=output_size,
             has_bias=has_bias,
         )
-
-
 class LinearColParallelMerged(_LinearTPImpl):
     def __init__(
         self,
@@ -100,9 +98,11 @@ class LinearOProj(_LinearTPImpl):
         super().__init__(full_isize, full_osize, local_isize, local_osize, has_bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = F.linear(x, self.weight, self.bias)
+        y = F.linear(x, self.weight)
         if self._tp_size > 1:
             y = self._comm.all_reduce(y)
+        if self.bias is not None:
+            y = y + self.bias
         return y
 
 
@@ -121,7 +121,9 @@ class LinearRowParallel(_LinearTPImpl):
         super().__init__(input_size, output_size, local_input_size, local_output_size, has_bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = F.linear(x, self.weight, self.bias)
+        y = F.linear(x, self.weight)
         if self._tp_size > 1:
             y = self._comm.all_reduce(y)
+        if self.bias is not None:
+            y = y + self.bias
         return y

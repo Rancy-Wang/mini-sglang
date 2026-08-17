@@ -41,8 +41,11 @@ class UserMsg(BaseBackendMsg):
     radix_key_to_token: torch.Tensor | None = None  # CPU 1D int64, -1 for virtual markers
     radix_token_to_key: torch.Tensor | None = None  # CPU 1D int64, full-token to key axis
     radix_commit_key_len: int | None = None  # internal upper bound for Radix match/commit
-    target_msg_id: int | None = None
-    drop_message: Dict[int, List[int]] | None = None
+    radix_marker_ids: List[int] | None = None  # scheduler-owned request leases
+    drop_event_positions: torch.Tensor | None = None  # CPU 1D int32 absolute boundaries
+    drop_range_offsets: torch.Tensor | None = None  # CPU 1D int32 CSR offsets
+    drop_position_ranges: torch.Tensor | None = None  # CPU 1D int32 flattened [start, end, ...]
+    radix_commit_token_len: int | None = None  # full-token warmup commit boundary
     enable_thinking: bool | None = None
     stop: List[str] | None = None
     stop_token_seqs: List[List[int]] | None = None
@@ -51,9 +54,7 @@ class UserMsg(BaseBackendMsg):
     internal_uid: int | None = None
     prefix_keep_mask: torch.Tensor | None = None  # CPU 1D bool tensor for prefix filtering
     full_input_ids: torch.Tensor | None = None  # CPU 1D int32 full token stream
-    full_kv_owner: torch.Tensor | None = None  # CPU 1D int32 KV deletion ownership
-    full_query_epoch: torch.Tensor | None = None  # CPU 1D int32 monotonic drop-state epoch
-    drop_visible_until: torch.Tensor | None = None  # CPU 1D int32 first drop event by owner
+    full_token_visible_until: torch.Tensor | None = None  # CPU 1D int32 first hidden query pos
     full_keep_mask: torch.Tensor | None = None  # CPU 1D int32 final full-to-active mask
     use_context_mask: bool = False  # internal warmup: Prefill the full stream with a custom mask
 

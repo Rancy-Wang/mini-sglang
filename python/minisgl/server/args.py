@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import argparse
 import os
+import warnings
 from dataclasses import dataclass
 from typing import List, Tuple
 
-import torch
 from minisgl.distributed import DistributedInfo
 from minisgl.scheduler import SchedulerConfig
 from minisgl.utils import init_logger
@@ -151,7 +151,18 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         "--graph",
         type=int,
         default=ServerArgs.cuda_graph_max_bs,
-        help="The maximum batch size for CUDA graph capture. None means auto-tuning based on the GPU memory.",
+        help=(
+            "The maximum fixed batch size for whole-model CUDA graph capture. "
+            "GPT-OSS defaults to eager when omitted; use --graph 1 to opt in. "
+            "Piecewise capture and GPT-OSS graph auto-tuning are unsupported."
+        ),
+    )
+    parser.add_argument(
+        "--disable-cuda-graph",
+        action="store_const",
+        const=0,
+        dest="cuda_graph_max_bs",
+        help="Disable CUDA graph capture and always use eager decode.",
     )
 
     parser.add_argument(
@@ -234,23 +245,23 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         choices=["bitmask", "symbol", "delta-marker"],
         default=ServerArgs.radix_drop_key_mode,
         help=(
-            "How drop-message state is injected into Radix keys. "
-            "'delta-marker' inserts virtual canonical-delta markers and is the default; "
-            "'bitmask' keeps the legacy high-32-bit mask; 'symbol' interns the exact "
-            "(token, drop-state) pair into one int64 Radix symbol."
+            "How Drop state is injected into Radix keys. Token-position Drop requires "
+            "'delta-marker', which interns canonical absolute-position ranges into "
+            "virtual keys and is the default. 'bitmask' and 'symbol' remain available "
+            "only for no-Drop legacy operation."
         ),
     )
 
     parser.add_argument(
         "--contextual-prefill-mode",
         type=str,
-        choices=["staged", "flashinfer-mask", "flashattention-mask"],
+        choices=["staged", "mask", "flashinfer-mask", "flashattention-mask"],
         default=ServerArgs.contextual_prefill_mode,
         help=(
-            "How a low-hit contextual warmup is Prefilled. 'staged' keeps the "
-            "legacy per-message fallback; 'flashinfer-mask' uses one isolated "
-            "full-context Prefill with a GPU packed custom mask; "
-            "'flashattention-mask' uses an FA4 CuTe GPU mask on Hopper/Blackwell."
+            "How contextual warmup is Prefilled. 'mask' is the default and lets "
+            "the selected Prefill attention backend compile its native exact mask; "
+            "'staged' keeps the legacy cache-hit and per-message fallback. The "
+            "backend-specific mask names are deprecated aliases for 'mask'."
         ),
     )
 
@@ -263,10 +274,22 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     # Parse arguments
     kwargs = parser.parse_args(args).__dict__.copy()
 
+    legacy_contextual_mode = kwargs["contextual_prefill_mode"]
+    if legacy_contextual_mode in {"flashinfer-mask", "flashattention-mask"}:
+        warnings.warn(
+            f"--contextual-prefill-mode {legacy_contextual_mode} is deprecated; "
+            "use --contextual-prefill-mode mask and select the Prefill attention "
+            "backend with --attention-backend.",
+            FutureWarning,
+            stacklevel=2,
+        )
+        kwargs["contextual_prefill_mode"] = "mask"
+
     # resolve some arguments
     run_shell |= kwargs.pop("shell_mode")
     if run_shell:
-        kwargs["cuda_graph_max_bs"] = 1
+        if kwargs["cuda_graph_max_bs"] != 0:
+            kwargs["cuda_graph_max_bs"] = 1
         kwargs["max_running_req"] = 1
         kwargs["silent_output"] = True
 
@@ -285,17 +308,15 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
             kwargs["model_path"] = model_path
     del kwargs["model_source"]
 
-    if (dtype_str := kwargs["dtype"]) == "auto":
+    from minisgl.models.config import resolve_model_dtype
+
+    if kwargs["dtype"] == "auto":
         from minisgl.utils import cached_load_hf_config
 
-        dtype_str = cached_load_hf_config(kwargs["model_path"]).dtype
-
-    DTYPE_MAP = {
-        "float16": torch.float16,
-        "bfloat16": torch.bfloat16,
-        "float32": torch.float32,
-    }
-    kwargs["dtype"] = DTYPE_MAP[dtype_str] if isinstance(dtype_str, str) else dtype_str
+        hf_config = cached_load_hf_config(kwargs["model_path"])
+        kwargs["dtype"] = resolve_model_dtype(hf_config, "auto")
+    else:
+        kwargs["dtype"] = resolve_model_dtype({}, kwargs["dtype"])
     kwargs["tp_info"] = DistributedInfo(0, kwargs["tensor_parallel_size"])
     del kwargs["tensor_parallel_size"]
 

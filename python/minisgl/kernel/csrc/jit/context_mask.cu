@@ -10,9 +10,7 @@
 namespace {
 
 struct ContextMaskKernelParams {
-  const std::int32_t *__restrict__ kv_owner;
-  const std::int32_t *__restrict__ query_epoch;
-  const std::int32_t *__restrict__ visible_until;
+  const std::int32_t *__restrict__ token_visible_until;
   std::uint8_t *__restrict__ output;
   std::int64_t query_start;
   std::int64_t query_length;
@@ -40,10 +38,9 @@ build_context_mask(const __grid_constant__ ContextMaskKernelParams params) {
       const auto query_offset = flat_idx / params.key_length;
       const auto key_position = flat_idx - query_offset * params.key_length;
       const auto query_position = params.query_start + query_offset;
-      const auto owner = params.kv_owner[key_position];
       const bool causal = key_position <= query_position;
       const bool visible =
-          params.query_epoch[query_position] <= params.visible_until[owner];
+          query_position < params.token_visible_until[key_position];
       packed |= static_cast<std::uint8_t>(
           (causal && visible) ? (1u << bit) : 0u);
     }
@@ -56,28 +53,20 @@ template <std::size_t num_threads = 256,
           std::size_t max_concurrency = 1,
           bool use_pdl = false>
 struct ContextMaskKernel {
-  static void run(const tvm::ffi::TensorView kv_owner,
-                  const tvm::ffi::TensorView query_epoch,
-                  const tvm::ffi::TensorView visible_until,
+  static void run(const tvm::ffi::TensorView token_visible_until,
                   const tvm::ffi::TensorView output,
                   std::int64_t query_start,
                   std::int64_t query_length,
                   std::int64_t key_length) {
     using namespace host;
     auto full_length = SymbolicSize{"full_length"};
-    auto owner_count = SymbolicSize{"owner_count"};
     auto packed_length = SymbolicSize{"packed_length"};
     auto device = SymbolicDevice{};
 
     TensorMatcher({full_length})
         .with_dtype<std::int32_t>()
         .with_device<kDLCUDA>(device)
-        .verify(kv_owner)
-        .verify(query_epoch);
-    TensorMatcher({owner_count})
-        .with_dtype<std::int32_t>()
-        .with_device<kDLCUDA>(device)
-        .verify(visible_until);
+        .verify(token_visible_until);
     TensorMatcher({packed_length})
         .with_dtype<std::uint8_t>()
         .with_device<kDLCUDA>(device)
@@ -89,8 +78,6 @@ struct ContextMaskKernel {
                  "ContextMaskKernel: query range exceeds metadata length.");
     RuntimeCheck(key_length <= full_length.unwrap(),
                  "ContextMaskKernel: key range exceeds metadata length.");
-    RuntimeCheck(owner_count.unwrap() > 0,
-                 "ContextMaskKernel: visible-until metadata is empty.");
 
     const auto num_bits = query_length * key_length;
     const auto num_bytes = (num_bits + 7) / 8;
@@ -98,12 +85,8 @@ struct ContextMaskKernel {
                  "ContextMaskKernel: packed output length mismatch.");
 
     const auto params = ContextMaskKernelParams{
-        .kv_owner =
-            static_cast<const std::int32_t *>(kv_owner.data_ptr()),
-        .query_epoch =
-            static_cast<const std::int32_t *>(query_epoch.data_ptr()),
-        .visible_until =
-            static_cast<const std::int32_t *>(visible_until.data_ptr()),
+        .token_visible_until = static_cast<const std::int32_t *>(
+            token_visible_until.data_ptr()),
         .output = static_cast<std::uint8_t *>(output.data_ptr()),
         .query_start = query_start,
         .query_length = query_length,
@@ -120,9 +103,7 @@ struct ContextMaskKernel {
 };
 
 struct ContextMaskUnpackedKernelParams {
-  const std::int32_t *__restrict__ kv_owner;
-  const std::int32_t *__restrict__ query_epoch;
-  const std::int32_t *__restrict__ visible_until;
+  const std::int32_t *__restrict__ token_visible_until;
   std::uint8_t *__restrict__ output;
   std::int64_t query_start;
   std::int64_t key_length;
@@ -142,10 +123,9 @@ build_context_mask_unpacked(
     const auto query_offset = flat_idx / params.key_length;
     const auto key_position = flat_idx - query_offset * params.key_length;
     const auto query_position = params.query_start + query_offset;
-    const auto owner = params.kv_owner[key_position];
     const bool causal = key_position <= query_position;
     const bool visible =
-        params.query_epoch[query_position] <= params.visible_until[owner];
+        query_position < params.token_visible_until[key_position];
     params.output[flat_idx] = static_cast<std::uint8_t>(causal && visible);
   }
   PDL::launch<kUsePDL>();
@@ -155,28 +135,20 @@ template <std::size_t num_threads = 256,
           std::size_t max_concurrency = 1,
           bool use_pdl = false>
 struct ContextMaskUnpackedKernel {
-  static void run(const tvm::ffi::TensorView kv_owner,
-                  const tvm::ffi::TensorView query_epoch,
-                  const tvm::ffi::TensorView visible_until,
+  static void run(const tvm::ffi::TensorView token_visible_until,
                   const tvm::ffi::TensorView output,
                   std::int64_t query_start,
                   std::int64_t query_length,
                   std::int64_t key_length) {
     using namespace host;
     auto full_length = SymbolicSize{"full_length"};
-    auto owner_count = SymbolicSize{"owner_count"};
     auto output_length = SymbolicSize{"output_length"};
     auto device = SymbolicDevice{};
 
     TensorMatcher({full_length})
         .with_dtype<std::int32_t>()
         .with_device<kDLCUDA>(device)
-        .verify(kv_owner)
-        .verify(query_epoch);
-    TensorMatcher({owner_count})
-        .with_dtype<std::int32_t>()
-        .with_device<kDLCUDA>(device)
-        .verify(visible_until);
+        .verify(token_visible_until);
     TensorMatcher({output_length})
         .with_dtype<std::uint8_t>()
         .with_device<kDLCUDA>(device)
@@ -188,19 +160,14 @@ struct ContextMaskUnpackedKernel {
                  "ContextMaskUnpackedKernel: query range exceeds metadata length.");
     RuntimeCheck(key_length <= full_length.unwrap(),
                  "ContextMaskUnpackedKernel: key range exceeds metadata length.");
-    RuntimeCheck(owner_count.unwrap() > 0,
-                 "ContextMaskUnpackedKernel: visible-until metadata is empty.");
 
     const auto num_elements = query_length * key_length;
     RuntimeCheck(output_length.unwrap() == num_elements,
                  "ContextMaskUnpackedKernel: output length mismatch.");
 
     const auto params = ContextMaskUnpackedKernelParams{
-        .kv_owner = static_cast<const std::int32_t *>(kv_owner.data_ptr()),
-        .query_epoch =
-            static_cast<const std::int32_t *>(query_epoch.data_ptr()),
-        .visible_until =
-            static_cast<const std::int32_t *>(visible_until.data_ptr()),
+        .token_visible_until = static_cast<const std::int32_t *>(
+            token_visible_until.data_ptr()),
         .output = static_cast<std::uint8_t *>(output.data_ptr()),
         .query_start = query_start,
         .key_length = key_length,

@@ -8,7 +8,12 @@ import torch
 from minisgl.core import Batch, get_global_ctx
 from minisgl.utils import is_sm100_supported
 
-from .base import BaseAttnBackend, BaseAttnMetadata
+from .base import (
+    BaseAttnBackend,
+    BaseAttnMetadata,
+    build_context_attention_batch,
+    compile_context_page_tables,
+)
 from .utils import BaseCaptureData
 
 if TYPE_CHECKING:
@@ -20,6 +25,17 @@ class FACaptureData(BaseCaptureData):
     pass
 
 
+@dataclass(frozen=True)
+class FAContextSegmentMetadata:
+    query_start: int
+    query_end: int
+    page_table: torch.Tensor
+    cache_seqlens: torch.Tensor
+    cu_seqlens_q: torch.Tensor
+    cu_seqlens_k: torch.Tensor
+    max_seqlen_q: int
+
+
 @dataclass
 class FAMetadata(BaseAttnMetadata):
     cu_seqlens_k: torch.Tensor
@@ -29,29 +45,42 @@ class FAMetadata(BaseAttnMetadata):
     max_seqlen_q: int
 
     page_table: torch.Tensor
-    context_mask_aux: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None
+    context_mask_aux: tuple[torch.Tensor, torch.Tensor] | None = None
+    context_segments: FAContextSegmentMetadata | None = None
+    sliding_context_segments: FAContextSegmentMetadata | None = None
 
     def get_last_indices(self, bs: int) -> torch.Tensor:
         return self.cu_seqlens_q[1 : 1 + bs] - 1
 
 
 def is_fa_context_mask_supported(device: torch.device | int | None = None) -> bool:
-    """Whether FA4's CuTe custom mask can run on the selected CUDA device."""
+    """Whether an exact FA3-segment or FA4 custom-mask adapter is available."""
 
     if not torch.cuda.is_available():
         return False
     major, _ = torch.cuda.get_device_capability(device)
-    return major in (9, 10, 11)
+    return major in (8, 9, 10, 11)
 
 
 def validate_fa_context_mask_support(device: torch.device | int | None = None) -> None:
     if not is_fa_context_mask_supported(device):
         capability = torch.cuda.get_device_capability(device) if torch.cuda.is_available() else None
         raise ValueError(
-            "--contextual-prefill-mode flashattention-mask requires the FA4 CuTe "
-            "custom-mask kernel on SM90/SM100/SM110; "
-            f"current CUDA capability is {capability}. Use flashinfer-mask on SM80."
+            "--contextual-prefill-mode mask with FlashAttention requires the FA3 segmented "
+            "adapter on SM80/SM90 or the FA4 CuTe custom-mask adapter on SM100/SM110; "
+            f"current CUDA capability is {capability}."
         )
+
+    major, _ = torch.cuda.get_device_capability(device)
+    if major in (8, 9):
+        try:
+            from sgl_kernel.flash_attn import flash_attn_with_kvcache  # noqa: F401
+        except Exception as exc:
+            raise RuntimeError(
+                "FlashAttention context-mask mode on SM80/SM90 requires a working "
+                "sgl-kernel FA3 installation for the selected architecture."
+            ) from exc
+        return
 
     try:
         import inspect
@@ -82,12 +111,9 @@ def _get_context_visibility_mask_mod():
 
     @cute.jit
     def context_visibility_mask_mod(batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
-        full_kv_owner, full_query_epoch, drop_visible_until, query_start = aux_tensors
+        full_token_visible_until, query_start = aux_tensors
         query_position = q_idx + query_start[0]
-        owner = full_kv_owner[kv_idx]
-        return (kv_idx <= query_position) & (
-            full_query_epoch[query_position] <= drop_visible_until[owner]
-        )
+        return (kv_idx <= query_position) & (query_position < full_token_visible_until[kv_idx])
 
     return context_visibility_mask_mod
 
@@ -104,12 +130,52 @@ class FlashAttentionBackend(BaseAttnBackend):
         self.scale = config.head_dim**-0.5
         self.version = 4 if is_sm100_supported() else 3
 
+    def validate_context_mask_prefill(self, device: torch.device | int | None = None) -> None:
+        validate_fa_context_mask_support(device)
+
+    @property
+    def supports_multi_context_mask_prefill(self) -> bool:
+        return self.version == 3
+
     def forward(
-        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer_id: int, batch: Batch
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer_id: int,
+        batch: Batch,
+        *,
+        sinks: torch.Tensor | None = None,
+        sliding_window: int | None = None,
     ) -> torch.Tensor:
         metadata = batch.attn_metadata
         assert isinstance(metadata, FAMetadata)
         self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
+        if metadata.context_segments is not None and self.version == 3:
+            segments = metadata.context_segments
+            window_size = (sliding_window, 0) if sliding_window is not None else (-1, -1)
+            if sliding_window is not None:
+                if metadata.sliding_context_segments is None:
+                    raise RuntimeError(
+                        "FlashAttention context-mask metadata is missing absolute-position "
+                        "sliding segments."
+                    )
+                segments = metadata.sliding_context_segments
+                window_size = (-1, -1)
+            return _fa3_context_mask_impl(
+                q=q,
+                k_cache=self.kvcache.k_cache(layer_id),
+                v_cache=self.kvcache.v_cache(layer_id),
+                segments=segments,
+                softmax_scale=self.scale,
+                window_size=window_size,
+                sinks=sinks,
+            )
+        if metadata.context_mask_aux is not None and (sinks is not None or sliding_window is not None):
+            raise RuntimeError(
+                "FA4 Context mask with GPT-OSS sinks/sliding attention is not enabled; "
+                "use the FA3 adapter on SM80/SM90."
+            )
         return _fa_sgl_impl(
             q=q,
             k_cache=self.kvcache.k_cache(layer_id),
@@ -121,6 +187,8 @@ class FlashAttentionBackend(BaseAttnBackend):
             max_seqlen_q=metadata.max_seqlen_q,
             softmax_scale=self.scale,
             version=self.version,
+            window_size=(sliding_window, 0) if sliding_window is not None else (-1, -1),
+            sinks=sinks,
             context_mask_aux=metadata.context_mask_aux,
         )
 
@@ -128,13 +196,13 @@ class FlashAttentionBackend(BaseAttnBackend):
         reqs = batch.padded_reqs
         masked_reqs = [req for req in reqs if req.use_context_mask]
         if masked_reqs:
-            if not batch.is_prefill or batch.size != 1 or len(reqs) != 1:
+            if not batch.is_prefill or len(masked_reqs) != len(reqs):
                 raise RuntimeError(
-                    "FlashAttention context-mask Prefill must be an unpadded, single-request batch."
+                    "FlashAttention context-mask Prefill cannot mix masked and ordinary requests."
                 )
-            if len(masked_reqs) != 1:
+            if self.version != 3 and len(masked_reqs) != 1:
                 raise RuntimeError(
-                    "Mixed masked and ordinary FlashAttention requests are unsupported."
+                    "FA4 context-mask Prefill remains restricted to one request per batch."
                 )
 
         padded_size = len(reqs)
@@ -167,24 +235,53 @@ class FlashAttentionBackend(BaseAttnBackend):
             new_page_table.div_(self.page_size, rounding_mode="floor")
 
         context_mask_aux = None
+        context_segments = None
+        sliding_context_segments = None
         if masked_reqs:
             if self.page_size != 1:
                 raise RuntimeError(
                     "FlashAttention context-mask Prefill currently requires page_size=1."
                 )
-            req = masked_reqs[0]
-            if (
-                req.full_kv_owner is None
-                or req.full_query_epoch is None
-                or req.drop_visible_until is None
-            ):
-                raise RuntimeError("Context-mask Prefill request is missing visibility metadata.")
-            context_mask_aux = (
-                req.full_kv_owner.to(device=device, dtype=torch.int32, non_blocking=True),
-                req.full_query_epoch.to(device=device, dtype=torch.int32, non_blocking=True),
-                req.drop_visible_until.to(device=device, dtype=torch.int32, non_blocking=True),
-                torch.tensor([req.cached_len], device=device, dtype=torch.int32),
-            )
+            if self.version == 3:
+
+                def _compile_fa_context(sliding_window: int | None):
+                    context_batch = build_context_attention_batch(
+                        masked_reqs, sliding_window=sliding_window
+                    )
+                    compiled = compile_context_page_tables(page_table, context_batch)
+                    cu_seqlens_q = context_batch.cu_seqlens_q.pin_memory().to(
+                        device, non_blocking=True
+                    )
+                    cu_seqlens_k = context_batch.cu_seqlens_k.pin_memory().to(
+                        device, non_blocking=True
+                    )
+                    return FAContextSegmentMetadata(
+                        query_start=0,
+                        query_end=context_batch.num_queries,
+                        page_table=compiled.padded_page_table,
+                        cache_seqlens=(cu_seqlens_k[1:] - cu_seqlens_k[:-1]),
+                        cu_seqlens_q=cu_seqlens_q,
+                        cu_seqlens_k=cu_seqlens_k,
+                        max_seqlen_q=context_batch.max_seqlen_q,
+                    )
+
+                context_segments = _compile_fa_context(None)
+                if self.config.sliding_window is not None:
+                    sliding_context_segments = _compile_fa_context(
+                        self.config.sliding_window - 1
+                    )
+            else:
+                req = masked_reqs[0]
+                if req.full_token_visible_until is None:
+                    raise RuntimeError(
+                        "Context-mask Prefill request is missing visibility metadata."
+                    )
+                context_mask_aux = (
+                    req.full_token_visible_until.to(
+                        device=device, dtype=torch.int32, non_blocking=True
+                    ),
+                    torch.tensor([req.cached_len], device=device, dtype=torch.int32),
+                )
         batch.attn_metadata = FAMetadata(
             cu_seqlens_k=cu_seqlens_k,
             cu_seqlens_q=cu_seqlens_q,
@@ -193,6 +290,8 @@ class FlashAttentionBackend(BaseAttnBackend):
             max_seqlen_q=max_seqlen_q,
             page_table=new_page_table,
             context_mask_aux=context_mask_aux,
+            context_segments=context_segments,
+            sliding_context_segments=sliding_context_segments,
         )
 
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
@@ -248,12 +347,40 @@ def _get_fa4_context_mask_runner():
     return private_func, False
 
 
+def _fa3_context_mask_impl(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    segments: FAContextSegmentMetadata,
+    softmax_scale: float,
+    window_size: Tuple[int, int],
+    sinks: torch.Tensor | None,
+) -> torch.Tensor:
+    """Run exact Context mask Prefill as causal FA3 over active-KV segments."""
+
+    query = q[segments.query_start : segments.query_end]
+    return _fa_sgl_impl(
+        q=query,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        page_table=segments.page_table,
+        cache_seqlens=segments.cache_seqlens,
+        cu_seqlens_q=segments.cu_seqlens_q,
+        cu_seqlens_k=segments.cu_seqlens_k,
+        max_seqlen_q=segments.max_seqlen_q,
+        softmax_scale=softmax_scale,
+        version=3,
+        window_size=window_size,
+        sinks=sinks,
+    )
+
+
 def _fa4_context_mask_impl(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
     page_table: torch.Tensor,
-    context_mask_aux: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    context_mask_aux: tuple[torch.Tensor, torch.Tensor],
     softmax_scale: float,
     softcap: float,
     pack_gqa: bool | None,
@@ -314,7 +441,8 @@ def _fa_sgl_impl(
     num_splits: int = 0,  # Can be tuned for speed
     pack_gqa: bool | None = None,  # Can be tuned for speed
     causal: bool = True,
-    context_mask_aux: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    sinks: torch.Tensor | None = None,
+    context_mask_aux: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     if context_mask_aux is not None:
         return _fa4_context_mask_impl(
@@ -336,21 +464,45 @@ def _fa_sgl_impl(
             "If you're sure it's correctly installed, try `apt update && apt install libnuma1`."
         ) from e
 
+    kwargs = {
+        "q": q,
+        "k_cache": k_cache,
+        "v_cache": v_cache,
+        "page_table": page_table,
+        "cache_seqlens": cache_seqlens,
+        "cu_seqlens_q": cu_seqlens_q,
+        "cu_seqlens_k_new": cu_seqlens_k,
+        "max_seqlen_q": max_seqlen_q,
+        "softmax_scale": softmax_scale,
+        "sm_margin": sm_margin,
+        "window_size": window_size,
+        "softcap": softcap,
+        "num_splits": num_splits,
+        "pack_gqa": pack_gqa,
+        "causal": causal,
+        "ver": version,  # TODO: support FA4 on blackwell
+    }
+    if version == 3 and sinks is not None:
+        # sgl-kernel FA3 accepts a sinks argument on SM80, but its kernel does
+        # not include it in the softmax denominator. Recover the exact GPT-OSS
+        # result from the ordinary output and per-row natural-log LSE:
+        #   sum(exp(scores) * V) / (sum(exp(scores)) + exp(sink)).
+        out, lse, *_ = flash_attn_with_kvcache(  # type: ignore
+            **kwargs,
+            sinks=None,
+            return_softmax_lse=True,
+        )
+        if lse.shape != (out.shape[1], out.shape[0]):
+            raise RuntimeError(
+                "Unexpected FA3 LSE shape while applying GPT-OSS attention sinks: "
+                f"output={tuple(out.shape)}, lse={tuple(lse.shape)}."
+            )
+        sink_scale = torch.sigmoid(
+            lse.float() - sinks.float().reshape(-1, 1)
+        ).transpose(0, 1)
+        return (out.float() * sink_scale.unsqueeze(-1)).to(out.dtype)
+
     return flash_attn_with_kvcache(  # type: ignore
-        q=q,
-        k_cache=k_cache,
-        v_cache=v_cache,
-        page_table=page_table,
-        cache_seqlens=cache_seqlens,
-        cu_seqlens_q=cu_seqlens_q,
-        cu_seqlens_k_new=cu_seqlens_k,
-        max_seqlen_q=max_seqlen_q,
-        softmax_scale=softmax_scale,
-        sm_margin=sm_margin,
-        window_size=window_size,
-        softcap=softcap,
-        num_splits=num_splits,
-        pack_gqa=pack_gqa,
-        causal=causal,
-        ver=version,  # TODO: support FA4 on blackwell
+        **kwargs,
+        sinks=sinks,
     )

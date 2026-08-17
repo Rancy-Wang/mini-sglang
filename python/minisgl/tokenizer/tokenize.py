@@ -7,6 +7,7 @@ from typing import Any, Dict, List
 
 import torch
 from minisgl.message import TokenizeMsg
+from minisgl.message.tokenizer import get_gpt_oss_terminal_stop_token_ids
 from minisgl.tokenizer.template_provenance import build_template_token_provenance
 from transformers import PreTrainedTokenizerBase
 
@@ -19,12 +20,22 @@ class TokenizedResult:
     radix_match_ids: torch.Tensor | None
     prefix_keep_mask: torch.Tensor
     full_input_ids: torch.Tensor | None = None
-    full_kv_owner: torch.Tensor | None = None
-    full_query_epoch: torch.Tensor | None = None
-    drop_visible_until: torch.Tensor | None = None
+    full_token_visible_until: torch.Tensor | None = None
     full_keep_mask: torch.Tensor | None = None
+    drop_event_positions: torch.Tensor | None = None
+    drop_range_offsets: torch.Tensor | None = None
+    drop_position_ranges: torch.Tensor | None = None
+    radix_commit_token_len: int | None = None
     stop_token_seqs: List[List[int]] | None = None
     message_meta: dict | None = None
+
+
+@dataclass(frozen=True)
+class PositionDropPlan:
+    event_positions: torch.Tensor
+    range_offsets: torch.Tensor
+    position_ranges: torch.Tensor
+    full_token_visible_until: torch.Tensor
 
 
 class TokenizeManager:
@@ -38,6 +49,11 @@ class TokenizeManager:
             raise ValueError(f"Unsupported radix drop key mode: {radix_drop_key_mode}")
         self.tokenizer = tokenizer
         self.radix_drop_key_mode = radix_drop_key_mode
+        tokenizer_name = str(getattr(tokenizer, "name_or_path", "")).lower()
+        tokenizer_class = type(tokenizer).__name__.lower()
+        self.is_gpt_oss = "gpt-oss" in tokenizer_name or "gptoss" in tokenizer_class
+        self._reasoning_effort: str | None = None
+        self._harmony_encoding = None
         # Be optimistic: many tokenizers accept extra kwargs via **kwargs even
         # when the explicit signature does not list `enable_thinking`.
         self._supports_enable_thinking = True
@@ -53,6 +69,16 @@ class TokenizeManager:
         enable_thinking: bool | None,
         tools: List[Dict[str, Any]] | None,
     ) -> Any:
+        if self.is_gpt_oss:
+            tokens = self._render_harmony_tokens(
+                messages,
+                add_generation_prompt=add_generation_prompt,
+                enable_thinking=enable_thinking,
+                tools=tools,
+            )
+            if tokenize:
+                return tokens
+            return self._get_harmony_encoding().decode(tokens)
         kwargs = {
             "tokenize": tokenize,
             "add_generation_prompt": add_generation_prompt,
@@ -76,6 +102,152 @@ class TokenizeManager:
                     self._supports_tools = False
                     continue
                 raise
+
+    def _get_harmony_encoding(self):
+        if self._harmony_encoding is None:
+            try:
+                from openai_harmony import HarmonyEncodingName, load_harmony_encoding
+            except ImportError as exc:
+                raise RuntimeError(
+                    "GPT-OSS chat requests require openai-harmony>=0.0.8."
+                ) from exc
+            self._harmony_encoding = load_harmony_encoding(
+                HarmonyEncodingName.HARMONY_GPT_OSS
+            )
+        return self._harmony_encoding
+
+    def _render_harmony_tokens(
+        self,
+        messages: List[dict[str, Any]],
+        *,
+        add_generation_prompt: bool,
+        enable_thinking: bool | None,
+        tools: List[Dict[str, Any]] | None,
+    ) -> List[int]:
+        from openai_harmony import (
+            Author,
+            Conversation,
+            DeveloperContent,
+            ReasoningEffort,
+            Role,
+            SystemContent,
+            ToolDescription,
+        )
+        from openai_harmony import (
+            Message as HarmonyMessage,
+        )
+
+        effort_text = self._reasoning_effort
+        if effort_text is None and enable_thinking is False:
+            effort_text = "low"
+        effort = {
+            "low": ReasoningEffort.LOW,
+            "medium": ReasoningEffort.MEDIUM,
+            "high": ReasoningEffort.HIGH,
+        }.get(str(effort_text or "medium").lower())
+        if effort is None:
+            raise ValueError("reasoning_effort must be one of: low, medium, high")
+
+        harmony_messages = [
+            HarmonyMessage.from_role_and_content(
+                Role.SYSTEM,
+                SystemContent.new()
+                .with_reasoning_effort(effort)
+                .with_required_channels(["analysis", "commentary", "final"]),
+            )
+        ]
+
+        instructions = [
+            self._normalize_message_content(raw.get("content"))
+            for raw in messages
+            if str(raw.get("role", "")).lower() in {"system", "developer"}
+            and self._normalize_message_content(raw.get("content"))
+        ]
+        developer = DeveloperContent.new()
+        if instructions:
+            developer.with_instructions("\n\n".join(instructions))
+        descriptions = []
+        for tool in tools or []:
+            fn = tool.get("function", tool) if isinstance(tool, dict) else {}
+            if not isinstance(fn, dict) or not fn.get("name"):
+                continue
+            descriptions.append(
+                ToolDescription.new(
+                    str(fn["name"]),
+                    str(fn.get("description") or ""),
+                    parameters=fn.get("parameters"),
+                )
+            )
+        if descriptions:
+            developer.with_function_tools(descriptions)
+        if instructions or descriptions:
+            harmony_messages.append(
+                HarmonyMessage.from_role_and_content(Role.DEVELOPER, developer)
+            )
+
+        tool_names: dict[str, str] = {}
+        for raw in messages:
+            role = str(raw.get("role", "user")).lower()
+            if role in {"system", "developer"}:
+                continue
+            content = self._normalize_message_content(raw.get("content"))
+            if role == "user":
+                harmony_messages.append(
+                    HarmonyMessage.from_role_and_content(Role.USER, content)
+                )
+                continue
+            if role == "assistant":
+                reasoning = raw.get("reasoning_content")
+                if isinstance(reasoning, str) and reasoning:
+                    harmony_messages.append(
+                        HarmonyMessage.from_role_and_content(Role.ASSISTANT, reasoning).with_channel(
+                            "analysis"
+                        )
+                    )
+                if content:
+                    harmony_messages.append(
+                        HarmonyMessage.from_role_and_content(Role.ASSISTANT, content).with_channel(
+                            "final"
+                        )
+                    )
+                for call in raw.get("tool_calls") or []:
+                    if not isinstance(call, dict):
+                        continue
+                    fn = call.get("function")
+                    if not isinstance(fn, dict) or not fn.get("name"):
+                        continue
+                    name = str(fn["name"])
+                    if call.get("id") is not None:
+                        tool_names[str(call["id"])] = name
+                    arguments = fn.get("arguments", "{}")
+                    if not isinstance(arguments, str):
+                        arguments = self._json_dumps(arguments)
+                    harmony_messages.append(
+                        HarmonyMessage.from_role_and_content(Role.ASSISTANT, arguments)
+                        .with_channel("commentary")
+                        .with_recipient(f"functions.{name}")
+                        .with_content_type("<|constrain|>json")
+                    )
+                continue
+            if role in {"tool", "function"}:
+                name = raw.get("name") or tool_names.get(str(raw.get("tool_call_id", "")))
+                if not name:
+                    raise ValueError(
+                        "GPT-OSS tool results require name or a matching tool_call_id."
+                    )
+                harmony_messages.append(
+                    HarmonyMessage.from_author_and_content(
+                        Author.new(Role.TOOL, f"functions.{name}"), content
+                    )
+                )
+                continue
+            raise ValueError(f"Unsupported GPT-OSS Harmony role: {role}")
+
+        conversation = Conversation.from_messages(harmony_messages)
+        encoding = self._get_harmony_encoding()
+        if add_generation_prompt:
+            return encoding.render_conversation_for_completion(conversation, Role.ASSISTANT)
+        return encoding.render_conversation(conversation)
 
     def _apply_chat_template(
         self,
@@ -117,7 +289,9 @@ class TokenizeManager:
 
     @staticmethod
     def _json_dumps(value: Any) -> str:
-        return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+        return json.dumps(
+            value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str
+        )
 
     def _normalize_message_content(self, content: Any) -> str:
         if content is None:
@@ -165,7 +339,7 @@ class TokenizeManager:
                 chunks.append("Tool policy: you must call at least one tool before final answer.")
             chunks.append(
                 "When calling a tool, output strictly in this format only:\n"
-                "<tool_call>{\"name\":\"<tool_name>\",\"arguments\":{...}}</tool_call>"
+                '<tool_call>{"name":"<tool_name>","arguments":{...}}</tool_call>'
             )
             chunks.append("Do not provide final answer before tool responses are received.")
         chunks.append("Available tools:\n" + self._json_dumps(tools))
@@ -213,11 +387,7 @@ class TokenizeManager:
             return None
         if mode != "function" or forced_tool_name is None:
             return tools
-        selected = [
-            tool
-            for tool in tools
-            if self._extract_tool_name(tool) == forced_tool_name
-        ]
+        selected = [tool for tool in tools if self._extract_tool_name(tool) == forced_tool_name]
         # Keep all tools as fallback if we cannot find an exact match.
         return selected if len(selected) > 0 else tools
 
@@ -260,7 +430,9 @@ class TokenizeManager:
                 continue
 
             if role == "assistant" and isinstance(raw.get("tool_calls"), list):
-                message["tool_calls"] = self._normalize_tool_calls_for_template(raw.get("tool_calls"))
+                message["tool_calls"] = self._normalize_tool_calls_for_template(
+                    raw.get("tool_calls")
+                )
 
             if role == "tool":
                 if raw.get("tool_call_id") is not None:
@@ -286,7 +458,9 @@ class TokenizeManager:
 
         return messages, target_offset
 
-    def _normalize_drop_message(self, drop_message: dict[int, List[int]] | None) -> dict[int, List[int]]:
+    def _normalize_drop_message(
+        self, drop_message: dict[int, List[int]] | None
+    ) -> dict[int, List[int]]:
         if not drop_message:
             return {}
         normalized: dict[int, List[int]] = {}
@@ -350,63 +524,108 @@ class TokenizeManager:
         return mask
 
     @staticmethod
-    def _canonical_delta_ranges(dropped_ids: set[int]) -> List[List[int]]:
-        ids = sorted(dropped_ids)
-        if not ids:
-            return []
-        ranges: List[List[int]] = []
-        start = previous = ids[0]
-        for msg_id in ids[1:]:
-            if msg_id == previous + 1:
-                previous = msg_id
+    def _build_owner_position_ranges(
+        owners: List[int],
+    ) -> dict[int, List[tuple[int, int]]]:
+        """Return exact full-token ranges for every provenance owner."""
+
+        ranges: dict[int, List[tuple[int, int]]] = {}
+        if not owners:
+            return ranges
+        start = 0
+        owner = int(owners[0])
+        for pos in range(1, len(owners) + 1):
+            next_owner = int(owners[pos]) if pos < len(owners) else None
+            if next_owner == owner:
                 continue
-            ranges.append([start, previous + 1])
-            start = previous = msg_id
-        ranges.append([start, previous + 1])
+            ranges.setdefault(owner, []).append((start, pos))
+            if pos < len(owners):
+                start = pos
+                owner = int(next_owner)
         return ranges
 
-    def _build_delta_markers(
-        self,
+    @staticmethod
+    def _canonicalize_position_ranges(
+        ranges: List[tuple[int, int]],
+    ) -> List[tuple[int, int]]:
+        if not ranges:
+            return []
+        normalized = sorted((int(start), int(end)) for start, end in ranges)
+        merged: List[tuple[int, int]] = []
+        for start, end in normalized:
+            if start < 0 or end <= start:
+                raise ValueError(f"Invalid token-position Drop range: [{start}, {end})")
+            if merged and start <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+            else:
+                merged.append((start, end))
+        return merged
+
+    @classmethod
+    def _ranges_for_messages(
+        cls,
+        owner_ranges: dict[int, List[tuple[int, int]]],
+        message_ids: set[int],
+    ) -> List[tuple[int, int]]:
+        ranges: List[tuple[int, int]] = []
+        for msg_id in sorted(message_ids):
+            ranges.extend(owner_ranges.get(msg_id, ()))
+        return cls._canonicalize_position_ranges(ranges)
+
+    @classmethod
+    def _build_position_drop_plan(
+        cls,
         drop_message: dict[int, List[int]],
         query_epoch: List[int],
-    ) -> List[dict[str, Any]]:
-        """Place newly effective deltas before the first query epoch after each event."""
+        owner_ranges: dict[int, List[tuple[int, int]]],
+    ) -> PositionDropPlan:
+        """Compile message selectors into absolute half-open position deltas."""
 
-        effective: set[int] = set()
-        delta_by_pos: dict[int, set[int]] = {}
-        events_by_pos: dict[int, List[int]] = {}
+        delta_by_pos: dict[int, List[tuple[int, int]]] = {}
+        effective_messages: set[int] = set()
         for event_n in sorted(drop_message):
-            newly_effective = set(drop_message[event_n]) - effective
-            effective.update(drop_message[event_n])
-            if not newly_effective:
+            newly_effective = set(drop_message[event_n]) - effective_messages
+            effective_messages.update(drop_message[event_n])
+            delta_ranges = cls._ranges_for_messages(owner_ranges, newly_effective)
+            if not delta_ranges:
                 continue
             insertion_pos = bisect_right(query_epoch, event_n)
-            delta_by_pos.setdefault(insertion_pos, set()).update(newly_effective)
-            events_by_pos.setdefault(insertion_pos, []).append(event_n)
+            if any(end > insertion_pos for _, end in delta_ranges):
+                raise ValueError(
+                    "A Drop event cannot hide a token before that token has been computed: "
+                    f"event={event_n}, insertion_pos={insertion_pos}, ranges={delta_ranges}"
+                )
+            delta_by_pos.setdefault(insertion_pos, []).extend(delta_ranges)
 
-        return [
-            {
-                "insertion_pos": insertion_pos,
-                "delta": self._canonical_delta_ranges(delta_by_pos[insertion_pos]),
-                "event_ns": events_by_pos[insertion_pos],
-            }
-            for insertion_pos in sorted(delta_by_pos)
-        ]
-
-    @staticmethod
-    def _build_drop_visible_until(
-        drop_message: dict[int, List[int]], message_count_with_generation: int
-    ) -> torch.Tensor:
-        result = torch.full(
-            (message_count_with_generation,),
+        event_positions: List[int] = []
+        range_offsets: List[int] = [0]
+        flat_ranges: List[tuple[int, int]] = []
+        visible_until = torch.full(
+            (len(query_epoch),),
             torch.iinfo(torch.int32).max,
             dtype=torch.int32,
             device="cpu",
         )
-        for n, ids in drop_message.items():
-            for msg_id in ids:
-                result[msg_id] = min(int(result[msg_id].item()), n)
-        return result
+        for insertion_pos in sorted(delta_by_pos):
+            canonical = cls._canonicalize_position_ranges(delta_by_pos[insertion_pos])
+            if not canonical:
+                continue
+            event_positions.append(insertion_pos)
+            flat_ranges.extend(canonical)
+            range_offsets.append(len(flat_ranges))
+            for start, end in canonical:
+                visible_until[start:end] = torch.minimum(
+                    visible_until[start:end],
+                    torch.tensor(insertion_pos, dtype=torch.int32, device="cpu"),
+                )
+
+        position_ranges = torch.tensor(flat_ranges, dtype=torch.int32, device="cpu").reshape(-1)
+        return PositionDropPlan(
+            event_positions=torch.tensor(event_positions, dtype=torch.int32, device="cpu"),
+            range_offsets=torch.tensor(range_offsets, dtype=torch.int32, device="cpu"),
+            position_ranges=position_ranges,
+            full_token_visible_until=visible_until,
+        )
 
     @staticmethod
     def _encode_radix_key(token_id: int, drop_mask: int) -> int:
@@ -425,7 +644,9 @@ class TokenizeManager:
         target_offset: int,
     ) -> int:
         if msg.target_msg_id is None:
-            target_msg_id = max(normalized_msg_count - 1, 0) if msg.is_warmup else normalized_msg_count
+            target_msg_id = (
+                max(normalized_msg_count - 1, 0) if msg.is_warmup else normalized_msg_count
+            )
         else:
             target_msg_id = int(msg.target_msg_id) + target_offset
         if target_msg_id < 0 or target_msg_id > normalized_msg_count:
@@ -435,11 +656,9 @@ class TokenizeManager:
         return target_msg_id
 
     def _build_stop_token_seqs(self, stop: List[str] | None) -> List[List[int]] | None:
-        if not stop:
-            return None
         dedup: set[tuple[int, ...]] = set()
         result: List[List[int]] = []
-        for raw in stop:
+        for raw in stop or []:
             text = str(raw)
             if len(text) == 0:
                 continue
@@ -454,6 +673,12 @@ class TokenizeManager:
                 continue
             dedup.add(key)
             result.append(token_ids)
+        if self.is_gpt_oss:
+            for token_id in get_gpt_oss_terminal_stop_token_ids():
+                key = (int(token_id),)
+                if key not in dedup:
+                    dedup.add(key)
+                    result.append([int(token_id)])
         return result if len(result) > 0 else None
 
     @staticmethod
@@ -528,6 +753,19 @@ class TokenizeManager:
         query_epoch: List[int] = []
         unstable_rounds = 0
 
+        if self.is_gpt_oss:
+            # Harmony always injects model system metadata (and may inject a
+            # tool-bearing developer message). Keep that exact token prefix
+            # outside user message ownership so Drop never removes it.
+            assembled = self._apply_chat_template(
+                [],
+                add_generation_prompt=False,
+                enable_thinking=enable_thinking,
+                tools=tools,
+            )
+            owner = [-1] * len(assembled)
+            query_epoch = [0] * len(assembled)
+
         for i in range(len(messages)):
             curr = self._apply_chat_template(
                 messages[: i + 1],
@@ -535,15 +773,13 @@ class TokenizeManager:
                 enable_thinking=enable_thinking,
                 tools=tools,
             )
-            if i == 0:
+            if i == 0 and not assembled:
                 assembled = curr
                 owner = [0] * len(curr)
                 query_epoch = [0] * len(curr)
                 continue
 
-            owner, lcp, _, unstable = self._merge_owner_track(
-                assembled, owner, curr, new_owner=i
-            )
+            owner, lcp, _, unstable = self._merge_owner_track(assembled, owner, curr, new_owner=i)
             query_epoch = self._merge_query_epoch_track(
                 query_epoch,
                 len(curr),
@@ -574,7 +810,13 @@ class TokenizeManager:
 
     def _chat_tokenize(self, msg: TokenizeMsg) -> TokenizedResult:
         assert isinstance(msg.text, list)
+        self._reasoning_effort = msg.reasoning_effort
         drop_message = self._normalize_drop_message(msg.drop_message)
+        if drop_message and self.radix_drop_key_mode != "delta-marker":
+            raise ValueError(
+                "Token-position Drop requires radix_drop_key_mode='delta-marker'; "
+                f"got {self.radix_drop_key_mode!r}."
+            )
         tool_choice_mode, forced_tool_name = self._normalize_tool_choice(msg.tool_choice)
         selected_tools = self._select_tools_for_choice(
             msg.tools,
@@ -582,13 +824,17 @@ class TokenizeManager:
             forced_tool_name=forced_tool_name,
         )
 
-        messages, target_offset = self._build_template_messages(
-            msg.text,
-            selected_tools,
-            tool_choice_mode=tool_choice_mode,
-            forced_tool_name=forced_tool_name,
-            safe_mode=False,
-        )
+        if self.is_gpt_oss:
+            messages = [dict(message) for message in msg.text]
+            target_offset = 0
+        else:
+            messages, target_offset = self._build_template_messages(
+                msg.text,
+                selected_tools,
+                tool_choice_mode=tool_choice_mode,
+                forced_tool_name=forced_tool_name,
+                safe_mode=False,
+            )
         safe_mode = False
         effective_tools = selected_tools
         try:
@@ -605,6 +851,8 @@ class TokenizeManager:
                 tools=selected_tools,
             )
         except Exception:
+            if self.is_gpt_oss:
+                raise
             messages, target_offset = self._build_template_messages(
                 msg.text,
                 selected_tools,
@@ -628,9 +876,7 @@ class TokenizeManager:
             )
         if not self._supports_tools:
             effective_tools = None
-        effective_enable_thinking = (
-            msg.enable_thinking if self._supports_enable_thinking else None
-        )
+        effective_enable_thinking = msg.enable_thinking if self._supports_enable_thinking else None
         drop_message = self._shift_and_validate_drop_message(
             drop_message,
             target_offset=target_offset,
@@ -662,7 +908,7 @@ class TokenizeManager:
         )
 
         cross_owner_tokens = 0
-        if drop_message:
+        if drop_message and not self.is_gpt_oss:
             canonical_no_gen = self._render_chat_template(
                 messages,
                 add_generation_prompt=False,
@@ -688,6 +934,8 @@ class TokenizeManager:
             owner_with_gen = provenance.owners
             cross_owner_tokens = provenance.cross_owner_tokens
 
+        owner_ranges = self._build_owner_position_ranges(owner_with_gen)
+
         target_msg_id = self._resolve_target_msg_id(
             msg,
             len(messages),
@@ -699,20 +947,19 @@ class TokenizeManager:
             else None
         )
         dropped_for_target = self._build_drop_set(drop_message, target_msg_id)
-        owner_tensor = torch.tensor(owner_with_gen, dtype=torch.int32, device="cpu")
-        query_epoch_tensor = torch.tensor(query_epoch_with_gen, dtype=torch.int32, device="cpu")
-        delta_markers = (
-            self._build_delta_markers(drop_message, query_epoch_with_gen)
-            if self.radix_drop_key_mode == "delta-marker"
-            else []
-        )
-        drop_visible_until = self._build_drop_visible_until(
-            drop_message, len(messages) + 1
+        position_drop_plan = (
+            self._build_position_drop_plan(
+                drop_message,
+                query_epoch_with_gen,
+                owner_ranges,
+            )
+            if drop_message
+            else None
         )
 
         keep_mask = torch.ones(len(full_with_gen_tensor), dtype=torch.bool, device="cpu")
-        for msg_id in dropped_for_target:
-            keep_mask &= owner_tensor != msg_id
+        for start, end in self._ranges_for_messages(owner_ranges, dropped_for_target):
+            keep_mask[start:end] = False
 
         input_ids = full_with_gen_tensor[keep_mask].contiguous()
         true_positions = torch.arange(len(full_with_gen_tensor), dtype=torch.int32)[keep_mask]
@@ -782,10 +1029,22 @@ class TokenizeManager:
             radix_match_ids=radix_match_ids,
             prefix_keep_mask=prefix_keep_mask,
             full_input_ids=(full_with_gen_tensor if drop_message else None),
-            full_kv_owner=(owner_tensor if drop_message else None),
-            full_query_epoch=(query_epoch_tensor if drop_message else None),
-            drop_visible_until=(drop_visible_until if drop_message else None),
+            full_token_visible_until=(
+                position_drop_plan.full_token_visible_until
+                if position_drop_plan is not None
+                else None
+            ),
             full_keep_mask=(keep_mask.to(dtype=torch.int32).contiguous() if drop_message else None),
+            drop_event_positions=(
+                position_drop_plan.event_positions if position_drop_plan is not None else None
+            ),
+            drop_range_offsets=(
+                position_drop_plan.range_offsets if position_drop_plan is not None else None
+            ),
+            drop_position_ranges=(
+                position_drop_plan.position_ranges if position_drop_plan is not None else None
+            ),
+            radix_commit_token_len=warmup_commit_token_len,
             stop_token_seqs=self._build_stop_token_seqs(msg.stop),
             message_meta={
                 "raw_len_with_gen": len(full_with_gen_tensor),
@@ -794,7 +1053,6 @@ class TokenizeManager:
                 "owner_starts": owner_starts,
                 "radix_state_starts": radix_state_starts,
                 "cross_owner_tokens": cross_owner_tokens,
-                "delta_markers": delta_markers,
                 "unstable_rounds": unstable_rounds,
                 "no_gen_with_gen_unstable": int(unstable_with_gen),
                 "no_gen_with_gen_lcp": no_gen_with_gen_lcp,
