@@ -102,7 +102,8 @@ Scheduler -> Detokenizer -> Frontend：非流式响应顶层返回，流式只�
 
 本地只做只读/静态验证：所有修改 Python 文件 `compileall` 通过，`git diff --check` 通过；
 R3 修改范围未超出获批的 23 个路径，R5 代码修改未超出获批的 7 个源码/测试路径，R7
-修改未超出获批的 7 个源码、测试和文档路径。`ruff` 在本地和远端专用环境都未安装，
+修改未超出获批的 7 个源码、测试和文档路径，R8 修改未超出获批的 6 个源码、测试和文档
+路径。`ruff` 在本地和远端专用环境都未安装，
 因此没有声称 lint 通过；本地 Python 也没有 `pytest`，测试统一在远端专用环境执行。
 
 远端使用 `/share/wangruoxi/.conda/envs/minisgl-gpt-oss-r4`，pytest 因该环境没有 coverage
@@ -116,6 +117,8 @@ R3 修改范围未超出获批的 23 个路径，R5 代码修改未超出获批�
   passed。
 - R7 CUDA Graph/scheduler/GPT-OSS 聚焦回归：27 passed；加入 model、launch、Context prefill
   和多请求 Context prefill 后的扩展回归：56 passed。
+- R8 `GraphRunner` AST 与 `origin/main` 对比一致，源码中不存在两条 System-test 专用 capture
+  日志；远端 CUDA Graph/scheduler/GPT-OSS/model/launch/Context prefill 扩展回归：54 passed。
 
 真实模型与服务验证：
 
@@ -139,6 +142,10 @@ R3 修改范围未超出获批的 23 个路径，R5 代码修改未超出获批�
   `cuda_graph_max_bs=None` 自动展开为 `[1, 2, 4, 8, ..., 160]`，全部 23 个 shape 捕获
   成功。每个服务的单请求和 4 条并发 chat completion 均返回 HTTP 200；单元测试另验证
   实际 decode batch size 3 向上 padding 到已捕获的 shape 4 并进入 graph replay 条件。
+- R8 在 GPU 4 对 Qwen3-1.7B 与 GPT-OSS-20B 重跑默认启动：两者都输出 `main` 的捕获前后
+  可用显存与 `Capturing graphs: bs = ...` 进度，均未输出
+  `Captured whole-model CUDA graph bs=...` 或 `Usable CUDA graph sizes: ...`。两者的单请求
+  和 4 条并发 chat completion 再次全部返回 HTTP 200。
 - Qwen3-1.7B 使用 `--disable-cuda-graph` 的实机回归把最大 batch 解析为 `0`，日志明确显示
   `CUDA graph is disabled.`，服务仍正常启动并返回 HTTP 200。
 
