@@ -20,6 +20,26 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _calculate_cache_ratios(
+    cached_len: int,
+    full_matchable_prefix_len: int,
+    active_matchable_prefix_len: int,
+) -> tuple[float, float]:
+    if not 0 <= cached_len <= active_matchable_prefix_len <= full_matchable_prefix_len:
+        raise ValueError(
+            "Cache ratio lengths must satisfy "
+            "0 <= cached <= active_matchable <= full_matchable, got "
+            f"{cached_len}, {active_matchable_prefix_len}, {full_matchable_prefix_len}."
+        )
+    cache_hit_ratio = (
+        1.0 if full_matchable_prefix_len == 0 else cached_len / full_matchable_prefix_len
+    )
+    cache_reuse_ratio = (
+        1.0 if active_matchable_prefix_len == 0 else cached_len / active_matchable_prefix_len
+    )
+    return cache_hit_ratio, cache_reuse_ratio
+
+
 def _supports_multi_context_mask_prefill() -> bool:
     try:
         backend = get_global_ctx().attn_backend
@@ -46,7 +66,7 @@ class PrefillAdder:
 
     def _try_allocate_one(
         self, req: PendingReq
-    ) -> Tuple[BaseCacheHandle, int, float, torch.Tensor, int] | None:
+    ) -> Tuple[BaseCacheHandle, int, float, float, torch.Tensor, int] | None:
         if self.table_manager.available_size == 0:
             return None
 
@@ -66,8 +86,12 @@ class PrefillAdder:
             cached_len = match.active_cached_len
             cached_indices = match.active_match_indices
             initial_full_match_indices = match.full_match_indices[: match.full_cached_len]
-        effective_prefix_len = self.cache_manager.matchable_active_prefix_len(req)
-        hit_ratio = 1.0 if effective_prefix_len == 0 else cached_len / effective_prefix_len
+        full_prefix_len, active_prefix_len = self.cache_manager.matchable_prefix_lens(req)
+        cache_hit_ratio, cache_reuse_ratio = _calculate_cache_ratios(
+            cached_len,
+            full_prefix_len,
+            active_prefix_len,
+        )
         # TODO: better estimate policy
         extend_len = req.input_len - cached_len
         estimated_len = extend_len + req.output_len
@@ -94,7 +118,8 @@ class PrefillAdder:
         return (
             cache_handle,
             table_idx,
-            hit_ratio,
+            cache_hit_ratio,
+            cache_reuse_ratio,
             initial_full_match_indices.clone(),
             cached_len,
         )
@@ -106,6 +131,7 @@ class PrefillAdder:
         table_idx: int,
         cached_len: int,
         cache_hit_ratio: float,
+        cache_reuse_ratio: float,
         initial_full_match_indices: torch.Tensor,
         initial_active_cached_len: int,
     ) -> Req:
@@ -142,6 +168,7 @@ class PrefillAdder:
             prefix_keep_mask=pending_req.prefix_keep_mask,
             is_warmup=pending_req.is_warmup,
             cache_hit_ratio=cache_hit_ratio,
+            cache_reuse_ratio=cache_reuse_ratio,
             full_input_ids=pending_req.full_input_ids,
             full_token_visible_until=pending_req.full_token_visible_until,
             full_keep_mask=pending_req.full_keep_mask,
@@ -164,6 +191,7 @@ class PrefillAdder:
                 table_idx=chunked_req.table_idx,
                 cached_len=chunked_req.cached_len,
                 cache_hit_ratio=chunked_req.cache_hit_ratio,
+                cache_reuse_ratio=chunked_req.cache_reuse_ratio,
                 initial_full_match_indices=chunked_req.initial_full_match_indices,
                 initial_active_cached_len=chunked_req.initial_active_cached_len,
             )
@@ -173,6 +201,7 @@ class PrefillAdder:
                 cache_handle,
                 table_idx,
                 cache_hit_ratio,
+                cache_reuse_ratio,
                 initial_full_match_indices,
                 initial_active_cached_len,
             ) = resource
@@ -182,6 +211,7 @@ class PrefillAdder:
                 table_idx=table_idx,
                 cached_len=initial_active_cached_len,
                 cache_hit_ratio=cache_hit_ratio,
+                cache_reuse_ratio=cache_reuse_ratio,
                 initial_full_match_indices=initial_full_match_indices,
                 initial_active_cached_len=initial_active_cached_len,
             )

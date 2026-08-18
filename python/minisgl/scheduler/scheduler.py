@@ -227,7 +227,7 @@ class Scheduler(SchedulerIOMixin):
                     reply.append(
                         WarmupAckMsg(
                             uid=req.uid,
-                            hit_ratio=req.cache_hit_ratio,
+                            hit_ratio=req.cache_reuse_ratio,
                             finished=finished,
                         )
                     )

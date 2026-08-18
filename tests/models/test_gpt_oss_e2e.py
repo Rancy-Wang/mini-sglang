@@ -5,6 +5,7 @@ import minisgl.engine.engine as engine_module
 import minisgl.models.gpt_oss as gpt_oss
 import pytest
 import torch
+from minisgl.layers.embedding import ParallelLMHead
 
 
 def _attention_config(layer_type):
@@ -86,7 +87,11 @@ def test_engine_dummy_and_loaded_weights_follow_template_dtype(monkeypatch):
         engine_module,
         "load_weight",
         lambda model_path, device: iter(
-            (("packed", torch.ones(4, dtype=torch.uint8)), ("bias", torch.ones(4)))
+            (
+                ("packed", torch.ones(4, dtype=torch.uint8)),
+                ("bias", torch.ones(4)),
+                ("lm_head.weight", torch.ones(4)),
+            )
         ),
     )
     loaded = engine._load_weight_state_dict(
@@ -95,3 +100,18 @@ def test_engine_dummy_and_loaded_weights_follow_template_dtype(monkeypatch):
 
     assert loaded["packed"].dtype == torch.uint8
     assert loaded["bias"].dtype == torch.bfloat16
+    assert loaded["lm_head.weight"].dtype == torch.float32
+
+
+def test_tied_lm_head_consumes_redundant_checkpoint_weight():
+    lm_head = object.__new__(ParallelLMHead)
+    lm_head.tied_embedding = object()
+    state_dict = {
+        "lm_head.weight": torch.ones(4),
+        "unexpected.weight": torch.ones(1),
+    }
+
+    lm_head.load_state_dict(state_dict, prefix="lm_head", _internal=True)
+
+    assert "lm_head.weight" not in state_dict
+    assert list(state_dict) == ["unexpected.weight"]

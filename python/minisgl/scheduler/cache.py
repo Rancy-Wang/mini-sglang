@@ -140,12 +140,16 @@ class CacheManager:
         )
 
     @classmethod
-    def matchable_active_prefix_len(cls, req: PendingReq) -> int:
+    def matchable_prefix_lens(cls, req: PendingReq) -> tuple[int, int]:
         radix_query, query_virtual_mask = cls._radix_query_prefix(req)
         if query_virtual_mask is None:
-            return max(req.input_len - 1, 0)
+            prefix_len = max(req.input_len - 1, 0)
+            return prefix_len, prefix_len
         full_token_prefix_len = int(torch.count_nonzero(~query_virtual_mask).item())
-        return int(torch.count_nonzero(req.true_positions < full_token_prefix_len).item())
+        active_token_prefix_len = int(
+            torch.count_nonzero(req.true_positions < full_token_prefix_len).item()
+        )
+        return full_token_prefix_len, active_token_prefix_len
 
     def match_req(self, req: PendingReq) -> ContextMatchResult | None:
         assert req.input_len > 0, "Input length must be greater than 0."
