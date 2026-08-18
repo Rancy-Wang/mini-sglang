@@ -20,6 +20,8 @@ git log --oneline -8
 - R3 实现提交：
   - `c4526a5 feat(context): add selectable token-position drop rules`
   - `bd513a4 fix(context): retain and map Harmony thinking components`
+- R5 loader/ratio 实现提交：
+  - `0080608 fix(context): support tied weights and honest cache ratios`
 - 上述实现提交已 push 到 `origin/System-test`，并在
   `InfiniAI-BUS:/share/wangruoxi/repo/mini-sglang` fast-forward 拉取。包含本 snapshot 的后续
   文档 checkpoint 应以动态 `git rev-parse HEAD` 为准。
@@ -56,6 +58,22 @@ tests/kernel/test_context_mask.py
 position、mask/staged warmup 与 cache 生命周期。最终生成请求的 `cache_hit_ratio` 已贯通
 Scheduler -> Detokenizer -> Frontend：非流式响应顶层返回，流式只在 terminal chunk 返回。
 
+## PLAN-CS-20260818-R5 已实现范围
+
+- tied-weight checkpoint 可以同时包含 `model.embed_tokens.weight` 与冗余
+  `lm_head.weight`。`Engine._load_weight_state_dict` 对模型模板内键继续按模板 dtype 转换，
+  保护 GPT-OSS packed `uint8`；模板外键原样交给严格模型加载器，已有 tied
+  `ParallelLMHead` 消费冗余 lm-head 键，真正未知键仍由顶层拒绝。入口见
+  `python/minisgl/engine/engine.py:159-177` 与
+  `python/minisgl/layers/embedding.py:59-85`；顶层剩余键检查见
+  `python/minisgl/layers/base.py:32-53`。
+- 公开 `cache_hit_ratio = cached_active_len / full_matchable_prefix_len`；分母是 Drop 前全部
+  Radix 可匹配真实 token，不含最后一个强制 Prefill token 与 virtual marker。内部
+  `cache_reuse_ratio = cached_active_len / active_matchable_prefix_len` 只供 warmup/fallback
+  使用。长度计算和公式见 `python/minisgl/scheduler/cache.py:121-152`、
+  `python/minisgl/scheduler/prefill.py:23-40`；Scheduler 分流见
+  `python/minisgl/scheduler/scheduler.py:225-255`。
+
 核心入口见：
 
 - `python/minisgl/tokenizer/drop_rules.py:60`、`:138`、`:288`；
@@ -67,9 +85,9 @@ Scheduler -> Detokenizer -> Frontend：非流式响应顶层返回，流式只�
 
 ## 已完成验证
 
-本地只做只读/静态验证：所有修改 Python 文件 `compileall` 通过，`git diff --check` 通过，
-修改范围未超出获批的 23 个路径。`ruff` 在本地和远端专用环境都未安装，因此没有声称 lint
-通过。
+本地只做只读/静态验证：所有修改 Python 文件 `compileall` 通过，`git diff --check` 通过；
+R3 修改范围未超出获批的 23 个路径，R5 代码修改未超出获批的 7 个源码/测试路径。`ruff`
+在本地和远端专用环境都未安装，因此没有声称 lint 通过。
 
 远端使用 `/share/wangruoxi/.conda/envs/minisgl-gpt-oss-r4`，pytest 因该环境没有 coverage
 插件而显式使用 `-o addopts=`：
@@ -78,6 +96,8 @@ Scheduler -> Detokenizer -> Frontend：非流式响应顶层返回，流式只�
   owner 猜测，随后改为 retention config + component token cursor。
 - Harmony 修复定向复测：23 passed。
 - Context/Radix/mask/API/GPT-OSS 扩展回归：67 passed。
+- R5 tied loader/ratio 聚焦回归：19 passed；扩展 model/cache/scheduler/server 回归：70
+  passed。
 
 真实模型与服务验证：
 
@@ -86,12 +106,17 @@ Scheduler -> Detokenizer -> Frontend：非流式响应顶层返回，流式只�
   `TextDropRule` 的 full IDs、keep mask、active IDs、absolute positions 和 delta metadata
   全部相等；事件位置为 `55`，Drop 绝对区间为 `[11,42)`。
 - DeepSeek-R1-Distill-Qwen-1.5B 单卡 mini-sglang HTTP 服务中，Message/Text 两请求均返回
-  200、相同输出和 `cache_hit_ratio=1.0`；流式 ratio 只出现在第 4 个 terminal chunk。
+  200、相同输出；流式 ratio 只出现在第 4 个 terminal chunk。
   不具备已识别 history-retention guard 的该模型对 `thinking_drop` 返回预期 HTTP 400
   `thinking_history_not_preservable`。
-- Qwen3-1.7B mini-sglang 服务启动受已有 loader tied-weight 问题阻塞：checkpoint 不含
-  `lm_head.weight`，loader 报 `KeyError`。该问题发生在本次 Drop 请求路径之前；同一模型的
-  真实 Transformers 生成和 tokenizer Drop 映射已通过，服务验证改用上述 DeepSeek 小模型。
+- 原始 `/share/public/public_models/Qwen3-1.7B` checkpoint 实际同时含
+  `model.embed_tokens.weight` 与 `lm_head.weight`。R5 后 GPU 7 直接加载该目录成功，日志到达
+  `Model weights are ready` 和 Uvicorn startup，真实 chat completion 返回 HTTP 200；不再需要
+  `model-view-untied` workaround。
+- 同一 Qwen3 四消息实验中，无 Drop 冷/热请求的公开 ratio 为 `0.0 -> 1.0`；先缓存完整
+  prompt，再以 `MessageDropRule` 删除历史 user+assistant 后，冷/热 Drop 请求均为
+  `25 / 56 = 0.44642857142857145`。25 是命中的 active token，56 是 Drop 前 matchable
+  token；内部复用率为 `25 / 25 = 1.0`，不会误触发 staged `< 0.95` fallback。
 
 ## 当前限制与后续检查
 

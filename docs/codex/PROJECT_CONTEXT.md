@@ -105,12 +105,22 @@ delta-marker 要求最终 `page_size=1`，且不兼容要求非 unit page 的 TR
 
 Radix 先匹配完整 key 轴，移除 virtual marker 的 `-1` page 后得到 `full_match_indices`，再按
 `prefix_keep_mask` 过滤为 `active_match_indices`。入口分别见
-`python/minisgl/scheduler/cache.py:198`（full match）、`:150`（active match）和 `:143`
-（matchable prefix length）。Prefill 命中率为
-`cached_active_len / matchable_active_prefix_len`，空分母为 `1.0`
-（`python/minisgl/scheduler/prefill.py:69`）。
+`python/minisgl/scheduler/cache.py:202`（full match）、`:154`（active match）和 `:143`
+（`matchable_prefix_lens`）。该函数同时返回 Drop 前 full matchable 长度和 Drop 后 active
+matchable 长度；最后一个强制 Prefill token 与 virtual marker 都不进入分母
+（`python/minisgl/scheduler/cache.py:121-152`）。
 
-请求结束时，`python/minisgl/scheduler/cache.py:469` 的 `_cache_finished_delta_req` 用 active
+`python/minisgl/scheduler/prefill.py:23-40` 的 `_calculate_cache_ratios` 明确产生两个值：
+
+- 公开 `cache_hit_ratio = cached_active_len / full_matchable_prefix_len`，表示“命中的未 Drop
+  token / Drop 前全部可匹配真实 token”；
+- 内部 `cache_reuse_ratio = cached_active_len / active_matchable_prefix_len`，表示幸存上下文
+  的复用完整度。
+
+两者空分母都定义为 `1.0`，且强制检查
+`cached <= active_matchable <= full_matchable`。
+
+请求结束时，`python/minisgl/scheduler/cache.py:473` 的 `_cache_finished_delta_req` 用 active
 KV slot 与 absolute position 重建 full-token prefix；virtual page 固定为 `-1`，真实 hole
 截断可提交前缀，slot 冲突直接报错。Radix 生命周期与完整性检查分别见
 `python/minisgl/kvcache/radix_cache.py:581`（insert）、`:640`（prune）、`:715`（evict）和
@@ -130,8 +140,11 @@ KV slot 与 absolute position 重建 full-token prefix；virtual page 固定为 
 不支持的实际 Prefill backend 在启动期失败，不会退化为普通 causal attention。FA4 mask
 Prefill 仍限制每批一个 mask 请求，GPT-OSS sinks/sliding-window 与该 mask 组合未启用。
 
-`staged` 只作兼容/排障：首次 warmup `hit_ratio >= 0.95` 即结束，严格低于 `0.95` 才发送
-逐 message prefix。commit boundary 通过
+`staged` 只作兼容/排障：warmup 使用内部 `cache_reuse_ratio`，首次
+`cache_reuse_ratio >= 0.95` 即结束，严格低于 `0.95` 才发送逐 message prefix；因此 Drop
+比例本身不会制造虚假的低命中 fallback。Scheduler 发送该内部值见
+`python/minisgl/scheduler/scheduler.py:225-233`，比较点见
+`python/minisgl/server/api_server.py:799-803`。commit boundary 通过
 `python/minisgl/scheduler/radix_delta.py:223` 映射到包含边界 marker 的 key prefix。
 
 最终用户生成请求的 `cache_hit_ratio` 只在 terminal reply 传播
@@ -139,7 +152,18 @@ Prefill 仍限制每批一个 mask 请求，GPT-OSS sinks/sliding-window 与该 
 （`python/minisgl/server/api_server.py:1161`），流式只位于最后一个 finish chunk
 （同文件 `:953`）。内部 warmup ratio 不暴露给用户。
 
-## 八、操作不变量与验证边界
+## 八、tied-weight 启动兼容
+
+tied 模型的运行时模板不重复登记 `lm_head.weight`，但合法 checkpoint 可以同时保存
+embedding 与 lm-head 两个别名。`Engine._load_weight_state_dict` 只对模板内键采用模板 dtype；
+模板外键保持 checkpoint dtype 并继续传给模型加载器
+（`python/minisgl/engine/engine.py:159-177`）。tied `ParallelLMHead` 消费冗余 weight/bias，
+非 tied 模型仍按普通参数加载，其他未知键仍会留给顶层严格检查
+（`python/minisgl/layers/embedding.py:59-85`、`python/minisgl/layers/base.py:32-53`）。不能
+回退为统一 `self.dtype` 转换，因为 GPT-OSS packed MXFP4 权重需要保持模板指定的
+`uint8`。
+
+## 九、操作不变量与验证边界
 
 必须保持：无 Drop 基线不变；public message 顺序与模板 provenance 对齐；绝对 position 不
 压缩；full/active metadata 不混用；不同 Drop history 不碰撞；request/tree marker refs 与

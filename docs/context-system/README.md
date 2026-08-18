@@ -271,14 +271,21 @@ segments. FlashAttention uses the FA3 segmented adapter on SM80/SM90 or the FA4
 backend instead of requiring the frontend mode to name that backend.
 
 `staged` remains available for compatibility and diagnosis. It first measures the
-active-prefix cache hit. A hit ratio greater than or equal to `0.95` ends warmup;
-only a strictly lower ratio triggers per-message prefix warmups.
+internal active-prefix cache reuse. A `cache_reuse_ratio` greater than or equal to
+`0.95` ends warmup; only a strictly lower ratio triggers per-message prefix
+warmups. This internal value is separate from the user-visible `cache_hit_ratio`.
 
 Known limitations remain backend-specific. Context-mask Prefill requires
 `page_size=1`. FA4 mask Prefill is restricted to one request per batch, and its
 GPT-OSS sinks/sliding-window combination is not enabled. A backend or GPU build
 without the required adapter is rejected instead of silently running ordinary
 causal attention.
+
+For tied embeddings, a checkpoint may legally contain both
+`model.embed_tokens.weight` and a redundant `lm_head.weight`. The loader preserves
+template-specific dtypes for known model tensors (including GPT-OSS packed
+`uint8`), while passing template-external keys to the strict model loader. The
+tied LM head consumes its redundant alias; unrelated unknown keys remain errors.
 
 ## Chat API
 
@@ -331,8 +338,10 @@ sampling. `message_drop.drop_messages` 的 JSON object key 在 wire 上是字符
 Drop Rule 只支持 chat `messages`，不支持 plain `prompt`。结构、子串、occurrence、thinking
 来源或模板能力校验失败均返回 HTTP 400。非流式成功响应在顶层返回
 `cache_hit_ratio`；流式响应只在最后一个带 `finish_reason` 的 SSE chunk 顶层返回该字段。
-它是最终用户生成请求的 `cached_active_len / matchable_active_prefix_len`（空分母为 1.0），
-内部 warmup 的 ratio 不会暴露为用户结果。
+它是最终用户生成请求的 `cached_active_len / full_matchable_prefix_len`：分子是命中的未
+Drop token，分母是 Drop 前全部可参与 Radix 匹配的真实 token，不包含最后一个强制 Prefill
+token 和 virtual marker；空分母为 1.0。内部 warmup 使用
+`cached_active_len / active_matchable_prefix_len`，不会暴露为用户结果。
 
 ## Implementation map
 
@@ -344,7 +353,8 @@ Drop Rule 只支持 chat `messages`，不支持 plain `prompt`。结构、子串
 | Thinking retention adapter | [`thinking_template.py`](../../python/minisgl/tokenizer/thinking_template.py#L86), [`tokenize.py`](../../python/minisgl/tokenizer/tokenize.py#L273) |
 | Position-range Drop compilation | [`tokenize.py`](../../python/minisgl/tokenizer/tokenize.py#L700), [`tokenize.py`](../../python/minisgl/tokenizer/tokenize.py#L1045) |
 | Virtual delta markers | [`radix_delta.py`](../../python/minisgl/scheduler/radix_delta.py#L12-L261) |
-| Full-path cache match and active-KV filtering | [`cache.py`](../../python/minisgl/scheduler/cache.py#L103-L179) |
+| Full-path cache match and active-KV filtering | [`cache.py`](../../python/minisgl/scheduler/cache.py#L121-L200) |
 | Startup and backend constraints | [`args.py`](../../python/minisgl/server/args.py#L176-L265), [`scheduler.py`](../../python/minisgl/scheduler/scheduler.py#L55-L131) |
-| Contextual warmup | [`api_server.py`](../../python/minisgl/server/api_server.py#L755), [`prefill.py`](../../python/minisgl/scheduler/prefill.py#L47) |
+| Contextual warmup | [`api_server.py`](../../python/minisgl/server/api_server.py#L755), [`prefill.py`](../../python/minisgl/scheduler/prefill.py#L67) |
 | Cache-hit ratio response propagation | [`scheduler.py`](../../python/minisgl/scheduler/scheduler.py#L255), [`tokenizer/server.py`](../../python/minisgl/tokenizer/server.py#L121), [`api_server.py`](../../python/minisgl/server/api_server.py#L953) |
+| Tied-weight checkpoint loading | [`engine.py`](../../python/minisgl/engine/engine.py#L159-L177), [`embedding.py`](../../python/minisgl/layers/embedding.py#L59-L85), [`base.py`](../../python/minisgl/layers/base.py#L32-L53) |
