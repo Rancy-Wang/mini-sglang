@@ -65,6 +65,8 @@ class TokenizeManager:
         self.is_gpt_oss = "gpt-oss" in tokenizer_name or "gptoss" in tokenizer_class
         self._reasoning_effort: str | None = None
         self._harmony_encoding = None
+        self._preserve_harmony_thinking = False
+        self._harmony_thinking_ranges: dict[int, List[tuple[int, int]]] = {}
         self._chat_template_override: str | None = None
         self._chat_template_kwargs: dict[str, Any] = {}
         # Be optimistic: many tokenizers accept extra kwargs via **kwargs even
@@ -144,6 +146,8 @@ class TokenizeManager:
             Author,
             Conversation,
             DeveloperContent,
+            RenderConversationConfig,
+            RenderOptions,
             ReasoningEffort,
             Role,
             SystemContent,
@@ -172,6 +176,7 @@ class TokenizeManager:
                 .with_required_channels(["analysis", "commentary", "final"]),
             )
         ]
+        thinking_components: dict[int, tuple[int, str]] = {}
 
         instructions = [
             self._normalize_message_content(raw.get("content"))
@@ -202,7 +207,7 @@ class TokenizeManager:
             )
 
         tool_names: dict[str, str] = {}
-        for raw in messages:
+        for raw_message_id, raw in enumerate(messages):
             role = str(raw.get("role", "user")).lower()
             if role in {"system", "developer"}:
                 continue
@@ -215,11 +220,13 @@ class TokenizeManager:
             if role == "assistant":
                 reasoning = raw.get("reasoning_content")
                 if isinstance(reasoning, str) and reasoning:
+                    component_id = len(harmony_messages)
                     harmony_messages.append(
                         HarmonyMessage.from_role_and_content(
                             Role.ASSISTANT, reasoning
                         ).with_channel("analysis")
                     )
+                    thinking_components[component_id] = (raw_message_id, reasoning)
                 if content:
                     harmony_messages.append(
                         HarmonyMessage.from_role_and_content(Role.ASSISTANT, content).with_channel(
@@ -261,9 +268,55 @@ class TokenizeManager:
 
         conversation = Conversation.from_messages(harmony_messages)
         encoding = self._get_harmony_encoding()
+        config = None
+        if self._preserve_harmony_thinking:
+            config = RenderConversationConfig(auto_drop_analysis=False)
+            render_options = RenderOptions(
+                conversation_has_function_tools=bool(descriptions)
+            )
+            component_stream: List[int] = []
+            thinking_ranges: dict[int, List[tuple[int, int]]] = {}
+            for component_id, component in enumerate(harmony_messages):
+                component_ids = [
+                    int(token_id)
+                    for token_id in encoding.render(component, render_options)
+                ]
+                thinking_source = thinking_components.get(component_id)
+                if thinking_source is not None:
+                    raw_message_id, source = thinking_source
+                    needle = [int(token_id) for token_id in encoding.encode(source)]
+                    local_start, local_end = self._find_owned_token_subsequence(
+                        component_ids,
+                        [raw_message_id] * len(component_ids),
+                        needle,
+                        owner=raw_message_id,
+                        field="thinking",
+                    )
+                    thinking_ranges.setdefault(raw_message_id, []).append(
+                        (
+                            len(component_stream) + local_start,
+                            len(component_stream) + local_end,
+                        )
+                    )
+                component_stream.extend(component_ids)
+            self._harmony_thinking_ranges = thinking_ranges
+        else:
+            component_stream = []
+            self._harmony_thinking_ranges = {}
+
         if add_generation_prompt:
-            return encoding.render_conversation_for_completion(conversation, Role.ASSISTANT)
-        return encoding.render_conversation(conversation)
+            result = encoding.render_conversation_for_completion(
+                conversation, Role.ASSISTANT, config
+            )
+        else:
+            result = encoding.render_conversation(conversation, config)
+        result = [int(token_id) for token_id in result]
+        if self._preserve_harmony_thinking and result[: len(component_stream)] != component_stream:
+            raise RuntimeError(
+                "Harmony thinking retention changed component token boundaries; "
+                "cannot construct exact thinking provenance."
+            )
+        return result
 
     def _apply_chat_template(
         self,
@@ -1065,6 +1118,13 @@ class TokenizeManager:
                     spans=[(rendered_start, rendered_start + len(source))],
                     field="thinking",
                 )
+            elif self.is_gpt_oss:
+                ranges = self._harmony_thinking_ranges.get(raw_message_id, [])
+                if not ranges:
+                    raise ValueError(
+                        f"Cannot map thinking for messages[{raw_message_id}] into "
+                        "the retained Harmony analysis component"
+                    )
             else:
                 needle = self.tokenizer.encode(source, add_special_tokens=False)
                 if isinstance(needle, torch.Tensor):
@@ -1099,6 +1159,8 @@ class TokenizeManager:
     def _chat_tokenize(self, msg: TokenizeMsg) -> TokenizedResult:
         assert isinstance(msg.text, list)
         self._reasoning_effort = msg.reasoning_effort
+        self._preserve_harmony_thinking = False
+        self._harmony_thinking_ranges = {}
         self._chat_template_override = None
         self._chat_template_kwargs = {}
         drop_rule = parse_drop_rule(
@@ -1119,11 +1181,17 @@ class TokenizeManager:
             forced_tool_name=forced_tool_name,
         )
         thinking_template_capability: str | None = None
-        if isinstance(drop_rule, ThinkingDropRule) and not self.is_gpt_oss:
-            thinking_plan = prepare_thinking_template(self.tokenizer, tools=selected_tools)
-            self._chat_template_override = thinking_plan.chat_template
-            self._chat_template_kwargs = thinking_plan.template_kwargs
-            thinking_template_capability = thinking_plan.capability
+        if isinstance(drop_rule, ThinkingDropRule):
+            if self.is_gpt_oss:
+                self._preserve_harmony_thinking = True
+                thinking_template_capability = "harmony_auto_drop_disabled"
+            else:
+                thinking_plan = prepare_thinking_template(
+                    self.tokenizer, tools=selected_tools
+                )
+                self._chat_template_override = thinking_plan.chat_template
+                self._chat_template_kwargs = thinking_plan.template_kwargs
+                thinking_template_capability = thinking_plan.capability
 
         if self.is_gpt_oss:
             messages = [dict(message) for message in msg.text]
