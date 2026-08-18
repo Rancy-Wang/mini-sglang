@@ -152,9 +152,8 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         type=int,
         default=ServerArgs.cuda_graph_max_bs,
         help=(
-            "The maximum fixed batch size for whole-model CUDA graph capture. "
-            "GPT-OSS defaults to eager when omitted; use --graph 1 to opt in. "
-            "Piecewise capture and GPT-OSS graph auto-tuning are unsupported."
+            "The maximum batch size for whole-model CUDA graph capture. "
+            "By default, all models use a GPU-memory-based maximum. Set to 0 to disable."
         ),
     )
     parser.add_argument(

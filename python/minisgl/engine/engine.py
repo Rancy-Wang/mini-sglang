@@ -126,7 +126,6 @@ class Engine:
             vocab_size=config.model_config.vocab_size,
             dummy_req=self.dummy_req,
             tp_cpu_group=self.tp_cpu_group,
-            is_gpt_oss=config.model_config.is_gpt_oss,
         )
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:

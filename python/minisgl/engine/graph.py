@@ -48,15 +48,9 @@ def _determine_cuda_graph_bs(
     cuda_graph_bs: List[int] | None,
     cuda_graph_max_bs: int | None,
     free_memory: int,
-    is_gpt_oss: bool = False,
 ) -> List[int]:
     if cuda_graph_bs is not None:
         return sorted({bs for bs in cuda_graph_bs if bs > 0})
-
-    if cuda_graph_max_bs is None and is_gpt_oss:
-        # GPT-OSS stays eager unless the operator explicitly requests a fixed
-        # whole-model graph size. This avoids any startup-time auto tuning.
-        return []
 
     free_memory_gb = free_memory / (1 << 30)
     if cuda_graph_max_bs is None:
@@ -94,54 +88,47 @@ class GraphRunner:
         vocab_size: int,
         dummy_req: Req,
         tp_cpu_group: torch.distributed.ProcessGroup | None = None,
-        is_gpt_oss: bool = False,
     ) -> None:
-        target_bs_list = _determine_cuda_graph_bs(
+        graph_bs_list = _determine_cuda_graph_bs(
             cuda_graph_bs=cuda_graph_bs,
             cuda_graph_max_bs=cuda_graph_max_bs,
             free_memory=free_memory,
-            is_gpt_oss=is_gpt_oss,
         )
         self.attn_backend = attn_backend
-        self.target_bs_list = target_bs_list
-        self.failed_bs: set[int] = set()
         self.graph_map: Dict[int, torch.cuda.CUDAGraph] = {}
         self.dummy_req = dummy_req
         self.stream = stream
         self.device = device
-        self.model = model
-        self.tp_cpu_group = tp_cpu_group
         self._pool = None
         self.buffer: GraphCaptureBuffer | None = None
-        if not target_bs_list:
+        if not graph_bs_list:
             logger.info_rank0("CUDA graph is disabled.")
             return
         self.attn_backend.init_capture_graph(
             max_seq_len=max_seq_len,
-            bs_list=target_bs_list,
+            bs_list=graph_bs_list,
         )
-        self.buffer = GraphCaptureBuffer.init(max(target_bs_list), vocab_size, self.device)
-        self._capture_graphs()
+        self.buffer = GraphCaptureBuffer.init(max(graph_bs_list), vocab_size, self.device)
+        self._capture_graphs(graph_bs_list, model, tp_cpu_group)
 
     @property
     def graph_bs_list(self) -> List[int]:
         return sorted(self.graph_map)
 
-    @property
-    def max_graph_bs(self) -> int:
-        return max(self.graph_map, default=0)
-
-    def _capture_graphs(self) -> None:
-        logger.info_rank0(
-            f"Capturing fixed whole-model CUDA graphs with sizes: {self.target_bs_list}"
-        )
-        for bs in sorted(self.target_bs_list, reverse=True):
-            local_success = True
+    def _capture_graphs(
+        self,
+        graph_bs_list: List[int],
+        model: BaseLLMModel,
+        tp_cpu_group: torch.distributed.ProcessGroup | None,
+    ) -> None:
+        logger.info_rank0(f"Capturing whole-model CUDA graphs with sizes: {graph_bs_list}")
+        for bs in reversed(graph_bs_list):
+            graph = None
             try:
-                self._capture_one(bs)
+                graph = self._capture_one(bs, model)
+                local_success = True
             except Exception:
                 local_success = False
-                self.graph_map.pop(bs, None)
                 logger.exception(f"CUDA graph capture failed for bs={bs}; using eager fallback.")
 
             success = torch.tensor(int(local_success), dtype=torch.int32, device="cpu")
@@ -149,21 +136,20 @@ class GraphRunner:
                 torch.distributed.all_reduce(
                     success,
                     op=torch.distributed.ReduceOp.MIN,
-                    group=self.tp_cpu_group,
+                    group=tp_cpu_group,
                 )
-            if not bool(success.item()):
-                self.mark_capture_failed(bs)
+            if bool(success.item()):
+                assert graph is not None
+                self.graph_map[bs] = graph
+                logger.info_rank0(f"Captured whole-model CUDA graph bs={bs}.")
+            else:
                 logger.warning_rank0(
                     f"CUDA graph bs={bs} failed on at least one TP rank; using eager fallback."
                 )
 
         logger.info_rank0(f"Usable CUDA graph sizes: {self.graph_bs_list}")
 
-    def mark_capture_failed(self, bs: int) -> None:
-        self.graph_map.pop(bs, None)
-        self.failed_bs.add(bs)
-
-    def _capture_one(self, bs: int) -> None:
+    def _capture_one(self, bs: int, model: BaseLLMModel) -> torch.cuda.CUDAGraph:
         assert self.buffer is not None
         torch.cuda.synchronize(self.device)
         graph = torch.cuda.CUDAGraph()
@@ -172,13 +158,12 @@ class GraphRunner:
         self.attn_backend.prepare_for_capture(batch)
         self.buffer.set_batch(batch)
         with get_global_ctx().forward_batch(batch):
-            self.buffer.logits[:bs] = self.model.forward()
+            self.buffer.logits[:bs] = model.forward()
             with torch.cuda.graph(graph, pool=self._pool, stream=self.stream):
-                self.buffer.logits[:bs] = self.model.forward()
+                self.buffer.logits[:bs] = model.forward()
         if self._pool is None:
             self._pool = graph.pool()
-        self.graph_map[bs] = graph
-        logger.info_rank0(f"Captured whole-model CUDA graph bs={bs}.")
+        return graph
 
     def can_use_cuda_graph(self, batch: Batch) -> bool:
         return batch.is_decode and batch.padded_size in self.graph_map

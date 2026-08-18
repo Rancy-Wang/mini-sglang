@@ -74,6 +74,20 @@ Scheduler -> Detokenizer -> Frontend：非流式响应顶层返回，流式只�
   `python/minisgl/scheduler/prefill.py:23-40`；Scheduler 分流见
   `python/minisgl/scheduler/scheduler.py:225-255`。
 
+## PLAN-CS-20260818-R7 已实现范围
+
+- CUDA Graph 对所有模型（包括 GPT-OSS）默认开启。`cuda_graph_max_bs=None` 时按启动前可用
+  GPU 显存选择最大 batch size：大于 80 GiB 使用 256，否则使用 160；显式设置为 `0` 或使用
+  `--disable-cuda-graph` 才关闭。解析与 batch 列表生成见
+  `python/minisgl/engine/graph.py:47-66`，CLI 入口见 `python/minisgl/server/args.py:149-165`。
+- `GraphRunner.graph_map` 是成功捕获 shape 的唯一事实来源，不再维护 GPT-OSS 特判、目标列表、
+  最大值和失败集合等重复状态。每个 shape 独立捕获，TP 各 rank 通过 CPU group 汇总结果；仅当
+  所有 rank 成功时才登记 graph，失败 shape 单独回退 eager。实现见
+  `python/minisgl/engine/graph.py:77-150`。
+- Decode batch 只向上 padding 到实际成功捕获的最小 shape；Prefill 不 padding。batch size
+  大于 1 与 batch size 1 使用同一选择和 replay 路径，见
+  `python/minisgl/engine/graph.py:168-186`。
+
 核心入口见：
 
 - `python/minisgl/tokenizer/drop_rules.py:60`、`:138`、`:288`；
@@ -82,6 +96,7 @@ Scheduler -> Detokenizer -> Frontend：非流式响应顶层返回，流式只�
 - `python/minisgl/tokenizer/thinking_template.py:86`；
 - `python/minisgl/tokenizer/tokenize.py:700`、`:1045`、`:1159`；
 - `python/minisgl/server/api_server.py:161`、`:755`、`:953`、`:1161`。
+- `python/minisgl/engine/graph.py:47`、`:77`、`:118`、`:168`。
 
 ## 已完成验证
 

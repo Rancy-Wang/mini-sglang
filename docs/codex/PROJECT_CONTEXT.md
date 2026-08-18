@@ -163,7 +163,22 @@ embedding 与 lm-head 两个别名。`Engine._load_weight_state_dict` 只对模�
 回退为统一 `self.dtype` 转换，因为 GPT-OSS packed MXFP4 权重需要保持模板指定的
 `uint8`。
 
-## 九、操作不变量与验证边界
+## 九、CUDA Graph 默认策略与回退
+
+`cuda_graph_max_bs=None` 表示默认开启，而不是关闭。所有模型（包括 GPT-OSS）统一根据启动前
+可用 GPU 显存生成 capture shapes：显存大于 80 GiB 时最大 batch size 为 256，否则为 160；
+显式 `0` 才产生空列表并关闭。列表生成见
+`python/minisgl/engine/graph.py:47-66`（`_determine_cuda_graph_bs`），公开参数及关闭别名见
+`python/minisgl/server/args.py:149-165`。
+
+`GraphRunner` 对每个 shape 分别捕获，并在 TP 模式下通过 CPU process group 汇总所有 rank 的
+成功状态。只有所有 rank 均成功的 graph 才进入 `graph_map`；该映射是可 replay shape 的唯一
+事实来源，失败 shape 只回退 eager，不影响其他 shape。捕获和 TP 汇总见
+`python/minisgl/engine/graph.py:118-166`，Engine 传入通信组见
+`python/minisgl/engine/engine.py:117-129`。Decode batch 向上 padding 到最小可用 shape 后才允许
+replay；Prefill 始终保持原 batch size，见 `python/minisgl/engine/graph.py:168-186`。
+
+## 十、操作不变量与验证边界
 
 必须保持：无 Drop 基线不变；public message 顺序与模板 provenance 对齐；绝对 position 不
 压缩；full/active metadata 不混用；不同 Drop history 不碰撞；request/tree marker refs 与
