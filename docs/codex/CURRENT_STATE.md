@@ -101,8 +101,9 @@ Scheduler -> Detokenizer -> Frontend：非流式响应顶层返回，流式只�
 ## 已完成验证
 
 本地只做只读/静态验证：所有修改 Python 文件 `compileall` 通过，`git diff --check` 通过；
-R3 修改范围未超出获批的 23 个路径，R5 代码修改未超出获批的 7 个源码/测试路径。`ruff`
-在本地和远端专用环境都未安装，因此没有声称 lint 通过。
+R3 修改范围未超出获批的 23 个路径，R5 代码修改未超出获批的 7 个源码/测试路径，R7
+修改未超出获批的 7 个源码、测试和文档路径。`ruff` 在本地和远端专用环境都未安装，
+因此没有声称 lint 通过；本地 Python 也没有 `pytest`，测试统一在远端专用环境执行。
 
 远端使用 `/share/wangruoxi/.conda/envs/minisgl-gpt-oss-r4`，pytest 因该环境没有 coverage
 插件而显式使用 `-o addopts=`：
@@ -113,6 +114,8 @@ R3 修改范围未超出获批的 23 个路径，R5 代码修改未超出获批�
 - Context/Radix/mask/API/GPT-OSS 扩展回归：67 passed。
 - R5 tied loader/ratio 聚焦回归：19 passed；扩展 model/cache/scheduler/server 回归：70
   passed。
+- R7 CUDA Graph/scheduler/GPT-OSS 聚焦回归：27 passed；加入 model、launch、Context prefill
+  和多请求 Context prefill 后的扩展回归：56 passed。
 
 真实模型与服务验证：
 
@@ -132,6 +135,12 @@ R3 修改范围未超出获批的 23 个路径，R5 代码修改未超出获批�
   prompt，再以 `MessageDropRule` 删除历史 user+assistant 后，冷/热 Drop 请求均为
   `25 / 56 = 0.44642857142857145`。25 是命中的 active token，56 是 Drop 前 matchable
   token；内部复用率为 `25 / 25 = 1.0`，不会误触发 staged `< 0.95` fallback。
+- R7 在 GPU 4 未显式传 CUDA Graph 参数分别启动 Qwen3-1.7B 与 GPT-OSS-20B；两者均把
+  `cuda_graph_max_bs=None` 自动展开为 `[1, 2, 4, 8, ..., 160]`，全部 23 个 shape 捕获
+  成功。每个服务的单请求和 4 条并发 chat completion 均返回 HTTP 200；单元测试另验证
+  实际 decode batch size 3 向上 padding 到已捕获的 shape 4 并进入 graph replay 条件。
+- Qwen3-1.7B 使用 `--disable-cuda-graph` 的实机回归把最大 batch 解析为 `0`，日志明确显示
+  `CUDA graph is disabled.`，服务仍正常启动并返回 HTTP 200。
 
 ## 当前限制与后续检查
 
