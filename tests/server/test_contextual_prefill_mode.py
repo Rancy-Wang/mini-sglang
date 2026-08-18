@@ -25,7 +25,7 @@ def _frontend(mode, hit_ratios):
     return manager
 
 
-def _run_warmup(manager, drop_message=None):
+def _run_warmup(manager, drop_rule=None):
     messages = [
         {"role": "user", "content": "first"},
         {"role": "assistant", "content": "second"},
@@ -34,7 +34,8 @@ def _run_warmup(manager, drop_message=None):
     asyncio.run(
         manager.run_contextual_warmup(
             messages,
-            drop_message or {"1": [0]},
+            drop_rule
+            or {"type": "message_drop", "drop_messages": {"1": [0]}},
             enable_thinking=None,
             reasoning_effort=None,
             tools=None,
@@ -65,7 +66,7 @@ def test_mask_mode_sends_one_full_stream_context_warmup():
     msg = manager.send_one.await_args.args[0]
     assert msg.use_context_mask
     assert msg.is_warmup
-    assert msg.target_msg_id == 2
+    assert msg.target_msg_id == 3
     assert len(msg.text) == 3
 
 
@@ -94,7 +95,10 @@ def test_staged_mode_keeps_strictly_low_hit_message_fallback():
 def test_future_only_drop_schedule_skips_contextual_warmup():
     manager = _frontend("mask", [])
 
-    _run_warmup(manager, {"3": [0]})
+    _run_warmup(
+        manager,
+        {"type": "message_drop", "drop_messages": {"3": [0]}},
+    )
 
     manager.new_user.assert_not_called()
     manager.send_one.assert_not_awaited()

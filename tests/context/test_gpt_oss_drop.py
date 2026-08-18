@@ -94,7 +94,10 @@ def test_harmony_agent_history_drop_preserves_system_tools_and_absolute_position
     assert "SECRET_USER" not in active_text
     assert "PRIVATE_REASON" not in active_text
     assert "SECRET_TOOL_RESULT" not in active_text
-    assert all(marker in full_text for marker in ("SECRET_USER", "PRIVATE_REASON", "SECRET_TOOL_RESULT"))
+    assert all(
+        marker in full_text
+        for marker in ("SECRET_USER", "PRIVATE_REASON", "SECRET_TOOL_RESULT")
+    )
 
     assert result.drop_event_positions.numel() == 1
     event_position = int(result.drop_event_positions[0])
@@ -106,3 +109,36 @@ def test_harmony_agent_history_drop_preserves_system_tools_and_absolute_position
         result.true_positions,
         torch.arange(len(result.full_input_ids), dtype=torch.int32)[~dropped],
     )
+
+
+def test_harmony_thinking_drop_removes_only_analysis_content_tokens():
+    messages = [
+        {"role": "user", "content": "Compute 15 + 27."},
+        {
+            "role": "assistant",
+            "reasoning_content": "PRIVATE_HARMONY_REASONING",
+            "content": "The answer is 42.",
+        },
+        {"role": "user", "content": "Multiply it by 3."},
+    ]
+    result = TokenizeManager(GptOssTokenizerStub()).tokenize(
+        [
+            TokenizeMsg(
+                uid=2,
+                text=messages,
+                sampling_params=SamplingParams(max_tokens=1),
+                target_msg_id=len(messages),
+                drop_rule={"type": "thinking_drop"},
+            )
+        ]
+    )[0]
+    encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
+    full = encoding.decode(result.full_input_ids.tolist())
+    active = encoding.decode(result.input_ids.tolist())
+
+    assert "PRIVATE_HARMONY_REASONING" in full
+    assert "PRIVATE_HARMONY_REASONING" not in active
+    assert "The answer is 42." in active
+    # Harmony protocol/channel delimiters are owner metadata, not reasoning content.
+    assert "analysis" in active
+    assert result.drop_event_positions.numel() == 1

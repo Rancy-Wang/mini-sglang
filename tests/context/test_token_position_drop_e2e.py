@@ -10,10 +10,20 @@ from minisgl.tokenizer.template_provenance import build_template_token_provenanc
 from minisgl.tokenizer.tokenize import TokenizeManager
 from transformers import AutoTokenizer
 
-QWEN3_17B = Path(
-    "/share/wangruoxi/.cache/huggingface/hub/"
-    "models--Qwen--Qwen3-1.7B/snapshots/"
-    "70d244cc86ccca08cf5af4e1e306ecf908b1ad5e"
+QWEN3_17B = next(
+    (
+        path
+        for path in (
+            Path("/share/public/public_models/Qwen3-1.7B"),
+            Path(
+                "/share/wangruoxi/.cache/huggingface/hub/"
+                "models--Qwen--Qwen3-1.7B/snapshots/"
+                "70d244cc86ccca08cf5af4e1e306ecf908b1ad5e"
+            ),
+        )
+        if path.exists()
+    ),
+    Path("/share/public/public_models/Qwen3-1.7B"),
 )
 
 

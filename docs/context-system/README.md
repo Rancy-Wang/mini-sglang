@@ -134,50 +134,90 @@ its content and appending those tokens. The template may extend or rewrite its
 previous suffix, so Mini-SGLang re-renders the conversation and recomputes the
 boundary tracks from the resulting full stream.
 
-## Drop semantics
+## 三种 Drop Rule
 
-`drop_message` is a schedule:
+公开接口统一使用 `drop_rule.type` 判别规则。三个公开 Python 类分别是
+`MessageDropRule`、`TextDropRule` 和 `ThinkingDropRule`。旧顶层 `drop_message`
+仍可兼容输入，并在入口转换成 `MessageDropRule`；同一请求同时给出新旧接口会返回
+HTTP 400。
 
-```text
-drop_message[event_message_id] = [message_id, ...]
-```
+### MessageDropRule：按完整 message 删除
 
-Event `n` takes effect **after message `n`**. It affects later messages and the
-following generation prompt, not message `n` itself. At target epoch `t`, the
-active dropped set is:
-
-```text
-union(drop_message[n] for every n < t)
-```
-
-Rules:
-
-- Event IDs and message IDs are non-negative signed 64-bit integers.
-- An event may only drop messages whose IDs are less than or equal to the event
-  ID; it cannot drop a future message.
-- Events are cumulative. Repeating an already dropped ID has no additional
-  effect.
-- Future events are accepted by validation. An event whose ID is not earlier than
-  the current target epoch has no effect on the current output.
-- An empty or omitted `drop_message` follows the normal no-Drop path.
-
-Example:
+接口名是 `message_drop`，字段仍叫 `drop_messages`，不使用 `schedule`：
 
 ```json
-{
-  "messages": [
-    {"role": "system", "content": "Answer briefly."},
-    {"role": "user", "content": "My temporary code is 4815."},
-    {"role": "assistant", "content": "Noted."},
-    {"role": "user", "content": "Continue without using the temporary code."}
-  ],
-  "drop_message": {"2": [1]}
+"drop_rule": {
+  "type": "message_drop",
+  "drop_messages": {"3": [1, 2]}
 }
 ```
 
-Message `1` is visible while message `2` is produced. After message `2`, its
-rendered token ranges are hidden from message `3` and from the next assistant
-generation.
+事件 `n` 在 message `n` 完成后生效；目标 epoch `t` 的已删除集合是所有 `n < t`
+事件的并集。每个 message ID 对应完整模板 provenance owner，因此 role header、content、
+结束符和属于该 message 的模板分隔符一起删除。事件和 ID 必须是非负 signed-int64，事件
+不能引用未来 message；尚未发生的未来事件可以保留在请求中。
+
+### TextDropRule：按原始 content 子串删除
+
+接口名是 `text_drop`。`drop_messages` 必须与 `messages` 等长、同序且逐项 role 相同；
+用户不提供 message ID。某项不删除时，`content` 可写 `null`、`""`、`[]` 或
+`[""]`：
+
+```json
+"drop_rule": {
+  "type": "text_drop",
+  "drop_messages": [
+    {"role": "system", "content": null},
+    {"role": "user", "content": "temporary code"},
+    {"role": "assistant", "content": ["Noted", "briefly"]},
+    {"role": "user", "content": ""}
+  ]
+}
+```
+
+`content` 可为 `str` 或 `list[str]`，从而在一条 message 内选择不连续片段。每个非空
+selector 必须是对应原始 `messages[i].content` 的大小写敏感精确子串，不做 Unicode
+normalization；否则返回 HTTP 400。匹配使用 UTF-8 Aho-Corasick O(n) AOT CPU kernel，
+同时保留等价 Python reference/fallback 和输入、pattern、输出数量上限。
+
+重复子串默认选择从左到右第 1 次、允许重叠。用户也可提供 `occurrence`：单个字符串配
+正整数，字符串列表必须配等长 `list[int]`，不能只给部分 selector 编号。例如：
+
+```json
+{"role": "user", "content": ["aba", "answer"], "occurrence": [2, 1]}
+```
+
+原始字符区间先映射到完整 chat-template render 中该 message 的唯一 content span，再通过
+fast tokenizer 的 canonical `offset_mapping` 映射到绝对 token 区间。只有完全包含在字符
+区间内的 token 才删除；横跨边界的 token 保留。如果 selector 没有覆盖任何完整 token，
+请求失败而不是扩大删除范围。若一条 message 的 selector 并集恰好覆盖完整原始 content，
+系统提升为完整 owner ranges，使它与相同 message ID 的 `MessageDropRule` 精确等价。该规则
+固定在最新 user Prefill 完成后生效。
+
+### ThinkingDropRule：保留文本、删除 thinking KV
+
+接口名是 `thinking_drop`：
+
+```json
+"drop_rule": {"type": "thinking_drop"}
+```
+
+未开启时完全沿用模型 tokenizer/chat template，不做能力探测、模板覆盖或 thinking 解析。
+开启后，thinking 必须来自 assistant 的 `reasoning_content`，或 content 中唯一、完整、非嵌套
+且位于开头的 `<think>...</think>`。两者同时出现但内容不一致、标签残缺或有歧义时返回
+HTTP 400；系统不会从普通 prose 猜测 thinking。
+
+系统仅在该规则开启时做惰性 retention probe，并按 tokenizer 身份、模板 SHA、tools variant
+缓存结果。原生保留历史 thinking 的模板不修改；已识别的 Qwen 历史过滤 guard 使用请求级
+Jinja adapter，私有 `preserve_thinking_history` 只对当前请求生效，且必须通过“实际 reasoning
+出现一次、无 reasoning 输出不变”的后置校验。未知的过滤模板 fail closed，返回
+`thinking_history_not_preservable`。GPT-OSS 使用原生 Harmony `analysis` channel；只删除
+analysis 内容 token，channel/recipient/protocol token 保留。
+
+每段 thinking 的 Drop event 位于对应 assistant message 末尾。因此 assistant final token 可见
+同轮 thinking，后续 user/tool/assistant-generation 不可见。冷缓存 `mask` warmup 仍输入完整
+token timeline，以 `full_token_visible_until` 保证先计算 thinking/final，再在事件处删除其
+active KV。
 
 ### Token and cache behavior
 
@@ -215,7 +255,7 @@ Relevant options:
 
 | Option | Values and behavior |
 | --- | --- |
-| `--radix-drop-key-mode` | `delta-marker` is the default and the only mode that accepts a non-empty `drop_message`. `bitmask` and `symbol` are legacy no-Drop modes. |
+| `--radix-drop-key-mode` | `delta-marker` is the default and the only mode that accepts a non-empty Drop Rule. `bitmask` and `symbol` are legacy no-Drop modes. |
 | `--page-size` | Must be `1` with `delta-marker`. TRTLLM attention is incompatible because it requires non-unit pages. |
 | `--contextual-prefill-mode` | `mask` (default) or `staged`. The old `flashinfer-mask` and `flashattention-mask` names are deprecated CLI aliases for `mask`. |
 | `--attn` / `--attention-backend` | In `mask` mode, the selected Prefill backend compiles its native exact representation. FlashInfer and FlashAttention are supported; unsupported backends fail during startup. |
@@ -259,7 +299,10 @@ curl http://127.0.0.1:1919/v1/chat/completions \
       {"role": "assistant", "content": "Noted."},
       {"role": "user", "content": "Continue without using the temporary code."}
     ],
-    "drop_message": {"2": [1]},
+    "drop_rule": {
+      "type": "message_drop",
+      "drop_messages": {"2": [1]}
+    },
     "max_tokens": 64,
     "stream": false
   }'
@@ -280,21 +323,26 @@ The backend applies `max_tokens`, `temperature`, `top_k`, `top_p`, `ignore_eos`,
 `stop`, and `stream`. The chat path also supports `enable_thinking`,
 `reasoning_effort`, `tools`, and `tool_choice`. The schema currently accepts `n`,
 `presence_penalty`, and `frequency_penalty`, but does not apply them to backend
-sampling. JSON object keys in `drop_message` are strings on the wire and are
-parsed as integer event IDs.
+sampling. `message_drop.drop_messages` 的 JSON object key 在 wire 上是字符串，并解析为
+整数事件 ID。
 
-`drop_message` is supported only with chat `messages`, not with a plain `prompt`.
-Invalid schedules return HTTP `400`. Responses use the existing OpenAI-compatible
-chat completion or server-sent event format.
+Drop Rule 只支持 chat `messages`，不支持 plain `prompt`。结构、子串、occurrence、thinking
+来源或模板能力校验失败均返回 HTTP 400。非流式成功响应在顶层返回
+`cache_hit_ratio`；流式响应只在最后一个带 `finish_reason` 的 SSE chunk 顶层返回该字段。
+它是最终用户生成请求的 `cached_active_len / matchable_active_prefix_len`（空分母为 1.0），
+内部 warmup 的 ratio 不会暴露为用户结果。
 
 ## Implementation map
 
 | Concern | Source |
 | --- | --- |
-| Public schema and validation | [`api_server.py`](../../python/minisgl/server/api_server.py#L86-L145), [`OpenAICompletionRequest`](../../python/minisgl/server/api_server.py#L584-L617) |
-| Template-independent epochs and token ownership | [`tokenize.py`](../../python/minisgl/tokenizer/tokenize.py#L745-L965), [`template_provenance.py`](../../python/minisgl/tokenizer/template_provenance.py#L23-L272) |
-| Position-range Drop compilation | [`tokenize.py`](../../python/minisgl/tokenizer/tokenize.py#L487-L628) |
+| Public schema and validation | [`drop_rules.py`](../../python/minisgl/tokenizer/drop_rules.py), [`api_server.py`](../../python/minisgl/server/api_server.py) |
+| Template-independent epochs and token ownership | [`tokenize.py`](../../python/minisgl/tokenizer/tokenize.py), [`template_provenance.py`](../../python/minisgl/tokenizer/template_provenance.py) |
+| Text matcher | [`text_match.py`](../../python/minisgl/kernel/text_match.py), [`text_match.cpp`](../../python/minisgl/kernel/csrc/src/text_match.cpp) |
+| Thinking retention adapter | [`thinking_template.py`](../../python/minisgl/tokenizer/thinking_template.py) |
+| Position-range Drop compilation | [`tokenize.py`](../../python/minisgl/tokenizer/tokenize.py) |
 | Virtual delta markers | [`radix_delta.py`](../../python/minisgl/scheduler/radix_delta.py#L12-L261) |
 | Full-path cache match and active-KV filtering | [`cache.py`](../../python/minisgl/scheduler/cache.py#L103-L179) |
 | Startup and backend constraints | [`args.py`](../../python/minisgl/server/args.py#L176-L265), [`scheduler.py`](../../python/minisgl/scheduler/scheduler.py#L55-L131) |
 | Contextual warmup | [`api_server.py`](../../python/minisgl/server/api_server.py#L721-L777), [`prefill.py`](../../python/minisgl/scheduler/prefill.py#L47-L230) |
+| Cache-hit ratio response propagation | [`scheduler.py`](../../python/minisgl/scheduler/scheduler.py), [`tokenizer/server.py`](../../python/minisgl/tokenizer/server.py), [`api_server.py`](../../python/minisgl/server/api_server.py) |

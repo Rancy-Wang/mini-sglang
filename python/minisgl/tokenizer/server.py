@@ -118,6 +118,7 @@ def tokenize_worker(
                             finished=msg.finished,
                             finish_reason=msg.finish_reason,
                             matched_stop=msg.matched_stop,
+                            cache_hit_ratio=msg.cache_hit_ratio,
                         )
                         for msg, reply in zip(detokenize_msg, replies, strict=True)
                     ]

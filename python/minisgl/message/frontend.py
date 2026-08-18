@@ -29,6 +29,7 @@ class UserReply(BaseFrontendMsg):
     finished: bool
     finish_reason: str | None = None
     matched_stop: str | None = None
+    cache_hit_ratio: float | None = None
 
 
 @dataclass

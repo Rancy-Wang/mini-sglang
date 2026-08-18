@@ -8,12 +8,12 @@
 
 ## 一、输入、完整模板与 token provenance
 
-`drop_message[n] = [message_id, ...]` 表示事件 `n` 生效后，后续 query 不再看见列出的
-历史消息。HTTP 层允许尚未发生的 schedule，但已生效事件不得引用不存在或未来的消息；
-有 Drop 时必须使用 `delta-marker`（`python/minisgl/server/api_server.py:86-142`，
-`_validate_drop_message`）。tokenizer 再做 int64 范围、future-message 与 prefix warmup
-校验（`python/minisgl/tokenizer/tokenize.py:458-508`，`_normalize_drop_message`、
-`_shift_and_validate_drop_message`）。
+公开 `drop_rule.type` 选择 `message_drop`、`text_drop` 或 `thinking_drop`。三种规则分别按
+完整 message owner、严格原始 content 子串、结构化 assistant thinking 选择内容，但都会
+编译到同一绝对 token-position delta wire。旧顶层 `drop_message` 只作为
+`MessageDropRule` 兼容入口；新旧字段同时出现会拒绝。结构、role 对齐、occurrence、子串和
+thinking 来源在 `python/minisgl/tokenizer/drop_rules.py` 校验，HTTP 入口在
+`python/minisgl/server/api_server.py` 转成 canonical wire。
 
 消息边界不是把每条消息单独 tokenize 后拼接。`TokenizeManager._round_by_round_no_gen`
 对完整 chat template 的逐轮结果比较稳定前缀/后缀，生成 owner 和 query epoch；普通
@@ -129,3 +129,20 @@ full/active metadata 不混用；不同 Drop history 不碰撞；request/tree ma
 本地只编辑 `System-test`。完成获批修改并 commit/push 后，才在 `InfiniAI-BUS` 的
 `/share/wangruoxi/repo/mini-sglang` 执行 `git pull --ff-only origin System-test`，激活 conda
 环境 `rosetta` 并运行 Linux/CUDA 测试；禁止直接编辑远端源码。
+
+## 七、Text/Thinking Drop 与响应命中率
+
+`TextDropRule.drop_messages` 与原始 `messages` 严格等长、同序、同 role；空 selector 是
+no-op。非空 `str | list[str]` 使用 UTF-8 Aho-Corasick kernel 找到允许重叠的 occurrence，
+再从 raw content span 映射到 canonical rendered char span 和 fast-tokenizer offsets。只删除
+完全包含的 token；跨边界 token 保留。selector 并集覆盖完整 content 时提升为完整 owner
+ranges，因此与相同目标的 `MessageDropRule` 精确等价。
+
+`ThinkingDropRule` 未开启时不改变 tokenizer。开启后只接受 `reasoning_content` 或唯一 leading
+`<think>` block；惰性 probe 判断模型模板是否原生保留历史 thinking。Qwen-like 已知 guard
+使用请求级 adapter，未知过滤模板 fail closed；Harmony 直接按 analysis 内容 token 定位。
+thinking 的事件在对应 assistant 末尾，保证 final 可见同轮 thinking，而后续 query 不可见。
+
+Scheduler 仍用 `cached_len / matchable_active_prefix_len`（空分母 1.0）计算
+`cache_hit_ratio`。该值只随最终生成请求的 terminal reply 传回：非流式位于 OpenAI response
+顶层，流式只位于最后一个 finish chunk；内部 warmup ratio 不对用户暴露。

@@ -6,9 +6,20 @@ from dataclasses import dataclass
 from typing import Any, Dict, List
 
 import torch
+from minisgl.kernel.text_match import find_all
 from minisgl.message import TokenizeMsg
 from minisgl.message.tokenizer import get_gpt_oss_terminal_stop_token_ids
-from minisgl.tokenizer.template_provenance import build_template_token_provenance
+from minisgl.tokenizer.drop_rules import (
+    MessageDropRule,
+    TextDropRule,
+    ThinkingDropRule,
+    parse_drop_rule,
+)
+from minisgl.tokenizer.template_provenance import (
+    TemplateTokenProvenance,
+    build_template_token_provenance,
+)
+from minisgl.tokenizer.thinking_template import prepare_thinking_template
 from transformers import PreTrainedTokenizerBase
 
 
@@ -54,6 +65,8 @@ class TokenizeManager:
         self.is_gpt_oss = "gpt-oss" in tokenizer_name or "gptoss" in tokenizer_class
         self._reasoning_effort: str | None = None
         self._harmony_encoding = None
+        self._chat_template_override: str | None = None
+        self._chat_template_kwargs: dict[str, Any] = {}
         # Be optimistic: many tokenizers accept extra kwargs via **kwargs even
         # when the explicit signature does not list `enable_thinking`.
         self._supports_enable_thinking = True
@@ -87,6 +100,9 @@ class TokenizeManager:
             kwargs["enable_thinking"] = enable_thinking
         if tools is not None and self._supports_tools:
             kwargs["tools"] = tools
+        if self._chat_template_override is not None:
+            kwargs["chat_template"] = self._chat_template_override
+        kwargs.update(self._chat_template_kwargs)
         while True:
             try:
                 return self.tokenizer.apply_chat_template(messages, **kwargs)
@@ -200,9 +216,9 @@ class TokenizeManager:
                 reasoning = raw.get("reasoning_content")
                 if isinstance(reasoning, str) and reasoning:
                     harmony_messages.append(
-                        HarmonyMessage.from_role_and_content(Role.ASSISTANT, reasoning).with_channel(
-                            "analysis"
-                        )
+                        HarmonyMessage.from_role_and_content(
+                            Role.ASSISTANT, reasoning
+                        ).with_channel("analysis")
                     )
                 if content:
                     harmony_messages.append(
@@ -627,6 +643,171 @@ class TokenizeManager:
             full_token_visible_until=visible_until,
         )
 
+    @classmethod
+    def _build_position_range_drop_plan(
+        cls,
+        event_ranges: dict[int, List[tuple[int, int]]],
+        query_epoch: List[int],
+    ) -> PositionDropPlan:
+        """Compile rule-produced absolute ranges into the generic delta wire."""
+
+        delta_by_pos: dict[int, List[tuple[int, int]]] = {}
+        effective_ranges: List[tuple[int, int]] = []
+        for event_n in sorted(event_ranges):
+            canonical = cls._canonicalize_position_ranges(event_ranges[event_n])
+            newly_effective = cls._subtract_position_ranges(canonical, effective_ranges)
+            effective_ranges = cls._canonicalize_position_ranges(effective_ranges + canonical)
+            if not newly_effective:
+                continue
+            insertion_pos = bisect_right(query_epoch, event_n)
+            if any(end > insertion_pos for _, end in newly_effective):
+                raise ValueError(
+                    "A Drop event cannot hide a token before that token has been computed: "
+                    f"event={event_n}, insertion_pos={insertion_pos}, ranges={newly_effective}"
+                )
+            delta_by_pos.setdefault(insertion_pos, []).extend(newly_effective)
+
+        event_positions: List[int] = []
+        range_offsets: List[int] = [0]
+        flat_ranges: List[tuple[int, int]] = []
+        visible_until = torch.full(
+            (len(query_epoch),),
+            torch.iinfo(torch.int32).max,
+            dtype=torch.int32,
+            device="cpu",
+        )
+        for insertion_pos in sorted(delta_by_pos):
+            canonical = cls._canonicalize_position_ranges(delta_by_pos[insertion_pos])
+            if not canonical:
+                continue
+            event_positions.append(insertion_pos)
+            flat_ranges.extend(canonical)
+            range_offsets.append(len(flat_ranges))
+            for start, end in canonical:
+                visible_until[start:end] = torch.minimum(
+                    visible_until[start:end],
+                    torch.tensor(insertion_pos, dtype=torch.int32, device="cpu"),
+                )
+        return PositionDropPlan(
+            event_positions=torch.tensor(event_positions, dtype=torch.int32, device="cpu"),
+            range_offsets=torch.tensor(range_offsets, dtype=torch.int32, device="cpu"),
+            position_ranges=torch.tensor(
+                flat_ranges, dtype=torch.int32, device="cpu"
+            ).reshape(-1),
+            full_token_visible_until=visible_until,
+        )
+
+    @staticmethod
+    def _subtract_position_ranges(
+        ranges: List[tuple[int, int]],
+        covered: List[tuple[int, int]],
+    ) -> List[tuple[int, int]]:
+        result: List[tuple[int, int]] = []
+        for start, end in ranges:
+            fragments = [(start, end)]
+            for cover_start, cover_end in covered:
+                next_fragments: List[tuple[int, int]] = []
+                for frag_start, frag_end in fragments:
+                    if cover_end <= frag_start or cover_start >= frag_end:
+                        next_fragments.append((frag_start, frag_end))
+                        continue
+                    if frag_start < cover_start:
+                        next_fragments.append((frag_start, cover_start))
+                    if cover_end < frag_end:
+                        next_fragments.append((cover_end, frag_end))
+                fragments = next_fragments
+            result.extend(fragments)
+        return result
+
+    @staticmethod
+    def _rendered_source_start(
+        provenance: TemplateTokenProvenance,
+        *,
+        owner: int,
+        source: str,
+        field: str,
+    ) -> int:
+        candidates = []
+        for start, end in find_all(provenance.rendered_text, [source])[0]:
+            if all(candidate == owner for candidate in provenance.char_owners[start:end]):
+                candidates.append(start)
+        if len(candidates) != 1:
+            raise ValueError(
+                f"Cannot map {field} for messages[{owner}] uniquely into the "
+                "canonical chat template"
+            )
+        return candidates[0]
+
+    @classmethod
+    def _token_ranges_for_char_spans(
+        cls,
+        provenance: TemplateTokenProvenance,
+        *,
+        owner: int,
+        spans: List[tuple[int, int]],
+        field: str,
+    ) -> List[tuple[int, int]]:
+        selected: List[int] = []
+        for token_id, (start, end) in enumerate(provenance.offsets):
+            if provenance.owners[token_id] != owner or start == end:
+                continue
+            if any(start >= span_start and end <= span_end for span_start, span_end in spans):
+                selected.append(token_id)
+        if not selected:
+            raise ValueError(
+                f"{field} for messages[{owner}] contains no complete token; "
+                "boundary-crossing tokens are kept"
+            )
+        ranges: List[tuple[int, int]] = []
+        start = previous = selected[0]
+        for token_id in selected[1:]:
+            if token_id == previous + 1:
+                previous = token_id
+                continue
+            ranges.append((start, previous + 1))
+            start = previous = token_id
+        ranges.append((start, previous + 1))
+        return cls._canonicalize_position_ranges(ranges)
+
+    @staticmethod
+    def _find_owned_token_subsequence(
+        full_ids: List[int],
+        owners: List[int],
+        needle: List[int],
+        *,
+        owner: int,
+        field: str,
+    ) -> tuple[int, int]:
+        if not needle:
+            raise ValueError(f"{field} for messages[{owner}] tokenizes to an empty sequence")
+        # KMP keeps the GPT-OSS Harmony fallback linear in the full token stream.
+        prefix = [0] * len(needle)
+        j = 0
+        for i in range(1, len(needle)):
+            while j and needle[i] != needle[j]:
+                j = prefix[j - 1]
+            if needle[i] == needle[j]:
+                j += 1
+                prefix[i] = j
+        matches: List[tuple[int, int]] = []
+        j = 0
+        for i, token in enumerate(full_ids):
+            while j and token != needle[j]:
+                j = prefix[j - 1]
+            if token == needle[j]:
+                j += 1
+                if j == len(needle):
+                    start = i + 1 - len(needle)
+                    end = i + 1
+                    if all(candidate == owner for candidate in owners[start:end]):
+                        matches.append((start, end))
+                    j = prefix[j - 1]
+        if len(matches) != 1:
+            raise ValueError(
+                f"Cannot map {field} for messages[{owner}] uniquely into the Harmony token stream"
+            )
+        return matches[0]
+
     @staticmethod
     def _encode_radix_key(token_id: int, drop_mask: int) -> int:
         # Keep token id in low 32 bits and drop bitset in high 32 bits.
@@ -808,11 +989,125 @@ class TokenizeManager:
         # Position is in rewritten middle; map to rewritten block start.
         return lcp
 
+    def _compile_rule_position_events(
+        self,
+        rule: MessageDropRule | TextDropRule | ThinkingDropRule,
+        *,
+        raw_messages: List[Dict[str, Any]],
+        owner_ranges: dict[int, List[tuple[int, int]]],
+        provenance: TemplateTokenProvenance | None,
+        full_input_ids: List[int],
+        owners: List[int],
+        target_offset: int,
+        normalized_message_count: int,
+    ) -> dict[int, List[tuple[int, int]]]:
+        if isinstance(rule, MessageDropRule):
+            return rule.position_events(
+                owner_ranges,
+                target_offset=target_offset,
+                normalized_message_count=normalized_message_count,
+            )
+
+        if isinstance(rule, TextDropRule):
+            trigger = rule.trigger_message_id + target_offset
+            if trigger >= normalized_message_count:
+                return {}
+            ranges: List[tuple[int, int]] = []
+            for raw_message_id, selection in enumerate(rule.selections):
+                if selection is None:
+                    continue
+                owner = raw_message_id + target_offset
+                if selection.whole_message:
+                    ranges.extend(owner_ranges.get(owner, ()))
+                    continue
+                if provenance is None:
+                    raise ValueError(
+                        "Partial text_drop requires a fast tokenizer with canonical offset mapping"
+                    )
+                source = self._normalize_message_content(
+                    raw_messages[raw_message_id].get("content")
+                )
+                rendered_start = self._rendered_source_start(
+                    provenance,
+                    owner=owner,
+                    source=source,
+                    field="content",
+                )
+                rendered_spans = [
+                    (rendered_start + start, rendered_start + end)
+                    for start, end in selection.spans
+                ]
+                ranges.extend(
+                    self._token_ranges_for_char_spans(
+                        provenance,
+                        owner=owner,
+                        spans=rendered_spans,
+                        field="text_drop content",
+                    )
+                )
+            return {trigger: self._canonicalize_position_ranges(ranges)} if ranges else {}
+
+        events: dict[int, List[tuple[int, int]]] = {}
+        for raw_message_id, source in rule.thinking_by_message.items():
+            owner = raw_message_id + target_offset
+            if owner >= normalized_message_count:
+                continue
+            if provenance is not None:
+                rendered_start = self._rendered_source_start(
+                    provenance,
+                    owner=owner,
+                    source=source,
+                    field="thinking",
+                )
+                ranges = self._token_ranges_for_char_spans(
+                    provenance,
+                    owner=owner,
+                    spans=[(rendered_start, rendered_start + len(source))],
+                    field="thinking",
+                )
+            else:
+                needle = self.tokenizer.encode(source, add_special_tokens=False)
+                if isinstance(needle, torch.Tensor):
+                    needle = needle.view(-1).tolist()
+                ranges = [
+                    self._find_owned_token_subsequence(
+                        full_input_ids,
+                        owners,
+                        [int(token_id) for token_id in needle],
+                        owner=owner,
+                        field="thinking",
+                    )
+                ]
+            events[owner] = self._canonicalize_position_ranges(ranges)
+        return events
+
+    @classmethod
+    def _ranges_effective_for_target(
+        cls,
+        event_ranges: dict[int, List[tuple[int, int]]],
+        target_msg_id: int,
+    ) -> List[tuple[int, int]]:
+        return cls._canonicalize_position_ranges(
+            [
+                item
+                for event, ranges in event_ranges.items()
+                if event < target_msg_id
+                for item in ranges
+            ]
+        )
+
     def _chat_tokenize(self, msg: TokenizeMsg) -> TokenizedResult:
         assert isinstance(msg.text, list)
         self._reasoning_effort = msg.reasoning_effort
-        drop_message = self._normalize_drop_message(msg.drop_message)
-        if drop_message and self.radix_drop_key_mode != "delta-marker":
+        self._chat_template_override = None
+        self._chat_template_kwargs = {}
+        drop_rule = parse_drop_rule(
+            getattr(msg, "drop_rule", None),
+            msg.text,
+            legacy_drop_message=msg.drop_message,
+            allow_internal=True,
+        )
+        if drop_rule is not None and self.radix_drop_key_mode != "delta-marker":
             raise ValueError(
                 "Token-position Drop requires radix_drop_key_mode='delta-marker'; "
                 f"got {self.radix_drop_key_mode!r}."
@@ -823,6 +1118,12 @@ class TokenizeManager:
             mode=tool_choice_mode,
             forced_tool_name=forced_tool_name,
         )
+        thinking_template_capability: str | None = None
+        if isinstance(drop_rule, ThinkingDropRule) and not self.is_gpt_oss:
+            thinking_plan = prepare_thinking_template(self.tokenizer, tools=selected_tools)
+            self._chat_template_override = thinking_plan.chat_template
+            self._chat_template_kwargs = thinking_plan.template_kwargs
+            thinking_template_capability = thinking_plan.capability
 
         if self.is_gpt_oss:
             messages = [dict(message) for message in msg.text]
@@ -851,7 +1152,7 @@ class TokenizeManager:
                 tools=selected_tools,
             )
         except Exception:
-            if self.is_gpt_oss:
+            if self.is_gpt_oss or isinstance(drop_rule, ThinkingDropRule):
                 raise
             messages, target_offset = self._build_template_messages(
                 msg.text,
@@ -877,11 +1178,6 @@ class TokenizeManager:
         if not self._supports_tools:
             effective_tools = None
         effective_enable_thinking = msg.enable_thinking if self._supports_enable_thinking else None
-        drop_message = self._shift_and_validate_drop_message(
-            drop_message,
-            target_offset=target_offset,
-            normalized_message_count=len(messages),
-        )
         full_no_gen_tensor = torch.tensor(full_no_gen, dtype=torch.int32, device="cpu")
         full_with_gen_tensor = torch.tensor(full_with_gen, dtype=torch.int32, device="cpu")
         next_assistant_id = len(messages)
@@ -907,8 +1203,9 @@ class TokenizeManager:
             else [generation_prompt_epoch] * len(full_with_gen)
         )
 
+        provenance: TemplateTokenProvenance | None = None
         cross_owner_tokens = 0
-        if drop_message and not self.is_gpt_oss:
+        if drop_rule is not None and not self.is_gpt_oss:
             canonical_no_gen = self._render_chat_template(
                 messages,
                 add_generation_prompt=False,
@@ -930,11 +1227,27 @@ class TokenizeManager:
                 tools=effective_tools,
                 add_generation_prompt=True,
                 enable_thinking=effective_enable_thinking,
+                chat_template=self._chat_template_override,
+                template_kwargs=self._chat_template_kwargs,
             )
             owner_with_gen = provenance.owners
             cross_owner_tokens = provenance.cross_owner_tokens
 
         owner_ranges = self._build_owner_position_ranges(owner_with_gen)
+        event_ranges = (
+            self._compile_rule_position_events(
+                drop_rule,
+                raw_messages=msg.text,
+                owner_ranges=owner_ranges,
+                provenance=provenance,
+                full_input_ids=full_with_gen,
+                owners=owner_with_gen,
+                target_offset=target_offset,
+                normalized_message_count=len(messages),
+            )
+            if drop_rule is not None
+            else {}
+        )
 
         target_msg_id = self._resolve_target_msg_id(
             msg,
@@ -946,19 +1259,14 @@ class TokenizeManager:
             if msg.is_warmup and not msg.use_context_mask
             else None
         )
-        dropped_for_target = self._build_drop_set(drop_message, target_msg_id)
         position_drop_plan = (
-            self._build_position_drop_plan(
-                drop_message,
-                query_epoch_with_gen,
-                owner_ranges,
-            )
-            if drop_message
+            self._build_position_range_drop_plan(event_ranges, query_epoch_with_gen)
+            if event_ranges
             else None
         )
 
         keep_mask = torch.ones(len(full_with_gen_tensor), dtype=torch.bool, device="cpu")
-        for start, end in self._ranges_for_messages(owner_ranges, dropped_for_target):
+        for start, end in self._ranges_effective_for_target(event_ranges, target_msg_id):
             keep_mask[start:end] = False
 
         input_ids = full_with_gen_tensor[keep_mask].contiguous()
@@ -1001,7 +1309,21 @@ class TokenizeManager:
             previous_epoch = epoch
             if start >= len(radix_match_ids):
                 continue
-            dropped_ids = sorted(self._build_drop_set(drop_message, epoch))
+            dropped_ids = (
+                sorted(
+                    self._build_drop_set(
+                        {
+                            trigger + target_offset: [
+                                message_id + target_offset for message_id in message_ids
+                            ]
+                            for trigger, message_ids in drop_rule.drop_messages.items()
+                        },
+                        epoch,
+                    )
+                )
+                if isinstance(drop_rule, MessageDropRule)
+                else []
+            )
             start_meta: dict[str, Any] = {
                 "msg_id": epoch,
                 "epoch": epoch,
@@ -1009,7 +1331,7 @@ class TokenizeManager:
                 "compact_start": compact_pos(start),
             }
             if self.radix_drop_key_mode == "bitmask":
-                drop_mask = self._build_drop_mask(drop_message, epoch)
+                drop_mask = sum(1 << message_id for message_id in dropped_ids)
                 token_id = int(radix_match_ids[start].item())
                 radix_match_ids[start] = self._encode_radix_key(token_id, drop_mask)
                 start_meta["drop_mask"] = drop_mask
@@ -1028,13 +1350,15 @@ class TokenizeManager:
             radix_input_ids=radix_input_ids,
             radix_match_ids=radix_match_ids,
             prefix_keep_mask=prefix_keep_mask,
-            full_input_ids=(full_with_gen_tensor if drop_message else None),
+            full_input_ids=(full_with_gen_tensor if event_ranges else None),
             full_token_visible_until=(
                 position_drop_plan.full_token_visible_until
                 if position_drop_plan is not None
                 else None
             ),
-            full_keep_mask=(keep_mask.to(dtype=torch.int32).contiguous() if drop_message else None),
+            full_keep_mask=(
+                keep_mask.to(dtype=torch.int32).contiguous() if event_ranges else None
+            ),
             drop_event_positions=(
                 position_drop_plan.event_positions if position_drop_plan is not None else None
             ),
@@ -1063,6 +1387,8 @@ class TokenizeManager:
                 "warmup_commit_token_len": warmup_commit_token_len,
                 "safe_mode": int(safe_mode),
                 "radix_drop_key_mode": self.radix_drop_key_mode,
+                "drop_rule_type": drop_rule.type if drop_rule is not None else None,
+                "thinking_template_capability": thinking_template_capability,
             },
         )
 
