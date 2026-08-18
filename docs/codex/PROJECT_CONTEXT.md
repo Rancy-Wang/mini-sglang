@@ -163,20 +163,24 @@ embedding 与 lm-head 两个别名。`Engine._load_weight_state_dict` 只对模�
 回退为统一 `self.dtype` 转换，因为 GPT-OSS packed MXFP4 权重需要保持模板指定的
 `uint8`。
 
-## 九、CUDA Graph 默认策略与回退
+## 九、CUDA Graph 默认策略与 main 捕获流程
 
 `cuda_graph_max_bs=None` 表示默认开启，而不是关闭。所有模型（包括 GPT-OSS）统一根据启动前
 可用 GPU 显存生成 capture shapes：显存大于 80 GiB 时最大 batch size 为 256，否则为 160；
 显式 `0` 才产生空列表并关闭。列表生成见
-`python/minisgl/engine/graph.py:47-66`（`_determine_cuda_graph_bs`），公开参数及关闭别名见
+`python/minisgl/engine/graph.py:49-68`（`_determine_cuda_graph_bs`），公开参数及关闭别名见
 `python/minisgl/server/args.py:149-165`。
 
-`GraphRunner` 对每个 shape 分别捕获，并在 TP 模式下通过 CPU process group 汇总所有 rank 的
-成功状态。只有所有 rank 均成功的 graph 才进入 `graph_map`；该映射是可 replay shape 的唯一
-事实来源，失败 shape 只回退 eager，不影响其他 shape。捕获和 TP 汇总见
-`python/minisgl/engine/graph.py:118-166`，Engine 传入通信组见
-`python/minisgl/engine/engine.py:117-129`。Decode batch 向上 padding 到最小可用 shape 后才允许
-replay；Prefill 始终保持原 batch size，见 `python/minisgl/engine/graph.py:168-186`。
+`GraphRunner` 的捕获过程与上游 `main` 保持一致：启动时同步设备、清空 CUDA allocator cache、
+重置峰值显存统计，输出捕获前后可用显存，并用 `tqdm` 按 batch size 从大到小显示捕获进度。
+所有 shape 共用第一个 graph 的 memory pool。捕获过程不输出逐 shape
+`Captured whole-model CUDA graph bs=...` 日志，也不提供单 shape eager fallback；任一 capture
+异常会像 `main` 一样终止启动。实现见 `python/minisgl/engine/graph.py:106-148`。
+
+Decode batch 使用 `graph_bs_list` 向上 padding 到第一个可用 shape，超过最大 graph batch 或
+Prefill batch 保持原大小；replay 只处理不超过最大 graph batch 的 Decode，见
+`python/minisgl/engine/graph.py:150-167`。Context System 只扩充 dummy request 的 full/active
+元数据，不改变该捕获流程，Engine 调用见 `python/minisgl/engine/engine.py:100-128`。
 
 ## 十、操作不变量与验证边界
 

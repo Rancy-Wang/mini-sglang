@@ -74,19 +74,19 @@ Scheduler -> Detokenizer -> Frontend：非流式响应顶层返回，流式只�
   `python/minisgl/scheduler/prefill.py:23-40`；Scheduler 分流见
   `python/minisgl/scheduler/scheduler.py:225-255`。
 
-## PLAN-CS-20260818-R7 已实现范围
+## PLAN-CS-20260818-R7 / R8 已实现范围
 
 - CUDA Graph 对所有模型（包括 GPT-OSS）默认开启。`cuda_graph_max_bs=None` 时按启动前可用
   GPU 显存选择最大 batch size：大于 80 GiB 使用 256，否则使用 160；显式设置为 `0` 或使用
   `--disable-cuda-graph` 才关闭。解析与 batch 列表生成见
-  `python/minisgl/engine/graph.py:47-66`，CLI 入口见 `python/minisgl/server/args.py:149-165`。
-- `GraphRunner.graph_map` 是成功捕获 shape 的唯一事实来源，不再维护 GPT-OSS 特判、目标列表、
-  最大值和失败集合等重复状态。每个 shape 独立捕获，TP 各 rank 通过 CPU group 汇总结果；仅当
-  所有 rank 成功时才登记 graph，失败 shape 单独回退 eager。实现见
-  `python/minisgl/engine/graph.py:77-150`。
-- Decode batch 只向上 padding 到实际成功捕获的最小 shape；Prefill 不 padding。batch size
-  大于 1 与 batch size 1 使用同一选择和 replay 路径，见
-  `python/minisgl/engine/graph.py:168-186`。
+  `python/minisgl/engine/graph.py:49-68`，CLI 入口见 `python/minisgl/server/args.py:149-165`。
+- R8 将 `GraphRunner` 恢复为上游 `main` 的捕获过程和输出：同步、清理 allocator cache、重置
+  峰值统计，输出捕获前后可用显存，并用 `tqdm` 显示每个 batch size 的捕获进度；不再输出
+  `Captured whole-model CUDA graph bs=...` 或维护 System-test 专用的逐 shape/TP fallback。
+  capture 异常与 `main` 一样直接终止启动。实现见 `python/minisgl/engine/graph.py:79-148`。
+- Decode batch 按 `main` 规则向上 padding 到 `graph_bs_list` 中第一个可用 shape；超过最大 graph
+  batch 和 Prefill 不 padding。batch size 大于 1 与 batch size 1 使用同一 replay 路径，见
+  `python/minisgl/engine/graph.py:150-167`。
 
 核心入口见：
 
@@ -96,7 +96,7 @@ Scheduler -> Detokenizer -> Frontend：非流式响应顶层返回，流式只�
 - `python/minisgl/tokenizer/thinking_template.py:86`；
 - `python/minisgl/tokenizer/tokenize.py:700`、`:1045`、`:1159`；
 - `python/minisgl/server/api_server.py:161`、`:755`、`:953`、`:1161`。
-- `python/minisgl/engine/graph.py:47`、`:77`、`:118`、`:168`。
+- `python/minisgl/engine/graph.py:49`、`:79`、`:106`、`:150`。
 
 ## 已完成验证
 

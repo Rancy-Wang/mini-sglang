@@ -42,7 +42,7 @@ You can specify the backend using the `--attn` argument. If two values are provi
 
 ## CUDA Graph
 
-To minimize CPU launch overhead during decoding, Mini-SGLang captures and replays CUDA graphs by default for every model, including GPT-OSS. When no maximum is specified, it selects one from the available GPU memory. Use `--cuda-graph-max-bs n` to set an explicit maximum; setting it to `0`, or passing `--disable-cuda-graph`, disables the feature. A batch shape that fails to capture falls back to eager execution without disabling other successfully captured shapes.
+To minimize CPU launch overhead during decoding, Mini-SGLang captures and replays CUDA graphs by default for every model, including GPT-OSS. When no maximum is specified, it selects one from the available GPU memory. Use `--cuda-graph-max-bs n` to set an explicit maximum; setting it to `0`, or passing `--disable-cuda-graph`, disables the feature. Graph capture and its progress output follow the upstream `main` implementation.
 
 ## Radix Cache
 
