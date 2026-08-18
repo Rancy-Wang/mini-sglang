@@ -204,15 +204,17 @@ fast tokenizer 的 canonical `offset_mapping` 映射到绝对 token 区间。只
 
 未开启时完全沿用模型 tokenizer/chat template，不做能力探测、模板覆盖或 thinking 解析。
 开启后，thinking 必须来自 assistant 的 `reasoning_content`，或 content 中唯一、完整、非嵌套
-且位于开头的 `<think>...</think>`。两者同时出现但内容不一致、标签残缺或有歧义时返回
-HTTP 400；系统不会从普通 prose 猜测 thinking。
+且位于开头的 `<think>...</think>`。两种来源不得同时提供；双来源、标签残缺或有歧义时均
+返回 HTTP 400，系统不会从普通 prose 猜测 thinking。
 
 系统仅在该规则开启时做惰性 retention probe，并按 tokenizer 身份、模板 SHA、tools variant
 缓存结果。原生保留历史 thinking 的模板不修改；已识别的 Qwen 历史过滤 guard 使用请求级
 Jinja adapter，私有 `preserve_thinking_history` 只对当前请求生效，且必须通过“实际 reasoning
 出现一次、无 reasoning 输出不变”的后置校验。未知的过滤模板 fail closed，返回
-`thinking_history_not_preservable`。GPT-OSS 使用原生 Harmony `analysis` channel；只删除
-analysis 内容 token，channel/recipient/protocol token 保留。
+`thinking_history_not_preservable`。GPT-OSS 仅在该规则开启时用
+`RenderConversationConfig(auto_drop_analysis=False)` 保留原生 Harmony `analysis` component，
+逐 component 校验 token cursor，只删除 analysis 内容 token；channel/recipient/protocol
+token 保留。规则未开启时仍沿用 Harmony 默认的 `auto_drop_analysis` 行为。
 
 每段 thinking 的 Drop event 位于对应 assistant message 末尾。因此 assistant final token 可见
 同轮 thinking，后续 user/tool/assistant-generation 不可见。冷缓存 `mask` warmup 仍输入完整
@@ -336,13 +338,13 @@ Drop Rule 只支持 chat `messages`，不支持 plain `prompt`。结构、子串
 
 | Concern | Source |
 | --- | --- |
-| Public schema and validation | [`drop_rules.py`](../../python/minisgl/tokenizer/drop_rules.py), [`api_server.py`](../../python/minisgl/server/api_server.py) |
-| Template-independent epochs and token ownership | [`tokenize.py`](../../python/minisgl/tokenizer/tokenize.py), [`template_provenance.py`](../../python/minisgl/tokenizer/template_provenance.py) |
-| Text matcher | [`text_match.py`](../../python/minisgl/kernel/text_match.py), [`text_match.cpp`](../../python/minisgl/kernel/csrc/src/text_match.cpp) |
-| Thinking retention adapter | [`thinking_template.py`](../../python/minisgl/tokenizer/thinking_template.py) |
-| Position-range Drop compilation | [`tokenize.py`](../../python/minisgl/tokenizer/tokenize.py) |
+| Public schema and validation | [`drop_rules.py`](../../python/minisgl/tokenizer/drop_rules.py#L60), [`api_server.py`](../../python/minisgl/server/api_server.py#L161) |
+| Template-independent epochs and token ownership | [`tokenize.py`](../../python/minisgl/tokenizer/tokenize.py#L934), [`template_provenance.py`](../../python/minisgl/tokenizer/template_provenance.py#L206) |
+| Text matcher | [`text_match.py`](../../python/minisgl/kernel/text_match.py#L127), [`text_match.cpp`](../../python/minisgl/kernel/csrc/src/text_match.cpp#L37) |
+| Thinking retention adapter | [`thinking_template.py`](../../python/minisgl/tokenizer/thinking_template.py#L86), [`tokenize.py`](../../python/minisgl/tokenizer/tokenize.py#L273) |
+| Position-range Drop compilation | [`tokenize.py`](../../python/minisgl/tokenizer/tokenize.py#L700), [`tokenize.py`](../../python/minisgl/tokenizer/tokenize.py#L1045) |
 | Virtual delta markers | [`radix_delta.py`](../../python/minisgl/scheduler/radix_delta.py#L12-L261) |
 | Full-path cache match and active-KV filtering | [`cache.py`](../../python/minisgl/scheduler/cache.py#L103-L179) |
 | Startup and backend constraints | [`args.py`](../../python/minisgl/server/args.py#L176-L265), [`scheduler.py`](../../python/minisgl/scheduler/scheduler.py#L55-L131) |
-| Contextual warmup | [`api_server.py`](../../python/minisgl/server/api_server.py#L721-L777), [`prefill.py`](../../python/minisgl/scheduler/prefill.py#L47-L230) |
-| Cache-hit ratio response propagation | [`scheduler.py`](../../python/minisgl/scheduler/scheduler.py), [`tokenizer/server.py`](../../python/minisgl/tokenizer/server.py), [`api_server.py`](../../python/minisgl/server/api_server.py) |
+| Contextual warmup | [`api_server.py`](../../python/minisgl/server/api_server.py#L755), [`prefill.py`](../../python/minisgl/scheduler/prefill.py#L47) |
+| Cache-hit ratio response propagation | [`scheduler.py`](../../python/minisgl/scheduler/scheduler.py#L255), [`tokenizer/server.py`](../../python/minisgl/tokenizer/server.py#L121), [`api_server.py`](../../python/minisgl/server/api_server.py#L953) |

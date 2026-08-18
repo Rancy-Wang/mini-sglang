@@ -1,91 +1,104 @@
-# 当前状态 snapshot（2026-08-05）
+# 当前状态 snapshot（2026-08-18）
 
-这是便于新窗口恢复的静态 snapshot，不是“仓库仍然如此”的保证。每次 startup、resume
-或 compact 后都先动态运行：
+这是恢复新窗口时使用的静态 snapshot，不替代动态检查。每次 startup、resume 或 compact 后
+仍须先运行：
 
 ```bash
 git branch --show-current
-git rev-parse --short HEAD
+git rev-parse HEAD
 git status --short --branch
 git diff --stat
 git log --oneline -8
 ```
 
-事实冲突时以 working tree 为准，其次才是本文、会话 handoff 和旧 transcript。
+事实冲突时按 working tree > 本文 > handoff > 旧 transcript 的顺序处理。
 
 ## Snapshot 基线
 
 - 本地仓库：`/Users/x.puppet/Desktop/Undergraduate/Project/Contextual system/mini-sglang`
 - 分支：`System-test`
-- HEAD：`b43e5c8`（`Sort token Drop test imports`），当时与
-  `origin/System-test` 一致。
-- 最近 Context System 提交（旧到新）：
-  - `fbd9010 Implement token-position Drop backend`
-  - `08af742 Fix Radix bool mask FFI dtype`
-  - `a9ba6e6 Flatten token Drop range wire metadata`
-  - `f489533 Format token Drop implementation`
-  - `e5052bd Release Radix markers on invalid commit boundary`
-  - `1b8c03a Isolate marker cleanup regression test`
-  - `b43e5c8 Sort token Drop test imports`
+- R3 实现提交：
+  - `c4526a5 feat(context): add selectable token-position drop rules`
+  - `bd513a4 fix(context): retain and map Harmony thinking components`
+- 上述实现提交已 push 到 `origin/System-test`，并在
+  `InfiniAI-BUS:/share/wangruoxi/repo/mini-sglang` fast-forward 拉取。包含本 snapshot 的后续
+  文档 checkpoint 应以动态 `git rev-parse HEAD` 为准。
 
-## 当时的 dirty working tree
-
-共有 17 个 tracked dirty 文件，diff stat 为 775 insertions / 95 deletions：
+远端测试前原有的下列 untracked 文件保持原样，没有移动、清理或提交：
 
 ```text
-pyproject.toml
-python/minisgl/attention/base.py
-python/minisgl/attention/fa.py
-python/minisgl/attention/fi.py
-python/minisgl/engine/engine.py
-python/minisgl/engine/graph.py
-python/minisgl/layers/attention.py
-python/minisgl/layers/linear.py
-python/minisgl/message/tokenizer.py
-python/minisgl/models/config.py
-python/minisgl/models/register.py
-python/minisgl/models/weight.py
-python/minisgl/scheduler/scheduler.py
-python/minisgl/server/api_server.py
-python/minisgl/server/args.py
-python/minisgl/tokenizer/detokenize.py
-python/minisgl/tokenizer/tokenize.py
+contextual_readme.md
+python/minisgl/CODEX_TASK_CONTEXT_SYSTEM.md
+python/minisgl/INSTALL.md
+python/minisgl/MANIFEST.md
+python/minisgl/docs/
+tests/core/test_contextual_prefill.py
+tests/kernel/test_context_mask.py
 ```
 
-这些修改是续接 `PLAN-CS-20260804-R3` 的 GPT-OSS/Context System 原型；不得被本次
-Codex handoff 配置任务覆盖、restore、stash 或格式化。
+## PLAN-CS-20260818-R3 已实现范围
 
-主要 untracked GPT-OSS 实现与 tests：
+公开请求统一使用 `drop_rule`，并仅暴露三个规则类：
 
-```text
-python/minisgl/models/gpt_oss.py
-python/minisgl/moe/mxfp4.py
-tests/attention/test_gpt_oss_attention.py
-tests/models/test_gpt_oss_config.py
-tests/models/test_gpt_oss_e2e.py
-tests/models/test_gpt_oss_weight.py
-tests/moe/test_gpt_oss_mxfp4.py
-tests/server/test_cuda_graph_staged.py
-```
+- `MessageDropRule` / `message_drop`：字段继续叫 `drop_messages`，旧顶层
+  `drop_message` 在入口转换为该规则；没有 `schedule` 字段。
+- `TextDropRule` / `text_drop`：`drop_messages` 与历史 `messages` 等长、同序、同 role；
+  `content` 支持 `null | str | list[str]`。重复子串默认取最靠前 occurrence，也可完整提供
+  occurrence 编号。UTF-8 Aho-Corasick AOT CPU kernel 返回允许重叠的字符区间；只有完整落在
+  selector 内的 token 被删除，跨边界 token 保留，完整 content 覆盖提升为 message owner
+  ranges。
+- `ThinkingDropRule` / `thinking_drop`：不开启时不修改 tokenizer；开启后仅从结构化
+  `reasoning_content` 或唯一 leading `<think>` block 取 thinking。Qwen 历史过滤模板使用
+  request-local guard adapter，未知模板 fail closed；Harmony 仅在该规则开启时关闭
+  `auto_drop_analysis` 并逐 component 映射 analysis 内容 token。
 
-另有尚未纳入 Git 的项目 `AGENTS.md`、5 个自定义 agent、5 个 Context System skill 及
-checkpoint scripts；它们是主代理待 checkpoint 的项目配置，不是可清理噪声。`.DS_Store`
-属于纯 OS 噪声。
+三条规则统一编译成绝对 token-position delta wire，继续复用 delta-marker Radix、绝对
+position、mask/staged warmup 与 cache 生命周期。最终生成请求的 `cache_hit_ratio` 已贯通
+Scheduler -> Detokenizer -> Frontend：非流式响应顶层返回，流式只在 terminal chunk 返回。
 
-## 原型覆盖与验证状态
+核心入口见：
 
-working tree 原型覆盖 GPT-OSS 模型注册/配置、Harmony chat 与 stop/output、MXFP4 packed
-weight sharding/runtime、attention sinks 与 sliding window、分阶段 CUDA graph capture，
-同时携带现有 delta-marker/staged Context System。详细续接边界见会话 handoff。
+- `python/minisgl/tokenizer/drop_rules.py:60`、`:138`、`:288`；
+- `python/minisgl/kernel/text_match.py:127` 与
+  `python/minisgl/kernel/csrc/src/text_match.cpp:37`；
+- `python/minisgl/tokenizer/thinking_template.py:86`；
+- `python/minisgl/tokenizer/tokenize.py:700`、`:1045`、`:1159`；
+- `python/minisgl/server/api_server.py:161`、`:755`、`:953`、`:1161`。
 
-验证尚未完成。续接状态只记录了 `compileall` 与 diff/scope 检查通过；尚未运行新加的
-focused `pytest`，也尚未在 `InfiniAI-BUS` 的 `rosetta` 环境做 CUDA、TP 或端到端验证。
-因此不得声称 GPT-OSS 或 FA3 Context System mask 已受支持，也不得把本 snapshot 当成
-`PASSED` checkpoint。
+## 已完成验证
 
-## 固定同步流程
+本地只做只读/静态验证：所有修改 Python 文件 `compileall` 通过，`git diff --check` 通过，
+修改范围未超出获批的 23 个路径。`ruff` 在本地和远端专用环境都未安装，因此没有声称 lint
+通过。
 
-本地编辑 -> 精确暂存本任务文件 -> commit -> push `origin/System-test` ->
-`InfiniAI-BUS:/share/wangruoxi/repo/mini-sglang` 执行
-`git pull --ff-only origin System-test` -> 激活 conda `rosetta` -> 运行相称的远端测试。
-远端只 pull/test，不直接改源码。
+远端使用 `/share/wangruoxi/.conda/envs/minisgl-gpt-oss-r4`，pytest 因该环境没有 coverage
+插件而显式使用 `-o addopts=`：
+
+- 首轮聚焦测试：48 passed / 1 failed；唯一失败暴露了 Harmony analysis token 不能依赖旧
+  owner 猜测，随后改为 retention config + component token cursor。
+- Harmony 修复定向复测：23 passed。
+- Context/Radix/mask/API/GPT-OSS 扩展回归：67 passed。
+
+真实模型与服务验证：
+
+- Qwen3-1.7B 在 GPU 7 上实际生成 C2C `math_followup` 首轮 assistant：
+  `15 + 27 = 42.`。在完整四条历史中，`MessageDropRule {3:[1,2]}` 与等价完整-content
+  `TextDropRule` 的 full IDs、keep mask、active IDs、absolute positions 和 delta metadata
+  全部相等；事件位置为 `55`，Drop 绝对区间为 `[11,42)`。
+- DeepSeek-R1-Distill-Qwen-1.5B 单卡 mini-sglang HTTP 服务中，Message/Text 两请求均返回
+  200、相同输出和 `cache_hit_ratio=1.0`；流式 ratio 只出现在第 4 个 terminal chunk。
+  不具备已识别 history-retention guard 的该模型对 `thinking_drop` 返回预期 HTTP 400
+  `thinking_history_not_preservable`。
+- Qwen3-1.7B mini-sglang 服务启动受已有 loader tied-weight 问题阻塞：checkpoint 不含
+  `lm_head.weight`，loader 报 `KeyError`。该问题发生在本次 Drop 请求路径之前；同一模型的
+  真实 Transformers 生成和 tokenizer Drop 映射已通过，服务验证改用上述 DeepSeek 小模型。
+
+## 当前限制与后续检查
+
+- partial `TextDropRule` 的 canonical 字符 offset 映射要求 fast Hugging Face tokenizer；
+  GPT-OSS Harmony 当前正向覆盖的是完整-message Text promotion 与 Thinking component 映射。
+- Thinking retention 只自动适配已验证的 Qwen guard；未知会删除历史 thinking 的模板必须
+  新增有后置校验的专用 adapter，不能猜测普通 prose。
+- AOT matcher caps：16 MiB source、4096 patterns、1 MiB pattern bytes、1,000,000 matches。
+- 完成任何后续修改后仍执行：精确暂存 -> commit -> push -> 远端 `git pull --ff-only` ->
+  相称 Linux/CUDA 测试；远端源码只 pull/test，不直接编辑。

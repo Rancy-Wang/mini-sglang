@@ -1,148 +1,150 @@
 # mini-sglang Context System 项目上下文
 
-本文解释 2026-08-12 当前 working tree 中的 Context System。它是机制导航，不是修改
-授权；源码继续变化时，必须重新检查路径、符号和行号。当前默认组合是
-`radix_drop_key_mode="delta-marker"` 与 `contextual_prefill_mode="mask"`，而旧会话中
-把 message 文本或 `symbol` 当默认 Radix 状态的 pasted-text 说明已经过时
-（`python/minisgl/scheduler/config.py:15-21`，`SchedulerConfig`）。
+本文解释 2026-08-18 `System-test` 上的 Context System。它是机制导航，不是修改授权；动态
+事实和批准范围仍按 `AGENTS.md`、change gate 与 `CURRENT_STATE.md` 检查。默认组合是
+`radix_drop_key_mode="delta-marker"` 与 `contextual_prefill_mode="mask"`
+（`python/minisgl/scheduler/config.py:16`，`SchedulerConfig`）。
 
-## 一、输入、完整模板与 token provenance
+## 一、统一 Drop Rule 输入
 
-公开 `drop_rule.type` 选择 `message_drop`、`text_drop` 或 `thinking_drop`。三种规则分别按
-完整 message owner、严格原始 content 子串、结构化 assistant thinking 选择内容，但都会
-编译到同一绝对 token-position delta wire。旧顶层 `drop_message` 只作为
-`MessageDropRule` 兼容入口；新旧字段同时出现会拒绝。结构、role 对齐、occurrence、子串和
-thinking 来源在 `python/minisgl/tokenizer/drop_rules.py` 校验，HTTP 入口在
-`python/minisgl/server/api_server.py` 转成 canonical wire。
+公开 `drop_rule.type` 只选择三个类：
 
-消息边界不是把每条消息单独 tokenize 后拼接。`TokenizeManager._round_by_round_no_gen`
-对完整 chat template 的逐轮结果比较稳定前缀/后缀，生成 owner 和 query epoch；普通
-Hugging Face 模板在有 Drop 时还会渲染带 marker 的完整模板，并依靠 fast tokenizer 的
-`offset_mapping` 把完整输出 token 归属回消息
-（`python/minisgl/tokenizer/tokenize.py:697-789`，`_merge_owner_track`、
-`_round_by_round_no_gen`；`python/minisgl/tokenizer/template_provenance.py:203-239`，
-`build_template_token_provenance`）。因此 BOS/EOS、generation prompt、模板分隔符、空消息、
-special token 和模板重写都必须从完整模板结果判断，不能用字符查找或重复文本匹配猜边界。
+- `MessageDropRule` / `message_drop`：按完整 message owner 删除，字段名为
+  `drop_messages`，不使用 `schedule`；
+- `TextDropRule` / `text_drop`：按与原始 `messages` 等长、同序、同 role 的 content
+  selector 删除；
+- `ThinkingDropRule` / `thinking_drop`：保留结构化 thinking 文本进入完整 Radix token
+  流，但删除其 KV。
 
-当前未提交 GPT-OSS 原型改走 Harmony token stream，并把 Harmony 注入的 system/developer
-前缀标为 owner `-1`，避免 Drop 删除模型元数据；这是 working-tree 原型事实，不等于已
-通过端到端验证（`python/minisgl/tokenizer/tokenize.py:62-115`，`_call_chat_template`、
-`_get_harmony_encoding`；`python/minisgl/tokenizer/tokenize.py:742-789`，
-`_round_by_round_no_gen`）。
+三个类和校验分别始于 `python/minisgl/tokenizer/drop_rules.py:60`、`:138`、`:288`，统一
+解析在同文件 `:335`。旧顶层 `drop_message` 只作为 `MessageDropRule` 的兼容入口；新旧字段
+并存会拒绝。HTTP canonicalization 在 `python/minisgl/server/api_server.py:161`，canonical
+wire 通过 `python/minisgl/message/tokenizer.py:79` 进入 tokenizer。
 
-## 二、message selector 编译为绝对位置 delta
+## 二、完整模板、owner 与 query epoch
 
-owner 先被压成每个消息的完整 token 半开区间。每个 Drop event 只收集相对此前新生效的
-消息，转换为排序、去重、合并后的绝对 `[start, end)` 区间；event 插入位置来自
-`bisect_right(query_epoch, event_n)`。代码拒绝“token 尚未计算就被隐藏”的区间，并同时
-生成 `full_token_visible_until`，供可选 full-context mask warmup 使用
-（`python/minisgl/tokenizer/tokenize.py:523-625`，`_build_owner_position_ranges`、
-`_build_position_drop_plan`）。
+消息边界不能通过“每条消息独立 tokenize 后拼接”推断。`TokenizeManager` 对每个完整
+conversation prefix 重新应用 chat template；稳定前缀/后缀用于保守 owner attribution，只有
+稳定前缀继承旧 query epoch。实现见 `python/minisgl/tokenizer/tokenize.py:934`
+（`_merge_owner_track`）和同文件 `:979`（`_round_by_round_no_gen`）。
 
-最终请求保留两套明确不同的视图：
+普通 Hugging Face Drop 请求还会对完整 Jinja render 插入临时 provenance marker，再将
+character owner 通过 fast-tokenizer `offset_mapping` 投影回 token。canonical token IDs 必须
+与 `apply_chat_template(tokenize=True)` 完全相同；实现见
+`python/minisgl/tokenizer/template_provenance.py:206`。这使 role header、BOS/EOS、分隔符、
+generation prompt、模板重写和重复 content 都从完整模板事实确定，而不是靠文本猜 owner。
 
-- `full_input_ids` / `radix_match_ids` 是完整模板 token 轴；
-- `input_ids` 是按最终 `keep_mask` 压紧的 active token；
-- `true_positions` 保留 active token 在完整轴上的绝对位置；
-- `drop_event_positions`、`drop_range_offsets`、`drop_position_ranges` 是一维 wire metadata。
+最终保留两条不同轴：
 
-这些字段的组装见 `python/minisgl/tokenizer/tokenize.py:934-965` 和
-`python/minisgl/tokenizer/tokenize.py:1020-1044`（`TokenizeManager._chat_tokenize`）。没有
-Drop 时 `position_drop_plan` 为空、active 流保持线性，不能改变 mini-sglang 基线行为。
+- owner 回答“该 token 属于哪条 message”；
+- query epoch 回答“该 token 在哪次 prefix render 首次进入或被重写”。
 
-## 三、delta-marker Radix key
+owner 的连续区间在 `python/minisgl/tokenizer/tokenize.py:596` 构造。`full_input_ids` 保留完整
+模板轴，`input_ids` 是最终 active 轴，`true_positions` 保留 active token 的完整绝对位置，
+不会因 Drop gap 重新编号；字段组装在同文件 `:1159` 的 `_chat_tokenize`。
 
-Scheduler 收到完整三元 wire metadata 后，`inject_delta_markers` 在每个绝对事件边界插入
-一个 virtual key。canonical delta 是绝对 token 半开区间集合；相同 delta 复用同一负数
-signed-int64 marker，不同 delta 在该标量处产生不同 Radix 分支。virtual key 没有 KV page，
-`virtual_mask=True`、`key_to_token=-1`，真实 token 仍保留双向 key/token 映射
-（`python/minisgl/scheduler/radix_delta.py:56-87`，`DeltaMarkerRegistry`；
-`python/minisgl/scheduler/radix_delta.py:150-168`，`DeltaRadixLayout`、
-`key_prefix_len_for_token_boundary`；`python/minisgl/scheduler/radix_delta.py:205-268`，
-`inject_delta_markers`）。这使 token 文本相同但 Drop history 不同的请求不会错误共享状态。
+## 三、TextDropRule 的 raw text 到 token 映射
 
-Scheduler 将 layout 写回请求，并在异常、abort 和请求资源回收时释放 request refs
-（`python/minisgl/scheduler/scheduler.py:360-413`，`Scheduler._process_one_msg`；
-`python/minisgl/scheduler/scheduler.py:415-438`，`Scheduler._process_one_msg`、
-`_free_req_resources`）。delta-marker 要求最终 `page_size=1`，且不兼容要求非 unit page 的
-TRTLLM（`python/minisgl/scheduler/scheduler.py:54-100`，`Scheduler.__init__`）。
+每条 selector 必须是对应原始 `messages[i].content` 的大小写敏感精确子串，不做 Unicode
+normalization。`content` 支持 `null | str | list[str]`；空形态是 no-op。重复匹配允许重叠，
+默认取从左到右第 1 次；一旦提供 `occurrence`，`list[str]` 的每段都必须提供对应正整数。
 
-## 四、full match、active KV 与绝对 position
+匹配器是 UTF-8 Aho-Corasick：Python AOT wrapper/reference/fallback 在
+`python/minisgl/kernel/text_match.py:127`，稀疏 trie、failure/output-link C++ FFI 在
+`python/minisgl/kernel/csrc/src/text_match.cpp:37`。复杂度是输入、patterns 与实际输出之和；
+输入上限用于阻止异常资源消耗。
 
-Radix 先在完整 key 轴匹配，再删除 virtual marker 的 `-1` value，得到完整 token 的
-`full_match_indices`；普通请求随后按 `prefix_keep_mask` 过滤成
-`active_match_indices`。命中率分母是当前可匹配 active prefix，而不是完整 key 数
-（`python/minisgl/scheduler/cache.py:103-160`，`CacheManager._radix_query_prefix`、
-`matchable_active_prefix_len`、`match_req`；`python/minisgl/scheduler/prefill.py:39-92`，
-`PrefillAdder._try_allocate_one`）。调度表只装 active KV，forward 的 position 继续来自
-`true_positions`，所以删除历史 token 不会把幸存 token 的位置重新编号。
+raw character span 先在该 owner 的 canonical rendered content 中唯一定位，再通过 token
+offset 映射。只有完全包含在 selector span 中的 token 才 Drop；跨边界 token 保留，若没有
+任何完整 token 则请求失败。selector 并集完整覆盖 raw content 时提升为完整 message owner
+ranges，因此与相同目标的 `MessageDropRule` 精确等价。规则在最新 user Prefill 完成后生效；
+编译分支见 `python/minisgl/tokenizer/tokenize.py:1045`。
 
-请求结束提交 delta 分支时，`_cache_finished_delta_req` 用 active KV slot 与绝对 position
-重建 full-token prefix；virtual key 的 page value 固定为 `-1`，真实 hole 会截断可提交
-前缀，已匹配位置若指向不同 KV slot 会直接报错。未被 Radix 接纳或超出提交边界的 page
-随后释放（`python/minisgl/scheduler/cache.py:245-383`，
-`CacheManager._cache_finished_delta_req`）。Radix 插入、prune、evict 会增减 tree refs，
-`check_integrity` 同时验证 virtual/real page 值、size accounting 和 marker refs，不能通过
-放宽 integrity 检查掩盖 page/index 错配
-（`python/minisgl/kvcache/radix_cache.py:192-232`，`insert_prefix`；
-`python/minisgl/kvcache/radix_cache.py:287-342`，`prune_suffix`、`evict`；
-`python/minisgl/kvcache/radix_cache.py:354-386`，`check_integrity`）。
+## 四、ThinkingDropRule 的 retention 与定位
 
-## 五、默认 mask warmup 与可选 staged 回退
+规则不开启时不做 retention probe、不覆盖 chat template，也不改变模型自己的 thinking 删除
+行为。开启后只接受 assistant `reasoning_content` 或 content 开头唯一、完整、非嵌套的
+`<think>...</think>`；两种来源不能同时出现，也不从普通 prose 推测。
 
-有已生效 Drop 的请求默认发送一次 `mask` warmup。前端只设置
-`use_context_mask=True`，并携带 tokenizer 生成的完整 token 轴与
-`full_token_visible_until`；它不再指定 FlashInfer 或 FlashAttention 的私有格式
-（`python/minisgl/server/api_server.py:721-755`，
-`FrontendManager.run_contextual_warmup`）。Scheduler 根据实际 Prefill attention backend
-调用统一能力校验，不支持的 backend 在启动期失败，不能静默退化为普通 causal attention
-（`python/minisgl/scheduler/scheduler.py:104-112`，`Scheduler.__init__`；
-`python/minisgl/attention/base.py:296-348`，`BaseAttnBackend`、`HybridBackend`）。
+Hugging Face 模板按需运行 capability probe，并以 tokenizer 身份、模板 SHA 和 tools variant
+缓存。原生可保留的模板不改；已识别 Qwen guard 使用 request-local Jinja adapter，要求
+reasoning 精确出现一次且无 reasoning 的输出不变；未知过滤模板返回
+`thinking_history_not_preservable`。入口见
+`python/minisgl/tokenizer/thinking_template.py:86`。
 
-后端从同一可见性语义生成原生执行布局。FlashInfer 将请求编译成 active-KV segments；
-FlashAttention 在 SM80/SM90 使用 FA3 segmented adapter，在 SM100/SM110 使用 FA4
-`mask_mod` adapter（`python/minisgl/attention/base.py:102-230`，
-`build_context_attention_segments`、`build_context_attention_batch`；
-`python/minisgl/attention/fi.py:330-409`，`FlashInferBackend.prepare_metadata`；
-`python/minisgl/attention/fa.py:56-138`，`validate_fa_context_mask_support`、
-`FlashAttentionBackend.validate_context_mask_prefill`；
-`python/minisgl/attention/fa.py:195-292`，`FlashAttentionBackend.prepare_metadata`）。
-FA4 仍限制每批一个 mask 请求，且尚未启用 GPT-OSS sinks/sliding-window 与 Context mask
-的组合。
+GPT-OSS 使用 Harmony token stream。只有 Thinking rule 开启时才设置
+`RenderConversationConfig(auto_drop_analysis=False)`；随后逐 component 渲染并校验其 token
+前缀与 conversation render 一致，记录 analysis 内容的绝对 token cursor。Drop 只覆盖内容，
+channel/recipient/protocol token 保留；规则未开启时 Harmony 默认 `auto_drop_analysis` 不变。
+实现见 `python/minisgl/tokenizer/tokenize.py:137`、`:273` 和 `:1122`。
 
-`staged` 保留为兼容和排障路径。首次 warmup 若 `hit_ratio >= 0.95` 就结束；严格低于
-`0.95` 才依次发送 `messages[:end]` 的 prefix warmup
-（`python/minisgl/server/api_server.py:753-777`，
-`FrontendManager.run_contextual_warmup`）。命中率公式仍是
-`cached_active_len / matchable_active_prefix_len`，空分母取 `1.0`
-（`python/minisgl/scheduler/prefill.py:39-63`，`PrefillAdder._try_allocate_one`）。每个
-staged warmup 的 commit boundary 被映射到包含边界 marker 的 key prefix，避免把未来状态
-提前提交（`python/minisgl/tokenizer/tokenize.py:936-945`，`_chat_tokenize`；
-`python/minisgl/scheduler/radix_delta.py:159-168`，`key_prefix_len_for_token_boundary`）。
+每段 thinking 的事件位于对应 assistant message 末尾：assistant final 在同轮仍可见 thinking，
+后续 user/tool/assistant generation 不可见。
 
-## 六、操作不变量与远端验证
+## 五、统一绝对 position delta 与 Radix key
 
-必须保持：无 Drop 基线不变；message id 与模板 owner 一致；absolute position 不压缩；
-full/active metadata 不混用；不同 Drop history 不碰撞；request/tree marker refs 与 page 生命周期
-闭合；低命中 fallback 的公式、阈值和比较符不漂移。
+三种规则都先产生绝对半开 token ranges，再由
+`python/minisgl/tokenizer/tokenize.py:700`（`_build_position_range_drop_plan`）排序、合并、
+去除已生效重复区间。事件插入点是 `bisect_right(query_epoch, event_n)`；代码拒绝 token 尚未
+计算就被隐藏的 range，并生成 `full_token_visible_until` 供 mask warmup 使用。
 
-本地只编辑 `System-test`。完成获批修改并 commit/push 后，才在 `InfiniAI-BUS` 的
-`/share/wangruoxi/repo/mini-sglang` 执行 `git pull --ff-only origin System-test`，激活 conda
-环境 `rosetta` 并运行 Linux/CUDA 测试；禁止直接编辑远端源码。
+Scheduler 在每个事件边界插入 virtual delta marker：相同 canonical delta 复用同一负
+signed-int64 key，不同 Drop history 进入不同 Radix 分支。marker 没有 KV page，真实 token
+保留 key/token 双向映射。相关入口是：
 
-## 七、Text/Thinking Drop 与响应命中率
+- `python/minisgl/scheduler/radix_delta.py:57`，`DeltaMarkerRegistry`；
+- 同文件 `:151`，`DeltaRadixLayout`；
+- 同文件 `:223`，`key_prefix_len_for_token_boundary`；
+- 同文件 `:269`，`inject_delta_markers`。
 
-`TextDropRule.drop_messages` 与原始 `messages` 严格等长、同序、同 role；空 selector 是
-no-op。非空 `str | list[str]` 使用 UTF-8 Aho-Corasick kernel 找到允许重叠的 occurrence，
-再从 raw content span 映射到 canonical rendered char span 和 fast-tokenizer offsets。只删除
-完全包含的 token；跨边界 token 保留。selector 并集覆盖完整 content 时提升为完整 owner
-ranges，因此与相同目标的 `MessageDropRule` 精确等价。
+Scheduler 建立/释放 request refs 见 `python/minisgl/scheduler/scheduler.py:269` 与 `:407`。
+delta-marker 要求最终 `page_size=1`，且不兼容要求非 unit page 的 TRTLLM；启动校验始于同文件
+`:57`。
 
-`ThinkingDropRule` 未开启时不改变 tokenizer。开启后只接受 `reasoning_content` 或唯一 leading
-`<think>` block；惰性 probe 判断模型模板是否原生保留历史 thinking。Qwen-like 已知 guard
-使用请求级 adapter，未知过滤模板 fail closed；Harmony 直接按 analysis 内容 token 定位。
-thinking 的事件在对应 assistant 末尾，保证 final 可见同轮 thinking，而后续 query 不可见。
+## 六、full match、active KV 与提交
 
-Scheduler 仍用 `cached_len / matchable_active_prefix_len`（空分母 1.0）计算
-`cache_hit_ratio`。该值只随最终生成请求的 terminal reply 传回：非流式位于 OpenAI response
-顶层，流式只位于最后一个 finish chunk；内部 warmup ratio 不对用户暴露。
+Radix 先匹配完整 key 轴，移除 virtual marker 的 `-1` page 后得到 `full_match_indices`，再按
+`prefix_keep_mask` 过滤为 `active_match_indices`。入口分别见
+`python/minisgl/scheduler/cache.py:198`（full match）、`:150`（active match）和 `:143`
+（matchable prefix length）。Prefill 命中率为
+`cached_active_len / matchable_active_prefix_len`，空分母为 `1.0`
+（`python/minisgl/scheduler/prefill.py:69`）。
+
+请求结束时，`python/minisgl/scheduler/cache.py:469` 的 `_cache_finished_delta_req` 用 active
+KV slot 与 absolute position 重建 full-token prefix；virtual page 固定为 `-1`，真实 hole
+截断可提交前缀，slot 冲突直接报错。Radix 生命周期与完整性检查分别见
+`python/minisgl/kvcache/radix_cache.py:581`（insert）、`:640`（prune）、`:715`（evict）和
+`:863`（integrity）。不能通过放宽 integrity 检查掩盖 page/index 错配。
+
+## 七、mask warmup、staged 回退与 API ratio
+
+有当前生效 Drop 的请求默认发送一次 mask warmup，携带完整 token 轴和
+`full_token_visible_until`。入口是
+`python/minisgl/server/api_server.py:755`（`run_contextual_warmup`）。后端从同一可见性语义
+生成原生布局：
+
+- 通用 segments/batch：`python/minisgl/attention/base.py:102`、`:174`；
+- FlashInfer metadata：`python/minisgl/attention/fi.py:330`；
+- FlashAttention 能力与 metadata：`python/minisgl/attention/fa.py:65`、`:133`、`:195`。
+
+不支持的实际 Prefill backend 在启动期失败，不会退化为普通 causal attention。FA4 mask
+Prefill 仍限制每批一个 mask 请求，GPT-OSS sinks/sliding-window 与该 mask 组合未启用。
+
+`staged` 只作兼容/排障：首次 warmup `hit_ratio >= 0.95` 即结束，严格低于 `0.95` 才发送
+逐 message prefix。commit boundary 通过
+`python/minisgl/scheduler/radix_delta.py:223` 映射到包含边界 marker 的 key prefix。
+
+最终用户生成请求的 `cache_hit_ratio` 只在 terminal reply 传播
+（`python/minisgl/scheduler/scheduler.py:255`）：非流式位于 OpenAI response 顶层
+（`python/minisgl/server/api_server.py:1161`），流式只位于最后一个 finish chunk
+（同文件 `:953`）。内部 warmup ratio 不暴露给用户。
+
+## 八、操作不变量与验证边界
+
+必须保持：无 Drop 基线不变；public message 顺序与模板 provenance 对齐；绝对 position 不
+压缩；full/active metadata 不混用；不同 Drop history 不碰撞；request/tree marker refs 与
+page 生命周期闭合；fallback 阈值、比较符和命中率公式不漂移。
+
+本地只在 `System-test` 编辑。获批修改须先 commit/push，再到
+`InfiniAI-BUS:/share/wangruoxi/repo/mini-sglang` 执行 `git pull --ff-only origin System-test`，
+使用 `/share/wangruoxi/.conda/envs/minisgl-gpt-oss-r4` 做 Linux/CUDA 验证；远端源码不直接改。
