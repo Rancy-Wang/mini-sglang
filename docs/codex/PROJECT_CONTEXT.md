@@ -1,6 +1,6 @@
 # mini-sglang Context System 项目上下文
 
-本文解释 2026-08-18 `System-test` 上的 Context System。它是机制导航，不是修改授权；动态
+本文解释 2026-08-19 `System-test` 上的 Context System。它是机制导航，不是修改授权；动态
 事实和批准范围仍按 `AGENTS.md`、change gate 与 `CURRENT_STATE.md` 检查。默认组合是
 `radix_drop_key_mode="delta-marker"` 与 `contextual_prefill_mode="mask"`
 （`python/minisgl/scheduler/config.py:16`，`SchedulerConfig`）。
@@ -21,27 +21,34 @@
 并存会拒绝。HTTP canonicalization 在 `python/minisgl/server/api_server.py:161`，canonical
 wire 通过 `python/minisgl/message/tokenizer.py:79` 进入 tokenizer。
 
-## 二、完整模板、owner 与 query epoch
+## 二、MessageDropRule 的单次 tokenize、owner 与 query epoch
 
-消息边界不能通过“每条消息独立 tokenize 后拼接”推断。`TokenizeManager` 对每个完整
-conversation prefix 重新应用 chat template；稳定前缀/后缀用于保守 owner attribution，只有
-稳定前缀继承旧 query epoch。实现见 `python/minisgl/tokenizer/tokenize.py:934`
-（`_merge_owner_track`）和同文件 `:979`（`_round_by_round_no_gen`）。
+消息边界不能通过“每条消息独立 tokenize 后拼接”推断。只有 `MessageDropRule` 走单次 encode
+路径；`TextDropRule` 和 `ThinkingDropRule` 继续使用各自现有的字符/结构化 thinking 映射。
 
-普通 Hugging Face Drop 请求还会对完整 Jinja render 插入临时 provenance marker，再将
-character owner 通过 fast-tokenizer `offset_mapping` 投影回 token。canonical token IDs 必须
-与 `apply_chat_template(tokenize=True)` 完全相同；实现见
-`python/minisgl/tokenizer/template_provenance.py:206`。这使 role header、BOS/EOS、分隔符、
-generation prompt、模板重写和重复 content 都从完整模板事实确定，而不是靠文本猜 owner。
+普通 Hugging Face 模型先对完整 messages 做 render-only。系统编译 request-local traced Jinja
+template，在 output node 前后插入带随机 nonce 与当前 message object ID 的临时 marker
+（`python/minisgl/tokenizer/template_provenance.py:24-117`）。marker 仅存在于旁路字符串；移除
+后必须逐字符等于 canonical render，否则 fail closed。它不是 AddedToken，不修改 tokenizer
+词表、embedding 或模型输入。
 
-最终保留两条不同轴：
+canonical 完整文本只调用一次 fast tokenizer，并同时请求 `offset_mapping`
+（`python/minisgl/tokenizer/template_provenance.py:206-256`）。因此模型原生
+`<|im_start|>`、`<|im_end|>`、BOS/EOS、role header、separator 与 generation prompt 的 token
+IDs 完全不变。character owner 投影到 token 时用 token 第一个 character 的 owner；横跨两条
+message 的 token 强制归前一条，zero-width token 继承前一个 token
+（同文件 `:257-281`）。这既不会误删后一条 message，也不改变任何 position encoding。
 
-- owner 回答“该 token 属于哪条 message”；
-- query epoch 回答“该 token 在哪次 prefix render 首次进入或被重写”。
+GPT-OSS 不使用 Jinja marker。`_render_harmony_message_drop` 只调用一次原生
+`render_conversation_for_completion`，按 `<|start|>` 与终止 action token 分 component；Harmony
+合并的 system/developer 指令用 UTF-8 byte offset 再分割，token 第一个 byte 决定 owner。协议
+token 保持原样，见 `python/minisgl/tokenizer/tokenize.py:375-496`。
 
-owner 的连续区间在 `python/minisgl/tokenizer/tokenize.py:596` 构造。`full_input_ids` 保留完整
-模板轴，`input_ids` 是最终 active 轴，`true_positions` 保留 active token 的完整绝对位置，
-不会因 Drop gap 重新编号；字段组装在同文件 `:1159` 的 `_chat_tokenize`。
+最终 owner 回答“token 属于哪条 message”，query epoch 对 MessageDrop 直接由单调 owner ID
+得到；重排 message 的模板 fail closed（`python/minisgl/tokenizer/tokenize.py:1383-1496`）。
+owner 连续区间由同文件 `:819` 构造。`full_input_ids` 保留完整模板轴，`input_ids` 是 active
+轴，`true_positions` 从完整轴筛选且不因 Drop gap 重新编号（同文件 `:1576-1617`）。8、32、
+128 条 messages 的测试均断言 tokenizer encode 调用次数为 1。
 
 ## 三、TextDropRule 的 raw text 到 token 映射
 
@@ -182,7 +189,21 @@ Prefill batch 保持原大小；replay 只处理不超过最大 graph batch 的 
 `python/minisgl/engine/graph.py:150-167`。Context System 只扩充 dummy request 的 full/active
 元数据，不改变该捕获流程，Engine 调用见 `python/minisgl/engine/engine.py:100-128`。
 
-## 十、操作不变量与验证边界
+## 十、公开端口、内部端口与进程生命周期
+
+`ServerArgs.distributed_port` 初始为 `None`；启动时先用 uvicorn 相同的 `SO_REUSEADDR` 语义检查
+用户指定的公开 host/port，再从 `127.0.0.1:0` 动态取得内部 distributed 端口，且排除公开端口。
+内部端口不再等于 `public_port + 1`，所以占用 8001 不影响 `--port 8000`。入口见
+`python/minisgl/server/args.py:14-55` 与 `python/minisgl/server/launch.py:23-42,153-164`。
+
+parent 保存所有 scheduler、tokenizer、detokenizer `Process` handle 和 ack queue。启动 worker
+提前退出立即报具体 PID/exitcode；启动异常、正常返回、Ctrl-C 和 SIGTERM 都进入幂等 cleanup：
+先 terminate，bounded join，仍存活才 kill，再 close/join ack queue。Scheduler 将 SIGTERM
+转成自己的 `KeyboardInterrupt` 路径并执行 `scheduler.shutdown()`；Frontend 的两个 ZMQ queue
+同样只关闭一次。实现见 `python/minisgl/server/launch.py:44-150,166-240` 和
+`python/minisgl/server/api_server.py:981-995,1280-1333`。
+
+## 十一、操作不变量与验证边界
 
 必须保持：无 Drop 基线不变；public message 顺序与模板 provenance 对齐；绝对 position 不
 压缩；full/active metadata 不混用；不同 Drop history 不碰撞；request/tree marker refs 与

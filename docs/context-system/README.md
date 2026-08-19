@@ -22,44 +22,43 @@ builds two tracks over the final token stream:
   epoch `N = len(messages)`. A Drop event uses this track to determine its exact
   activation position.
 
-The general partitioning flow is:
+`MessageDropRule` 的分割流程只对完整 conversation 做一次真正的 tokenizer encode：
 
-1. Keep the submitted messages in order and preserve their public IDs through
-   request normalization.
-2. For each message index `i`, render the complete prefix `messages[:i+1]` with
-   the selected chat template and without a generation prompt. Never tokenize
-   messages independently and concatenate the results.
-3. Compare each prefix render with the previous one by exact token ID. The longest
-   common prefix identifies the part whose history is unchanged; a non-overlapping
-   longest common suffix is also recorded for conservative owner attribution.
-4. Render the complete message list again with the generation prompt. This is the
-   canonical full token stream, and the prompt uses the synthetic next-assistant
-   ID `N`, where `N = len(messages)`.
-5. Derive final message ownership from the canonical render when exact rendered
-   provenance is available, tokenize that render once, and project the rendered
-   ownership spans onto token offsets.
+1. 保持用户提交顺序，并在 request normalization 后保留 public message ID。
+2. 用模型原生 chat template 做 render-only：一次得到带 generation prompt 的 canonical
+   文本，另一次不带 generation prompt，只用于确定最后的 synthetic assistant 边界。这两次
+   都是 Jinja 字符串渲染，不调用 tokenizer encode。
+3. 系统编译一个 request-local 的 traced Jinja template，在每个 output node 前后临时写入带
+   message object ID 的随机 nonce marker。marker 只存在于这份旁路 render，解析 owner 后
+   立即删除；删除后的文本必须逐字符等于 canonical 文本，否则 fail closed。
+4. canonical 文本以 `add_special_tokens=False` 和 `offset_mapping` 调用 tokenizer **一次**。
+   `<|im_start|>`、`<|im_end|>`、BOS/EOS、role header 和模型的其他原生控制 token 都来自
+   原生模板文本并按原 tokenizer 规则编码。
+5. character owner 经 offset 投影为 token owner；generation prompt 使用 synthetic owner
+   `N = len(messages)`。MessageDrop 的 query epoch 直接由这个单调 owner 轴得到，不再对
+   `messages[:i]` 做逐前缀 tokenize。
+
+这些 marker 不是 `AddedToken`，不会写入 tokenizer vocabulary，也不会送进模型，所以无需
+训练或修改 embedding；`full_input_ids` 与未插 marker 时完全相同，所有 token 的 absolute
+position 也不变。tokenizer 调用次数与 message 数量无关，8、32、128 条 message 都是一次。
 
 ### Detailed boundary rules
 
-The owner track and query-epoch track answer different questions and are built
-with different rules:
+The owner track and query-epoch track answer different questions but, for
+`MessageDropRule`, both come from the one canonical stream:
 
-- **Provisional owner track during prefix comparison:** exact stable prefix and
-  suffix tokens retain their previous owners. Tokens in the rewritten middle are
-  assigned to the newly appended message. This is a conservative fallback for a
-  template that rewrites earlier output.
-- **Query-epoch track:** only the exact stable prefix retains its earlier epoch.
-  Every token from the first changed position onward receives the new message
-  epoch, including a suffix whose token values happen to match again. This keeps
-  the epoch sequence monotonic.
-- **Canonical owner track:** rendered output traced to a message object uses that
-  message's public ID. Static text before the first traceable message belongs to
-  `M0`; unowned template text after that follows the preceding owner. The final
+- **Canonical owner track:** output rendered while a message object is active uses
+  that message's public ID. Static text before the first traceable message belongs
+  to `M0`; later unowned template text follows the preceding owner. The final
   generation prompt belongs to synthetic owner `A_N`.
-- **Character-to-token projection:** the canonical render is tokenized once with
-  character offsets. If one token crosses an ownership boundary, its first
-  character decides the owner. A zero-width token inherits the previous token's
-  owner.
+- **Character-to-token projection:** if one token crosses a message boundary, its
+  first character decides the owner—therefore a token that starts in the previous
+  message is forcibly assigned to that previous message. A zero-width token also
+  inherits the previous token's owner. This never expands a Drop into the next
+  message.
+- **Query epoch:** owner IDs must be monotonic and are used directly as epochs. A
+  template that reorders messages is rejected because it cannot express ordered
+  Drop events safely.
 - **Drop ranges:** consecutive tokens with the same owner form a half-open
   `[start, end)` range. One message may own several non-contiguous ranges. Dropping
   that message removes every one of those ranges.
@@ -130,9 +129,18 @@ added. `A2` and `M2` both use numeric owner ID `2` by design. Appending `M3` the
 produces the final `A4` prompt shown above.
 
 This is why a new message cannot be represented by independently tokenizing only
-its content and appending those tokens. The template may extend or rewrite its
-previous suffix, so Mini-SGLang re-renders the conversation and recomputes the
-boundary tracks from the resulting full stream.
+its content and appending those tokens. Mini-SGLang instead renders the complete
+conversation, traces the template's native message loop, and encodes that one
+canonical stream once.
+
+### GPT-OSS Harmony boundary
+
+GPT-OSS 不走 Hugging Face Jinja marker 路径。`MessageDropRule` 调用
+`render_conversation_for_completion` 一次，并直接读取 Harmony 原生 `<|start|>` 与
+`<|end|>`/`<|call|>`/`<|return|>` protocol boundaries。Harmony 会把多条
+system/developer 指令合并到一个 component；系统在该 component 内按 UTF-8 byte 精确寻找原始
+指令，再用“token 的第一个 byte 决定 owner”投影。这样既保留 Harmony 原生控制 token，也不
+需要逐 message prefix render。
 
 ## 三种 Drop Rule
 
@@ -240,7 +248,21 @@ context length. Later message tokens are prefilled under the new visibility.
 
 ## Starting the server
 
-A Drop-enabled configuration with an explicit FlashInfer backend is:
+默认启动已经启用 Radix Drop key、`mask` prefill、自动 attention backend 和 CUDA Graph。
+例如卡 7 的 GPT-OSS 可以直接启动，不需要额外 Context 参数：
+
+```bash
+CUDA_VISIBLE_DEVICES=7 python -m minisgl \
+  --model /share/wangruoxi/models/gpt-oss-20b \
+  --port 8000
+```
+
+公开端口始终严格使用 `--port`。内部 distributed 端口从 loopback 动态选择，不再假定
+`public_port + 1`，因此其他进程占用 8001 不会阻止公开 8000 启动。系统在创建 worker 前检查
+公开端口；正常退出、Ctrl-C、SIGTERM 与启动异常都会关闭 frontend ZMQ、停止 scheduler 和
+tokenizer/detokenizer，按 terminate → bounded join → kill fallback 回收子进程及启动队列。
+
+需要显式写出 Drop 配置时，等价命令是：
 
 ```bash
 python -m minisgl \
@@ -252,6 +274,9 @@ python -m minisgl \
   --attn fi \
   --port 1919
 ```
+
+CUDA Graph 对所有模型默认开启，并按 `main` 的 capture shapes、过程和输出捕获；显式
+`--disable-cuda-graph` 或最大 batch size `0` 才关闭。
 
 Relevant options:
 
@@ -343,18 +368,44 @@ Drop token，分母是 Drop 前全部可参与 Radix 匹配的真实 token，不
 token 和 virtual marker；空分母为 1.0。内部 warmup 使用
 `cached_active_len / active_matchable_prefix_len`，不会暴露为用户结果。
 
+## R10 validation and performance snapshot
+
+R10 的 MessageDrop 边界实现已经在 Qwen/Harmony 单元测试和真实服务中验证：8、32、128 条
+messages 都只触发一次 canonical tokenizer encode，且 encoded IDs 与原生 chat template
+完全一致。GPU 服务验证覆盖了默认启动 `gpt-oss-20b`、Qwen3 tied、Qwen3 untied、Qwen3 MoE
+和 `gpt-oss-120b --tp 4`；这些模型都默认进入 CUDA Graph capture，MessageDrop 请求返回
+HTTP 200，并在 SIGTERM 后完成 scheduler shutdown 与 worker 回收。
+
+在 tau2-airline 的一个长上下文问题上，Qwen3-8B、默认设置、流式 `max_tokens=64` 的 median
+结果如下；System-test 使用 `MessageDropRule {"6": [2, 3]}`，main 不带 Drop：
+
+| System | Scenario | E2E ms | TTFT ms | Decode ms | cache_hit_ratio |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `origin/main` | sequential cold | 908.53 | 212.54 | 696.04 | n/a |
+| `System-test mask` | sequential cold | 984.02 | 282.27 | 701.68 | 0.9693 |
+| `System-test staged` | sequential cold | 1167.78 | 466.12 | 701.26 | 0.9686 |
+| `origin/main` | batch size 3 | 1345.22 | 415.26 | 932.48 | n/a |
+| `System-test mask` | batch size 3 | 1443.87 | 709.21 | 736.49 | 0.9693 |
+| `System-test staged` | batch size 3 | 1841.47 | 1090.54 | 741.35 | 0.9686 |
+
+CPU tokenizer microbench 也验证了单次 encode 的常数倍开销：8/32/128 条 messages 下，
+MessageDrop provenance 相对原生 `apply_chat_template` 的 median 分别约为
+`3.49x`、`3.45x`、`3.67x`，同时保持 exact IDs。
+
 ## Implementation map
 
 | Concern | Source |
 | --- | --- |
 | Public schema and validation | [`drop_rules.py`](../../python/minisgl/tokenizer/drop_rules.py#L60), [`api_server.py`](../../python/minisgl/server/api_server.py#L161) |
-| Template-independent epochs and token ownership | [`tokenize.py`](../../python/minisgl/tokenizer/tokenize.py#L934), [`template_provenance.py`](../../python/minisgl/tokenizer/template_provenance.py#L206) |
+| MessageDrop one-encode ownership | [`tokenize.py`](../../python/minisgl/tokenizer/tokenize.py#L1396), [`template_provenance.py`](../../python/minisgl/tokenizer/template_provenance.py#L24), [`template_provenance.py`](../../python/minisgl/tokenizer/template_provenance.py#L206) |
+| GPT-OSS native Harmony ownership | [`tokenize.py`](../../python/minisgl/tokenizer/tokenize.py#L375) |
 | Text matcher | [`text_match.py`](../../python/minisgl/kernel/text_match.py#L127), [`text_match.cpp`](../../python/minisgl/kernel/csrc/src/text_match.cpp#L37) |
 | Thinking retention adapter | [`thinking_template.py`](../../python/minisgl/tokenizer/thinking_template.py#L86), [`tokenize.py`](../../python/minisgl/tokenizer/tokenize.py#L273) |
-| Position-range Drop compilation | [`tokenize.py`](../../python/minisgl/tokenizer/tokenize.py#L700), [`tokenize.py`](../../python/minisgl/tokenizer/tokenize.py#L1045) |
+| Position-range Drop compilation and absolute positions | [`tokenize.py`](../../python/minisgl/tokenizer/tokenize.py#L923), [`tokenize.py`](../../python/minisgl/tokenizer/tokenize.py#L1268), [`tokenize.py`](../../python/minisgl/tokenizer/tokenize.py#L1602) |
 | Virtual delta markers | [`radix_delta.py`](../../python/minisgl/scheduler/radix_delta.py#L12-L261) |
 | Full-path cache match and active-KV filtering | [`cache.py`](../../python/minisgl/scheduler/cache.py#L121-L200) |
-| Startup and backend constraints | [`args.py`](../../python/minisgl/server/args.py#L176-L265), [`scheduler.py`](../../python/minisgl/scheduler/scheduler.py#L55-L131) |
+| Dynamic internal port and worker lifecycle | [`args.py`](../../python/minisgl/server/args.py#L14), [`launch.py`](../../python/minisgl/server/launch.py#L23), [`launch.py`](../../python/minisgl/server/launch.py#L81), [`api_server.py`](../../python/minisgl/server/api_server.py#L1280) |
+| Startup and backend constraints | [`args.py`](../../python/minisgl/server/args.py#L58), [`scheduler.py`](../../python/minisgl/scheduler/scheduler.py#L55-L131) |
 | Contextual warmup | [`api_server.py`](../../python/minisgl/server/api_server.py#L755), [`prefill.py`](../../python/minisgl/scheduler/prefill.py#L67) |
 | Cache-hit ratio response propagation | [`scheduler.py`](../../python/minisgl/scheduler/scheduler.py#L255), [`tokenizer/server.py`](../../python/minisgl/tokenizer/server.py#L121), [`api_server.py`](../../python/minisgl/server/api_server.py#L953) |
 | Tied-weight checkpoint loading | [`engine.py`](../../python/minisgl/engine/engine.py#L159-L177), [`embedding.py`](../../python/minisgl/layers/embedding.py#L59-L85), [`base.py`](../../python/minisgl/layers/base.py#L32-L53) |

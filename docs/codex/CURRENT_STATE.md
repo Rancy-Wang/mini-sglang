@@ -1,4 +1,4 @@
-# 当前状态 snapshot（2026-08-18）
+# 当前状态 snapshot（2026-08-19）
 
 这是恢复新窗口时使用的静态 snapshot，不替代动态检查。每次 startup、resume 或 compact 后
 仍须先运行：
@@ -22,6 +22,13 @@ git log --oneline -8
   - `bd513a4 fix(context): retain and map Harmony thinking components`
 - R5 loader/ratio 实现提交：
   - `0080608 fix(context): support tied weights and honest cache ratios`
+- R10 单次 tokenize 与启动生命周期实现提交：
+  - `40ae533 feat(context): tokenize message drop provenance once`
+  - `5592a0f fix(context): parse Harmony action boundaries`
+  - `a0233cc fix(context): align retained Harmony analysis`
+  - `761f993 fix(server): release startup queue resources`
+  - `b1121b5 fix(server): stop schedulers gracefully on SIGTERM`
+  - `1779408 fix(server): allow immediate public port reuse`
 - 上述实现提交已 push 到 `origin/System-test`，并在
   `InfiniAI-BUS:/share/wangruoxi/repo/mini-sglang` fast-forward 拉取。包含本 snapshot 的后续
   文档 checkpoint 应以动态 `git rev-parse HEAD` 为准。
@@ -88,6 +95,30 @@ Scheduler -> Detokenizer -> Frontend：非流式响应顶层返回，流式只�
   batch 和 Prefill 不 padding。batch size 大于 1 与 batch size 1 使用同一 replay 路径，见
   `python/minisgl/engine/graph.py:150-167`。
 
+## PLAN-CS-20260819-R10 已实现范围
+
+- `MessageDropRule` 对每个 `TokenizeMsg` 的 canonical conversation 只做一次 tokenizer encode。
+  Hugging Face Jinja 使用 render-only nonce marker 跟踪 message object owner；marker 在 encode
+  前剥离，clean text 必须与 canonical render 完全相同。marker 不加入 tokenizer vocabulary，
+  不进入模型。token 跨 message 边界时按第一个 character 归前一条，zero-width token 继承前
+  一个 owner。实现见 `python/minisgl/tokenizer/template_provenance.py:24-281` 与
+  `python/minisgl/tokenizer/tokenize.py:1396-1496`。
+- MessageDrop 的 query epoch 直接由单调 owner 得到；重排 messages 的模板 fail closed。
+  Drop 后 `true_positions` 仍由完整 token 轴筛选，不压缩 position encoding。8、32、128 条
+  messages 的单测均断言实际 encode 只调用 1 次。
+- GPT-OSS 使用一次 Harmony completion render，并以原生 `<|start|>` 和 action boundary 分割
+  component；合并的 system/developer instruction 用 UTF-8 byte ownership 精确拆分。Thinking
+  retention 同时兼容被 Harmony 默认过滤的 analysis component。
+- `--port` 只表示公开端口；内部 distributed 端口从 loopback 动态选择，不再使用
+  `public_port + 1`。公开端口在启动 worker 前检查，并采用 uvicorn 的 `SO_REUSEADDR` 重启
+  语义。实现见 `python/minisgl/server/args.py:14-55`、
+  `python/minisgl/server/launch.py:23-42,153-164`。
+- parent 保留所有 backend process handle。正常返回、Ctrl-C、SIGTERM、worker 提前退出和启动
+  exception 都统一关闭 frontend ZMQ、terminate → bounded join → kill fallback 回收 workers，
+  并 close/join ack queue；scheduler 的 SIGTERM 路径调用 `scheduler.shutdown()`。实现见
+  `python/minisgl/server/launch.py:44-150,166-240` 与
+  `python/minisgl/server/api_server.py:981-995,1280-1333`。
+
 核心入口见：
 
 - `python/minisgl/tokenizer/drop_rules.py:60`、`:138`、`:288`；
@@ -97,13 +128,19 @@ Scheduler -> Detokenizer -> Frontend：非流式响应顶层返回，流式只�
 - `python/minisgl/tokenizer/tokenize.py:700`、`:1045`、`:1159`；
 - `python/minisgl/server/api_server.py:161`、`:755`、`:953`、`:1161`。
 - `python/minisgl/engine/graph.py:49`、`:79`、`:106`、`:150`。
+- `python/minisgl/tokenizer/template_provenance.py:24`、`:206`、`:243`、`:260`；
+- `python/minisgl/tokenizer/tokenize.py:375`、`:1383`、`:1396`、`:1612`；
+- `python/minisgl/server/launch.py:23`、`:34`、`:81`、`:121`、`:153`；
+- `python/minisgl/server/api_server.py:981`、`:1280`。
 
 ## 已完成验证
 
 本地只做只读/静态验证：所有修改 Python 文件 `compileall` 通过，`git diff --check` 通过；
 R3 修改范围未超出获批的 23 个路径，R5 代码修改未超出获批的 7 个源码/测试路径，R7
 修改未超出获批的 7 个源码、测试和文档路径，R8 修改未超出获批的 6 个源码、测试和文档
-路径。`ruff` 在本地和远端专用环境都未安装，
+路径，R10 源码/测试修改未超出获批的 13 个源码/测试路径；本 snapshot 后续文档 checkpoint
+只修改 `docs/codex/CURRENT_STATE.md`、`docs/codex/PROJECT_CONTEXT.md` 和
+`docs/context-system/README.md`。`ruff` 在本地和远端专用环境都未安装，
 因此没有声称 lint 通过；本地 Python 也没有 `pytest`，测试统一在远端专用环境执行。
 
 远端使用 `/share/wangruoxi/.conda/envs/minisgl-gpt-oss-r4`，pytest 因该环境没有 coverage
@@ -119,6 +156,9 @@ R3 修改范围未超出获批的 23 个路径，R5 代码修改未超出获批�
   和多请求 Context prefill 后的扩展回归：56 passed。
 - R8 `GraphRunner` AST 与 `origin/main` 对比一致，源码中不存在两条 System-test 专用 capture
   日志；远端 CUDA Graph/scheduler/GPT-OSS/model/launch/Context prefill 扩展回归：54 passed。
+- R10 MessageDrop 单次 tokenize、Text/Thinking 等价、GPT-OSS drop、server launch 和模型族
+  startup 聚焦回归：33 passed；加入 Context、server、model、engine 相关目标后的扩展回归：
+  73 passed；最终 worker lifecycle/public port 单测：`tests/server/test_launch.py` 8 passed。
 
 真实模型与服务验证：
 
@@ -148,6 +188,31 @@ R3 修改范围未超出获批的 23 个路径，R5 代码修改未超出获批�
   和 4 条并发 chat completion 再次全部返回 HTTP 200。
 - Qwen3-1.7B 使用 `--disable-cuda-graph` 的实机回归把最大 batch 解析为 `0`，日志明确显示
   `CUDA graph is disabled.`，服务仍正常启动并返回 HTTP 200。
+- R10 默认启动命令
+  `CUDA_VISIBLE_DEVICES=7 python -m minisgl --model /share/wangruoxi/models/gpt-oss-20b --port 8000`
+  在 GPU 7 上无 Context 额外参数启动成功；即使 8001 被临时 listener 占用，公开 8000 仍
+  可用。日志走默认 auto FlashAttention、默认 CUDA Graph capture sizes `[1, 2, 4, ..., 160]`；
+  3 个并发 `MessageDropRule {"6": [2, 3]}` 请求均 HTTP 200，公开 `cache_hit_ratio` 为
+  `0.844262...`，服务可正常 SIGTERM 回收。
+- Qwen3 覆盖 tied、untied 与 MoE：Qwen3-1.7B tied 在 GPU 7、Qwen3-0.6B tied 在 GPU 6、
+  Qwen3-8B untied 在 GPU 0、Qwen3-30B-A3B MoE 在 GPU 1 都按默认 CUDA Graph 启动，MessageDrop
+  请求返回 HTTP 200，SIGTERM 后没有残留 semaphore warning。
+- GPT-OSS-120B 使用 GPU 0-3、`--tp 4` 启动成功，走 BF16 packed MXFP4、默认 CUDA Graph
+  sizes `[1, 2, 4, ..., 160]`；MessageDrop 请求 HTTP 200，公开 ratio 为 `0.8834951`，正常
+  shutdown。
+- tau2-airline 长上下文问题、Qwen3-8B、默认设置、流式 `max_tokens=64` 的 median 结果：
+  official `main` sequential 为 E2E `908.53 ms`、TTFT `212.54 ms`、decode `696.04 ms`；
+  System-test `mask` + `MessageDropRule {"6": [2, 3]}` sequential 为 E2E `984.02 ms`、TTFT
+  `282.27 ms`、decode `701.68 ms`、ratio `0.9693`；System-test `staged` sequential 为 E2E
+  `1167.78 ms`、TTFT `466.12 ms`、decode `701.26 ms`、ratio `0.9686`。
+- 同一 tau2-airline 实验的 batch size 3 median：official `main` 为 E2E `1345.22 ms`、TTFT
+  `415.26 ms`、decode `932.48 ms`；System-test `mask` 为 E2E `1443.87 ms`、TTFT
+  `709.21 ms`、decode `736.49 ms`、ratio `0.9693`；System-test `staged` 为 E2E
+  `1841.47 ms`、TTFT `1090.54 ms`、decode `741.35 ms`、ratio `0.9686`。
+- CPU tokenizer microbench 对比原生 `apply_chat_template` 与 MessageDrop provenance：
+  8 messages / 183 tokens 为 `0.550866 ms` vs `1.920417 ms`（`3.486x`），32 messages /
+  733 tokens 为 `1.580991 ms` vs `5.457848 ms`（`3.452x`），128 messages / 2969 tokens 为
+  `5.660504 ms` vs `20.748213 ms`（`3.665x`）；三组 exact token IDs 均与基线一致。
 
 ## 当前限制与后续检查
 
