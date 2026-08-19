@@ -125,13 +125,19 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
         scheduler = Scheduler(args)
         scheduler.sync_all_ranks()
 
-        if args.tp_info.is_primary():
-            ack_queue.put("Scheduler is ready")
+        previous_sigterm = signal.getsignal(signal.SIGTERM)
 
-        if args.silent_output:
-            logging.disable(logging.INFO)
+        def stop_scheduler(*_) -> None:
+            raise KeyboardInterrupt
 
+        signal.signal(signal.SIGTERM, stop_scheduler)
         try:
+            if args.tp_info.is_primary():
+                ack_queue.put("Scheduler is ready")
+
+            if args.silent_output:
+                logging.disable(logging.INFO)
+
             scheduler.run_forever()
         except KeyboardInterrupt:
             logger = init_logger(__name__)
@@ -139,6 +145,8 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
                 print()  # for a clean newline after ^C
                 logger.info("Scheduler exiting gracefully...")
             scheduler.shutdown()
+        finally:
+            signal.signal(signal.SIGTERM, previous_sigterm)
 
 
 def launch_server(run_shell: bool = False) -> None:
