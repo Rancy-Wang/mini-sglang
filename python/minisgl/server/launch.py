@@ -3,10 +3,12 @@ from __future__ import annotations
 import logging
 import multiprocessing as mp
 import queue
+import signal
+import socket
 import sys
 import time
 from dataclasses import replace
-from typing import TYPE_CHECKING, Sequence
+from typing import TYPE_CHECKING, Callable, Sequence
 
 from minisgl.distributed import DistributedInfo
 from minisgl.utils import init_logger
@@ -16,6 +18,27 @@ if TYPE_CHECKING:
 
 
 logger = init_logger(__name__, "initializer")
+
+
+def _check_public_port(host: str, port: int) -> None:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind((host, port))
+    except OSError as exc:
+        raise RuntimeError(
+            f"Public server port {host}:{port} is unavailable: {exc}"
+        ) from exc
+
+
+def _find_available_internal_port(*, exclude: set[int] | None = None) -> int:
+    excluded = exclude or set()
+    while True:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = int(sock.getsockname()[1])
+        if port not in excluded:
+            return port
 
 
 def _exited_workers(processes: Sequence[mp.Process]) -> list[mp.Process]:
@@ -73,6 +96,28 @@ def _stop_worker_processes(
         process.join()
 
 
+def _worker_cleanup(
+    processes: Sequence[mp.Process], ack_queue: mp.Queue[str]
+) -> Callable[[], None]:
+    stopped = False
+    queue_ref: mp.Queue[str] | None = ack_queue
+
+    def stop() -> None:
+        nonlocal queue_ref, stopped
+        if stopped:
+            return
+        stopped = True
+        _stop_worker_processes(processes)
+        assert queue_ref is not None
+        queue_ref.close()
+        queue_ref.join_thread()
+        # Do not keep the Queue's named semaphore alive through interpreter
+        # shutdown via this returned closure.
+        queue_ref = None
+
+    return stop
+
+
 def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
     import torch
     from minisgl.scheduler import Scheduler
@@ -81,13 +126,19 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
         scheduler = Scheduler(args)
         scheduler.sync_all_ranks()
 
-        if args.tp_info.is_primary():
-            ack_queue.put("Scheduler is ready")
+        previous_sigterm = signal.getsignal(signal.SIGTERM)
 
-        if args.silent_output:
-            logging.disable(logging.INFO)
+        def stop_scheduler(*_) -> None:
+            raise KeyboardInterrupt
 
+        signal.signal(signal.SIGTERM, stop_scheduler)
         try:
+            if args.tp_info.is_primary():
+                ack_queue.put("Scheduler is ready")
+
+            if args.silent_output:
+                logging.disable(logging.INFO)
+
             scheduler.run_forever()
         except KeyboardInterrupt:
             logger = init_logger(__name__)
@@ -95,6 +146,8 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
                 print()  # for a clean newline after ^C
                 logger.info("Scheduler exiting gracefully...")
             scheduler.shutdown()
+        finally:
+            signal.signal(signal.SIGTERM, previous_sigterm)
 
 
 def launch_server(run_shell: bool = False) -> None:
@@ -102,8 +155,15 @@ def launch_server(run_shell: bool = False) -> None:
     from .args import parse_args
 
     server_args, run_shell = parse_args(sys.argv[1:], run_shell)
+    _check_public_port(server_args.server_host, server_args.server_port)
+    server_args = replace(
+        server_args,
+        distributed_port=_find_available_internal_port(
+            exclude={server_args.server_port}
+        ),
+    )
 
-    def start_subprocess() -> None:
+    def start_subprocess() -> Callable[[], None]:
         import multiprocessing as mp
 
         from minisgl.tokenizer import tokenize_worker
@@ -115,6 +175,7 @@ def launch_server(run_shell: bool = False) -> None:
         # so that we can guarantee all subprocesses are ready
         ack_queue: mp.Queue[str] = mp.Queue()
         processes: list[mp.Process] = []
+        stop = _worker_cleanup(processes, ack_queue)
 
         try:
             for i in range(world_size):
@@ -173,13 +234,21 @@ def launch_server(run_shell: bool = False) -> None:
 
             # Only the primary scheduler sends an acknowledgment after all TP ranks sync.
             _wait_for_worker_acks(processes, ack_queue, num_tokenizers + 2)
+            return stop
         except BaseException:
-            _stop_worker_processes(processes)
-            ack_queue.close()
-            ack_queue.join_thread()
+            stop()
             raise
 
-    run_api_server(server_args, start_subprocess, run_shell=run_shell)
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
+
+    def interrupt_startup(signum, _) -> None:
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGTERM, interrupt_startup)
+    try:
+        run_api_server(server_args, start_subprocess, run_shell=run_shell)
+    finally:
+        signal.signal(signal.SIGTERM, previous_sigterm)
 
 
 if __name__ == "__main__":

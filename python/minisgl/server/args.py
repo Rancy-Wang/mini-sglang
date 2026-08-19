@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import os
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Tuple
 
 from minisgl.distributed import DistributedInfo
@@ -18,6 +18,7 @@ class ServerArgs(SchedulerConfig):
     num_tokenizer: int = 0
     silent_output: bool = False
     request_timeout: float = 300.0
+    distributed_port: int | None = field(default=None, repr=False)
 
     @property
     def share_tokenizer(self) -> bool:
@@ -49,7 +50,9 @@ class ServerArgs(SchedulerConfig):
 
     @property
     def distributed_addr(self) -> str:
-        return f"tcp://127.0.0.1:{self.server_port + 1}"
+        if self.distributed_port is None:
+            raise RuntimeError("The internal distributed port has not been assigned.")
+        return f"tcp://127.0.0.1:{self.distributed_port}"
 
 
 def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bool]:
@@ -152,9 +155,8 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         type=int,
         default=ServerArgs.cuda_graph_max_bs,
         help=(
-            "The maximum fixed batch size for whole-model CUDA graph capture. "
-            "GPT-OSS defaults to eager when omitted; use --graph 1 to opt in. "
-            "Piecewise capture and GPT-OSS graph auto-tuning are unsupported."
+            "The maximum batch size for whole-model CUDA graph capture. "
+            "By default, all models use a GPU-memory-based maximum. Set to 0 to disable."
         ),
     )
     parser.add_argument(
@@ -230,6 +232,17 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         default=ServerArgs.cache_type,
         choices=SUPPORTED_CACHE_MANAGER.supported_names(),
         help="The KV cache management strategy.",
+    )
+
+    parser.add_argument(
+        "--enable-drop-aware-eviction",
+        action="store_true",
+        dest="drop_aware_eviction",
+        help=(
+            "Opt in to token-granular Drop-aware Radix eviction. It preserves matched "
+            "Radix keys, reclaims Drop-safe KV blocks as holes, and requires radix cache, "
+            "delta-marker Drop keys, and page size 1. The default keeps legacy leaf LRU."
+        ),
     )
 
     parser.add_argument(

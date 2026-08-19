@@ -84,6 +84,7 @@ class Req:
     prefix_keep_mask: torch.Tensor | None = None  # cpu tensor for full->active prefix filtering
     is_warmup: bool = False
     cache_hit_ratio: float = 1.0
+    cache_reuse_ratio: float = 1.0
     full_input_ids: torch.Tensor | None = None
     full_token_visible_until: torch.Tensor | None = None
     full_keep_mask: torch.Tensor | None = None

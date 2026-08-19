@@ -25,6 +25,13 @@ from minisgl.message import (
     UserReply,
     WarmupReply,
 )
+from minisgl.tokenizer.drop_rules import (
+    MessageDropRule,
+    TextDropRule,
+    ThinkingDropRule,
+    parse_drop_rule,
+    project_drop_rule_for_prefix,
+)
 from minisgl.utils import ZmqAsyncPullQueue, ZmqAsyncPushQueue, init_logger
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import WordCompleter
@@ -149,6 +156,32 @@ def _to_wire_drop_message(drop_message: Dict[int, List[int]] | None) -> Dict[str
         str(int(raw_n)): [int(raw_id) for raw_id in raw_ids]
         for raw_n, raw_ids in drop_message.items()
     }
+
+
+def _parse_request_drop_rule(
+    *,
+    drop_rule: Dict[str, Any] | None,
+    legacy_drop_message: Dict[int, List[int]] | None,
+    messages: List[Dict[str, Any]],
+    radix_drop_key_mode: str,
+) -> dict[str, Any] | None:
+    try:
+        parsed = parse_drop_rule(
+            drop_rule,
+            messages,
+            legacy_drop_message=legacy_drop_message,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if parsed is not None and radix_drop_key_mode != "delta-marker":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Drop rules compile to token-position ranges and require "
+                "radix_drop_key_mode='delta-marker'."
+            ),
+        )
+    return parsed.to_wire() if parsed is not None else None
 
 
 def _extract_tool_function_name(tool: Dict[str, Any]) -> str | None:
@@ -611,6 +644,7 @@ class OpenAICompletionRequest(BaseModel):
 
     ignore_eos: bool = False
     drop_message: Dict[int, List[int]] | None = None
+    drop_rule: Dict[str, Any] | None = None
     enable_thinking: bool | None = None
     reasoning_effort: Literal["low", "medium", "high"] | None = None
     tools: List[Dict[str, Any]] | None = None
@@ -637,6 +671,7 @@ class FrontendManager:
     recv_tokenizer: ZmqAsyncPullQueue[BaseFrontendMsg]
     uid_counter: int = 0
     initialized: bool = False
+    stopped: bool = False
     ack_map: Dict[int, List[UserReply | WarmupReply | RequestErrorReply]] = field(
         default_factory=dict
     )
@@ -721,7 +756,7 @@ class FrontendManager:
     async def run_contextual_warmup(
         self,
         messages: List[Dict[str, Any]],
-        drop_message: Dict[str, List[int]],
+        drop_rule: Dict[str, Any],
         enable_thinking: bool | None,
         reasoning_effort: str | None,
         tools: List[Dict[str, Any]] | None,
@@ -729,18 +764,30 @@ class FrontendManager:
     ) -> None:
         # Event n changes visibility only for messages after n. A future event
         # therefore needs no special warmup for the current generation prompt.
-        if not any(int(raw_n) < len(messages) for raw_n in drop_message):
+        parsed_rule = parse_drop_rule(drop_rule, messages, allow_internal=True)
+        if isinstance(parsed_rule, MessageDropRule):
+            has_current_drop = any(
+                trigger < len(messages) and bool(message_ids)
+                for trigger, message_ids in parsed_rule.drop_messages.items()
+            )
+        elif isinstance(parsed_rule, TextDropRule):
+            has_current_drop = any(selection is not None for selection in parsed_rule.selections)
+        else:
+            has_current_drop = isinstance(parsed_rule, ThinkingDropRule) and bool(
+                parsed_rule.thinking_by_message
+            )
+        if not has_current_drop:
             return
-        warmup_target = max(len(messages) - 1, 0)
-        warmup_uid = self.new_user()
         use_context_mask = self.config.contextual_prefill_mode == "mask"
+        warmup_target = len(messages) if use_context_mask else max(len(messages) - 1, 0)
+        warmup_uid = self.new_user()
         await self.send_one(
             TokenizeMsg(
                 uid=warmup_uid,
                 text=messages,
                 sampling_params=SamplingParams(max_tokens=1, ignore_eos=True),
                 target_msg_id=warmup_target,
-                drop_message=drop_message,
+                drop_rule=drop_rule,
                 enable_thinking=enable_thinking,
                 reasoning_effort=reasoning_effort,
                 tools=tools,
@@ -759,13 +806,19 @@ class FrontendManager:
         # Fallback: staged prefill by message prefixes.
         for end in range(1, len(messages)):
             staged_uid = self.new_user()
+            staged_rule = project_drop_rule_for_prefix(drop_rule, end)
+            if staged_rule is not None and staged_rule.get("type") == "thinking_drop":
+                try:
+                    parse_drop_rule(staged_rule, messages[:end], allow_internal=True)
+                except ValueError:
+                    staged_rule = None
             await self.send_one(
                 TokenizeMsg(
                     uid=staged_uid,
                     text=messages[:end],
                     sampling_params=SamplingParams(max_tokens=1, ignore_eos=True),
                     target_msg_id=end - 1,
-                    drop_message=drop_message,
+                    drop_rule=staged_rule,
                     enable_thinking=enable_thinking,
                     reasoning_effort=reasoning_effort,
                     tools=tools,
@@ -799,6 +852,7 @@ class FrontendManager:
         buffered_output = ""
         final_finish_reason = "stop"
         matched_stop: str | None = None
+        cache_hit_ratio: float | None = None
         mode = _tool_choice_mode(tool_choice)
         forced_tool_name = _tool_choice_forced_name(tool_choice)
         require_tool_call = mode in {"required", "function"}
@@ -818,6 +872,8 @@ class FrontendManager:
                     final_finish_reason = ack.finish_reason
                 if ack.matched_stop is not None:
                     matched_stop = ack.matched_stop
+                if ack.cache_hit_ratio is not None:
+                    cache_hit_ratio = ack.cache_hit_ratio
 
                 if buffer_mode:
                     if ack.incremental_output:
@@ -895,6 +951,8 @@ class FrontendManager:
                 }
             ],
         }
+        if cache_hit_ratio is not None:
+            end_chunk["cache_hit_ratio"] = cache_hit_ratio
         yield f"data: {json.dumps(end_chunk)}\n\n".encode()
         yield b"data: [DONE]\n\n"
         logger.debug("Finished streaming response for user %s", uid)
@@ -921,6 +979,9 @@ class FrontendManager:
         await self.send_one(AbortMsg(uid=uid))
 
     def shutdown(self):
+        if self.stopped:
+            return
+        self.stopped = True
         self.send_tokenizer.stop()
         self.recv_tokenizer.stop()
 
@@ -967,12 +1028,7 @@ async def v1_root():
 @app.post("/v1/chat/completions")
 async def v1_completions(req: OpenAICompletionRequest, request: Request):
     state = get_global_state()
-    if req.drop_message is not None:
-        _validate_drop_message(
-            req.drop_message,
-            radix_drop_key_mode=state.config.radix_drop_key_mode,
-        )
-    wire_drop_message = _to_wire_drop_message(req.drop_message)
+    wire_drop_rule: dict[str, Any] | None = None
     normalized_tool_choice: str | Dict[str, Any] = "none"
     if req.messages:
         prompt = [msg.model_dump() for msg in req.messages]
@@ -980,9 +1036,9 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
     else:
         assert req.prompt is not None, "Either 'messages' or 'prompt' must be provided"
         prompt = req.prompt
-        if req.drop_message is not None:
+        if req.drop_message is not None or req.drop_rule is not None:
             raise HTTPException(
-                status_code=400, detail="drop_message is only supported with chat `messages` input."
+                status_code=400, detail="drop_rule is only supported with chat `messages` input."
             )
         if req.tools is not None:
             raise HTTPException(
@@ -994,11 +1050,12 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
                 detail="tool_choice is only supported with chat `messages` and `tools`.",
             )
 
-    if req.drop_message is not None and isinstance(prompt, list):
-        _validate_drop_message(
-            req.drop_message,
+    if isinstance(prompt, list):
+        wire_drop_rule = _parse_request_drop_rule(
+            drop_rule=req.drop_rule,
+            legacy_drop_message=req.drop_message,
+            messages=prompt,
             radix_drop_key_mode=state.config.radix_drop_key_mode,
-            message_count=len(prompt),
         )
 
     effective_stop = _build_effective_stop(
@@ -1008,11 +1065,11 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
         state.config.model_path,
     )
 
-    if wire_drop_message is not None and isinstance(prompt, list):
+    if wire_drop_rule is not None and isinstance(prompt, list):
         try:
             await state.run_contextual_warmup(
                 prompt,
-                wire_drop_message,
+                wire_drop_rule,
                 req.enable_thinking,
                 req.reasoning_effort,
                 req.tools,
@@ -1035,7 +1092,7 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
                 top_p=req.top_p,
             ),
             target_msg_id=(len(prompt) if isinstance(prompt, list) else None),
-            drop_message=wire_drop_message,
+            drop_rule=wire_drop_rule,
             enable_thinking=req.enable_thinking,
             reasoning_effort=req.reasoning_effort,
             tools=req.tools,
@@ -1061,6 +1118,7 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
     # Non-streaming: collect all chunks and return a single JSON response
     full_content = ""
     finish_reason = "stop"
+    cache_hit_ratio: float | None = None
     try:
         async for ack in state.wait_for_ack(uid):
             if not isinstance(ack, UserReply):
@@ -1068,6 +1126,8 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
             full_content += ack.incremental_output
             if ack.finish_reason is not None:
                 finish_reason = ack.finish_reason
+            if ack.cache_hit_ratio is not None:
+                cache_hit_ratio = ack.cache_hit_ratio
             if ack.finished:
                 break
     except RequestRejected as exc:
@@ -1084,7 +1144,7 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
             if finish_reason == "stop":
                 finish_reason = "tool_calls"
 
-    return {
+    response = {
         "id": f"chatcmpl-{uid}",
         "object": "chat.completion",
         "created": int(time.time()),
@@ -1102,6 +1162,9 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
             "total_tokens": 0,
         },
     }
+    if cache_hit_ratio is not None:
+        response["cache_hit_ratio"] = cache_hit_ratio
+    return response
 
 
 @app.get("/v1/models")
@@ -1113,19 +1176,13 @@ async def available_models():
 async def shell_completion(req: OpenAICompletionRequest):
     state = get_global_state()
     assert req.messages is not None, "Shell completion only supports chat-completions"
-    if req.drop_message is not None:
-        _validate_drop_message(
-            req.drop_message,
-            radix_drop_key_mode=state.config.radix_drop_key_mode,
-        )
-    wire_drop_message = _to_wire_drop_message(req.drop_message)
     prompt = [msg.model_dump() for msg in req.messages]
-    if req.drop_message is not None:
-        _validate_drop_message(
-            req.drop_message,
-            radix_drop_key_mode=state.config.radix_drop_key_mode,
-            message_count=len(prompt),
-        )
+    wire_drop_rule = _parse_request_drop_rule(
+        drop_rule=req.drop_rule,
+        legacy_drop_message=req.drop_message,
+        messages=prompt,
+        radix_drop_key_mode=state.config.radix_drop_key_mode,
+    )
     normalized_tool_choice = _normalize_tool_choice(req.tools, req.tool_choice)
     effective_stop = _build_effective_stop(
         req.stop,
@@ -1148,7 +1205,7 @@ async def shell_completion(req: OpenAICompletionRequest):
                 top_p=req.top_p,
             ),
             target_msg_id=len(prompt),
-            drop_message=wire_drop_message,
+            drop_rule=wire_drop_rule,
             enable_thinking=req.enable_thinking,
             reasoning_effort=req.reasoning_effort,
             tools=req.tools,
@@ -1218,16 +1275,13 @@ async def shell():
     finally:
         print("Exiting shell...")
         await asyncio.sleep(0.1)
-        get_global_state().shutdown()
-        # then kill all the subprocesses
-        import psutil
-
-        parent = psutil.Process()
-        for child in parent.children(recursive=True):
-            child.kill()
 
 
-def run_api_server(config: ServerArgs, start_backend: Callable[[], None], run_shell: bool) -> None:
+def run_api_server(
+    config: ServerArgs,
+    start_backend: Callable[[], Callable[[], None]],
+    run_shell: bool,
+) -> None:
     """
     Run the frontend API server (FastAPI + uvicorn) and wire it to the tokenizer process via ZMQ.
 
@@ -1246,26 +1300,34 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], None], run_sh
     host = config.server_host
     port = config.server_port
 
-    assert _GLOBAL_STATE is None, "Global state is already initialized"
-    _GLOBAL_STATE = FrontendManager(
-        config=config,
-        recv_tokenizer=ZmqAsyncPullQueue(
-            config.zmq_frontend_addr,
-            create=True,
-            decoder=BaseFrontendMsg.decoder,
-        ),
-        send_tokenizer=ZmqAsyncPushQueue(
-            config.zmq_tokenizer_addr,
-            create=config.frontend_create_tokenizer_link,
-            encoder=BaseTokenizerMsg.encoder,
-        ),
-    )
+    stop_backend: Callable[[], None] | None = None
+    try:
+        assert _GLOBAL_STATE is None, "Global state is already initialized"
+        _GLOBAL_STATE = FrontendManager(
+            config=config,
+            recv_tokenizer=ZmqAsyncPullQueue(
+                config.zmq_frontend_addr,
+                create=True,
+                decoder=BaseFrontendMsg.decoder,
+            ),
+            send_tokenizer=ZmqAsyncPushQueue(
+                config.zmq_tokenizer_addr,
+                create=config.frontend_create_tokenizer_link,
+                encoder=BaseTokenizerMsg.encoder,
+            ),
+        )
 
-    # start the backend here
-    start_backend()
-
-    logger.info(f"API server is ready to serve on {host}:{port}")
-    if not run_shell:
-        uvicorn.run(app, host=host, port=port)
-    else:
-        asyncio.run(shell())
+        stop_backend = start_backend()
+        logger.info(f"API server is ready to serve on {host}:{port}")
+        if not run_shell:
+            uvicorn.run(app, host=host, port=port)
+        else:
+            asyncio.run(shell())
+    finally:
+        try:
+            if _GLOBAL_STATE is not None:
+                _GLOBAL_STATE.shutdown()
+        finally:
+            if stop_backend is not None:
+                stop_backend()
+            _GLOBAL_STATE = None

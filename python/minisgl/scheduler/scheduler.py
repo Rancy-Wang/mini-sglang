@@ -27,6 +27,7 @@ from .radix_delta import (
     DeltaMarkerRegistry,
     inject_delta_markers,
     key_prefix_len_for_token_boundary,
+    select_effective_delta_events,
 )
 from .radix_symbol import RadixSymbolRegistry, inject_radix_symbols
 from .table import TableManager
@@ -54,6 +55,14 @@ ForwardData: TypeAlias = "Tuple[ForwardInput, ForwardOutput]"
 
 class Scheduler(SchedulerIOMixin):
     def __init__(self, config: SchedulerConfig):
+        if config.drop_aware_eviction and config.cache_type != "radix":
+            raise ValueError("--enable-drop-aware-eviction requires --cache-type radix.")
+        if config.drop_aware_eviction and config.radix_drop_key_mode != "delta-marker":
+            raise ValueError(
+                "--enable-drop-aware-eviction requires --radix-drop-key-mode delta-marker."
+            )
+        if config.drop_aware_eviction and config.page_size != 1:
+            raise ValueError("--enable-drop-aware-eviction requires --page-size 1.")
         if config.radix_drop_key_mode == "delta-marker" and config.page_size != 1:
             raise ValueError("Delta-marker Radix mode requires --page-size 1.")
         if config.radix_drop_key_mode == "delta-marker" and "trtllm" in config.attention_backend:
@@ -93,7 +102,11 @@ class Scheduler(SchedulerIOMixin):
             DeltaMarkerRegistry() if self.radix_drop_key_mode == "delta-marker" else None
         )
         self.cache_manager = CacheManager(
-            self.engine.num_pages, config.page_size, self.engine.page_table, config.cache_type
+            self.engine.num_pages,
+            config.page_size,
+            self.engine.page_table,
+            config.cache_type,
+            drop_aware_eviction=config.drop_aware_eviction,
         )
         if self.delta_marker_registry is not None:
             self.cache_manager.bind_delta_marker_registry(self.delta_marker_registry)
@@ -214,7 +227,7 @@ class Scheduler(SchedulerIOMixin):
                     reply.append(
                         WarmupAckMsg(
                             uid=req.uid,
-                            hit_ratio=req.cache_hit_ratio,
+                            hit_ratio=req.cache_reuse_ratio,
                             finished=finished,
                         )
                     )
@@ -239,6 +252,7 @@ class Scheduler(SchedulerIOMixin):
                             finished=finished,
                             finish_reason=finish_reason if finished else None,
                             matched_stop=matched_stop,
+                            cache_hit_ratio=req.cache_hit_ratio if finished else None,
                         )
                     )
 
@@ -316,6 +330,25 @@ class Scheduler(SchedulerIOMixin):
                     assert event_positions is not None
                     assert range_offsets is not None
                     assert position_ranges is not None
+                    drop_aware_eviction = getattr(
+                        getattr(self, "cache_manager", None),
+                        "drop_aware_eviction",
+                        False,
+                    )
+                    if drop_aware_eviction:
+                        if msg.full_keep_mask is None:
+                            raise ValueError(
+                                "Drop-aware delta markers require a target-specific "
+                                "full_keep_mask."
+                            )
+                        event_positions, range_offsets, position_ranges = (
+                            select_effective_delta_events(
+                                event_positions,
+                                range_offsets,
+                                position_ranges,
+                                msg.full_keep_mask,
+                            )
+                        )
                     marker_ids: tuple[int, ...] = ()
                     try:
                         layout = inject_delta_markers(

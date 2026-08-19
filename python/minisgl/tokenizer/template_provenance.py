@@ -17,6 +17,7 @@ class TemplateTokenProvenance:
     owners: list[int]
     offsets: list[tuple[int, int]]
     rendered_text: str
+    char_owners: list[int]
     cross_owner_tokens: int
 
 
@@ -85,6 +86,7 @@ def _render_traced_template(
     tools: list[dict[str, Any]] | None,
     add_generation_prompt: bool,
     enable_thinking: bool | None,
+    extra_template_kwargs: dict[str, Any] | None,
 ) -> tuple[str, str, re.Pattern[str]]:
     nonce = uuid.uuid4().hex
     marker_prefix = f"\x00minisgl-owner-{nonce}:"
@@ -102,6 +104,7 @@ def _render_traced_template(
     template_kwargs = dict(getattr(tokenizer, "special_tokens_map", {}))
     if enable_thinking is not None:
         template_kwargs["enable_thinking"] = enable_thinking
+    template_kwargs.update(extra_template_kwargs or {})
     traced = _compile_traced_template(chat_template).render(
         messages=messages,
         tools=tools,
@@ -206,16 +209,19 @@ def build_template_token_provenance(
     *,
     canonical_text: str,
     canonical_no_generation_text: str,
-    expected_input_ids: list[int],
+    expected_input_ids: list[int] | None,
     tools: list[dict[str, Any]] | None,
     add_generation_prompt: bool,
     enable_thinking: bool | None,
+    chat_template: str | None = None,
+    template_kwargs: dict[str, Any] | None = None,
 ) -> TemplateTokenProvenance:
     if not bool(getattr(tokenizer, "is_fast", False)):
         raise RuntimeError(
             "Drop Message ownership requires a fast tokenizer with offset_mapping support."
         )
-    chat_template = tokenizer.get_chat_template(tools=tools)
+    if chat_template is None:
+        chat_template = tokenizer.get_chat_template(tools=tools)
     traced_text, _, marker_pattern = _render_traced_template(
         tokenizer,
         chat_template,
@@ -223,6 +229,7 @@ def build_template_token_provenance(
         tools=tools,
         add_generation_prompt=add_generation_prompt,
         enable_thinking=enable_thinking,
+        extra_template_kwargs=template_kwargs,
     )
     char_owners = _parse_character_owners(
         traced_text,
@@ -239,7 +246,9 @@ def build_template_token_provenance(
         return_offsets_mapping=True,
     )
     input_ids = [int(token_id) for token_id in encoded["input_ids"]]
-    if input_ids != [int(token_id) for token_id in expected_input_ids]:
+    if expected_input_ids is not None and input_ids != [
+        int(token_id) for token_id in expected_input_ids
+    ]:
         raise RuntimeError(
             "Canonical chat text tokenization differs from apply_chat_template(tokenize=True)."
         )
@@ -268,5 +277,6 @@ def build_template_token_provenance(
         owners=owners,
         offsets=offsets,
         rendered_text=canonical_text,
+        char_owners=char_owners,
         cross_owner_tokens=cross_owner_tokens,
     )

@@ -125,8 +125,6 @@ class Engine:
             max_seq_len=aligned_max_seq_len,
             vocab_size=config.model_config.vocab_size,
             dummy_req=self.dummy_req,
-            tp_cpu_group=self.tp_cpu_group,
-            is_gpt_oss=config.model_config.is_gpt_oss,
         )
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
@@ -168,7 +166,11 @@ class Engine:
                 for key, value in template.items()
             }
         return {
-            key: value.to(dtype=template[key].dtype)
+            key: (
+                value.to(dtype=target.dtype)
+                if (target := template.get(key)) is not None
+                else value
+            )
             for key, value in load_weight(config.model_path, self.device)
         }
 
