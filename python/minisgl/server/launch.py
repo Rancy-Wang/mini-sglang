@@ -23,6 +23,7 @@ logger = init_logger(__name__, "initializer")
 def _check_public_port(host: str, port: int) -> None:
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.bind((host, port))
     except OSError as exc:
         raise RuntimeError(

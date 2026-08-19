@@ -3,6 +3,7 @@ import queue
 import socket
 import weakref
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -120,6 +121,16 @@ def test_public_port_failure_is_reported_before_workers_start():
         port = int(occupied.getsockname()[1])
         with pytest.raises(RuntimeError, match=f"127.0.0.1:{port} is unavailable"):
             _check_public_port("127.0.0.1", port)
+
+
+def test_public_port_check_uses_server_restart_socket_semantics():
+    with patch("minisgl.server.launch.socket.socket") as socket_factory:
+        sock = socket_factory.return_value.__enter__.return_value
+
+        _check_public_port("127.0.0.1", 8000)
+
+    sock.setsockopt.assert_called_once_with(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind.assert_called_once_with(("127.0.0.1", 8000))
 
 
 def test_worker_cleanup_is_idempotent_and_closes_ack_queue():
