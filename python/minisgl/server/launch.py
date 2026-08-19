@@ -99,15 +99,20 @@ def _worker_cleanup(
     processes: Sequence[mp.Process], ack_queue: mp.Queue[str]
 ) -> Callable[[], None]:
     stopped = False
+    queue_ref: mp.Queue[str] | None = ack_queue
 
     def stop() -> None:
-        nonlocal stopped
+        nonlocal queue_ref, stopped
         if stopped:
             return
         stopped = True
         _stop_worker_processes(processes)
-        ack_queue.close()
-        ack_queue.join_thread()
+        assert queue_ref is not None
+        queue_ref.close()
+        queue_ref.join_thread()
+        # Do not keep the Queue's named semaphore alive through interpreter
+        # shutdown via this returned closure.
+        queue_ref = None
 
     return stop
 

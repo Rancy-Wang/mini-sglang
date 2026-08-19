@@ -1,5 +1,7 @@
+import gc
 import queue
 import socket
+import weakref
 from types import SimpleNamespace
 
 import pytest
@@ -123,6 +125,7 @@ def test_public_port_failure_is_reported_before_workers_start():
 def test_worker_cleanup_is_idempotent_and_closes_ack_queue():
     process = FakeProcess("worker", 1)
     ack_queue = ClosableQueue()
+    queue_ref = weakref.ref(ack_queue)
     stop = _worker_cleanup([process], ack_queue)
 
     stop()
@@ -131,6 +134,9 @@ def test_worker_cleanup_is_idempotent_and_closes_ack_queue():
     assert process.terminate_calls == 1
     assert ack_queue.close_calls == 1
     assert ack_queue.join_calls == 1
+    del ack_queue
+    gc.collect()
+    assert queue_ref() is None
 
 
 def test_api_server_return_stops_frontend_and_backend(monkeypatch):
