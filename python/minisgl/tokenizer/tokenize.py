@@ -411,22 +411,13 @@ class TokenizeManager:
             raise RuntimeError("Harmony render contains no message boundary tokens.")
 
         expected = [item for item in prompt.ownership if not item.is_analysis]
-        complete_ranges: list[tuple[int, int]] = []
-        generation_start: int | None = None
-        for start_id, start in enumerate(starts):
-            end = starts[start_id + 1] if start_id + 1 < len(starts) else len(input_ids)
-            has_end = any(
-                special_names.get(input_ids[position]) == "<|end|>"
-                for position in range(start, end)
-            )
-            if has_end:
-                complete_ranges.append((start, end))
-            else:
-                if start_id != len(starts) - 1:
-                    raise RuntimeError("Harmony message boundary is missing <|end|>.")
-                generation_start = start
-
-        if generation_start is None:
+        complete_ranges = list(zip(starts[:-1], starts[1:]))
+        generation_start = starts[-1]
+        if any(
+            special_names.get(input_ids[position])
+            in {"<|end|>", "<|call|>", "<|return|>"}
+            for position in range(generation_start, len(input_ids))
+        ):
             raise RuntimeError("Harmony completion render has no generation prompt.")
         if len(complete_ranges) != len(expected):
             raise RuntimeError(
