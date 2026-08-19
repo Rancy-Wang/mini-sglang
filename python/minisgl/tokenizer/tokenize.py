@@ -410,7 +410,6 @@ class TokenizeManager:
         if not starts:
             raise RuntimeError("Harmony render contains no message boundary tokens.")
 
-        expected = [item for item in prompt.ownership if not item.is_analysis]
         complete_ranges = list(zip(starts[:-1], starts[1:]))
         generation_start = starts[-1]
         if any(
@@ -419,7 +418,28 @@ class TokenizeManager:
             for position in range(generation_start, len(input_ids))
         ):
             raise RuntimeError("Harmony completion render has no generation prompt.")
-        if len(complete_ranges) != len(expected):
+        expected: list[_HarmonyComponentOwnership] = []
+        component_id = 0
+        for start, end in complete_ranges:
+            header = encoding.decode(input_ids[start:end]).split("<|message|>", 1)[0]
+            is_analysis = "<|channel|>analysis" in header
+            while (
+                component_id < len(prompt.ownership)
+                and prompt.ownership[component_id].is_analysis
+                and not is_analysis
+            ):
+                component_id += 1
+            if (
+                component_id >= len(prompt.ownership)
+                or prompt.ownership[component_id].is_analysis != is_analysis
+            ):
+                raise RuntimeError(
+                    "Harmony analysis filtering changed the native message stream; "
+                    "cannot align message ownership."
+                )
+            expected.append(prompt.ownership[component_id])
+            component_id += 1
+        if any(not item.is_analysis for item in prompt.ownership[component_id:]):
             raise RuntimeError(
                 "Harmony analysis filtering changed the native message stream; "
                 "cannot align message ownership."
