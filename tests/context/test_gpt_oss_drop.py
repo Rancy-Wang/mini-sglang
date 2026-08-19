@@ -16,6 +16,19 @@ class GptOssTokenizerStub:
         return load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS).encode(text)
 
 
+class CountingHarmonyEncoding:
+    def __init__(self):
+        self.inner = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
+        self.completion_renders = 0
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+    def render_conversation_for_completion(self, *args, **kwargs):
+        self.completion_renders += 1
+        return self.inner.render_conversation_for_completion(*args, **kwargs)
+
+
 def test_harmony_analysis_boundary_is_not_a_terminal_generation_stop():
     encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
     message_end = "".join(("<", "|", "end", "|", ">"))
@@ -109,6 +122,36 @@ def test_harmony_agent_history_drop_preserves_system_tools_and_absolute_position
         result.true_positions,
         torch.arange(len(result.full_input_ids), dtype=torch.int32)[~dropped],
     )
+
+
+def test_harmony_message_drop_renders_once_and_splits_merged_instructions():
+    messages = [
+        {"role": "system", "content": "KEEP_SYSTEM_INSTRUCTION"},
+        {"role": "developer", "content": "DROP_DEVELOPER_INSTRUCTION"},
+        {"role": "user", "content": "CONTINUE"},
+    ]
+    manager = TokenizeManager(GptOssTokenizerStub())
+    encoding = CountingHarmonyEncoding()
+    manager._harmony_encoding = encoding
+    result = manager.tokenize(
+        [
+            TokenizeMsg(
+                uid=3,
+                text=messages,
+                sampling_params=SamplingParams(max_tokens=1),
+                target_msg_id=len(messages),
+                drop_message={2: [1]},
+            )
+        ]
+    )[0]
+    active = encoding.decode(result.input_ids.tolist())
+    full = encoding.decode(result.full_input_ids.tolist())
+
+    assert encoding.completion_renders == 1
+    assert "KEEP_SYSTEM_INSTRUCTION" in active
+    assert "DROP_DEVELOPER_INSTRUCTION" not in active
+    assert "DROP_DEVELOPER_INSTRUCTION" in full
+    assert "CONTINUE" in active
 
 
 def test_harmony_thinking_drop_removes_only_analysis_content_tokens():

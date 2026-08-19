@@ -671,6 +671,7 @@ class FrontendManager:
     recv_tokenizer: ZmqAsyncPullQueue[BaseFrontendMsg]
     uid_counter: int = 0
     initialized: bool = False
+    stopped: bool = False
     ack_map: Dict[int, List[UserReply | WarmupReply | RequestErrorReply]] = field(
         default_factory=dict
     )
@@ -978,6 +979,9 @@ class FrontendManager:
         await self.send_one(AbortMsg(uid=uid))
 
     def shutdown(self):
+        if self.stopped:
+            return
+        self.stopped = True
         self.send_tokenizer.stop()
         self.recv_tokenizer.stop()
 
@@ -1271,16 +1275,13 @@ async def shell():
     finally:
         print("Exiting shell...")
         await asyncio.sleep(0.1)
-        get_global_state().shutdown()
-        # then kill all the subprocesses
-        import psutil
-
-        parent = psutil.Process()
-        for child in parent.children(recursive=True):
-            child.kill()
 
 
-def run_api_server(config: ServerArgs, start_backend: Callable[[], None], run_shell: bool) -> None:
+def run_api_server(
+    config: ServerArgs,
+    start_backend: Callable[[], Callable[[], None]],
+    run_shell: bool,
+) -> None:
     """
     Run the frontend API server (FastAPI + uvicorn) and wire it to the tokenizer process via ZMQ.
 
@@ -1299,26 +1300,34 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], None], run_sh
     host = config.server_host
     port = config.server_port
 
-    assert _GLOBAL_STATE is None, "Global state is already initialized"
-    _GLOBAL_STATE = FrontendManager(
-        config=config,
-        recv_tokenizer=ZmqAsyncPullQueue(
-            config.zmq_frontend_addr,
-            create=True,
-            decoder=BaseFrontendMsg.decoder,
-        ),
-        send_tokenizer=ZmqAsyncPushQueue(
-            config.zmq_tokenizer_addr,
-            create=config.frontend_create_tokenizer_link,
-            encoder=BaseTokenizerMsg.encoder,
-        ),
-    )
+    stop_backend: Callable[[], None] | None = None
+    try:
+        assert _GLOBAL_STATE is None, "Global state is already initialized"
+        _GLOBAL_STATE = FrontendManager(
+            config=config,
+            recv_tokenizer=ZmqAsyncPullQueue(
+                config.zmq_frontend_addr,
+                create=True,
+                decoder=BaseFrontendMsg.decoder,
+            ),
+            send_tokenizer=ZmqAsyncPushQueue(
+                config.zmq_tokenizer_addr,
+                create=config.frontend_create_tokenizer_link,
+                encoder=BaseTokenizerMsg.encoder,
+            ),
+        )
 
-    # start the backend here
-    start_backend()
-
-    logger.info(f"API server is ready to serve on {host}:{port}")
-    if not run_shell:
-        uvicorn.run(app, host=host, port=port)
-    else:
-        asyncio.run(shell())
+        stop_backend = start_backend()
+        logger.info(f"API server is ready to serve on {host}:{port}")
+        if not run_shell:
+            uvicorn.run(app, host=host, port=port)
+        else:
+            asyncio.run(shell())
+    finally:
+        try:
+            if _GLOBAL_STATE is not None:
+                _GLOBAL_STATE.shutdown()
+        finally:
+            if stop_backend is not None:
+                stop_backend()
+            _GLOBAL_STATE = None

@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import os
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Tuple
 
 from minisgl.distributed import DistributedInfo
@@ -18,6 +18,7 @@ class ServerArgs(SchedulerConfig):
     num_tokenizer: int = 0
     silent_output: bool = False
     request_timeout: float = 300.0
+    distributed_port: int | None = field(default=None, repr=False)
 
     @property
     def share_tokenizer(self) -> bool:
@@ -49,7 +50,9 @@ class ServerArgs(SchedulerConfig):
 
     @property
     def distributed_addr(self) -> str:
-        return f"tcp://127.0.0.1:{self.server_port + 1}"
+        if self.distributed_port is None:
+            raise RuntimeError("The internal distributed port has not been assigned.")
+        return f"tcp://127.0.0.1:{self.distributed_port}"
 
 
 def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bool]:

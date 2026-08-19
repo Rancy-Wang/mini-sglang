@@ -49,6 +49,22 @@ class PositionDropPlan:
     full_token_visible_until: torch.Tensor
 
 
+@dataclass(frozen=True)
+class _HarmonyComponentOwnership:
+    owner: int
+    sources: tuple[tuple[int, str], ...] = ()
+    is_analysis: bool = False
+
+
+@dataclass(frozen=True)
+class _HarmonyPrompt:
+    conversation: Any
+    components: list[Any]
+    ownership: list[_HarmonyComponentOwnership]
+    thinking_components: dict[int, tuple[int, str]]
+    has_function_tools: bool
+
+
 class TokenizeManager:
     def __init__(
         self,
@@ -134,20 +150,17 @@ class TokenizeManager:
             )
         return self._harmony_encoding
 
-    def _render_harmony_tokens(
+    def _build_harmony_prompt(
         self,
         messages: List[dict[str, Any]],
         *,
-        add_generation_prompt: bool,
         enable_thinking: bool | None,
         tools: List[Dict[str, Any]] | None,
-    ) -> List[int]:
+    ) -> _HarmonyPrompt:
         from openai_harmony import (
             Author,
             Conversation,
             DeveloperContent,
-            RenderConversationConfig,
-            RenderOptions,
             ReasoningEffort,
             Role,
             SystemContent,
@@ -176,17 +189,20 @@ class TokenizeManager:
                 .with_required_channels(["analysis", "commentary", "final"]),
             )
         ]
+        ownership = [_HarmonyComponentOwnership(owner=-1)]
         thinking_components: dict[int, tuple[int, str]] = {}
 
-        instructions = [
-            self._normalize_message_content(raw.get("content"))
-            for raw in messages
+        instruction_sources = tuple(
+            (raw_message_id, content)
+            for raw_message_id, raw in enumerate(messages)
             if str(raw.get("role", "")).lower() in {"system", "developer"}
-            and self._normalize_message_content(raw.get("content"))
-        ]
+            and (content := self._normalize_message_content(raw.get("content")))
+        )
         developer = DeveloperContent.new()
-        if instructions:
-            developer.with_instructions("\n\n".join(instructions))
+        if instruction_sources:
+            developer.with_instructions(
+                "\n\n".join(content for _, content in instruction_sources)
+            )
         descriptions = []
         for tool in tools or []:
             fn = tool.get("function", tool) if isinstance(tool, dict) else {}
@@ -201,9 +217,15 @@ class TokenizeManager:
             )
         if descriptions:
             developer.with_function_tools(descriptions)
-        if instructions or descriptions:
+        if instruction_sources or descriptions:
             harmony_messages.append(
                 HarmonyMessage.from_role_and_content(Role.DEVELOPER, developer)
+            )
+            ownership.append(
+                _HarmonyComponentOwnership(
+                    owner=instruction_sources[0][0] if instruction_sources else -1,
+                    sources=instruction_sources,
+                )
             )
 
         tool_names: dict[str, str] = {}
@@ -216,6 +238,7 @@ class TokenizeManager:
                 harmony_messages.append(
                     HarmonyMessage.from_role_and_content(Role.USER, content)
                 )
+                ownership.append(_HarmonyComponentOwnership(owner=raw_message_id))
                 continue
             if role == "assistant":
                 reasoning = raw.get("reasoning_content")
@@ -227,12 +250,19 @@ class TokenizeManager:
                         ).with_channel("analysis")
                     )
                     thinking_components[component_id] = (raw_message_id, reasoning)
+                    ownership.append(
+                        _HarmonyComponentOwnership(
+                            owner=raw_message_id,
+                            is_analysis=True,
+                        )
+                    )
                 if content:
                     harmony_messages.append(
                         HarmonyMessage.from_role_and_content(Role.ASSISTANT, content).with_channel(
                             "final"
                         )
                     )
+                    ownership.append(_HarmonyComponentOwnership(owner=raw_message_id))
                 for call in raw.get("tool_calls") or []:
                     if not isinstance(call, dict):
                         continue
@@ -251,6 +281,7 @@ class TokenizeManager:
                         .with_recipient(f"functions.{name}")
                         .with_content_type("<|constrain|>json")
                     )
+                    ownership.append(_HarmonyComponentOwnership(owner=raw_message_id))
                 continue
             if role in {"tool", "function"}:
                 name = raw.get("name") or tool_names.get(str(raw.get("tool_call_id", "")))
@@ -263,25 +294,48 @@ class TokenizeManager:
                         Author.new(Role.TOOL, f"functions.{name}"), content
                     )
                 )
+                ownership.append(_HarmonyComponentOwnership(owner=raw_message_id))
                 continue
             raise ValueError(f"Unsupported GPT-OSS Harmony role: {role}")
 
-        conversation = Conversation.from_messages(harmony_messages)
+        return _HarmonyPrompt(
+            conversation=Conversation.from_messages(harmony_messages),
+            components=harmony_messages,
+            ownership=ownership,
+            thinking_components=thinking_components,
+            has_function_tools=bool(descriptions),
+        )
+
+    def _render_harmony_tokens(
+        self,
+        messages: List[dict[str, Any]],
+        *,
+        add_generation_prompt: bool,
+        enable_thinking: bool | None,
+        tools: List[Dict[str, Any]] | None,
+    ) -> List[int]:
+        from openai_harmony import RenderConversationConfig, RenderOptions, Role
+
+        prompt = self._build_harmony_prompt(
+            messages,
+            enable_thinking=enable_thinking,
+            tools=tools,
+        )
         encoding = self._get_harmony_encoding()
         config = None
         if self._preserve_harmony_thinking:
             config = RenderConversationConfig(auto_drop_analysis=False)
             render_options = RenderOptions(
-                conversation_has_function_tools=bool(descriptions)
+                conversation_has_function_tools=prompt.has_function_tools
             )
             component_stream: List[int] = []
             thinking_ranges: dict[int, List[tuple[int, int]]] = {}
-            for component_id, component in enumerate(harmony_messages):
+            for component_id, component in enumerate(prompt.components):
                 component_ids = [
                     int(token_id)
                     for token_id in encoding.render(component, render_options)
                 ]
-                thinking_source = thinking_components.get(component_id)
+                thinking_source = prompt.thinking_components.get(component_id)
                 if thinking_source is not None:
                     raw_message_id, source = thinking_source
                     needle = [int(token_id) for token_id in encoding.encode(source)]
@@ -306,10 +360,10 @@ class TokenizeManager:
 
         if add_generation_prompt:
             result = encoding.render_conversation_for_completion(
-                conversation, Role.ASSISTANT, config
+                prompt.conversation, Role.ASSISTANT, config
             )
         else:
-            result = encoding.render_conversation(conversation, config)
+            result = encoding.render_conversation(prompt.conversation, config)
         result = [int(token_id) for token_id in result]
         if self._preserve_harmony_thinking and result[: len(component_stream)] != component_stream:
             raise RuntimeError(
@@ -317,6 +371,118 @@ class TokenizeManager:
                 "cannot construct exact thinking provenance."
             )
         return result
+
+    def _render_harmony_message_drop(
+        self,
+        messages: List[dict[str, Any]],
+        *,
+        enable_thinking: bool | None,
+        tools: List[Dict[str, Any]] | None,
+    ) -> tuple[List[int], List[int], int]:
+        """Render once and recover message owners from Harmony protocol boundaries."""
+
+        from openai_harmony import Role
+
+        prompt = self._build_harmony_prompt(
+            messages,
+            enable_thinking=enable_thinking,
+            tools=tools,
+        )
+        encoding = self._get_harmony_encoding()
+        input_ids = [
+            int(token_id)
+            for token_id in encoding.render_conversation_for_completion(
+                prompt.conversation,
+                Role.ASSISTANT,
+            )
+        ]
+
+        special_names = {
+            token_id: encoding.decode([token_id])
+            for token_id in set(input_ids)
+            if encoding.is_special_token(token_id)
+        }
+        starts = [
+            position
+            for position, token_id in enumerate(input_ids)
+            if special_names.get(token_id) == "<|start|>"
+        ]
+        if not starts:
+            raise RuntimeError("Harmony render contains no message boundary tokens.")
+
+        expected = [item for item in prompt.ownership if not item.is_analysis]
+        complete_ranges: list[tuple[int, int]] = []
+        generation_start: int | None = None
+        for start_id, start in enumerate(starts):
+            end = starts[start_id + 1] if start_id + 1 < len(starts) else len(input_ids)
+            has_end = any(
+                special_names.get(input_ids[position]) == "<|end|>"
+                for position in range(start, end)
+            )
+            if has_end:
+                complete_ranges.append((start, end))
+            else:
+                if start_id != len(starts) - 1:
+                    raise RuntimeError("Harmony message boundary is missing <|end|>.")
+                generation_start = start
+
+        if generation_start is None:
+            raise RuntimeError("Harmony completion render has no generation prompt.")
+        if len(complete_ranges) != len(expected):
+            raise RuntimeError(
+                "Harmony analysis filtering changed the native message stream; "
+                "cannot align message ownership."
+            )
+
+        owners = [-1] * len(input_ids)
+        decode_bytes = getattr(getattr(encoding, "_inner", None), "decode_bytes", None)
+        for (start, end), component in zip(complete_ranges, expected):
+            owners[start:end] = [component.owner] * (end - start)
+            if len(component.sources) < 2:
+                continue
+            if decode_bytes is None:
+                raise RuntimeError(
+                    "Harmony byte decoding is required to split merged system messages."
+                )
+
+            token_bytes = [bytes(decode_bytes([token_id])) for token_id in input_ids[start:end]]
+            offsets = [0]
+            for value in token_bytes:
+                offsets.append(offsets[-1] + len(value))
+            rendered = b"".join(token_bytes)
+            byte_owners = [component.owner] * len(rendered)
+            cursor = 0
+            previous_owner = component.owner
+            for source_owner, source in component.sources:
+                needle = source.encode("utf-8")
+                source_start = rendered.find(needle, cursor)
+                if source_start < 0:
+                    raise RuntimeError(
+                        "Harmony changed system/developer message text; "
+                        "cannot construct exact ownership."
+                    )
+                source_end = source_start + len(needle)
+                byte_owners[cursor:source_start] = [previous_owner] * (
+                    source_start - cursor
+                )
+                byte_owners[source_start:source_end] = [source_owner] * len(needle)
+                cursor = source_end
+                previous_owner = source_owner
+            byte_owners[cursor:] = [previous_owner] * (len(rendered) - cursor)
+
+            previous_token_owner = component.owner
+            for local_id, (byte_start, byte_end) in enumerate(
+                zip(offsets[:-1], offsets[1:])
+            ):
+                if byte_start == byte_end:
+                    token_owner = previous_token_owner
+                else:
+                    token_owner = byte_owners[byte_start]
+                owners[start + local_id] = token_owner
+                previous_token_owner = token_owner
+
+        owners[generation_start:] = [len(messages)] * (len(input_ids) - generation_start)
+        return input_ids, owners, generation_start
 
     def _apply_chat_template(
         self,
@@ -355,6 +521,52 @@ class TokenizeManager:
         if not isinstance(result, str):
             raise RuntimeError("Chat template did not return text with tokenize=False.")
         return result
+
+    def _build_template_provenance(
+        self,
+        messages: List[dict[str, Any]],
+        *,
+        enable_thinking: bool | None,
+        tools: List[Dict[str, Any]] | None,
+        expected_input_ids: List[int] | None,
+    ) -> TemplateTokenProvenance:
+        def render(add_generation_prompt: bool) -> str:
+            return self._render_chat_template(
+                messages,
+                add_generation_prompt=add_generation_prompt,
+                enable_thinking=effective_enable_thinking,
+                tools=effective_tools,
+            )
+
+        effective_tools = tools
+        effective_enable_thinking = enable_thinking
+        canonical_no_gen = render(False)
+        canonical_with_gen = render(True)
+        supported_tools = tools if self._supports_tools else None
+        supported_thinking = (
+            enable_thinking if self._supports_enable_thinking else None
+        )
+        if (
+            supported_tools is not effective_tools
+            or supported_thinking != effective_enable_thinking
+        ):
+            effective_tools = supported_tools
+            effective_enable_thinking = supported_thinking
+            canonical_no_gen = render(False)
+            canonical_with_gen = render(True)
+
+        return build_template_token_provenance(
+            self.tokenizer,
+            messages,
+            canonical_text=canonical_with_gen,
+            canonical_no_generation_text=canonical_no_gen,
+            expected_input_ids=expected_input_ids,
+            tools=effective_tools,
+            add_generation_prompt=True,
+            enable_thinking=effective_enable_thinking,
+            chat_template=self._chat_template_override,
+            template_kwargs=self._chat_template_kwargs,
+        )
 
     @staticmethod
     def _json_dumps(value: Any) -> str:
@@ -1156,6 +1368,20 @@ class TokenizeManager:
             ]
         )
 
+    @staticmethod
+    def _query_epochs_from_owners(owners: List[int], message_count: int) -> List[int]:
+        epochs: List[int] = []
+        previous = 0
+        for owner in owners:
+            epoch = 0 if owner < 0 else min(owner, message_count)
+            if epoch < previous:
+                raise RuntimeError(
+                    "Chat template reordered messages; cannot construct monotonic Drop events."
+                )
+            epochs.append(epoch)
+            previous = epoch
+        return epochs
+
     def _chat_tokenize(self, msg: TokenizeMsg) -> TokenizedResult:
         assert isinstance(msg.text, list)
         self._reasoning_effort = msg.reasoning_effort
@@ -1206,100 +1432,135 @@ class TokenizeManager:
             )
         safe_mode = False
         effective_tools = selected_tools
-        try:
-            full_no_gen, no_gen_owner, no_gen_query_epoch, unstable_rounds = (
-                self._round_by_round_no_gen(messages, msg.enable_thinking, selected_tools)
+        provenance: TemplateTokenProvenance | None = None
+        cross_owner_tokens = 0
+        if isinstance(drop_rule, MessageDropRule):
+            if self.is_gpt_oss:
+                full_with_gen, owner_with_gen, gen_prompt_start = (
+                    self._render_harmony_message_drop(
+                        messages,
+                        enable_thinking=msg.enable_thinking,
+                        tools=selected_tools,
+                    )
+                )
+            else:
+                try:
+                    provenance = self._build_template_provenance(
+                        messages,
+                        enable_thinking=msg.enable_thinking,
+                        tools=selected_tools,
+                        expected_input_ids=None,
+                    )
+                except Exception:
+                    messages, target_offset = self._build_template_messages(
+                        msg.text,
+                        selected_tools,
+                        tool_choice_mode=tool_choice_mode,
+                        forced_tool_name=forced_tool_name,
+                        safe_mode=True,
+                    )
+                    safe_mode = True
+                    effective_tools = None
+                    provenance = self._build_template_provenance(
+                        messages,
+                        enable_thinking=msg.enable_thinking,
+                        tools=None,
+                        expected_input_ids=None,
+                    )
+                full_with_gen = provenance.input_ids
+                owner_with_gen = provenance.owners
+                cross_owner_tokens = provenance.cross_owner_tokens
+                try:
+                    gen_prompt_start = owner_with_gen.index(len(messages))
+                except ValueError:
+                    gen_prompt_start = len(full_with_gen)
+
+            full_no_gen = full_with_gen[:gen_prompt_start]
+            query_epoch_with_gen = self._query_epochs_from_owners(
+                owner_with_gen, len(messages)
             )
-            if len(messages) == 0:
-                no_gen_owner = []
-                no_gen_query_epoch = []
-            full_with_gen = self._apply_chat_template(
-                messages,
-                add_generation_prompt=True,
-                enable_thinking=msg.enable_thinking,
-                tools=selected_tools,
+            unstable_rounds = 0
+            no_gen_with_gen_lcp = gen_prompt_start
+            no_gen_with_gen_lcsuf = 0
+            unstable_with_gen = False
+        else:
+            try:
+                full_no_gen, no_gen_owner, no_gen_query_epoch, unstable_rounds = (
+                    self._round_by_round_no_gen(
+                        messages, msg.enable_thinking, selected_tools
+                    )
+                )
+                if len(messages) == 0:
+                    no_gen_owner = []
+                    no_gen_query_epoch = []
+                full_with_gen = self._apply_chat_template(
+                    messages,
+                    add_generation_prompt=True,
+                    enable_thinking=msg.enable_thinking,
+                    tools=selected_tools,
+                )
+            except Exception:
+                if self.is_gpt_oss or isinstance(drop_rule, ThinkingDropRule):
+                    raise
+                messages, target_offset = self._build_template_messages(
+                    msg.text,
+                    selected_tools,
+                    tool_choice_mode=tool_choice_mode,
+                    forced_tool_name=forced_tool_name,
+                    safe_mode=True,
+                )
+                safe_mode = True
+                effective_tools = None
+                full_no_gen, no_gen_owner, no_gen_query_epoch, unstable_rounds = (
+                    self._round_by_round_no_gen(messages, msg.enable_thinking, None)
+                )
+                if len(messages) == 0:
+                    no_gen_owner = []
+                    no_gen_query_epoch = []
+                full_with_gen = self._apply_chat_template(
+                    messages,
+                    add_generation_prompt=True,
+                    enable_thinking=msg.enable_thinking,
+                    tools=None,
+                )
+
+            next_assistant_id = len(messages)
+            owner_with_gen, no_gen_with_gen_lcp, no_gen_with_gen_lcsuf, unstable_with_gen = (
+                self._merge_owner_track(
+                    full_no_gen,
+                    no_gen_owner,
+                    full_with_gen,
+                    new_owner=next_assistant_id,
+                )
+                if len(full_no_gen) > 0
+                else ([next_assistant_id] * len(full_with_gen), 0, 0, False)
             )
-        except Exception:
-            if self.is_gpt_oss or isinstance(drop_rule, ThinkingDropRule):
-                raise
-            messages, target_offset = self._build_template_messages(
-                msg.text,
-                selected_tools,
-                tool_choice_mode=tool_choice_mode,
-                forced_tool_name=forced_tool_name,
-                safe_mode=True,
+            query_epoch_with_gen = (
+                self._merge_query_epoch_track(
+                    no_gen_query_epoch,
+                    len(full_with_gen),
+                    stable_prefix_len=no_gen_with_gen_lcp,
+                    new_epoch=next_assistant_id,
+                )
+                if len(full_no_gen) > 0
+                else [next_assistant_id] * len(full_with_gen)
             )
-            safe_mode = True
-            effective_tools = None
-            full_no_gen, no_gen_owner, no_gen_query_epoch, unstable_rounds = (
-                self._round_by_round_no_gen(messages, msg.enable_thinking, None)
-            )
-            if len(messages) == 0:
-                no_gen_owner = []
-                no_gen_query_epoch = []
-            full_with_gen = self._apply_chat_template(
-                messages,
-                add_generation_prompt=True,
-                enable_thinking=msg.enable_thinking,
-                tools=None,
-            )
+
+            if drop_rule is not None and not self.is_gpt_oss:
+                provenance = self._build_template_provenance(
+                    messages,
+                    enable_thinking=msg.enable_thinking,
+                    tools=effective_tools,
+                    expected_input_ids=full_with_gen,
+                )
+                owner_with_gen = provenance.owners
+                cross_owner_tokens = provenance.cross_owner_tokens
+
         if not self._supports_tools:
             effective_tools = None
-        effective_enable_thinking = msg.enable_thinking if self._supports_enable_thinking else None
         full_no_gen_tensor = torch.tensor(full_no_gen, dtype=torch.int32, device="cpu")
         full_with_gen_tensor = torch.tensor(full_with_gen, dtype=torch.int32, device="cpu")
         next_assistant_id = len(messages)
-        generation_prompt_epoch = next_assistant_id
-        owner_with_gen, no_gen_with_gen_lcp, no_gen_with_gen_lcsuf, unstable_with_gen = (
-            self._merge_owner_track(
-                full_no_gen,
-                no_gen_owner,
-                full_with_gen,
-                new_owner=next_assistant_id,
-            )
-            if len(full_no_gen) > 0
-            else ([next_assistant_id] * len(full_with_gen), 0, 0, False)
-        )
-        query_epoch_with_gen = (
-            self._merge_query_epoch_track(
-                no_gen_query_epoch,
-                len(full_with_gen),
-                stable_prefix_len=no_gen_with_gen_lcp,
-                new_epoch=generation_prompt_epoch,
-            )
-            if len(full_no_gen) > 0
-            else [generation_prompt_epoch] * len(full_with_gen)
-        )
-
-        provenance: TemplateTokenProvenance | None = None
-        cross_owner_tokens = 0
-        if drop_rule is not None and not self.is_gpt_oss:
-            canonical_no_gen = self._render_chat_template(
-                messages,
-                add_generation_prompt=False,
-                enable_thinking=effective_enable_thinking,
-                tools=effective_tools,
-            )
-            canonical_with_gen = self._render_chat_template(
-                messages,
-                add_generation_prompt=True,
-                enable_thinking=effective_enable_thinking,
-                tools=effective_tools,
-            )
-            provenance = build_template_token_provenance(
-                self.tokenizer,
-                messages,
-                canonical_text=canonical_with_gen,
-                canonical_no_generation_text=canonical_no_gen,
-                expected_input_ids=full_with_gen,
-                tools=effective_tools,
-                add_generation_prompt=True,
-                enable_thinking=effective_enable_thinking,
-                chat_template=self._chat_template_override,
-                template_kwargs=self._chat_template_kwargs,
-            )
-            owner_with_gen = provenance.owners
-            cross_owner_tokens = provenance.cross_owner_tokens
 
         owner_ranges = self._build_owner_position_ranges(owner_with_gen)
         event_ranges = (

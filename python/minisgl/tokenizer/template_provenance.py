@@ -209,7 +209,7 @@ def build_template_token_provenance(
     *,
     canonical_text: str,
     canonical_no_generation_text: str,
-    expected_input_ids: list[int],
+    expected_input_ids: list[int] | None,
     tools: list[dict[str, Any]] | None,
     add_generation_prompt: bool,
     enable_thinking: bool | None,
@@ -246,7 +246,9 @@ def build_template_token_provenance(
         return_offsets_mapping=True,
     )
     input_ids = [int(token_id) for token_id in encoded["input_ids"]]
-    if input_ids != [int(token_id) for token_id in expected_input_ids]:
+    if expected_input_ids is not None and input_ids != [
+        int(token_id) for token_id in expected_input_ids
+    ]:
         raise RuntimeError(
             "Canonical chat text tokenization differs from apply_chat_template(tokenize=True)."
         )
