@@ -2,12 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
 import time
-import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from functools import lru_cache
 from typing import Any, Callable, Dict, List, Literal, Tuple
 
 import uvicorn
@@ -39,6 +36,7 @@ from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 
 from .args import ServerArgs
+from .response_parser import ChatResponseParser, infer_tool_call_parser
 
 logger = init_logger(__name__, "FrontendAPI")
 
@@ -282,330 +280,47 @@ def _normalize_tool_choice(
     return normalized
 
 
-def _dedup_keep_order(values: List[str]) -> List[str]:
-    seen: set[str] = set()
-    out: List[str] = []
-    for value in values:
-        if len(value) == 0 or value in seen:
-            continue
-        seen.add(value)
-        out.append(value)
-    return out
+def _validate_tools(tools: List[Dict[str, Any]] | None) -> None:
+    for index, tool in enumerate(tools or []):
+        if not isinstance(tool, dict) or tool.get("type", "function") != "function":
+            raise HTTPException(
+                status_code=400,
+                detail=f"tools[{index}] must be an OpenAI function tool.",
+            )
+        function = tool.get("function")
+        if not isinstance(function, dict):
+            raise HTTPException(
+                status_code=400,
+                detail=f"tools[{index}].function must be an object.",
+            )
+        name = function.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise HTTPException(
+                status_code=400,
+                detail=f"tools[{index}].function.name must be a non-empty string.",
+            )
+        parameters = function.get("parameters")
+        if parameters is not None and not isinstance(parameters, dict):
+            raise HTTPException(
+                status_code=400,
+                detail=f"tools[{index}].function.parameters must be a JSON Schema object.",
+            )
 
 
-def _infer_tool_stop_strings(model_path: str) -> List[str]:
-    model = model_path.lower()
-    # Borrowed from sglang function-call detector conventions.
-    inferred: List[str] = ["</tool_call>"]
-    if "qwen" in model:
-        inferred.extend(["\n</tool_call>", "<|im_end|>"])
-    if "glm" in model:
-        inferred.append("</tool_call>")
-    if "deepseek" in model:
-        inferred.extend(["<｜tool▁calls▁end｜>", "<｜tool_calls_end｜>"])
-    if "kimi" in model or "k2" in model:
-        inferred.append("<|tool_calls_section_end|>")
-    if "step" in model:
-        inferred.append("<｜tool_calls_end｜>")
-    return _dedup_keep_order(inferred)
+def _normalize_stop(stop: str | List[str] | None) -> List[str]:
+    if stop is None:
+        return []
+    return [stop] if isinstance(stop, str) else list(stop)
 
 
-def _build_effective_stop(
-    user_stop: List[str] | None,
+def _tools_for_choice(
     tools: List[Dict[str, Any]] | None,
     tool_choice: str | Dict[str, Any] | None,
-    model_path: str,
-) -> List[str]:
-    merged = list(user_stop or [])
-    if tools and _tool_choice_mode(tool_choice) != "none":
-        merged.extend(_infer_tool_stop_strings(model_path))
-    return _dedup_keep_order(merged)
-
-
-_TOOL_BLOCK_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
-_KIMI_TOOL_CALL_RE = re.compile(
-    r"<\|tool_call_begin\|>\s*(?P<tool_call_id>[\w\.]+:\d+)\s*"
-    r"<\|tool_call_argument_begin\|>\s*(?P<function_arguments>\{.*?\})\s*"
-    r"<\|tool_call_end\|>",
-    re.DOTALL,
-)
-_JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(\{.*?\}|\[.*?\])\s*```", re.DOTALL)
-
-
-def _format_tool_arguments(arguments: Any) -> str:
-    if arguments is None:
-        return "{}"
-    if isinstance(arguments, str):
-        return arguments
-    return json.dumps(arguments, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
-
-
-def _build_tool_call(
-    name: str, arguments: Any, idx: int, call_id: str | None = None
-) -> Dict[str, Any]:
-    return {
-        "id": call_id or f"call_{uuid.uuid4().hex[:24]}",
-        "type": "function",
-        "index": idx,
-        "function": {
-            "name": name,
-            "arguments": _format_tool_arguments(arguments),
-        },
-    }
-
-
-def _coerce_tool_call_item(item: Any, idx: int) -> Dict[str, Any] | None:
-    if not isinstance(item, dict):
-        return None
-    call_id = item.get("id")
-    if isinstance(item.get("function"), dict):
-        function = item["function"]
-        name = function.get("name")
-        arguments = function.get("arguments")
-    else:
-        name = item.get("name")
-        arguments = item.get("arguments")
-    if not isinstance(name, str) or len(name) == 0:
-        return None
-    return _build_tool_call(name=name, arguments=arguments, idx=idx, call_id=call_id)
-
-
-def _extract_json_objects(blob: str) -> List[Dict[str, Any]]:
-    parsed: List[Dict[str, Any]] = []
-    depth = 0
-    start = -1
-    in_string = False
-    escaped = False
-    for i, ch in enumerate(blob):
-        if in_string:
-            if escaped:
-                escaped = False
-            elif ch == "\\":
-                escaped = True
-            elif ch == '"':
-                in_string = False
-            continue
-
-        if ch == '"':
-            in_string = True
-            continue
-        if ch == "{":
-            if depth == 0:
-                start = i
-            depth += 1
-            continue
-        if ch == "}":
-            if depth == 0:
-                continue
-            depth -= 1
-            if depth == 0 and start >= 0:
-                candidate = blob[start : i + 1]
-                try:
-                    obj = json.loads(candidate)
-                except Exception:
-                    continue
-                if isinstance(obj, dict):
-                    parsed.append(obj)
-    return parsed
-
-
-def _parse_tool_calls_from_text(
-    text: str,
-    forced_tool_name: str | None = None,
-) -> tuple[str, List[Dict[str, Any]] | None]:
-    working_text = text
-    tool_calls: List[Dict[str, Any]] = []
-
-    def _append_candidates(payload: Any) -> None:
-        if isinstance(payload, dict) and isinstance(payload.get("tool_calls"), list):
-            for item in payload["tool_calls"]:
-                call = _coerce_tool_call_item(item, len(tool_calls))
-                if call is not None:
-                    tool_calls.append(call)
-            return
-        if isinstance(payload, dict):
-            call = _coerce_tool_call_item(payload, len(tool_calls))
-            if call is not None:
-                tool_calls.append(call)
-            return
-        if isinstance(payload, list):
-            for item in payload:
-                call = _coerce_tool_call_item(item, len(tool_calls))
-                if call is not None:
-                    tool_calls.append(call)
-
-    # Qwen / GLM style: <tool_call>...</tool_call>
-    blocks = list(_TOOL_BLOCK_RE.finditer(working_text))
-    for block in blocks:
-        payload = block.group(1).strip()
-        candidates: List[Any] = []
-        try:
-            parsed = json.loads(payload)
-            candidates = parsed if isinstance(parsed, list) else [parsed]
-        except Exception:
-            # Fallback for very simple XML-ish GLM style: first line is name, rest are args
-            lines = [line for line in payload.splitlines() if len(line.strip()) > 0]
-            if len(lines) > 0:
-                candidates = [{"name": lines[0].strip(), "arguments": "\n".join(lines[1:]).strip()}]
-
-        _append_candidates(candidates)
-    if len(blocks) > 0:
-        working_text = _TOOL_BLOCK_RE.sub("", working_text).strip()
-
-    # Kimi-K2 style sections.
-    kimi_found = False
-    for match in _KIMI_TOOL_CALL_RE.finditer(text):
-        kimi_found = True
-        raw_id = match.group("tool_call_id")
-        raw_args = match.group("function_arguments")
-        name = raw_id.split(":", 1)[0]
-        if name.startswith("functions."):
-            name = name[len("functions.") :]
-        try:
-            args = json.loads(raw_args)
-        except Exception:
-            args = raw_args
-        _append_candidates(
-            {
-                "id": raw_id,
-                "function": {
-                    "name": name,
-                    "arguments": args,
-                },
-            }
-        )
-    if kimi_found:
-        working_text = (
-            working_text.replace("<|tool_calls_section_begin|>", "")
-            .replace("<|tool_calls_section_end|>", "")
-            .strip()
-        )
-
-    # DeepSeek / STEP style wrappers where JSON objects are embedded in a section.
-    wrappers = [
-        ("<｜tool▁calls▁begin｜>", "<｜tool▁calls▁end｜>"),
-        ("<｜tool_calls_begin｜>", "<｜tool_calls_end｜>"),
-    ]
-    for begin, end in wrappers:
-        if begin not in working_text or end not in working_text:
-            continue
-        section = working_text.split(begin, 1)[1].split(end, 1)[0]
-        for obj in _extract_json_objects(section):
-            _append_candidates(obj)
-        working_text = working_text.replace(begin + section + end, "").strip()
-
-    # Markdown fenced JSON block fallback.
-    fenced_blocks = list(_JSON_FENCE_RE.finditer(working_text))
-    for match in fenced_blocks:
-        payload = match.group(1).strip()
-        try:
-            parsed = json.loads(payload)
-        except Exception:
-            continue
-        _append_candidates(parsed)
-    if len(fenced_blocks) > 0:
-        working_text = _JSON_FENCE_RE.sub("", working_text).strip()
-
-    # Generic JSON fallback: entire output is a function call object/array.
-    if len(tool_calls) == 0:
-        stripped = working_text.strip()
-        try:
-            parsed = json.loads(stripped)
-        except Exception:
-            parsed = None
-        _append_candidates(parsed)
-        if len(tool_calls) > 0:
-            working_text = ""
-
-    if forced_tool_name is not None and len(tool_calls) > 0:
-        filtered: List[Dict[str, Any]] = []
-        for call in tool_calls:
-            fn = call.get("function")
-            if isinstance(fn, dict) and fn.get("name") == forced_tool_name:
-                filtered.append(call)
-        tool_calls = filtered
-
-    return working_text, (tool_calls if len(tool_calls) > 0 else None)
-
-
-@lru_cache(maxsize=8)
-def _is_gpt_oss_model(model_path: str) -> bool:
-    try:
-        from minisgl.utils import cached_load_hf_config
-
-        config = cached_load_hf_config(model_path)
-        return getattr(config, "model_type", None) == "gpt_oss"
-    except Exception:
-        normalized = model_path.lower().replace("_", "-")
-        return "gpt-oss" in normalized
-
-
-@dataclass(frozen=True)
-class HarmonyOutput:
-    content: str
-    reasoning_content: str
-    tool_calls: List[Dict[str, Any]] | None
-
-
-def _harmony_content_text(message: Any) -> str:
-    parts = []
-    for content in getattr(message, "content", ()):
-        text = getattr(content, "text", None)
-        if isinstance(text, str):
-            parts.append(text)
-    return "".join(parts)
-
-
-def _parse_harmony_output(raw_text: str) -> HarmonyOutput:
-    try:
-        from openai_harmony import (
-            HarmonyEncodingName,
-            Role,
-            StreamableParser,
-            load_harmony_encoding,
-        )
-    except ImportError as exc:
-        raise RuntimeError("GPT-OSS responses require openai-harmony>=0.0.8.") from exc
-
-    encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
-    tokens = encoding.encode(raw_text, allowed_special="all")
-    parser = StreamableParser(encoding, Role.ASSISTANT, strict=False)
-    for token in tokens:
-        parser.process(int(token))
-
-    entries: List[tuple[str | None, str | None, str]] = []
-    for message in parser.messages:
-        entries.append(
-            (message.channel, message.recipient, _harmony_content_text(message))
-        )
-    current = parser.current_content
-    if current:
-        current_entry = (parser.current_channel, parser.current_recipient, current)
-        if not entries or entries[-1] != current_entry:
-            entries.append(current_entry)
-
-    final_parts: List[str] = []
-    reasoning_parts: List[str] = []
-    tool_calls: List[Dict[str, Any]] = []
-    for channel, recipient, content in entries:
-        if recipient:
-            name = recipient.removeprefix("functions.")
-            tool_calls.append(
-                _build_tool_call(
-                    name=name,
-                    arguments=content,
-                    idx=len(tool_calls),
-                )
-            )
-        elif channel == "analysis":
-            reasoning_parts.append(content)
-        elif channel in {"final", "commentary", None}:
-            final_parts.append(content)
-    return HarmonyOutput(
-        content="".join(final_parts),
-        reasoning_content="".join(reasoning_parts),
-        tool_calls=tool_calls or None,
-    )
+) -> List[Dict[str, Any]] | None:
+    forced_name = _tool_choice_forced_name(tool_choice)
+    if not tools or forced_name is None:
+        return tools
+    return [tool for tool in tools if _extract_tool_function_name(tool) == forced_name]
 
 
 class GenerateRequest(BaseModel):
@@ -616,7 +331,7 @@ class GenerateRequest(BaseModel):
 
 class Message(BaseModel):
     role: Literal["system", "user", "assistant", "tool", "function"]
-    content: str | None = None
+    content: str | List[Dict[str, Any]] | None = None
     reasoning_content: str | None = None
     name: str | None = None
     tool_call_id: str | None = None
@@ -631,14 +346,15 @@ class OpenAICompletionRequest(BaseModel):
     prompt: str | None = None
     messages: List[Message] | None = None
 
-    max_tokens: int = 16
+    max_tokens: int = Field(default=16, ge=1)
+    max_completion_tokens: int | None = Field(default=None, ge=1)
     temperature: float = 1.0
 
     top_k: int = -1
     top_p: float = 1.0
     n: int = 1
     stream: bool = False
-    stop: List[str] = Field(default_factory=list)
+    stop: str | List[str] | None = None
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
 
@@ -649,6 +365,10 @@ class OpenAICompletionRequest(BaseModel):
     reasoning_effort: Literal["low", "medium", "high"] | None = None
     tools: List[Dict[str, Any]] | None = None
     tool_choice: str | Dict[str, Any] | None = None
+    parallel_tool_calls: bool = True
+    separate_reasoning: bool = True
+    stream_reasoning: bool = True
+    seed: int | None = None
 
 
 class ModelCard(BaseModel):
@@ -847,23 +567,51 @@ class FrontendManager:
         uid: int,
         tools: List[Dict[str, Any]] | None = None,
         tool_choice: str | Dict[str, Any] | None = None,
+        enable_thinking: bool | None = None,
+        separate_reasoning: bool = True,
+        stream_reasoning: bool = True,
     ):
-        first_chunk = True
-        buffered_output = ""
         final_finish_reason = "stop"
         matched_stop: str | None = None
         cache_hit_ratio: float | None = None
-        mode = _tool_choice_mode(tool_choice)
-        forced_tool_name = _tool_choice_forced_name(tool_choice)
-        require_tool_call = mode in {"required", "function"}
-        is_gpt_oss = _is_gpt_oss_model(self.config.model_path)
-        # Harmony channels and recipients can only be interpreted after their
-        # control-token-delimited message is complete. Buffer GPT-OSS output so
-        # those tokens never leak through the OpenAI-compatible response.
-        buffer_mode = is_gpt_oss or (
-            tools is not None and len(tools) > 0 and mode != "none"
+        parser = ChatResponseParser(
+            model_path=self.config.model_path,
+            tools=tools if _tool_choice_mode(tool_choice) != "none" else None,
+            tool_call_parser=self.config.tool_call_parser,
+            reasoning_parser=self.config.reasoning_parser,
+            enable_thinking=enable_thinking,
+            separate_reasoning=separate_reasoning,
+            stream_reasoning=stream_reasoning,
         )
-        tool_call_missing = False
+
+        role_chunk = {
+            "id": f"chatcmpl-{uid}",
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "choices": [
+                {"delta": {"role": "assistant", "content": ""}, "index": 0, "finish_reason": None}
+            ],
+        }
+        yield f"data: {json.dumps(role_chunk)}\n\n".encode()
+
+        def encode_piece(piece) -> bytes | None:
+            delta: Dict[str, Any] = {}
+            if piece.reasoning_content:
+                delta["reasoning_content"] = piece.reasoning_content
+            if piece.content:
+                delta["content"] = piece.content
+            if piece.tool_calls:
+                delta["tool_calls"] = piece.tool_calls
+            if not delta:
+                return None
+            chunk = {
+                "id": f"chatcmpl-{uid}",
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "choices": [{"delta": delta, "index": 0, "finish_reason": None}],
+            }
+            return f"data: {json.dumps(chunk)}\n\n".encode()
+
         try:
             async for ack in self.wait_for_ack(uid):
                 if not isinstance(ack, UserReply):
@@ -874,27 +622,10 @@ class FrontendManager:
                     matched_stop = ack.matched_stop
                 if ack.cache_hit_ratio is not None:
                     cache_hit_ratio = ack.cache_hit_ratio
-
-                if buffer_mode:
-                    if ack.incremental_output:
-                        buffered_output += ack.incremental_output
-                    if ack.finished:
-                        break
-                    continue
-
-                delta = {}
-                if first_chunk:
-                    delta["role"] = "assistant"
-                    first_chunk = False
                 if ack.incremental_output:
-                    delta["content"] = ack.incremental_output
-
-                chunk = {
-                    "id": f"cmpl-{uid}",
-                    "object": "text_completion.chunk",
-                    "choices": [{"delta": delta, "index": 0, "finish_reason": None}],
-                }
-                yield f"data: {json.dumps(chunk)}\n\n".encode()
+                    encoded = encode_piece(parser.feed(ack.incremental_output))
+                    if encoded is not None:
+                        yield encoded
 
                 if ack.finished:
                     break
@@ -903,51 +634,24 @@ class FrontendManager:
             yield b"data: [DONE]\n\n"
             return
 
-        if buffer_mode:
-            reasoning_content = ""
-            if is_gpt_oss:
-                harmony = _parse_harmony_output(buffered_output)
-                clean_text = harmony.content
-                reasoning_content = harmony.reasoning_content
-                tool_calls = harmony.tool_calls
-            else:
-                clean_text, tool_calls = _parse_tool_calls_from_text(
-                    buffered_output, forced_tool_name=forced_tool_name
-                )
-            if tool_calls is not None and final_finish_reason == "stop":
-                final_finish_reason = "tool_calls"
-            if require_tool_call and tool_calls is None:
-                final_finish_reason = "tool_call_missing"
-                tool_call_missing = True
-
-            delta: Dict[str, Any] = {"role": "assistant"}
-            if reasoning_content:
-                delta["reasoning_content"] = reasoning_content
-            if tool_calls is not None:
-                delta["tool_calls"] = tool_calls
-            if len(clean_text) > 0:
-                delta["content"] = clean_text
-            if tool_call_missing:
-                delta["tool_call_missing"] = True
-
-            chunk = {
-                "id": f"cmpl-{uid}",
-                "object": "text_completion.chunk",
-                "choices": [{"delta": delta, "index": 0, "finish_reason": None}],
-            }
-            yield f"data: {json.dumps(chunk)}\n\n".encode()
+        tail = parser.finish()
+        encoded = encode_piece(tail)
+        if encoded is not None:
+            yield encoded
+        if parser.has_tool_calls and final_finish_reason == "stop":
+            final_finish_reason = "tool_calls"
 
         # send final finish_reason
         end_chunk = {
-            "id": f"cmpl-{uid}",
-            "object": "text_completion.chunk",
+            "id": f"chatcmpl-{uid}",
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
             "choices": [
                 {
                     "delta": {},
                     "index": 0,
                     "finish_reason": final_finish_reason,
                     "matched_stop": matched_stop,
-                    "tool_call_missing": tool_call_missing,
                 }
             ],
         }
@@ -1030,9 +734,25 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
     state = get_global_state()
     wire_drop_rule: dict[str, Any] | None = None
     normalized_tool_choice: str | Dict[str, Any] = "none"
+    _validate_tools(req.tools)
     if req.messages:
         prompt = [msg.model_dump() for msg in req.messages]
         normalized_tool_choice = _normalize_tool_choice(req.tools, req.tool_choice)
+        if (
+            req.tools
+            and _tool_choice_mode(normalized_tool_choice) != "none"
+            and infer_tool_call_parser(
+                state.config.model_path, state.config.tool_call_parser
+            )
+            is None
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "No tool-call parser can be inferred for this model; set "
+                    "--tool-call-parser explicitly."
+                ),
+            )
     else:
         assert req.prompt is not None, "Either 'messages' or 'prompt' must be provided"
         prompt = req.prompt
@@ -1058,11 +778,11 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
             radix_drop_key_mode=state.config.radix_drop_key_mode,
         )
 
-    effective_stop = _build_effective_stop(
-        req.stop,
-        req.tools,
-        normalized_tool_choice,
-        state.config.model_path,
+    effective_stop = _normalize_stop(req.stop)
+    max_tokens = (
+        req.max_completion_tokens
+        if req.max_completion_tokens is not None
+        else req.max_tokens
     )
 
     if wire_drop_rule is not None and isinstance(prompt, list):
@@ -1086,10 +806,11 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
             text=prompt,
             sampling_params=SamplingParams(
                 ignore_eos=req.ignore_eos,
-                max_tokens=req.max_tokens,
+                max_tokens=max_tokens,
                 temperature=req.temperature,
                 top_k=req.top_k,
                 top_p=req.top_p,
+                seed=req.seed,
             ),
             target_msg_id=(len(prompt) if isinstance(prompt, list) else None),
             drop_rule=wire_drop_rule,
@@ -1106,8 +827,11 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
             state.stream_with_cancellation(
                 state.stream_chat_completions(
                     uid,
-                    tools=req.tools,
+                    tools=_tools_for_choice(req.tools, normalized_tool_choice),
                     tool_choice=normalized_tool_choice,
+                    enable_thinking=req.enable_thinking,
+                    separate_reasoning=req.separate_reasoning,
+                    stream_reasoning=req.stream_reasoning,
                 ),
                 request,
                 uid,
@@ -1119,6 +843,8 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
     full_content = ""
     finish_reason = "stop"
     cache_hit_ratio: float | None = None
+    prompt_tokens = 0
+    completion_tokens = 0
     try:
         async for ack in state.wait_for_ack(uid):
             if not isinstance(ack, UserReply):
@@ -1128,21 +854,35 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
                 finish_reason = ack.finish_reason
             if ack.cache_hit_ratio is not None:
                 cache_hit_ratio = ack.cache_hit_ratio
+            if ack.prompt_tokens is not None:
+                prompt_tokens = ack.prompt_tokens
+            if ack.completion_tokens is not None:
+                completion_tokens = ack.completion_tokens
             if ack.finished:
                 break
     except RequestRejected as exc:
         raise _http_error(exc) from exc
 
-    response_message: Dict[str, Any] = {"role": "assistant", "content": full_content}
-    if _is_gpt_oss_model(state.config.model_path):
-        harmony = _parse_harmony_output(full_content)
-        response_message["content"] = harmony.content
-        if harmony.reasoning_content:
-            response_message["reasoning_content"] = harmony.reasoning_content
-        if harmony.tool_calls is not None:
-            response_message["tool_calls"] = harmony.tool_calls
-            if finish_reason == "stop":
-                finish_reason = "tool_calls"
+    parser = ChatResponseParser(
+        model_path=state.config.model_path,
+        tools=(
+            _tools_for_choice(req.tools, normalized_tool_choice)
+            if _tool_choice_mode(normalized_tool_choice) != "none"
+            else None
+        ),
+        tool_call_parser=state.config.tool_call_parser,
+        reasoning_parser=state.config.reasoning_parser,
+        enable_thinking=req.enable_thinking,
+        separate_reasoning=req.separate_reasoning,
+    )
+    parsed = parser.parse_full(full_content)
+    response_message: Dict[str, Any] = {"role": "assistant", "content": parsed.content}
+    if parsed.reasoning_content:
+        response_message["reasoning_content"] = parsed.reasoning_content
+    if parsed.tool_calls is not None:
+        response_message["tool_calls"] = parsed.tool_calls
+        if finish_reason == "stop":
+            finish_reason = "tool_calls"
 
     response = {
         "id": f"chatcmpl-{uid}",
@@ -1157,9 +897,9 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
             }
         ],
         "usage": {
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "total_tokens": 0,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
         },
     }
     if cache_hit_ratio is not None:
@@ -1184,12 +924,7 @@ async def shell_completion(req: OpenAICompletionRequest):
         radix_drop_key_mode=state.config.radix_drop_key_mode,
     )
     normalized_tool_choice = _normalize_tool_choice(req.tools, req.tool_choice)
-    effective_stop = _build_effective_stop(
-        req.stop,
-        req.tools,
-        normalized_tool_choice,
-        state.config.model_path,
-    )
+    effective_stop = _normalize_stop(req.stop)
 
     # TODO: support more sampling parameters
     uid = state.new_user()
@@ -1199,10 +934,15 @@ async def shell_completion(req: OpenAICompletionRequest):
             text=prompt,
             sampling_params=SamplingParams(
                 ignore_eos=req.ignore_eos,
-                max_tokens=req.max_tokens,
+                max_tokens=(
+                    req.max_completion_tokens
+                    if req.max_completion_tokens is not None
+                    else req.max_tokens
+                ),
                 temperature=req.temperature,
                 top_k=req.top_k,
                 top_p=req.top_p,
+                seed=req.seed,
             ),
             target_msg_id=len(prompt),
             drop_rule=wire_drop_rule,

@@ -36,6 +36,7 @@ class UserMsg(BaseBackendMsg):
     true_positions: torch.Tensor  # CPU 1D int32 tensor (absolute positions)
     radix_input_ids: torch.Tensor  # CPU 1D int64 tensor for radix match
     sampling_params: SamplingParams
+    prompt_tokens: int | None = None
     radix_match_ids: torch.Tensor | None = None  # CPU 1D int64 tensor for radix query
     radix_key_virtual_mask: torch.Tensor | None = None  # CPU 1D bool, key-axis virtual markers
     radix_key_to_token: torch.Tensor | None = None  # CPU 1D int64, -1 for virtual markers

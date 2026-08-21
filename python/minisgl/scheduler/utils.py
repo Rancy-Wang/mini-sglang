@@ -19,6 +19,7 @@ class PendingReq:
     radix_input_ids: torch.Tensor
     radix_match_ids: torch.Tensor | None
     sampling_params: SamplingParams
+    prompt_tokens: int = 0
     stop: List[str] | None = None
     stop_token_seqs: List[List[int]] | None = None
     initial_full_match_indices: torch.Tensor | None = None

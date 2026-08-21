@@ -30,6 +30,7 @@ class TokenizedResult:
     radix_input_ids: torch.Tensor
     radix_match_ids: torch.Tensor | None
     prefix_keep_mask: torch.Tensor
+    prompt_tokens: int
     full_input_ids: torch.Tensor | None = None
     full_token_visible_until: torch.Tensor | None = None
     full_keep_mask: torch.Tensor | None = None
@@ -85,11 +86,10 @@ class TokenizeManager:
         self._harmony_thinking_ranges: dict[int, List[tuple[int, int]]] = {}
         self._chat_template_override: str | None = None
         self._chat_template_kwargs: dict[str, Any] = {}
+        self._template_requires_bare_tools = False
         # Be optimistic: many tokenizers accept extra kwargs via **kwargs even
         # when the explicit signature does not list `enable_thinking`.
         self._supports_enable_thinking = True
-        # Many recent chat templates support `tools`; gracefully downgrade when unsupported.
-        self._supports_tools = True
 
     def _call_chat_template(
         self,
@@ -116,11 +116,12 @@ class TokenizeManager:
         }
         if enable_thinking is not None and self._supports_enable_thinking:
             kwargs["enable_thinking"] = enable_thinking
-        if tools is not None and self._supports_tools:
-            kwargs["tools"] = tools
+        if tools is not None:
+            kwargs["tools"] = self._effective_template_tools(tools)
         if self._chat_template_override is not None:
             kwargs["chat_template"] = self._chat_template_override
         kwargs.update(self._chat_template_kwargs)
+        tried_bare_tools = self._template_requires_bare_tools
         while True:
             try:
                 return self.tokenizer.apply_chat_template(messages, **kwargs)
@@ -131,11 +132,21 @@ class TokenizeManager:
                     kwargs.pop("enable_thinking")
                     self._supports_enable_thinking = False
                     continue
-                if "tools" in kwargs and "tools" in str(exc):
-                    kwargs.pop("tools")
-                    self._supports_tools = False
-                    continue
-                raise
+                error = exc
+            except Exception as exc:
+                error = exc
+
+            if tools is None or tried_bare_tools:
+                raise error
+
+            # Match SGLang's compatibility path: use OpenAI wrappers first,
+            # then retry a flat function-only list for templates that reject it.
+            flat_tools = self._flatten_tools(tools)
+            if flat_tools == kwargs.get("tools"):
+                raise error
+            kwargs["tools"] = flat_tools
+            self._template_requires_bare_tools = True
+            tried_bare_tools = True
 
     def _get_harmony_encoding(self):
         if self._harmony_encoding is None:
@@ -549,22 +560,18 @@ class TokenizeManager:
                 tools=effective_tools,
             )
 
-        effective_tools = tools
+        effective_tools = self._effective_template_tools(tools)
         effective_enable_thinking = enable_thinking
         canonical_no_gen = render(False)
         canonical_with_gen = render(True)
-        supported_tools = tools if self._supports_tools else None
         supported_thinking = (
             enable_thinking if self._supports_enable_thinking else None
         )
-        if (
-            supported_tools is not effective_tools
-            or supported_thinking != effective_enable_thinking
-        ):
-            effective_tools = supported_tools
+        if supported_thinking != effective_enable_thinking:
             effective_enable_thinking = supported_thinking
             canonical_no_gen = render(False)
             canonical_with_gen = render(True)
+        effective_tools = self._effective_template_tools(tools)
 
         return build_template_token_provenance(
             self.tokenizer,
@@ -590,6 +597,21 @@ class TokenizeManager:
             return ""
         if isinstance(content, str):
             return content
+        if isinstance(content, list):
+            parts: List[str] = []
+            for part in content:
+                if not isinstance(part, dict):
+                    raise ValueError("Message content parts must be objects.")
+                part_type = part.get("type")
+                if part_type in {"text", "input_text"} and isinstance(part.get("text"), str):
+                    parts.append(part["text"])
+                elif part_type == "thinking" and isinstance(part.get("thinking"), str):
+                    parts.append(part["thinking"])
+                else:
+                    raise ValueError(
+                        "MiniSGL currently supports only text content parts in chat messages."
+                    )
+            return "".join(parts)
         return self._json_dumps(content)
 
     def _normalize_tool_calls_for_template(self, tool_calls: Any) -> List[Dict[str, Any]]:
@@ -612,30 +634,6 @@ class TokenizeManager:
                 call["function"] = fn
             normalized.append(call)
         return normalized
-
-    def _serialize_tools_for_system(
-        self,
-        tools: List[Dict[str, Any]],
-        *,
-        mode: str,
-        forced_tool_name: str | None,
-    ) -> str:
-        chunks: List[str] = []
-        if mode in {"required", "function"}:
-            if mode == "function" and forced_tool_name is not None:
-                chunks.append(
-                    "Tool policy: you must call exactly this function first: "
-                    f"{forced_tool_name}."
-                )
-            else:
-                chunks.append("Tool policy: you must call at least one tool before final answer.")
-            chunks.append(
-                "When calling a tool, output strictly in this format only:\n"
-                '<tool_call>{"name":"<tool_name>","arguments":{...}}</tool_call>'
-            )
-            chunks.append("Do not provide final answer before tool responses are received.")
-        chunks.append("Available tools:\n" + self._json_dumps(tools))
-        return "\n\n".join(chunks)
 
     @staticmethod
     def _extract_tool_name(tool: Any) -> str | None:
@@ -683,13 +681,31 @@ class TokenizeManager:
         # Keep all tools as fallback if we cannot find an exact match.
         return selected if len(selected) > 0 else tools
 
+    @staticmethod
+    def _flatten_tools(
+        tools: List[Dict[str, Any]] | None,
+    ) -> List[Dict[str, Any]] | None:
+        if not tools:
+            return None
+        return [
+            dict(tool["function"])
+            if isinstance(tool, dict) and isinstance(tool.get("function"), dict)
+            else dict(tool)
+            for tool in tools
+        ]
+
+    def _effective_template_tools(
+        self,
+        tools: List[Dict[str, Any]] | None,
+    ) -> List[Dict[str, Any]] | None:
+        if self._template_requires_bare_tools:
+            return self._flatten_tools(tools)
+        return tools
+
     def _build_template_messages(
         self,
         raw_messages: List[Dict[str, Any]],
-        tools: List[Dict[str, Any]] | None,
         *,
-        tool_choice_mode: str,
-        forced_tool_name: str | None,
         safe_mode: bool,
     ) -> tuple[List[dict[str, Any]], int]:
         messages: List[dict[str, Any]] = []
@@ -734,21 +750,10 @@ class TokenizeManager:
 
             messages.append(message)
 
-        target_offset = 0
-        if tools:
-            tool_text = self._serialize_tools_for_system(
-                tools,
-                mode=tool_choice_mode,
-                forced_tool_name=forced_tool_name,
-            )
-            if messages and str(messages[0].get("role", "")).lower() == "system":
-                base = self._normalize_message_content(messages[0].get("content"))
-                messages[0]["content"] = (base + "\n\n" + tool_text) if base else tool_text
-            else:
-                messages.insert(0, {"role": "system", "content": tool_text})
-                target_offset = 1
-
-        return messages, target_offset
+        # Tool definitions are rendered exactly once by the model's chat
+        # template.  They must never be duplicated into a synthetic system
+        # message because that changes both model semantics and Drop ownership.
+        return messages, 0
 
     def _normalize_drop_message(
         self, drop_message: dict[int, List[int]] | None
@@ -1417,6 +1422,7 @@ class TokenizeManager:
             mode=tool_choice_mode,
             forced_tool_name=forced_tool_name,
         )
+        template_tools = selected_tools
         thinking_template_capability: str | None = None
         if isinstance(drop_rule, ThinkingDropRule):
             if self.is_gpt_oss:
@@ -1424,7 +1430,7 @@ class TokenizeManager:
                 thinking_template_capability = "harmony_auto_drop_disabled"
             else:
                 thinking_plan = prepare_thinking_template(
-                    self.tokenizer, tools=selected_tools
+                    self.tokenizer, tools=template_tools
                 )
                 self._chat_template_override = thinking_plan.chat_template
                 self._chat_template_kwargs = thinking_plan.template_kwargs
@@ -1436,13 +1442,10 @@ class TokenizeManager:
         else:
             messages, target_offset = self._build_template_messages(
                 msg.text,
-                selected_tools,
-                tool_choice_mode=tool_choice_mode,
-                forced_tool_name=forced_tool_name,
                 safe_mode=False,
             )
         safe_mode = False
-        effective_tools = selected_tools
+        effective_tools = template_tools
         provenance: TemplateTokenProvenance | None = None
         cross_owner_tokens = 0
         if isinstance(drop_rule, MessageDropRule):
@@ -1459,15 +1462,12 @@ class TokenizeManager:
                     provenance = self._build_template_provenance(
                         messages,
                         enable_thinking=msg.enable_thinking,
-                        tools=selected_tools,
+                        tools=template_tools,
                         expected_input_ids=None,
                     )
                 except Exception:
                     messages, target_offset = self._build_template_messages(
                         msg.text,
-                        selected_tools,
-                        tool_choice_mode=tool_choice_mode,
-                        forced_tool_name=forced_tool_name,
                         safe_mode=True,
                     )
                     safe_mode = True
@@ -1498,7 +1498,7 @@ class TokenizeManager:
             try:
                 full_no_gen, no_gen_owner, no_gen_query_epoch, unstable_rounds = (
                     self._round_by_round_no_gen(
-                        messages, msg.enable_thinking, selected_tools
+                        messages, msg.enable_thinking, template_tools
                     )
                 )
                 if len(messages) == 0:
@@ -1508,16 +1508,13 @@ class TokenizeManager:
                     messages,
                     add_generation_prompt=True,
                     enable_thinking=msg.enable_thinking,
-                    tools=selected_tools,
+                    tools=template_tools,
                 )
             except Exception:
                 if self.is_gpt_oss or isinstance(drop_rule, ThinkingDropRule):
                     raise
                 messages, target_offset = self._build_template_messages(
                     msg.text,
-                    selected_tools,
-                    tool_choice_mode=tool_choice_mode,
-                    forced_tool_name=forced_tool_name,
                     safe_mode=True,
                 )
                 safe_mode = True
@@ -1567,8 +1564,6 @@ class TokenizeManager:
                 owner_with_gen = provenance.owners
                 cross_owner_tokens = provenance.cross_owner_tokens
 
-        if not self._supports_tools:
-            effective_tools = None
         full_no_gen_tensor = torch.tensor(full_no_gen, dtype=torch.int32, device="cpu")
         full_with_gen_tensor = torch.tensor(full_with_gen, dtype=torch.int32, device="cpu")
         next_assistant_id = len(messages)
@@ -1690,6 +1685,7 @@ class TokenizeManager:
             radix_input_ids=radix_input_ids,
             radix_match_ids=radix_match_ids,
             prefix_keep_mask=prefix_keep_mask,
+            prompt_tokens=len(full_with_gen_tensor),
             full_input_ids=(full_with_gen_tensor if event_ranges else None),
             full_token_visible_until=(
                 position_drop_plan.full_token_visible_until
@@ -1753,6 +1749,7 @@ class TokenizeManager:
                         prefix_keep_mask=torch.ones(
                             max(len(input_ids) - 1, 0), dtype=torch.int32, device="cpu"
                         ),
+                        prompt_tokens=len(input_ids),
                         stop_token_seqs=self._build_stop_token_seqs(msg.stop),
                         message_meta=None,
                     )

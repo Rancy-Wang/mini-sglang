@@ -56,6 +56,7 @@ class SamplingParams:
     top_p: float = 1.0
     ignore_eos: bool = False
     max_tokens: int = 1024
+    seed: int | None = None
 
     @property
     def is_greedy(self) -> bool:
@@ -79,6 +80,7 @@ class Req:
     uid: int
     sampling_params: SamplingParams
     cache_handle: BaseCacheHandle
+    prompt_tokens: int = 0
     stop: List[str] | None = None
     stop_token_seqs: List[List[int]] | None = None
     prefix_keep_mask: torch.Tensor | None = None  # cpu tensor for full->active prefix filtering
@@ -247,6 +249,11 @@ class Req:
     @property
     def can_decode(self) -> bool:
         return self.remain_len > 0
+
+    @property
+    def completion_tokens(self) -> int:
+        active_prompt_tokens = self.max_device_len - self.output_len
+        return self.device_len - active_prompt_tokens
 
     def match_stop(self) -> tuple[bool, str | None]:
         if not self.stop_token_seqs:

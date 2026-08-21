@@ -253,6 +253,8 @@ class Scheduler(SchedulerIOMixin):
                             finish_reason=finish_reason if finished else None,
                             matched_stop=matched_stop,
                             cache_hit_ratio=req.cache_hit_ratio if finished else None,
+                            prompt_tokens=req.prompt_tokens if finished else None,
+                            completion_tokens=req.completion_tokens if finished else None,
                         )
                     )
 

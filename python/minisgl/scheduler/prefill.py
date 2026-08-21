@@ -24,16 +24,20 @@ def _calculate_cache_ratios(
     cached_len: int,
     full_matchable_prefix_len: int,
     active_matchable_prefix_len: int,
+    total_prompt_len: int,
 ) -> tuple[float, float]:
-    if not 0 <= cached_len <= active_matchable_prefix_len <= full_matchable_prefix_len:
+    if not (
+        0 <= cached_len <= active_matchable_prefix_len <= full_matchable_prefix_len <= total_prompt_len
+    ):
         raise ValueError(
             "Cache ratio lengths must satisfy "
-            "0 <= cached <= active_matchable <= full_matchable, got "
-            f"{cached_len}, {active_matchable_prefix_len}, {full_matchable_prefix_len}."
+            "0 <= cached <= active_matchable <= full_matchable <= total_prompt, got "
+            f"{cached_len}, {active_matchable_prefix_len}, {full_matchable_prefix_len}, "
+            f"{total_prompt_len}."
         )
-    cache_hit_ratio = (
-        1.0 if full_matchable_prefix_len == 0 else cached_len / full_matchable_prefix_len
-    )
+    # Public metric: reusable, non-Dropped token hits divided by every prompt
+    # token. The active-only denominator remains an internal warmup metric.
+    cache_hit_ratio = 1.0 if total_prompt_len == 0 else cached_len / total_prompt_len
     cache_reuse_ratio = (
         1.0 if active_matchable_prefix_len == 0 else cached_len / active_matchable_prefix_len
     )
@@ -91,6 +95,7 @@ class PrefillAdder:
             cached_len,
             full_prefix_len,
             active_prefix_len,
+            req.prompt_tokens,
         )
         # TODO: better estimate policy
         extend_len = req.input_len - cached_len
@@ -163,6 +168,7 @@ class PrefillAdder:
             uid=pending_req.uid,
             cache_handle=cache_handle,
             sampling_params=pending_req.sampling_params,
+            prompt_tokens=pending_req.prompt_tokens,
             stop=pending_req.stop,
             stop_token_seqs=pending_req.stop_token_seqs,
             prefix_keep_mask=pending_req.prefix_keep_mask,
@@ -252,6 +258,7 @@ class PrefillManager:
                 radix_input_ids=radix_input_ids,
                 radix_match_ids=req.radix_match_ids,
                 sampling_params=req.sampling_params,
+                prompt_tokens=req.prompt_tokens or len(input_ids),
                 stop=req.stop,
                 stop_token_seqs=req.stop_token_seqs,
                 is_warmup=req.is_warmup,

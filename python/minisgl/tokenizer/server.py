@@ -119,6 +119,8 @@ def tokenize_worker(
                             finish_reason=msg.finish_reason,
                             matched_stop=msg.matched_stop,
                             cache_hit_ratio=msg.cache_hit_ratio,
+                            prompt_tokens=msg.prompt_tokens,
+                            completion_tokens=msg.completion_tokens,
                         )
                         for msg, reply in zip(detokenize_msg, replies, strict=True)
                     ]
@@ -175,6 +177,7 @@ def tokenize_worker(
                                 radix_input_ids=t.radix_input_ids,
                                 radix_match_ids=t.radix_match_ids,
                                 sampling_params=msg.sampling_params,
+                                prompt_tokens=t.prompt_tokens,
                                 drop_event_positions=t.drop_event_positions,
                                 drop_range_offsets=t.drop_range_offsets,
                                 drop_position_ranges=t.drop_position_ranges,

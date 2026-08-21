@@ -18,6 +18,8 @@ class ServerArgs(SchedulerConfig):
     num_tokenizer: int = 0
     silent_output: bool = False
     request_timeout: float = 300.0
+    tool_call_parser: str | None = "auto"
+    reasoning_parser: str | None = "auto"
     distributed_port: int | None = field(default=None, repr=False)
 
     @property
@@ -182,6 +184,25 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         help=(
             "Maximum seconds to wait without a reply for one request. "
             "Set to 0 to disable the timeout."
+        ),
+    )
+
+    parser.add_argument(
+        "--tool-call-parser",
+        choices=["auto", "qwen", "qwen25", "qwen3_coder", "llama3", "gpt-oss"],
+        default=ServerArgs.tool_call_parser,
+        help=(
+            "Parser for model-native tool calls. 'auto' selects the SGLang-compatible "
+            "parser for Qwen3, DeepSeek-R1-Distill, and GPT-OSS models."
+        ),
+    )
+    parser.add_argument(
+        "--reasoning-parser",
+        choices=["auto", "qwen3", "deepseek-r1", "gpt-oss"],
+        default=ServerArgs.reasoning_parser,
+        help=(
+            "Parser for reasoning output. 'auto' selects the SGLang-compatible parser "
+            "for Qwen3, DeepSeek-R1-Distill, and GPT-OSS models."
         ),
     )
 
