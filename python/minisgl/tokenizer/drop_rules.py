@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
-from minisgl.kernel.text_match import find_all
+from minisgl.kernel.text_match import find_all, find_ordered_latest
 
 
 MAX_DROP_MESSAGES = 4096
@@ -22,6 +23,44 @@ def _content(message: Mapping[str, Any]) -> str:
     if not isinstance(content, str):
         raise ValueError("text_drop requires every selected message content to be a string or null")
     return content
+
+
+def _matchable_content(message: Mapping[str, Any], *, field: str) -> str:
+    content = message.get("content")
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for part_id, part in enumerate(content):
+            if not isinstance(part, Mapping):
+                raise ValueError(f"{field}.content[{part_id}] must be an object")
+            part_type = part.get("type")
+            value = part.get("text") if part_type in {"text", "input_text"} else None
+            if part_type == "thinking":
+                value = part.get("thinking")
+            if not isinstance(value, str):
+                raise ValueError(
+                    f"{field}.content supports only text, input_text, and thinking parts"
+                )
+            parts.append(value)
+        return "".join(parts)
+    raise ValueError(f"{field}.content must be a string, text-part list, or null")
+
+
+def _protocol_fingerprint(message: Mapping[str, Any]) -> str:
+    role = _role(message)
+    protocol: dict[str, Any] = {"role": role}
+    if role == "assistant":
+        protocol["reasoning_content"] = message.get("reasoning_content")
+        protocol["tool_calls"] = message.get("tool_calls")
+    elif role == "tool":
+        protocol["name"] = message.get("name")
+        protocol["tool_call_id"] = message.get("tool_call_id")
+    elif message.get("name") is not None:
+        protocol["name"] = message.get("name")
+    return json.dumps(protocol, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
 def _positive_int(value: Any, *, field: str) -> int:
@@ -285,6 +324,174 @@ class TextDropRule:
 
 
 @dataclass(frozen=True)
+class KeepTextDropRule:
+    """Keep an ordered visible-text projection over a complete Radix history."""
+
+    full_messages: tuple[dict[str, Any], ...]
+    keep_spans: tuple[tuple[int, int] | None, ...]
+    force: bool = False
+    use_visible_as_full: bool = False
+    fallback_reason: str | None = None
+    type: str = "keep_text_drop"
+
+    @classmethod
+    def from_payload(
+        cls,
+        payload: Mapping[str, Any],
+        messages: Sequence[Mapping[str, Any]],
+        *,
+        allow_internal: bool = False,
+    ) -> KeepTextDropRule:
+        internal = "_keep_spans" in payload
+        allowed = (
+            {"type", "force", "_keep_spans"}
+            if internal and allow_internal
+            else {"type", "full_messages", "force"}
+        )
+        unknown = set(payload) - allowed
+        if unknown:
+            raise ValueError(f"keep_text_drop has unsupported fields: {sorted(unknown)}")
+
+        force = payload.get("force", False)
+        if not isinstance(force, bool):
+            raise ValueError("keep_text_drop.force must be a boolean")
+        if internal:
+            if not allow_internal:
+                raise ValueError("drop_rule contains a reserved internal field")
+            raw_full: Sequence[Mapping[str, Any]] = messages
+        else:
+            public_full = payload.get("full_messages")
+            if not isinstance(public_full, list):
+                raise ValueError("keep_text_drop.full_messages must be a list")
+            if not all(isinstance(message, Mapping) for message in public_full):
+                raise ValueError("every keep_text_drop.full_messages entry must be an object")
+            raw_full = public_full
+        if not raw_full:
+            raise ValueError("keep_text_drop.full_messages must not be empty")
+        if len(raw_full) > MAX_DROP_MESSAGES:
+            raise ValueError(f"keep_text_drop supports at most {MAX_DROP_MESSAGES} full_messages")
+        full_messages = tuple(dict(message) for message in raw_full)
+        for message_id, message in enumerate(full_messages):
+            role = _role(message)
+            if role not in {"system", "user", "assistant", "tool"}:
+                raise ValueError(
+                    f"keep_text_drop.full_messages[{message_id}].role is invalid"
+                )
+            _matchable_content(message, field=f"keep_text_drop.full_messages[{message_id}]")
+
+        if internal:
+            raw_spans = payload.get("_keep_spans")
+            if not isinstance(raw_spans, list) or len(raw_spans) != len(full_messages):
+                raise ValueError(
+                    "internal keep_text_drop._keep_spans must align with full_messages"
+                )
+            keep_spans: list[tuple[int, int] | None] = []
+            for message_id, (raw_span, message) in enumerate(
+                zip(raw_spans, full_messages, strict=True)
+            ):
+                if raw_span is None:
+                    keep_spans.append(None)
+                    continue
+                if (
+                    not isinstance(raw_span, list)
+                    or len(raw_span) != 2
+                    or any(
+                        isinstance(value, bool) or not isinstance(value, int) for value in raw_span
+                    )
+                ):
+                    raise ValueError(
+                        f"internal keep_text_drop._keep_spans[{message_id}] is invalid"
+                    )
+                start, end = raw_span
+                source = _matchable_content(
+                    message, field=f"keep_text_drop.full_messages[{message_id}]"
+                )
+                if start < 0 or end < start or end > len(source):
+                    raise ValueError(
+                        f"internal keep_text_drop._keep_spans[{message_id}] is out of range"
+                    )
+                keep_spans.append((start, end))
+            return cls(full_messages, tuple(keep_spans), force=force)
+
+        if not messages:
+            raise ValueError("keep_text_drop requires at least one visible message")
+        if len(messages) > len(full_messages):
+            reason = "visible messages cannot outnumber keep_text_drop.full_messages"
+            if force:
+                return cls(
+                    tuple(dict(message) for message in messages),
+                    tuple(),
+                    force=True,
+                    use_visible_as_full=True,
+                    fallback_reason=reason,
+                )
+            raise ValueError(reason)
+
+        full_contents = [
+            _matchable_content(message, field=f"keep_text_drop.full_messages[{message_id}]")
+            for message_id, message in enumerate(full_messages)
+        ]
+        visible_contents = [
+            _matchable_content(message, field=f"messages[{message_id}]")
+            for message_id, message in enumerate(messages)
+        ]
+        fingerprints = [
+            *(_protocol_fingerprint(message) for message in full_messages),
+            *(_protocol_fingerprint(message) for message in messages),
+        ]
+        key_ids = {value: key_id for key_id, value in enumerate(dict.fromkeys(fingerprints))}
+        full_keys = [key_ids[_protocol_fingerprint(message)] for message in full_messages]
+        visible_keys = [key_ids[_protocol_fingerprint(message)] for message in messages]
+        try:
+            matches = find_ordered_latest(
+                full_contents,
+                visible_contents,
+                source_keys=full_keys,
+                pattern_keys=visible_keys,
+            )
+        except ValueError as exc:
+            reason = str(exc)
+            if force:
+                return cls(
+                    tuple(dict(message) for message in messages),
+                    tuple(),
+                    force=True,
+                    use_visible_as_full=True,
+                    fallback_reason=reason,
+                )
+            raise ValueError(f"keep_text_drop projection failed: {reason}") from exc
+
+        keep_spans: list[tuple[int, int] | None] = [None] * len(full_messages)
+        for source_id, start, end in matches:
+            keep_spans[source_id] = (start, end)
+        return cls(full_messages, tuple(keep_spans), force=force)
+
+    def to_wire(self) -> dict[str, Any]:
+        if self.use_visible_as_full:
+            raise RuntimeError("forced keep_text_drop fallback has no Drop wire payload")
+        return {
+            "type": self.type,
+            "force": self.force,
+            "_keep_spans": [list(span) if span is not None else None for span in self.keep_spans],
+        }
+
+    def has_drop(self) -> bool:
+        return any(
+            span is None
+            or span
+            != (
+                0,
+                len(
+                    _matchable_content(message, field=f"keep_text_drop.full_messages[{message_id}]")
+                ),
+            )
+            for message_id, (message, span) in enumerate(
+                zip(self.full_messages, self.keep_spans, strict=True)
+            )
+        )
+
+
+@dataclass(frozen=True)
 class ThinkingDropRule:
     """Retain structured assistant thinking in the full stream, then drop its KV."""
 
@@ -329,7 +536,7 @@ class ThinkingDropRule:
         return {"type": self.type}
 
 
-DropRule = MessageDropRule | TextDropRule | ThinkingDropRule
+DropRule = MessageDropRule | TextDropRule | KeepTextDropRule | ThinkingDropRule
 
 
 def parse_drop_rule(
@@ -347,16 +554,21 @@ def parse_drop_rule(
         payload = {"type": "message_drop", "drop_messages": legacy_drop_message}
     if not isinstance(payload, Mapping):
         raise ValueError("drop_rule must be an object")
-    if "_trigger_message_id" in payload and not allow_internal:
+    if any(str(field).startswith("_") for field in payload) and not allow_internal:
         raise ValueError("drop_rule contains a reserved internal field")
     rule_type = payload.get("type")
     if rule_type == "message_drop":
         return MessageDropRule.from_payload(payload, messages)
     if rule_type == "text_drop":
         return TextDropRule.from_payload(payload, messages)
+    if rule_type == "keep_text_drop":
+        return KeepTextDropRule.from_payload(payload, messages, allow_internal=allow_internal)
     if rule_type == "thinking_drop":
         return ThinkingDropRule.from_payload(payload, messages)
-    raise ValueError("drop_rule.type must be one of: message_drop, text_drop, thinking_drop")
+    raise ValueError(
+        "drop_rule.type must be one of: message_drop, text_drop, "
+        "keep_text_drop, thinking_drop"
+    )
 
 
 def project_drop_rule_for_prefix(
@@ -381,6 +593,12 @@ def project_drop_rule_for_prefix(
             "type": rule_type,
             "drop_messages": list(payload.get("drop_messages", []))[:prefix_len],
             "_trigger_message_id": trigger,
+        }
+    if rule_type == "keep_text_drop":
+        return {
+            "type": rule_type,
+            "force": bool(payload.get("force", False)),
+            "_keep_spans": list(payload.get("_keep_spans", []))[:prefix_len],
         }
     if rule_type == "thinking_drop":
         return {"type": rule_type}

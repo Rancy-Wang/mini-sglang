@@ -142,6 +142,117 @@ auto aho_find_all(const tvm::ffi::TensorView source,
   return count;
 }
 
+auto ordered_latest_find(const tvm::ffi::TensorView flat_sources,
+                         const tvm::ffi::TensorView source_offsets,
+                         const tvm::ffi::TensorView source_keys,
+                         const tvm::ffi::TensorView flat_patterns,
+                         const tvm::ffi::TensorView pattern_offsets,
+                         const tvm::ffi::TensorView pattern_keys,
+                         const tvm::ffi::TensorView matches) -> int64_t {
+  host::RuntimeCheck(is_cpu_int_tensor(flat_sources, 1, 32),
+                     "flat_sources must be a contiguous 1D CPU int32 tensor");
+  host::RuntimeCheck(is_cpu_int_tensor(source_offsets, 1, 64),
+                     "source_offsets must be a contiguous 1D CPU int64 tensor");
+  host::RuntimeCheck(is_cpu_int_tensor(source_keys, 1, 64),
+                     "source_keys must be a contiguous 1D CPU int64 tensor");
+  host::RuntimeCheck(is_cpu_int_tensor(flat_patterns, 1, 32),
+                     "flat_patterns must be a contiguous 1D CPU int32 tensor");
+  host::RuntimeCheck(is_cpu_int_tensor(pattern_offsets, 1, 64),
+                     "pattern_offsets must be a contiguous 1D CPU int64 tensor");
+  host::RuntimeCheck(is_cpu_int_tensor(pattern_keys, 1, 64),
+                     "pattern_keys must be a contiguous 1D CPU int64 tensor");
+  host::RuntimeCheck(is_cpu_int_tensor(matches, 2, 64) && matches.size(1) == 3,
+                     "matches must be a contiguous [N, 3] CPU int64 tensor");
+  host::RuntimeCheck(source_offsets.size(0) == source_keys.size(0) + 1,
+                     "source offsets and keys have inconsistent lengths");
+  host::RuntimeCheck(pattern_offsets.size(0) == pattern_keys.size(0) + 1,
+                     "pattern offsets and keys have inconsistent lengths");
+  host::RuntimeCheck(matches.size(0) == pattern_keys.size(0),
+                     "matches must provide one row per pattern");
+
+  const auto *sources = static_cast<const int32_t *>(flat_sources.data_ptr());
+  const auto *source_starts =
+      static_cast<const int64_t *>(source_offsets.data_ptr());
+  const auto *source_key_values =
+      static_cast<const int64_t *>(source_keys.data_ptr());
+  const auto *patterns = static_cast<const int32_t *>(flat_patterns.data_ptr());
+  const auto *pattern_starts =
+      static_cast<const int64_t *>(pattern_offsets.data_ptr());
+  const auto *pattern_key_values =
+      static_cast<const int64_t *>(pattern_keys.data_ptr());
+  auto *result = static_cast<int64_t *>(matches.data_ptr());
+
+  int64_t source_id = source_keys.size(0) - 1;
+  for (int64_t pattern_id = pattern_keys.size(0) - 1; pattern_id >= 0;
+       --pattern_id) {
+    const int64_t pattern_begin = pattern_starts[pattern_id];
+    const int64_t pattern_end = pattern_starts[pattern_id + 1];
+    const int64_t pattern_size = pattern_end - pattern_begin;
+    host::RuntimeCheck(pattern_begin >= 0 && pattern_end >= pattern_begin &&
+                           pattern_end <= flat_patterns.size(0),
+                       "pattern_offsets contains an invalid range");
+
+    std::vector<int64_t> prefix(pattern_size, 0);
+    for (int64_t i = 1, matched = 0; i < pattern_size; ++i) {
+      const int32_t value = patterns[pattern_end - 1 - i];
+      while (matched > 0 &&
+             value != patterns[pattern_end - 1 - matched]) {
+        matched = prefix[matched - 1];
+      }
+      if (value == patterns[pattern_end - 1 - matched]) {
+        ++matched;
+      }
+      prefix[i] = matched;
+    }
+
+    bool found = false;
+    while (source_id >= 0 && !found) {
+      const int64_t current_source = source_id--;
+      if (source_key_values[current_source] != pattern_key_values[pattern_id]) {
+        continue;
+      }
+      const int64_t source_begin = source_starts[current_source];
+      const int64_t source_end = source_starts[current_source + 1];
+      host::RuntimeCheck(source_begin >= 0 && source_end >= source_begin &&
+                             source_end <= flat_sources.size(0),
+                         "source_offsets contains an invalid range");
+
+      if (pattern_size == 0) {
+        result[pattern_id * 3] = current_source;
+        result[pattern_id * 3 + 1] = source_end - source_begin;
+        result[pattern_id * 3 + 2] = source_end - source_begin;
+        found = true;
+        break;
+      }
+
+      int64_t matched = 0;
+      for (int64_t pos = source_end; pos > source_begin; --pos) {
+        const int32_t value = sources[pos - 1];
+        while (matched > 0 &&
+               value != patterns[pattern_end - 1 - matched]) {
+          matched = prefix[matched - 1];
+        }
+        if (value == patterns[pattern_end - 1 - matched]) {
+          ++matched;
+        }
+        if (matched == pattern_size) {
+          const int64_t local_start = pos - source_begin - 1;
+          result[pattern_id * 3] = current_source;
+          result[pattern_id * 3 + 1] = local_start;
+          result[pattern_id * 3 + 2] = local_start + pattern_size;
+          found = true;
+          break;
+        }
+      }
+    }
+    if (!found) {
+      return pattern_id;
+    }
+  }
+  return -1;
+}
+
 } // namespace
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(aho_find_all, aho_find_all);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(ordered_latest_find, ordered_latest_find);

@@ -10,6 +10,8 @@ from minisgl.kvcache import BaseCacheHandle, create_prefix_cache
 from minisgl.utils import div_ceil
 
 if TYPE_CHECKING:
+    from minisgl.kvcache.base import InsertResult
+
     from .utils import PendingReq
 
 
@@ -587,24 +589,13 @@ class CacheManager:
                 key_indices,
                 commit_virtual_mask,
             )
-            active_slots = torch.arange(
-                len(active_indices), dtype=torch.int64, device=active_indices.device
-            )
-            newly_allocated = active_slots >= req.initial_active_cached_len
             active_key_positions = req.radix_token_to_key[active_positions]
-            key_positions_device = active_key_positions.to(
-                device=active_indices.device, non_blocking=True
-            )
-            adopted = (key_positions_device >= insert_result.cached_len) & (
-                key_positions_device < insert_result.handle.cached_len
-            )
-            self._free(
-                torch.cat(
-                    [
-                        active_indices[newly_allocated & (~adopted)],
-                        excluded_indices,
-                    ]
-                )
+            self._free_finished_candidates(
+                req,
+                active_indices,
+                active_key_positions,
+                insert_result,
+                excluded_indices,
             )
         finally:
             self.unlock(old_handle)
@@ -614,13 +605,50 @@ class CacheManager:
         page_indices = self.page_table[req.table_idx, : req.cached_len]
         old_handle = req.cache_handle
         cached_len, new_handle = self.prefix_cache.insert_prefix(insert_ids, page_indices)
-        self.unlock(old_handle)
-        self._free(page_indices[old_handle.cached_len : cached_len])
         if finished:
+            self.unlock(old_handle)
+            self._free(page_indices[old_handle.cached_len : cached_len])
             self._free(page_indices[new_handle.cached_len :])
-        else:
-            req.cache_handle = new_handle
-            self.lock(new_handle)
+            return
+
+        duplicate_slice = slice(old_handle.cached_len, cached_len)
+        duplicate_indices = page_indices[duplicate_slice].clone()
+        self.lock(new_handle)
+        try:
+            if cached_len > old_handle.cached_len:
+                canonical_indices = new_handle.get_matched_indices()
+                page_indices[duplicate_slice].copy_(canonical_indices[duplicate_slice])
+        except Exception:
+            self.unlock(new_handle)
+            raise
+        self.unlock(old_handle)
+        req.cache_handle = new_handle
+        self._free(duplicate_indices)
+
+    def _free_finished_candidates(
+        self,
+        req: Req,
+        candidates: torch.Tensor,
+        candidate_key_positions: torch.Tensor,
+        insert_result: InsertResult,
+        excluded: torch.Tensor | None = None,
+    ) -> None:
+        """Apply main's three cache regions after mapping active tokens to Radix keys."""
+
+        if len(candidates) != len(candidate_key_positions):
+            raise RuntimeError("Candidate pages and Radix key positions have different lengths.")
+        candidate_key_positions = candidate_key_positions.to(
+            device=candidates.device, dtype=torch.int64, non_blocking=True
+        )
+        active_slots = torch.arange(len(candidates), dtype=torch.int64, device=candidates.device)
+        newly_allocated = active_slots >= req.initial_active_cached_len
+        adopted = (candidate_key_positions >= insert_result.cached_len) & (
+            candidate_key_positions < insert_result.handle.cached_len
+        )
+        released = candidates[newly_allocated & (~adopted)]
+        if excluded is not None:
+            released = torch.cat([released, excluded])
+        self._free(released)
 
     def _cache_finished_sparse_req(self, req: Req) -> None:
         if self.page_size != 1:
@@ -684,13 +712,12 @@ class CacheManager:
                 req.radix_match_ids[:cacheable_len],
                 full_indices[:cacheable_len],
             )
-            in_cache_len = insert_result.cached_len
-            active_slots = torch.arange(
-                len(active_indices), dtype=torch.int64, device=active_indices.device
+            self._free_finished_candidates(
+                req,
+                active_indices,
+                full_positions,
+                insert_result,
             )
-            newly_allocated = active_slots >= req.initial_active_cached_len
-            adopted = (full_positions >= in_cache_len) & (full_positions < cacheable_len)
-            self._free(active_indices[newly_allocated & (~adopted)])
         finally:
             self.unlock(old_handle)
 
@@ -707,11 +734,12 @@ class CacheManager:
             )
             if insert_result.cached_len < req.initial_active_cached_len:
                 raise RuntimeError("Full-stream Radix prefix regressed during commit.")
-            slots = torch.arange(len(full_indices), dtype=torch.int64, device=full_indices.device)
-            duplicates = (slots >= req.initial_active_cached_len) & (
-                slots < insert_result.cached_len
+            self._free_finished_candidates(
+                req,
+                full_indices,
+                torch.arange(len(full_indices), dtype=torch.int64, device=full_indices.device),
+                insert_result,
             )
-            self._free(full_indices[duplicates])
         finally:
             self.unlock(old_handle)
 

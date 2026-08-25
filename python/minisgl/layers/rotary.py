@@ -17,6 +17,7 @@ class RotaryEmbedding(StateLessOP):
         max_position_embeddings: int,
         base: float,
         post_process: None | Callable[[torch.Tensor], torch.Tensor] = None,
+        attention_factor: float = 1.0,
     ) -> None:
         super().__init__()
         self.head_size = head_size
@@ -26,8 +27,8 @@ class RotaryEmbedding(StateLessOP):
             inv_freq = post_process(inv_freq)
         t = torch.arange(max_position_embeddings, dtype=torch.float)
         freqs = torch.einsum("i,j -> ij", t, inv_freq)
-        cos = freqs.cos()
-        sin = freqs.sin()
+        cos = freqs.cos() * attention_factor
+        sin = freqs.sin() * attention_factor
         # buffer, so don't load/save
         self._cos_sin_cache = torch.cat((cos, sin), dim=-1)
         assert self.head_size in [64, 128, 256, 512]
@@ -91,27 +92,75 @@ def _get_rope(
             return RotaryEmbedding(head_dim, rotary_dim, max_position, base, post_process)
 
         case "yarn":
-            factor: float = rope_scaling["factor"]
-            beta_fast: float = rope_scaling.get("beta_fast", 32.0)
-            beta_slow: float = rope_scaling.get("beta_slow", 1.0)
-            orig_max_pos: int = rope_scaling["original_max_position_embeddings"]
-
-            def _find_correction_dim(num_rotations: float) -> float:
-                return rotary_dim * math.log(orig_max_pos / (num_rotations * 2 * math.pi)) / (2 * math.log(base))
-
-            low = max(math.floor(_find_correction_dim(beta_fast)), 0)
-            high = min(math.ceil(_find_correction_dim(beta_slow)), rotary_dim // 2 - 1)
-
-            def post_process(inv_freq: torch.Tensor) -> torch.Tensor:
-                ramp = torch.clamp(
-                    (torch.arange(rotary_dim // 2, dtype=torch.float32) - low) / max(high - low, 1),
-                    0, 1,
-                )
-                return (inv_freq / factor) * ramp + inv_freq * (1 - ramp)
-
-            return RotaryEmbedding(head_dim, rotary_dim, max_position, base, post_process)
+            inv_freq, attention_factor = _get_yarn_parameters(
+                rotary_dim, base, rope_scaling
+            )
+            return RotaryEmbedding(
+                head_dim,
+                rotary_dim,
+                max_position,
+                base,
+                lambda _: inv_freq,
+                attention_factor,
+            )
 
     raise ValueError(f"Unsupported {rope_scaling = }")
+
+
+def _get_yarn_parameters(
+    rotary_dim: int,
+    base: float,
+    rope_scaling: Dict[str, Any],
+) -> tuple[torch.Tensor, float]:
+    """Match the YaRN frequencies and attention scaling used by Transformers."""
+
+    factor = float(rope_scaling["factor"])
+    beta_fast = float(rope_scaling.get("beta_fast", 32.0))
+    beta_slow = float(rope_scaling.get("beta_slow", 1.0))
+    orig_max_pos = int(rope_scaling["original_max_position_embeddings"])
+
+    def correction_dim(num_rotations: float) -> float:
+        return rotary_dim * math.log(orig_max_pos / (num_rotations * 2 * math.pi)) / (
+            2 * math.log(base)
+        )
+
+    low = correction_dim(beta_fast)
+    high = correction_dim(beta_slow)
+    if rope_scaling.get("truncate", True):
+        low, high = math.floor(low), math.ceil(high)
+    low, high = max(low, 0), min(high, rotary_dim - 1)
+    if low == high:
+        high += 0.001
+
+    inv_freq = 1.0 / (
+        base ** (torch.arange(0, rotary_dim, 2, dtype=torch.float32) / rotary_dim)
+    )
+    ramp = torch.clamp(
+        (torch.arange(rotary_dim // 2, dtype=torch.float32) - low) / (high - low),
+        0,
+        1,
+    )
+    extrapolation = (1 - ramp) * float(rope_scaling.get("extrapolation_factor", 1.0))
+    inv_freq = (inv_freq / factor) * (1 - extrapolation) + inv_freq * extrapolation
+
+    attention_factor = rope_scaling.get("attention_factor")
+    if attention_factor is None:
+        mscale = rope_scaling.get("mscale")
+        mscale_all_dim = rope_scaling.get("mscale_all_dim")
+
+        def get_mscale(multiplier: float = 1.0) -> float:
+            return 1.0 if factor <= 1 else 0.1 * multiplier * math.log(factor) + 1.0
+
+        if mscale is not None and mscale_all_dim is not None:
+            attention_factor = get_mscale(float(mscale)) / get_mscale(
+                float(mscale_all_dim)
+            )
+        else:
+            yarn_scale = (
+                get_mscale() if rope_scaling.get("apply_yarn_scaling", True) else 1.0
+            )
+            attention_factor = yarn_scale * float(rope_scaling.get("attn_factor", 1.0))
+    return inv_freq, float(attention_factor)
 
 
 _ROPE_DEVICE: torch.device | None = None

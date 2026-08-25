@@ -23,6 +23,7 @@ from minisgl.message import (
     WarmupReply,
 )
 from minisgl.tokenizer.drop_rules import (
+    KeepTextDropRule,
     MessageDropRule,
     TextDropRule,
     ThinkingDropRule,
@@ -162,7 +163,7 @@ def _parse_request_drop_rule(
     legacy_drop_message: Dict[int, List[int]] | None,
     messages: List[Dict[str, Any]],
     radix_drop_key_mode: str,
-) -> dict[str, Any] | None:
+) -> tuple[dict[str, Any] | None, List[Dict[str, Any]]]:
     try:
         parsed = parse_drop_rule(
             drop_rule,
@@ -170,7 +171,18 @@ def _parse_request_drop_rule(
             legacy_drop_message=legacy_drop_message,
         )
     except ValueError as exc:
+        logger.warning("Rejected invalid Drop rule: %s", exc)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if isinstance(parsed, KeepTextDropRule):
+        if parsed.use_visible_as_full:
+            logger.warning(
+                "keep_text_drop.force fallback: using visible messages as the full prompt: %s",
+                parsed.fallback_reason,
+            )
+            return None, messages
+        effective_messages = [dict(message) for message in parsed.full_messages]
+    else:
+        effective_messages = messages
     if parsed is not None and radix_drop_key_mode != "delta-marker":
         raise HTTPException(
             status_code=400,
@@ -179,7 +191,7 @@ def _parse_request_drop_rule(
                 "radix_drop_key_mode='delta-marker'."
             ),
         )
-    return parsed.to_wire() if parsed is not None else None
+    return (parsed.to_wire() if parsed is not None else None), effective_messages
 
 
 def _extract_tool_function_name(tool: Dict[str, Any]) -> str | None:
@@ -330,8 +342,9 @@ class GenerateRequest(BaseModel):
 
 
 class Message(BaseModel):
-    role: Literal["system", "user", "assistant", "tool", "function"]
+    role: Literal["system", "developer", "user", "assistant", "tool", "function"]
     content: str | List[Dict[str, Any]] | None = None
+    reasoning: str | None = None
     reasoning_content: str | None = None
     name: str | None = None
     tool_call_id: str | None = None
@@ -492,6 +505,8 @@ class FrontendManager:
             )
         elif isinstance(parsed_rule, TextDropRule):
             has_current_drop = any(selection is not None for selection in parsed_rule.selections)
+        elif isinstance(parsed_rule, KeepTextDropRule):
+            has_current_drop = parsed_rule.has_drop()
         else:
             has_current_drop = isinstance(parsed_rule, ThinkingDropRule) and bool(
                 parsed_rule.thinking_by_message
@@ -771,7 +786,7 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
             )
 
     if isinstance(prompt, list):
-        wire_drop_rule = _parse_request_drop_rule(
+        wire_drop_rule, prompt = _parse_request_drop_rule(
             drop_rule=req.drop_rule,
             legacy_drop_message=req.drop_message,
             messages=prompt,
@@ -917,7 +932,7 @@ async def shell_completion(req: OpenAICompletionRequest):
     state = get_global_state()
     assert req.messages is not None, "Shell completion only supports chat-completions"
     prompt = [msg.model_dump() for msg in req.messages]
-    wire_drop_rule = _parse_request_drop_rule(
+    wire_drop_rule, prompt = _parse_request_drop_rule(
         drop_rule=req.drop_rule,
         legacy_drop_message=req.drop_message,
         messages=prompt,

@@ -257,12 +257,26 @@ def _harmony_encoding():
 
 
 def _parse_harmony(text: str, tools: List[Dict[str, Any]]) -> ParsedResponse:
-    from openai_harmony import Role, StreamableParser
+    from openai_harmony import HarmonyError, Role, StreamableParser
 
     encoding = _harmony_encoding()
     parser = StreamableParser(encoding, Role.ASSISTANT, strict=False)
-    for token in encoding.encode(text, allowed_special="all"):
-        parser.process(int(token))
+    try:
+        for token in encoding.encode(text, allowed_special="all"):
+            parser.process(int(token))
+    except HarmonyError:
+        # GPT-OSS occasionally places `to=functions.*` after the channel or
+        # content-type field.  The streaming parser accepts that unambiguous
+        # header, so keep non-stream responses behaviorally identical instead
+        # of turning a recoverable tool call into HTTP 500.
+        fallback = _HarmonyStream(tools)
+        pieces = (fallback.feed(text), fallback.finish())
+        calls = [call for piece in pieces for call in piece.tool_calls]
+        return ParsedResponse(
+            content="".join(piece.content for piece in pieces),
+            reasoning_content="".join(piece.reasoning_content for piece in pieces),
+            tool_calls=calls or None,
+        )
 
     entries: list[tuple[str | None, str | None, str]] = []
     for message in parser.messages:

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import json
-from bisect import bisect_right
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
+from datetime import date
 from typing import Any, Dict, List
 
 import torch
@@ -10,6 +11,7 @@ from minisgl.kernel.text_match import find_all
 from minisgl.message import TokenizeMsg
 from minisgl.message.tokenizer import get_gpt_oss_terminal_stop_token_ids
 from minisgl.tokenizer.drop_rules import (
+    KeepTextDropRule,
     MessageDropRule,
     TextDropRule,
     ThinkingDropRule,
@@ -197,6 +199,7 @@ class TokenizeManager:
                 Role.SYSTEM,
                 SystemContent.new()
                 .with_reasoning_effort(effort)
+                .with_conversation_start_date(date.today().isoformat())
                 .with_required_channels(["analysis", "commentary", "final"]),
             )
         ]
@@ -252,7 +255,27 @@ class TokenizeManager:
                 ownership.append(_HarmonyComponentOwnership(owner=raw_message_id))
                 continue
             if role == "assistant":
-                reasoning = raw.get("reasoning_content")
+                calls = raw.get("tool_calls") or []
+                if calls and content:
+                    harmony_messages.append(
+                        HarmonyMessage.from_role_and_content(
+                            Role.ASSISTANT, content
+                        ).with_channel("commentary")
+                    )
+                    ownership.append(_HarmonyComponentOwnership(owner=raw_message_id))
+                reasoning = raw.get("reasoning")
+                legacy_reasoning = raw.get("reasoning_content")
+                if (
+                    isinstance(reasoning, str)
+                    and isinstance(legacy_reasoning, str)
+                    and reasoning != legacy_reasoning
+                ):
+                    raise ValueError(
+                        "GPT-OSS assistant reasoning and reasoning_content must match "
+                        "when both are provided."
+                    )
+                if not isinstance(reasoning, str):
+                    reasoning = legacy_reasoning
                 if isinstance(reasoning, str) and reasoning:
                     component_id = len(harmony_messages)
                     harmony_messages.append(
@@ -267,14 +290,14 @@ class TokenizeManager:
                             is_analysis=True,
                         )
                     )
-                if content:
+                if content and not calls:
                     harmony_messages.append(
                         HarmonyMessage.from_role_and_content(Role.ASSISTANT, content).with_channel(
                             "final"
                         )
                     )
                     ownership.append(_HarmonyComponentOwnership(owner=raw_message_id))
-                for call in raw.get("tool_calls") or []:
+                for call in calls:
                     if not isinstance(call, dict):
                         continue
                     fn = call.get("function")
@@ -290,7 +313,7 @@ class TokenizeManager:
                         HarmonyMessage.from_role_and_content(Role.ASSISTANT, arguments)
                         .with_channel("commentary")
                         .with_recipient(f"functions.{name}")
-                        .with_content_type("<|constrain|>json")
+                        .with_content_type("json")
                     )
                     ownership.append(_HarmonyComponentOwnership(owner=raw_message_id))
                 continue
@@ -304,6 +327,8 @@ class TokenizeManager:
                     HarmonyMessage.from_author_and_content(
                         Author.new(Role.TOOL, f"functions.{name}"), content
                     )
+                    .with_channel("commentary")
+                    .with_recipient("assistant")
                 )
                 ownership.append(_HarmonyComponentOwnership(owner=raw_message_id))
                 continue
@@ -505,6 +530,55 @@ class TokenizeManager:
 
         owners[generation_start:] = [len(messages)] * (len(input_ids) - generation_start)
         return input_ids, owners, generation_start
+
+    def _build_harmony_provenance(
+        self,
+        input_ids: List[int],
+        owners: List[int],
+    ) -> TemplateTokenProvenance:
+        """Recover character offsets from Harmony bytes without retokenizing."""
+
+        encoding = self._get_harmony_encoding()
+        decode_bytes = getattr(getattr(encoding, "_inner", None), "decode_bytes", None)
+        if decode_bytes is None:
+            raise RuntimeError("Harmony byte decoding is required for keep_text_drop.")
+        token_bytes = [bytes(decode_bytes([token_id])) for token_id in input_ids]
+        byte_offsets = [0]
+        byte_owners: List[int] = []
+        for owner, value in zip(owners, token_bytes, strict=True):
+            byte_offsets.append(byte_offsets[-1] + len(value))
+            byte_owners.extend([owner] * len(value))
+        rendered_bytes = b"".join(token_bytes)
+        rendered_text = rendered_bytes.decode("utf-8")
+        char_byte_offsets = [0]
+        char_owners: List[int] = []
+        cross_owner_tokens = 0
+        byte_pos = 0
+        for char in rendered_text:
+            encoded = char.encode("utf-8")
+            char_owners.append(byte_owners[byte_pos] if encoded else 0)
+            byte_pos += len(encoded)
+            char_byte_offsets.append(byte_pos)
+
+        offsets: List[tuple[int, int]] = []
+        for token_id, (byte_start, byte_end) in enumerate(
+            zip(byte_offsets[:-1], byte_offsets[1:], strict=True)
+        ):
+            char_start = max(bisect_right(char_byte_offsets, byte_start) - 1, 0)
+            char_end = bisect_left(char_byte_offsets, byte_end)
+            offsets.append((char_start, char_end))
+            if byte_end > byte_start and any(
+                owner != owners[token_id] for owner in byte_owners[byte_start:byte_end]
+            ):
+                cross_owner_tokens += 1
+        return TemplateTokenProvenance(
+            input_ids=list(input_ids),
+            owners=list(owners),
+            offsets=offsets,
+            rendered_text=rendered_text,
+            char_owners=char_owners,
+            cross_owner_tokens=cross_owner_tokens,
+        )
 
     def _apply_chat_template(
         self,
@@ -1007,11 +1081,14 @@ class TokenizeManager:
         owner: int,
         source: str,
         field: str,
+        prefer_latest: bool = False,
     ) -> int:
         candidates = []
         for start, end in find_all(provenance.rendered_text, [source])[0]:
             if all(candidate == owner for candidate in provenance.char_owners[start:end]):
                 candidates.append(start)
+        if prefer_latest and candidates:
+            return candidates[-1]
         if len(candidates) != 1:
             raise ValueError(
                 f"Cannot map {field} for messages[{owner}] uniquely into the "
@@ -1027,14 +1104,28 @@ class TokenizeManager:
         owner: int,
         spans: List[tuple[int, int]],
         field: str,
+        boundary_mode: str = "contained",
+        allow_empty: bool = False,
     ) -> List[tuple[int, int]]:
+        if boundary_mode not in {"contained", "overlap"}:
+            raise ValueError(f"Unsupported token boundary mode: {boundary_mode}")
         selected: List[int] = []
         for token_id, (start, end) in enumerate(provenance.offsets):
             if provenance.owners[token_id] != owner or start == end:
                 continue
-            if any(start >= span_start and end <= span_end for span_start, span_end in spans):
+            if boundary_mode == "contained":
+                matched = any(
+                    start >= span_start and end <= span_end for span_start, span_end in spans
+                )
+            else:
+                matched = any(
+                    start < span_end and end > span_start for span_start, span_end in spans
+                )
+            if matched:
                 selected.append(token_id)
         if not selected:
+            if allow_empty:
+                return []
             raise ValueError(
                 f"{field} for messages[{owner}] contains no complete token; "
                 "boundary-crossing tokens are kept"
@@ -1042,6 +1133,22 @@ class TokenizeManager:
         ranges: List[tuple[int, int]] = []
         start = previous = selected[0]
         for token_id in selected[1:]:
+            if token_id == previous + 1:
+                previous = token_id
+                continue
+            ranges.append((start, previous + 1))
+            start = previous = token_id
+        ranges.append((start, previous + 1))
+        return cls._canonicalize_position_ranges(ranges)
+
+    @classmethod
+    def _position_ranges_from_ids(cls, token_ids: List[int]) -> List[tuple[int, int]]:
+        if not token_ids:
+            return []
+        token_ids = sorted(set(token_ids))
+        ranges: List[tuple[int, int]] = []
+        start = previous = token_ids[0]
+        for token_id in token_ids[1:]:
             if token_id == previous + 1:
                 previous = token_id
                 continue
@@ -1272,7 +1379,7 @@ class TokenizeManager:
 
     def _compile_rule_position_events(
         self,
-        rule: MessageDropRule | TextDropRule | ThinkingDropRule,
+        rule: MessageDropRule | TextDropRule | KeepTextDropRule | ThinkingDropRule,
         *,
         raw_messages: List[Dict[str, Any]],
         owner_ranges: dict[int, List[tuple[int, int]]],
@@ -1324,9 +1431,65 @@ class TokenizeManager:
                         owner=owner,
                         spans=rendered_spans,
                         field="text_drop content",
+                        allow_empty=True,
                     )
                 )
             return {trigger: self._canonicalize_position_ranges(ranges)} if ranges else {}
+
+        if isinstance(rule, KeepTextDropRule):
+            if provenance is None:
+                raise ValueError("keep_text_drop requires exact chat-template token provenance")
+            ranges: List[tuple[int, int]] = []
+            for raw_message_id, keep_span in enumerate(rule.keep_spans):
+                owner = raw_message_id + target_offset
+                if keep_span is None:
+                    ranges.extend(owner_ranges.get(owner, ()))
+                    continue
+
+                source = self._normalize_message_content(
+                    raw_messages[raw_message_id].get("content")
+                )
+                if not source:
+                    continue
+                rendered_start = self._rendered_source_start(
+                    provenance,
+                    owner=owner,
+                    source=source,
+                    field="keep_text_drop content",
+                    prefer_latest=True,
+                )
+                full_span = (rendered_start, rendered_start + len(source))
+                selected_span = (
+                    rendered_start + keep_span[0],
+                    rendered_start + keep_span[1],
+                )
+                content_ranges = self._token_ranges_for_char_spans(
+                    provenance,
+                    owner=owner,
+                    spans=[full_span],
+                    field="keep_text_drop full content",
+                    boundary_mode="contained",
+                    allow_empty=True,
+                )
+                kept_ranges = self._token_ranges_for_char_spans(
+                    provenance,
+                    owner=owner,
+                    spans=[selected_span],
+                    field="keep_text_drop selected content",
+                    boundary_mode="overlap",
+                    allow_empty=keep_span[0] == keep_span[1],
+                )
+                content_ids = {
+                    token_id for start, end in content_ranges for token_id in range(start, end)
+                }
+                kept_ids = {
+                    token_id for start, end in kept_ranges for token_id in range(start, end)
+                }
+                ranges.extend(self._position_ranges_from_ids(list(content_ids - kept_ids)))
+
+            trigger = max(normalized_message_count - 1, 0)
+            canonical = self._canonicalize_position_ranges(ranges)
+            return {trigger: canonical} if canonical else {}
 
         events: dict[int, List[tuple[int, int]]] = {}
         for raw_message_id, source in rule.thinking_by_message.items():
@@ -1448,7 +1611,9 @@ class TokenizeManager:
         effective_tools = template_tools
         provenance: TemplateTokenProvenance | None = None
         cross_owner_tokens = 0
-        if isinstance(drop_rule, MessageDropRule):
+        if isinstance(drop_rule, (MessageDropRule, KeepTextDropRule)) or (
+            self.is_gpt_oss and isinstance(drop_rule, TextDropRule)
+        ):
             if self.is_gpt_oss:
                 full_with_gen, owner_with_gen, gen_prompt_start = (
                     self._render_harmony_message_drop(
@@ -1457,6 +1622,9 @@ class TokenizeManager:
                         tools=selected_tools,
                     )
                 )
+                if isinstance(drop_rule, (TextDropRule, KeepTextDropRule)):
+                    provenance = self._build_harmony_provenance(full_with_gen, owner_with_gen)
+                    cross_owner_tokens = provenance.cross_owner_tokens
             else:
                 try:
                     provenance = self._build_template_provenance(
