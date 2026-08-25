@@ -18,6 +18,7 @@ from minisgl.message import (
     BaseTokenizerMsg,
     BatchFrontendMsg,
     RequestErrorReply,
+    ServerMetrics,
     TokenizeMsg,
     UserReply,
     WarmupReply,
@@ -589,6 +590,7 @@ class FrontendManager:
         final_finish_reason = "stop"
         matched_stop: str | None = None
         cache_hit_ratio: float | None = None
+        server_metrics: ServerMetrics | None = None
         parser = ChatResponseParser(
             model_path=self.config.model_path,
             tools=tools if _tool_choice_mode(tool_choice) != "none" else None,
@@ -637,6 +639,8 @@ class FrontendManager:
                     matched_stop = ack.matched_stop
                 if ack.cache_hit_ratio is not None:
                     cache_hit_ratio = ack.cache_hit_ratio
+                if ack.server_metrics is not None:
+                    server_metrics = ack.server_metrics
                 if ack.incremental_output:
                     encoded = encode_piece(parser.feed(ack.incremental_output))
                     if encoded is not None:
@@ -672,6 +676,8 @@ class FrontendManager:
         }
         if cache_hit_ratio is not None:
             end_chunk["cache_hit_ratio"] = cache_hit_ratio
+        if server_metrics is not None:
+            end_chunk["server_metrics"] = server_metrics.as_api_dict()
         yield f"data: {json.dumps(end_chunk)}\n\n".encode()
         yield b"data: [DONE]\n\n"
         logger.debug("Finished streaming response for user %s", uid)
@@ -746,6 +752,7 @@ async def v1_root():
 
 @app.post("/v1/chat/completions")
 async def v1_completions(req: OpenAICompletionRequest, request: Request):
+    request_received_ns = time.perf_counter_ns()
     state = get_global_state()
     wire_drop_rule: dict[str, Any] | None = None
     normalized_tool_choice: str | Dict[str, Any] = "none"
@@ -834,6 +841,7 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
             tools=req.tools,
             tool_choice=normalized_tool_choice,
             stop=effective_stop,
+            request_received_ns=request_received_ns,
         )
     )
 
@@ -860,6 +868,7 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
     cache_hit_ratio: float | None = None
     prompt_tokens = 0
     completion_tokens = 0
+    server_metrics: ServerMetrics | None = None
     try:
         async for ack in state.wait_for_ack(uid):
             if not isinstance(ack, UserReply):
@@ -873,6 +882,8 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
                 prompt_tokens = ack.prompt_tokens
             if ack.completion_tokens is not None:
                 completion_tokens = ack.completion_tokens
+            if ack.server_metrics is not None:
+                server_metrics = ack.server_metrics
             if ack.finished:
                 break
     except RequestRejected as exc:
@@ -919,6 +930,8 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
     }
     if cache_hit_ratio is not None:
         response["cache_hit_ratio"] = cache_hit_ratio
+    if server_metrics is not None:
+        response["server_metrics"] = server_metrics.as_api_dict()
     return response
 
 

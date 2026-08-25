@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List
 
+from .metrics import ServerMetrics
 from .utils import deserialize_type, serialize_type
 
 
@@ -32,6 +33,7 @@ class UserReply(BaseFrontendMsg):
     cache_hit_ratio: float | None = None
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
+    server_metrics: ServerMetrics | None = None
 
 
 @dataclass

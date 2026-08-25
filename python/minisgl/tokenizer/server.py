@@ -121,6 +121,7 @@ def tokenize_worker(
                             cache_hit_ratio=msg.cache_hit_ratio,
                             prompt_tokens=msg.prompt_tokens,
                             completion_tokens=msg.completion_tokens,
+                            server_metrics=msg.server_metrics,
                         )
                         for msg, reply in zip(detokenize_msg, replies, strict=True)
                     ]
@@ -193,6 +194,7 @@ def tokenize_worker(
                                 full_token_visible_until=t.full_token_visible_until,
                                 full_keep_mask=t.full_keep_mask,
                                 use_context_mask=msg.use_context_mask,
+                                request_received_ns=msg.request_received_ns,
                             )
                             for msg, t in tokenized_pairs
                         ]
