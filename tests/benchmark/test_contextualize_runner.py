@@ -106,7 +106,7 @@ def test_server_metric_derivation_and_linear_percentile():
     assert sample["dropped_prompt_tokens"] == 8
     assert sample["prompt_retention_ratio"] == 0.6
     assert sample["drop_effective"] is True
-    assert _percentile([1.0, 2.0, 3.0, 4.0], 95) == 3.8499999999999996
+    assert _percentile([1.0, 2.0, 3.0, 4.0], 95) == pytest.approx(3.85)
 
 
 def test_prepare_manifest_preserves_exact_request_and_hash():
