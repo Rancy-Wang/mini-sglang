@@ -51,6 +51,37 @@ Adopting the original design from [SGLang](https://github.com/sgl-project/sglang
 ![radix](https://lmsys.org/images/blog/sglang/radix_attn.jpg)
 *Illustration of Radix Attention from [LMSYS Blog](https://lmsys.org/blog/2024-01-17-sglang/).*
 
+## Keep-text Drop Rule
+
+`keep_text_drop` lets a stateless chat request expose only the ordered text that should remain
+visible while supplying the complete history used for Radix matching:
+
+```json
+{
+  "messages": [
+    {"role": "user", "content": "multiply it by 3"}
+  ],
+  "drop_rule": {
+    "type": "keep_text_drop",
+    "full_messages": [
+      {"role": "user", "content": "What is 15 + 27?"},
+      {"role": "assistant", "content": "15 + 27 = 42."},
+      {"role": "user", "content": "Then multiply it by 3."}
+    ],
+    "force": false
+  }
+}
+```
+
+Visible messages are matched in order from right to left, so repeated text selects the latest
+compatible messages by default. Role and tool-call protocol metadata must also match. A selected
+substring keeps every overlapping token, including tokens cut by either substring boundary, and
+keeps that message's chat-template wrapper tokens. Unselected messages are dropped completely.
+
+If projection fails, the default is an HTTP 400 response. Setting `force` to `true` instead runs a
+normal inference using the outer `messages` as the complete prompt and does not reuse the supplied
+hidden history.
+
 ## Overlap Scheduling
 
 To further reduce CPU overhead, Mini-SGLang employs overlap scheduling, a technique proposed in [NanoFlow](https://arxiv.org/abs/2408.12757). This approach overlaps the CPU scheduling overhead with GPU computation, improving overall system throughput.

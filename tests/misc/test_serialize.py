@@ -29,7 +29,17 @@ def test_serialize_deserialize():
     y = deserialize_type({"A": A}, data)
     logger.info(y)
 
-    u = BatchBackendMsg([UserMsg(uid=0, input_ids=t, sampling_params=SamplingParams())])
+    u = BatchBackendMsg(
+        [
+            UserMsg(
+                uid=0,
+                input_ids=t,
+                true_positions=torch.arange(len(t), dtype=torch.int32),
+                radix_input_ids=t.to(torch.int64),
+                sampling_params=SamplingParams(),
+            )
+        ]
+    )
     result = u.decoder(u.encoder())
     logger.info(u)
     logger.info(result)
