@@ -6,6 +6,7 @@ from .frontend import (
     UserReply,
     WarmupReply,
 )
+from .metrics import RequestMetricsState, ServerMetrics
 from .tokenizer import (
     AbortMsg,
     BaseTokenizerMsg,
@@ -34,4 +35,6 @@ __all__ = [
     "RequestErrorReply",
     "UserReply",
     "WarmupReply",
+    "RequestMetricsState",
+    "ServerMetrics",
 ]

@@ -58,6 +58,7 @@ class UserMsg(BaseBackendMsg):
     full_token_visible_until: torch.Tensor | None = None  # CPU 1D int32 first hidden query pos
     full_keep_mask: torch.Tensor | None = None  # CPU 1D int32 final full-to-active mask
     use_context_mask: bool = False  # internal warmup: Prefill the full stream with a custom mask
+    request_received_ns: int | None = None  # frontend monotonic clock, public requests only
 
 
 @dataclass

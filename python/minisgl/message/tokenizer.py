@@ -6,6 +6,7 @@ from typing import Any, Dict, List
 
 from minisgl.core import SamplingParams
 
+from .metrics import ServerMetrics
 from .utils import deserialize_type, serialize_type
 
 
@@ -53,6 +54,7 @@ class DetokenizeMsg(BaseTokenizerMsg):
     cache_hit_ratio: float | None = None
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
+    server_metrics: ServerMetrics | None = None
 
 
 @dataclass
@@ -90,6 +92,7 @@ class TokenizeMsg(BaseTokenizerMsg):
     is_warmup: bool = False
     internal_uid: int | None = None
     use_context_mask: bool = False
+    request_received_ns: int | None = None
 
 
 @dataclass
