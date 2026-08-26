@@ -89,15 +89,18 @@ def test_sparse_kernel_matches_full_visibility_reference() -> None:
         event_positions = sorted(rng.sample(range(16, full_len), rng.randint(1, 6)))
         available_starts = list(range(1, 15))
         rng.shuffle(available_starts)
-        ranges_by_event: list[list[tuple[int, int]]] = []
         visible_until = torch.full((full_len,), never, dtype=torch.int32)
         keep_mask = torch.ones(full_len, dtype=torch.int32)
         flat_ranges: list[int] = []
         offsets = [0]
         for event_position in event_positions:
             starts = sorted(available_starts.pop() for _ in range(rng.randint(1, 2)))
-            ranges = [(start, start + 1) for start in starts]
-            ranges_by_event.append(ranges)
+            ranges: list[tuple[int, int]] = []
+            for start in starts:
+                if ranges and start <= ranges[-1][1]:
+                    ranges[-1] = (ranges[-1][0], start + 1)
+                else:
+                    ranges.append((start, start + 1))
             for start, end in ranges:
                 visible_until[start:end] = event_position
                 keep_mask[start:end] = 0
