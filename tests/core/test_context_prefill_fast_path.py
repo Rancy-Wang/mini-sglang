@@ -41,6 +41,10 @@ def _pending_req() -> PendingReq:
             dtype=torch.int32,
         ),
         full_keep_mask=keep_mask,
+        drop_event_positions=torch.tensor([4], dtype=torch.int32),
+        drop_range_offsets=torch.tensor([0, 1], dtype=torch.int32),
+        drop_position_ranges=torch.tensor([1, 3], dtype=torch.int32),
+        drop_effective_event_count=1,
         use_context_mask=True,
     )
 
@@ -164,6 +168,7 @@ def test_context_prefill_plan_executes_direct_or_mask_from_same_full_lookup() ->
     assert not direct.use_context_mask
     assert direct.cached_indices.tolist() == [20, 23]
     assert direct.true_positions.tolist() == [0, 3, 4]
+    assert direct.drop_skipped_tokens == 2
 
     mask_cache = _PlanCache(active_cached_len=1)
     mask_adder = PrefillAdder(
@@ -180,9 +185,28 @@ def test_context_prefill_plan_executes_direct_or_mask_from_same_full_lookup() ->
     assert fallback.cached_len == 4
     assert fallback.true_positions.tolist() == [0, 1, 2, 3, 4]
     assert fallback.reason == "visibility_changes_within_extend"
+    assert fallback.drop_skipped_tokens == 0
 
 
-def test_two_eligible_context_warmups_batch_as_ordinary_extend() -> None:
+def test_context_prefill_fast_path_can_be_disabled_for_ablation() -> None:
+    adder = PrefillAdder(
+        token_budget=16,
+        reserved_size=0,
+        cache_manager=_PlanCache(active_cached_len=2),
+        table_manager=SimpleNamespace(),
+        enable_mask_free_context_prefill=False,
+    )
+
+    plan = adder.plan_context_prefill(_pending_req())
+
+    assert plan is not None
+    assert plan.use_context_mask
+    assert plan.reason == "mask_free_disabled"
+    assert plan.drop_skipped_tokens == 0
+
+
+def test_two_eligible_context_warmups_batch_as_ordinary_extend(monkeypatch) -> None:
+    monkeypatch.setattr(torch.Tensor, "pin_memory", lambda self: self)
     cache = _PlanCache(active_cached_len=2)
     table = SimpleNamespace(
         available_size=4,
@@ -191,6 +215,7 @@ def test_two_eligible_context_warmups_batch_as_ordinary_extend() -> None:
     )
     allocated_rows = iter(range(4))
     table.allocate = lambda: next(allocated_rows)
+    table.free = lambda _idx: None
     manager = PrefillManager(
         cache_manager=cache,
         table_manager=table,
@@ -206,4 +231,6 @@ def test_two_eligible_context_warmups_batch_as_ordinary_extend() -> None:
     assert batch is not None
     assert len(batch.reqs) == 2
     assert all(not req.use_context_mask for req in batch.reqs)
+    assert all(req.full_input_ids is None for req in batch.reqs)
+    assert [req.drop_skipped_tokens for req in batch.reqs] == [2, 2]
     assert [req.true_positions.tolist() for req in batch.reqs] == [[0, 3, 4], [0, 3, 4]]

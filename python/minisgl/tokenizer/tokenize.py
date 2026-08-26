@@ -39,6 +39,7 @@ class TokenizedResult:
     drop_event_positions: torch.Tensor | None = None
     drop_range_offsets: torch.Tensor | None = None
     drop_position_ranges: torch.Tensor | None = None
+    drop_effective_event_count: int = 0
     radix_commit_token_len: int | None = None
     stop_token_seqs: List[List[int]] | None = None
     message_meta: dict | None = None
@@ -50,6 +51,7 @@ class PositionDropPlan:
     range_offsets: torch.Tensor
     position_ranges: torch.Tensor
     full_token_visible_until: torch.Tensor
+    effective_event_count: int
 
 
 @dataclass(frozen=True)
@@ -996,6 +998,7 @@ class TokenizeManager:
             range_offsets=torch.tensor(range_offsets, dtype=torch.int32, device="cpu"),
             position_ranges=position_ranges,
             full_token_visible_until=visible_until,
+            effective_event_count=len(event_positions),
         )
 
     @classmethod
@@ -1003,10 +1006,12 @@ class TokenizeManager:
         cls,
         event_ranges: dict[int, List[tuple[int, int]]],
         query_epoch: List[int],
+        target_msg_id: int,
     ) -> PositionDropPlan:
         """Compile rule-produced absolute ranges into the generic delta wire."""
 
         delta_by_pos: dict[int, List[tuple[int, int]]] = {}
+        effective_by_pos: dict[int, bool | None] = {}
         effective_ranges: List[tuple[int, int]] = []
         for event_n in sorted(event_ranges):
             canonical = cls._canonicalize_position_ranges(event_ranges[event_n])
@@ -1021,10 +1026,15 @@ class TokenizeManager:
                     f"event={event_n}, insertion_pos={insertion_pos}, ranges={newly_effective}"
                 )
             delta_by_pos.setdefault(insertion_pos, []).extend(newly_effective)
+            is_effective = event_n < target_msg_id
+            previous = effective_by_pos.setdefault(insertion_pos, is_effective)
+            if previous != is_effective:
+                effective_by_pos[insertion_pos] = None
 
         event_positions: List[int] = []
         range_offsets: List[int] = [0]
         flat_ranges: List[tuple[int, int]] = []
+        effective_flags: List[bool | None] = []
         visible_until = torch.full(
             (len(query_epoch),),
             torch.iinfo(torch.int32).max,
@@ -1036,6 +1046,7 @@ class TokenizeManager:
             if not canonical:
                 continue
             event_positions.append(insertion_pos)
+            effective_flags.append(effective_by_pos[insertion_pos])
             flat_ranges.extend(canonical)
             range_offsets.append(len(flat_ranges))
             for start, end in canonical:
@@ -1043,6 +1054,15 @@ class TokenizeManager:
                     visible_until[start:end],
                     torch.tensor(insertion_pos, dtype=torch.int32, device="cpu"),
                 )
+        bool_flags = [flag for flag in effective_flags if flag is not None]
+        effective_event_count = sum(bool_flags)
+        if len(bool_flags) != len(effective_flags) or any(
+            bool_flags[effective_event_count:]
+        ):
+            # A template without a distinguishable target boundary can merge a
+            # current and future event. Keep the exact-mask reference available
+            # instead of guessing which ranges are effective.
+            effective_event_count = -1
         return PositionDropPlan(
             event_positions=torch.tensor(event_positions, dtype=torch.int32, device="cpu"),
             range_offsets=torch.tensor(range_offsets, dtype=torch.int32, device="cpu"),
@@ -1050,6 +1070,7 @@ class TokenizeManager:
                 flat_ranges, dtype=torch.int32, device="cpu"
             ).reshape(-1),
             full_token_visible_until=visible_until,
+            effective_event_count=effective_event_count,
         )
 
     @staticmethod
@@ -1763,7 +1784,11 @@ class TokenizeManager:
             else None
         )
         position_drop_plan = (
-            self._build_position_range_drop_plan(event_ranges, query_epoch_with_gen)
+            self._build_position_range_drop_plan(
+                event_ranges,
+                query_epoch_with_gen,
+                target_msg_id,
+            )
             if event_ranges
             else None
         )
@@ -1871,6 +1896,11 @@ class TokenizeManager:
             ),
             drop_position_ranges=(
                 position_drop_plan.position_ranges if position_drop_plan is not None else None
+            ),
+            drop_effective_event_count=(
+                position_drop_plan.effective_event_count
+                if position_drop_plan is not None
+                else 0
             ),
             radix_commit_token_len=warmup_commit_token_len,
             stop_token_seqs=self._build_stop_token_seqs(msg.stop),

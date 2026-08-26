@@ -46,6 +46,7 @@ class UserMsg(BaseBackendMsg):
     drop_event_positions: torch.Tensor | None = None  # CPU 1D int32 absolute boundaries
     drop_range_offsets: torch.Tensor | None = None  # CPU 1D int32 CSR offsets
     drop_position_ranges: torch.Tensor | None = None  # CPU 1D int32 flattened [start, end, ...]
+    drop_effective_event_count: int = 0  # target-effective prefix of drop events
     radix_commit_token_len: int | None = None  # full-token warmup commit boundary
     enable_thinking: bool | None = None
     stop: List[str] | None = None

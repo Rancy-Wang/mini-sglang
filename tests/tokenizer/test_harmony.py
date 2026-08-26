@@ -138,6 +138,7 @@ def test_harmony_partial_text_drop_uses_exact_provenance():
     assert result.message_meta["drop_rule_type"] == "text_drop"
     assert result.drop_position_ranges is not None
     assert result.drop_position_ranges.numel() > 0
+    assert result.drop_effective_event_count > 0
     assert result.full_keep_mask is not None
     assert result.full_keep_mask.eq(0).any()
     assert len(result.input_ids) < result.prompt_tokens
@@ -158,3 +159,25 @@ def test_harmony_partial_text_drop_uses_exact_provenance():
     )[0]
     assert partial.drop_position_ranges is None
     assert len(partial.input_ids) == partial.prompt_tokens
+
+
+def test_position_drop_wire_separates_effective_and_future_events():
+    plan = TokenizeManager._build_position_range_drop_plan(
+        {0: [(0, 1)], 5: [(1, 2)]},
+        query_epoch=[0, 1, 2, 3],
+        target_msg_id=4,
+    )
+
+    assert plan.event_positions.tolist() == [1, 4]
+    assert plan.effective_event_count == 1
+
+
+def test_position_drop_wire_marks_merged_target_boundary_ambiguous():
+    plan = TokenizeManager._build_position_range_drop_plan(
+        {3: [(0, 1)], 4: [(1, 2)]},
+        query_epoch=[0, 1, 2, 3],
+        target_msg_id=4,
+    )
+
+    assert plan.event_positions.tolist() == [4]
+    assert plan.effective_event_count == -1

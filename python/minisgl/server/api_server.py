@@ -352,6 +352,10 @@ class Message(BaseModel):
     tool_calls: List[Dict[str, Any]] | None = None
 
 
+class StreamOptions(BaseModel):
+    include_usage: bool = False
+
+
 class OpenAICompletionRequest(BaseModel):
     """Unified request model for OpenAI-style completions and chat-completions."""
 
@@ -368,6 +372,7 @@ class OpenAICompletionRequest(BaseModel):
     top_p: float = 1.0
     n: int = 1
     stream: bool = False
+    stream_options: StreamOptions | None = None
     stop: str | List[str] | None = None
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
@@ -396,6 +401,39 @@ class ModelCard(BaseModel):
 class ModelList(BaseModel):
     object: str = "list"
     data: List[ModelCard] = Field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class CacheUsageReport:
+    cached_tokens: int
+    drop_skipped_tokens: int = 0
+
+
+def _build_usage(
+    *,
+    prompt_tokens: int,
+    completion_tokens: int,
+    cached_tokens: int | None,
+    drop_skipped_tokens: int = 0,
+) -> Dict[str, Any]:
+    cached = int(cached_tokens or 0)
+    skipped = int(drop_skipped_tokens)
+    if cached < 0 or skipped < 0 or cached + skipped > prompt_tokens:
+        raise ValueError(
+            "Usage counts must satisfy 0 <= cached_tokens + drop_skipped_tokens "
+            f"<= prompt_tokens, got {cached} + {skipped} > {prompt_tokens}."
+        )
+    usage = {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+    }
+    if cached > 0 or skipped > 0:
+        usage["prompt_tokens_details"] = {
+            "cached_tokens": cached,
+            "drop_skipped_tokens": skipped,
+        }
+    return usage
 
 
 @dataclass
@@ -495,7 +533,7 @@ class FrontendManager:
         reasoning_effort: str | None,
         tools: List[Dict[str, Any]] | None,
         tool_choice: str | Dict[str, Any] | None,
-    ) -> int | None:
+    ) -> CacheUsageReport | None:
         # Event n changes visibility only for messages after n. A future event
         # therefore needs no special warmup for the current generation prompt.
         parsed_rule = parse_drop_rule(drop_rule, messages, allow_internal=True)
@@ -535,9 +573,12 @@ class FrontendManager:
         )
         warmup_ack = await self.wait_for_warmup(warmup_uid)
         if use_context_mask:
-            return warmup_ack.cached_tokens
+            return CacheUsageReport(
+                cached_tokens=warmup_ack.cached_tokens,
+                drop_skipped_tokens=warmup_ack.drop_skipped_tokens,
+            )
         if warmup_ack.hit_ratio >= 0.95:
-            return warmup_ack.cached_tokens
+            return CacheUsageReport(cached_tokens=warmup_ack.cached_tokens)
 
         # Fallback: staged prefill by message prefixes.
         for end in range(1, len(messages)):
@@ -564,7 +605,7 @@ class FrontendManager:
                 )
             )
             await self.wait_for_warmup(staged_uid)
-        return warmup_ack.cached_tokens
+        return CacheUsageReport(cached_tokens=warmup_ack.cached_tokens)
 
     async def stream_generate(self, uid: int):
         try:
@@ -587,13 +628,20 @@ class FrontendManager:
         enable_thinking: bool | None = None,
         separate_reasoning: bool = True,
         stream_reasoning: bool = True,
-        cache_report_cached_tokens: int | None = None,
+        model: str = "",
+        include_usage: bool = False,
+        cache_report: CacheUsageReport | None = None,
     ):
         final_finish_reason = "stop"
         matched_stop: str | None = None
-        cache_hit_ratio: float | None = None
-        cached_tokens: int | None = cache_report_cached_tokens
+        cached_tokens: int | None = (
+            cache_report.cached_tokens if cache_report is not None else None
+        )
+        drop_skipped_tokens = (
+            cache_report.drop_skipped_tokens if cache_report is not None else 0
+        )
         prompt_tokens = 0
+        completion_tokens = 0
         server_metrics: ServerMetrics | None = None
         parser = ChatResponseParser(
             model_path=self.config.model_path,
@@ -641,12 +689,12 @@ class FrontendManager:
                     final_finish_reason = ack.finish_reason
                 if ack.matched_stop is not None:
                     matched_stop = ack.matched_stop
-                if ack.cache_hit_ratio is not None:
-                    cache_hit_ratio = ack.cache_hit_ratio
                 if cached_tokens is None and ack.cached_tokens is not None:
                     cached_tokens = ack.cached_tokens
                 if ack.prompt_tokens is not None:
                     prompt_tokens = ack.prompt_tokens
+                if ack.completion_tokens is not None:
+                    completion_tokens = ack.completion_tokens
                 if ack.server_metrics is not None:
                     server_metrics = ack.server_metrics
                 if ack.incremental_output:
@@ -682,16 +730,24 @@ class FrontendManager:
                 }
             ],
         }
-        if cached_tokens is not None:
-            end_chunk["cached_tokens"] = cached_tokens
-            cache_hit_ratio = (
-                1.0 if prompt_tokens == 0 else cached_tokens / prompt_tokens
-            )
-        if cache_hit_ratio is not None:
-            end_chunk["cache_hit_ratio"] = cache_hit_ratio
         if server_metrics is not None:
             end_chunk["server_metrics"] = server_metrics.as_api_dict()
         yield f"data: {json.dumps(end_chunk)}\n\n".encode()
+        if include_usage:
+            usage_chunk = {
+                "id": f"chatcmpl-{uid}",
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": model,
+                "choices": [],
+                "usage": _build_usage(
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    cached_tokens=cached_tokens,
+                    drop_skipped_tokens=drop_skipped_tokens,
+                ),
+            }
+            yield f"data: {json.dumps(usage_chunk)}\n\n".encode()
         yield b"data: [DONE]\n\n"
         logger.debug("Finished streaming response for user %s", uid)
 
@@ -820,10 +876,10 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
         else req.max_tokens
     )
 
-    cache_report_cached_tokens: int | None = None
+    cache_report: CacheUsageReport | None = None
     if wire_drop_rule is not None and isinstance(prompt, list):
         try:
-            cache_report_cached_tokens = await state.run_contextual_warmup(
+            cache_report = await state.run_contextual_warmup(
                 prompt,
                 wire_drop_rule,
                 req.enable_thinking,
@@ -869,7 +925,11 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
                     enable_thinking=req.enable_thinking,
                     separate_reasoning=req.separate_reasoning,
                     stream_reasoning=req.stream_reasoning,
-                    cache_report_cached_tokens=cache_report_cached_tokens,
+                    model=req.model,
+                    include_usage=bool(
+                        req.stream_options is not None and req.stream_options.include_usage
+                    ),
+                    cache_report=cache_report,
                 ),
                 request,
                 uid,
@@ -880,8 +940,10 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
     # Non-streaming: collect all chunks and return a single JSON response
     full_content = ""
     finish_reason = "stop"
-    cache_hit_ratio: float | None = None
-    cached_tokens: int | None = cache_report_cached_tokens
+    cached_tokens: int | None = cache_report.cached_tokens if cache_report is not None else None
+    drop_skipped_tokens = (
+        cache_report.drop_skipped_tokens if cache_report is not None else 0
+    )
     prompt_tokens = 0
     completion_tokens = 0
     server_metrics: ServerMetrics | None = None
@@ -892,8 +954,6 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
             full_content += ack.incremental_output
             if ack.finish_reason is not None:
                 finish_reason = ack.finish_reason
-            if ack.cache_hit_ratio is not None:
-                cache_hit_ratio = ack.cache_hit_ratio
             if cached_tokens is None and ack.cached_tokens is not None:
                 cached_tokens = ack.cached_tokens
             if ack.prompt_tokens is not None:
@@ -928,11 +988,6 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
         if finish_reason == "stop":
             finish_reason = "tool_calls"
 
-    prompt_tokens_details = (
-        {"cached_tokens": cached_tokens}
-        if cached_tokens is not None and cached_tokens > 0
-        else None
-    )
     response = {
         "id": f"chatcmpl-{uid}",
         "object": "chat.completion",
@@ -945,17 +1000,13 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
                 "finish_reason": finish_reason,
             }
         ],
-        "usage": {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": prompt_tokens + completion_tokens,
-            "prompt_tokens_details": prompt_tokens_details,
-        },
+        "usage": _build_usage(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            cached_tokens=cached_tokens,
+            drop_skipped_tokens=drop_skipped_tokens,
+        ),
     }
-    if cached_tokens is not None:
-        cache_hit_ratio = 1.0 if prompt_tokens == 0 else cached_tokens / prompt_tokens
-    if cache_hit_ratio is not None:
-        response["cache_hit_ratio"] = cache_hit_ratio
     if server_metrics is not None:
         response["server_metrics"] = server_metrics.as_api_dict()
     return response

@@ -8,7 +8,7 @@ from minisgl.server.response_parser import (
     infer_reasoning_parser,
     infer_tool_call_parser,
 )
-from minisgl.scheduler.prefill import _calculate_cache_ratios
+from minisgl.scheduler.prefill import _calculate_cache_reuse_ratio
 from minisgl.tokenizer.detokenize import DetokenizeManager
 from minisgl.tokenizer.tokenize import TokenizeManager
 
@@ -210,14 +210,11 @@ def test_terminal_detokenize_flushes_last_word() -> None:
     assert output == ["lastword"]
 
 
-def test_public_cache_hit_ratio_uses_total_prompt_denominator() -> None:
-    hit_ratio, reuse_ratio = _calculate_cache_ratios(
+def test_internal_cache_reuse_ratio_uses_selected_prefix() -> None:
+    reuse_ratio = _calculate_cache_reuse_ratio(
         cached_len=5,
-        full_matchable_prefix_len=9,
-        active_matchable_prefix_len=5,
-        total_prompt_len=10,
+        matchable_prefix_len=5,
     )
-    assert hit_ratio == 0.5
     assert reuse_ratio == 1.0
 
 

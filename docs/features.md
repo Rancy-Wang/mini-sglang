@@ -82,6 +82,45 @@ If projection fails, the default is an HTTP 400 response. Setting `force` to `tr
 normal inference using the outer `messages` as the complete prompt and does not reuse the supplied
 hidden history.
 
+## Contextual Prefill Usage
+
+默认的 `mask` contextual prefill 会先用完整 Radix key 做一次匹配。调度器随后用
+tokenizer 产生的稀疏 Drop event/range 元数据判断 compact causal Extend 是否与精确
+Context mask 等价：等价时直接执行 mask-free Extend，不等价、元数据异常或模型使用
+sliding window 时保守回退到原始 mask Prefill。启动时添加
+`--disable-mask-free-context-prefill` 可以强制回退，供算法对照实验使用。
+
+非流式 OpenAI chat-completions 响应使用 SGLang 风格的 usage：
+
+```json
+{
+  "usage": {
+    "prompt_tokens": 82000,
+    "completion_tokens": 96,
+    "total_tokens": 82096,
+    "prompt_tokens_details": {
+      "cached_tokens": 50000,
+      "drop_skipped_tokens": 31000
+    }
+  }
+}
+```
+
+`prompt_tokens` 始终是完整 chat-template prompt 的 token 数；`cached_tokens` 是本次
+contextual prefill 真正复用的 KV token 数；`drop_skipped_tokens` 是因为等价的
+mask-free Drop 而没有进入 Prefill Attention 的完整 prompt token 数。只有 mask-free
+路径会报告非零 `drop_skipped_tokens`；mask fallback、staged 和无 Drop 请求均报告零。
+当两个明细值都为零时，响应省略 `prompt_tokens_details`。流式请求需要设置
+`"stream_options":{"include_usage":true}`，服务器会在 `[DONE]` 前发送一个
+`choices: []` 的最终 usage chunk。旧的顶层 `cache_hit_ratio` 不再返回。
+
+实现依据：tokenizer 将规则编译为按位置排序的稀疏 event/range wire，并在边界合并不
+可判定时标记回退（`python/minisgl/tokenizer/tokenize.py:1004`）；CPU AOT kernel 只
+检查未缓存 query 与有效 Drop 区间是否冲突
+（`python/minisgl/kernel/csrc/src/context_plan.cpp:21`）；调度器的快速路径与 O(N)
+精确参考回退位于 `python/minisgl/scheduler/prefill.py:68`，usage 的边界检查与结构位于
+`python/minisgl/server/api_server.py:405`。
+
 ## Overlap Scheduling
 
 To further reduce CPU overhead, Mini-SGLang employs overlap scheduling, a technique proposed in [NanoFlow](https://arxiv.org/abs/2408.12757). This approach overlaps the CPU scheduling overhead with GPU computation, improving overall system throughput.

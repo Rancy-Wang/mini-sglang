@@ -30,6 +30,10 @@ class PendingReq:
     full_input_ids: torch.Tensor | None = None
     full_token_visible_until: torch.Tensor | None = None
     full_keep_mask: torch.Tensor | None = None
+    drop_event_positions: torch.Tensor | None = None
+    drop_range_offsets: torch.Tensor | None = None
+    drop_position_ranges: torch.Tensor | None = None
+    drop_effective_event_count: int = 0
     use_context_mask: bool = False
     radix_key_virtual_mask: torch.Tensor | None = None
     radix_key_to_token: torch.Tensor | None = None

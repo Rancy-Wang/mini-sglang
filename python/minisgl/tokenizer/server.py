@@ -119,7 +119,6 @@ def tokenize_worker(
                             finish_reason=msg.finish_reason,
                             matched_stop=msg.matched_stop,
                             cached_tokens=msg.cached_tokens,
-                            cache_hit_ratio=msg.cache_hit_ratio,
                             prompt_tokens=msg.prompt_tokens,
                             completion_tokens=msg.completion_tokens,
                             server_metrics=msg.server_metrics,
@@ -138,6 +137,7 @@ def tokenize_worker(
                             uid=msg.uid,
                             hit_ratio=msg.hit_ratio,
                             cached_tokens=msg.cached_tokens,
+                            drop_skipped_tokens=msg.drop_skipped_tokens,
                             finished=msg.finished,
                         )
                         for msg in warmup_msg
@@ -188,6 +188,7 @@ def tokenize_worker(
                                 drop_event_positions=t.drop_event_positions,
                                 drop_range_offsets=t.drop_range_offsets,
                                 drop_position_ranges=t.drop_position_ranges,
+                                drop_effective_event_count=t.drop_effective_event_count,
                                 radix_commit_token_len=t.radix_commit_token_len,
                                 enable_thinking=msg.enable_thinking,
                                 stop=msg.stop,
