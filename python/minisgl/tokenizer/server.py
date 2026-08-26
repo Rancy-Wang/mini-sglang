@@ -118,6 +118,7 @@ def tokenize_worker(
                             finished=msg.finished,
                             finish_reason=msg.finish_reason,
                             matched_stop=msg.matched_stop,
+                            cached_tokens=msg.cached_tokens,
                             cache_hit_ratio=msg.cache_hit_ratio,
                             prompt_tokens=msg.prompt_tokens,
                             completion_tokens=msg.completion_tokens,
@@ -132,7 +133,12 @@ def tokenize_worker(
             if len(warmup_msg) > 0:
                 batch_output = BatchFrontendMsg(
                     data=[
-                        WarmupReply(uid=msg.uid, hit_ratio=msg.hit_ratio, finished=msg.finished)
+                        WarmupReply(
+                            uid=msg.uid,
+                            hit_ratio=msg.hit_ratio,
+                            cached_tokens=msg.cached_tokens,
+                            finished=msg.finished,
+                        )
                         for msg in warmup_msg
                     ]
                 )

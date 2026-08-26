@@ -494,7 +494,7 @@ class FrontendManager:
         reasoning_effort: str | None,
         tools: List[Dict[str, Any]] | None,
         tool_choice: str | Dict[str, Any] | None,
-    ) -> None:
+    ) -> int | None:
         # Event n changes visibility only for messages after n. A future event
         # therefore needs no special warmup for the current generation prompt.
         parsed_rule = parse_drop_rule(drop_rule, messages, allow_internal=True)
@@ -512,7 +512,7 @@ class FrontendManager:
                 parsed_rule.thinking_by_message
             )
         if not has_current_drop:
-            return
+            return None
         use_context_mask = self.config.contextual_prefill_mode == "mask"
         warmup_target = len(messages) if use_context_mask else max(len(messages) - 1, 0)
         warmup_uid = self.new_user()
@@ -534,9 +534,9 @@ class FrontendManager:
         )
         warmup_ack = await self.wait_for_warmup(warmup_uid)
         if use_context_mask:
-            return
+            return warmup_ack.cached_tokens
         if warmup_ack.hit_ratio >= 0.95:
-            return
+            return warmup_ack.cached_tokens
 
         # Fallback: staged prefill by message prefixes.
         for end in range(1, len(messages)):
@@ -563,6 +563,7 @@ class FrontendManager:
                 )
             )
             await self.wait_for_warmup(staged_uid)
+        return warmup_ack.cached_tokens
 
     async def stream_generate(self, uid: int):
         try:
@@ -585,10 +586,13 @@ class FrontendManager:
         enable_thinking: bool | None = None,
         separate_reasoning: bool = True,
         stream_reasoning: bool = True,
+        cache_report_cached_tokens: int | None = None,
     ):
         final_finish_reason = "stop"
         matched_stop: str | None = None
         cache_hit_ratio: float | None = None
+        cached_tokens: int | None = cache_report_cached_tokens
+        prompt_tokens = 0
         parser = ChatResponseParser(
             model_path=self.config.model_path,
             tools=tools if _tool_choice_mode(tool_choice) != "none" else None,
@@ -637,6 +641,10 @@ class FrontendManager:
                     matched_stop = ack.matched_stop
                 if ack.cache_hit_ratio is not None:
                     cache_hit_ratio = ack.cache_hit_ratio
+                if cached_tokens is None and ack.cached_tokens is not None:
+                    cached_tokens = ack.cached_tokens
+                if ack.prompt_tokens is not None:
+                    prompt_tokens = ack.prompt_tokens
                 if ack.incremental_output:
                     encoded = encode_piece(parser.feed(ack.incremental_output))
                     if encoded is not None:
@@ -670,6 +678,11 @@ class FrontendManager:
                 }
             ],
         }
+        if cached_tokens is not None:
+            end_chunk["cached_tokens"] = cached_tokens
+            cache_hit_ratio = (
+                1.0 if prompt_tokens == 0 else cached_tokens / prompt_tokens
+            )
         if cache_hit_ratio is not None:
             end_chunk["cache_hit_ratio"] = cache_hit_ratio
         yield f"data: {json.dumps(end_chunk)}\n\n".encode()
@@ -800,9 +813,10 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
         else req.max_tokens
     )
 
+    cache_report_cached_tokens: int | None = None
     if wire_drop_rule is not None and isinstance(prompt, list):
         try:
-            await state.run_contextual_warmup(
+            cache_report_cached_tokens = await state.run_contextual_warmup(
                 prompt,
                 wire_drop_rule,
                 req.enable_thinking,
@@ -847,6 +861,7 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
                     enable_thinking=req.enable_thinking,
                     separate_reasoning=req.separate_reasoning,
                     stream_reasoning=req.stream_reasoning,
+                    cache_report_cached_tokens=cache_report_cached_tokens,
                 ),
                 request,
                 uid,
@@ -858,6 +873,7 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
     full_content = ""
     finish_reason = "stop"
     cache_hit_ratio: float | None = None
+    cached_tokens: int | None = cache_report_cached_tokens
     prompt_tokens = 0
     completion_tokens = 0
     try:
@@ -869,6 +885,8 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
                 finish_reason = ack.finish_reason
             if ack.cache_hit_ratio is not None:
                 cache_hit_ratio = ack.cache_hit_ratio
+            if cached_tokens is None and ack.cached_tokens is not None:
+                cached_tokens = ack.cached_tokens
             if ack.prompt_tokens is not None:
                 prompt_tokens = ack.prompt_tokens
             if ack.completion_tokens is not None:
@@ -899,6 +917,11 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
         if finish_reason == "stop":
             finish_reason = "tool_calls"
 
+    prompt_tokens_details = (
+        {"cached_tokens": cached_tokens}
+        if cached_tokens is not None and cached_tokens > 0
+        else None
+    )
     response = {
         "id": f"chatcmpl-{uid}",
         "object": "chat.completion",
@@ -915,8 +938,11 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
             "total_tokens": prompt_tokens + completion_tokens,
+            "prompt_tokens_details": prompt_tokens_details,
         },
     }
+    if cached_tokens is not None:
+        cache_hit_ratio = 1.0 if prompt_tokens == 0 else cached_tokens / prompt_tokens
     if cache_hit_ratio is not None:
         response["cache_hit_ratio"] = cache_hit_ratio
     return response

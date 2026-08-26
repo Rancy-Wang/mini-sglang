@@ -112,7 +112,10 @@ class Scheduler(SchedulerIOMixin):
             self.cache_manager.bind_delta_marker_registry(self.delta_marker_registry)
         self.decode_manager = DecodeManager(config.page_size)
         self.prefill_manager = PrefillManager(
-            self.cache_manager, self.table_manager, self.decode_manager
+            self.cache_manager,
+            self.table_manager,
+            self.decode_manager,
+            has_sliding_window=config.model_config.sliding_window is not None,
         )
         if config.contextual_prefill_mode not in {"staged", "mask"}:
             raise ValueError(
@@ -228,6 +231,7 @@ class Scheduler(SchedulerIOMixin):
                         WarmupAckMsg(
                             uid=req.uid,
                             hit_ratio=req.cache_reuse_ratio,
+                            cached_tokens=req.initial_active_cached_len,
                             finished=finished,
                         )
                     )
@@ -252,6 +256,9 @@ class Scheduler(SchedulerIOMixin):
                             finished=finished,
                             finish_reason=finish_reason if finished else None,
                             matched_stop=matched_stop,
+                            cached_tokens=(
+                                req.initial_active_cached_len if finished else None
+                            ),
                             cache_hit_ratio=req.cache_hit_ratio if finished else None,
                             prompt_tokens=req.prompt_tokens if finished else None,
                             completion_tokens=req.completion_tokens if finished else None,

@@ -49,6 +49,7 @@ class DetokenizeMsg(BaseTokenizerMsg):
     finished: bool
     finish_reason: str | None = None
     matched_stop: str | None = None
+    cached_tokens: int | None = None
     cache_hit_ratio: float | None = None
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
@@ -58,6 +59,7 @@ class DetokenizeMsg(BaseTokenizerMsg):
 class WarmupAckMsg(BaseTokenizerMsg):
     uid: int
     hit_ratio: float
+    cached_tokens: int
     finished: bool
 
 
