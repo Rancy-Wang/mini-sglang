@@ -62,7 +62,8 @@ class ContextPrefillPlan:
     cached_len: int
     initial_full_match_indices: torch.Tensor
     reason: str
-    drop_skipped_tokens: int
+    radix_cached_tokens: int
+    usage_cached_tokens: int | None
 
 
 def _mask_free_context_reason_reference(
@@ -207,9 +208,9 @@ class PrefillAdder:
             else "mask_free_disabled"
         )
         if fallback_reason is None:
-            drop_skipped_tokens = req.prompt_tokens - len(req.input_ids)
-            if drop_skipped_tokens < 0:
-                raise ValueError("Active Context tokens cannot exceed full prompt tokens.")
+            radix_cached_tokens = full_match.handle.physical_cached_len
+            if active_match.active_cached_len > radix_cached_tokens:
+                raise RuntimeError("Active cache usage exceeds resident Radix matches.")
             logger.debug(
                 "Context warmup %s selected mask-free Extend with %d active cache hits.",
                 req.uid,
@@ -225,7 +226,8 @@ class PrefillAdder:
                 cached_len=active_match.active_cached_len,
                 initial_full_match_indices=active_match.full_match_indices,
                 reason="mask_free_visibility_equivalent",
-                drop_skipped_tokens=drop_skipped_tokens,
+                radix_cached_tokens=radix_cached_tokens,
+                usage_cached_tokens=active_match.active_cached_len,
             )
 
         assert req.full_input_ids is not None
@@ -253,14 +255,15 @@ class PrefillAdder:
             cached_len=full_match.safe_cached_len,
             initial_full_match_indices=full_match.full_match_indices,
             reason=fallback_reason,
-            drop_skipped_tokens=0,
+            radix_cached_tokens=full_match.handle.physical_cached_len,
+            usage_cached_tokens=None,
         )
 
     def _try_allocate_one(
         self,
         req: PendingReq,
         context_plan: ContextPrefillPlan | None = None,
-    ) -> Tuple[BaseCacheHandle, int, float, torch.Tensor, int, int] | None:
+    ) -> Tuple[BaseCacheHandle, int, float, torch.Tensor, int, int, int | None] | None:
         if self.table_manager.available_size == 0:
             return None
 
@@ -280,7 +283,8 @@ class PrefillAdder:
             cached_len = context_plan.cached_len
             cached_indices = context_plan.cached_indices
             initial_full_match_indices = context_plan.initial_full_match_indices
-            drop_skipped_tokens = context_plan.drop_skipped_tokens
+            radix_cached_tokens = context_plan.radix_cached_tokens
+            usage_cached_tokens = context_plan.usage_cached_tokens
         elif req.use_context_mask:
             match = self.cache_manager.match_full_req(req)
             if match is None:
@@ -289,7 +293,8 @@ class PrefillAdder:
             cached_len = match.safe_cached_len
             cached_indices = match.safe_match_indices
             initial_full_match_indices = match.full_match_indices
-            drop_skipped_tokens = 0
+            radix_cached_tokens = match.handle.physical_cached_len
+            usage_cached_tokens = None
         else:
             match = self.cache_manager.match_req(req)
             if match is None:
@@ -298,7 +303,8 @@ class PrefillAdder:
             cached_len = match.active_cached_len
             cached_indices = match.active_match_indices
             initial_full_match_indices = match.full_match_indices[: match.full_cached_len]
-            drop_skipped_tokens = 0
+            radix_cached_tokens = cached_len
+            usage_cached_tokens = cached_len
         full_prefix_len, active_prefix_len = self.cache_manager.matchable_prefix_lens(req)
         cache_reuse_ratio = _calculate_cache_reuse_ratio(
             cached_len,
@@ -354,7 +360,8 @@ class PrefillAdder:
             cache_reuse_ratio,
             initial_full_match_indices.clone(),
             cached_len,
-            drop_skipped_tokens,
+            radix_cached_tokens,
+            usage_cached_tokens,
         )
 
     def _add_one_req(
@@ -366,7 +373,8 @@ class PrefillAdder:
         cache_reuse_ratio: float,
         initial_full_match_indices: torch.Tensor,
         initial_active_cached_len: int,
-        drop_skipped_tokens: int,
+        radix_cached_tokens: int,
+        usage_cached_tokens: int | None,
     ) -> Req:
         remain_len = pending_req.input_len - cached_len
         chunk_size = min(self.token_budget, remain_len)
@@ -402,7 +410,13 @@ class PrefillAdder:
             prefix_keep_mask=pending_req.prefix_keep_mask,
             is_warmup=pending_req.is_warmup,
             cache_reuse_ratio=cache_reuse_ratio,
-            drop_skipped_tokens=drop_skipped_tokens,
+            radix_cached_tokens=radix_cached_tokens,
+            usage_cached_tokens=usage_cached_tokens,
+            drop_skipped_tokens=(
+                radix_cached_tokens - usage_cached_tokens
+                if usage_cached_tokens is not None
+                else 0
+            ),
             full_input_ids=(pending_req.full_input_ids if pending_req.use_context_mask else None),
             full_token_visible_until=(
                 pending_req.full_token_visible_until if pending_req.use_context_mask else None
@@ -433,7 +447,8 @@ class PrefillAdder:
                 cache_reuse_ratio=chunked_req.cache_reuse_ratio,
                 initial_full_match_indices=chunked_req.initial_full_match_indices,
                 initial_active_cached_len=chunked_req.initial_active_cached_len,
-                drop_skipped_tokens=chunked_req.drop_skipped_tokens,
+                radix_cached_tokens=chunked_req.radix_cached_tokens,
+                usage_cached_tokens=chunked_req.usage_cached_tokens,
             )
 
         if resource := self._try_allocate_one(pending_req, context_plan):
@@ -443,7 +458,8 @@ class PrefillAdder:
                 cache_reuse_ratio,
                 initial_full_match_indices,
                 initial_active_cached_len,
-                drop_skipped_tokens,
+                radix_cached_tokens,
+                usage_cached_tokens,
             ) = resource
             return self._add_one_req(
                 pending_req=pending_req,
@@ -453,7 +469,8 @@ class PrefillAdder:
                 cache_reuse_ratio=cache_reuse_ratio,
                 initial_full_match_indices=initial_full_match_indices,
                 initial_active_cached_len=initial_active_cached_len,
-                drop_skipped_tokens=drop_skipped_tokens,
+                radix_cached_tokens=radix_cached_tokens,
+                usage_cached_tokens=usage_cached_tokens,
             )
 
         return None

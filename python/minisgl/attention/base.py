@@ -30,6 +30,7 @@ class ContextAttentionSegment:
 class ContextAttentionBatch:
     """Ragged Context segments for a flattened multi-request Prefill batch."""
 
+    cached_tokens: tuple[int, ...]
     segment_table_indices: torch.Tensor
     key_positions: torch.Tensor
     cu_seqlens_q: torch.Tensor
@@ -191,6 +192,7 @@ def build_context_attention_batch(
     key_positions = []
     query_lengths = []
     key_lengths = []
+    cached_tokens = []
     expected_query_offset = 0
     for req in reqs:
         if req.full_token_visible_until is None:
@@ -202,6 +204,9 @@ def build_context_attention_batch(
             key_length=req.device_len,
             sliding_window=sliding_window,
         )
+        first_segment = segments[0]
+        first_query_length = first_segment.query_end - first_segment.query_start
+        cached_tokens.append(len(first_segment.key_positions) - first_query_length)
         local_query_offset = 0
         for segment in segments:
             if segment.query_start != local_query_offset:
@@ -221,6 +226,7 @@ def build_context_attention_batch(
     if int(cu_seqlens_q[-1]) != expected_query_offset:
         raise RuntimeError("Context batch query layout diverged from flattened Prefill Q.")
     return ContextAttentionBatch(
+        cached_tokens=tuple(cached_tokens),
         segment_table_indices=torch.tensor(segment_table_indices, dtype=torch.int32),
         key_positions=torch.cat(key_positions),
         cu_seqlens_q=cu_seqlens_q,

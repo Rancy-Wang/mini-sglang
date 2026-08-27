@@ -362,6 +362,12 @@ class FlashInferBackend(BaseAttnBackend):
                 context_batch = build_context_attention_batch(
                     masked_reqs, sliding_window=sliding_window
                 )
+                if sliding_window is None:
+                    for req, cached_tokens in zip(
+                        masked_reqs, context_batch.cached_tokens, strict=True
+                    ):
+                        if req.usage_cached_tokens is None:
+                            req.record_context_cache_usage(cached_tokens)
                 compiled = compile_context_page_tables(page_table, context_batch)
                 context_cu_q_cpu = context_batch.cu_seqlens_q.pin_memory()
                 context_cu_k_cpu = context_batch.cu_seqlens_k.pin_memory()

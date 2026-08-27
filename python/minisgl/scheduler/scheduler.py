@@ -246,7 +246,7 @@ class Scheduler(SchedulerIOMixin):
                         WarmupAckMsg(
                             uid=req.uid,
                             hit_ratio=req.cache_reuse_ratio,
-                            cached_tokens=req.initial_active_cached_len,
+                            cached_tokens=req.reported_cached_tokens,
                             drop_skipped_tokens=req.drop_skipped_tokens,
                             finished=finished,
                         )
@@ -281,7 +281,7 @@ class Scheduler(SchedulerIOMixin):
                             finish_reason=finish_reason if finished else None,
                             matched_stop=matched_stop,
                             cached_tokens=(
-                                req.initial_active_cached_len if finished else None
+                                req.reported_cached_tokens if finished else None
                             ),
                             prompt_tokens=req.prompt_tokens if finished else None,
                             completion_tokens=req.completion_tokens if finished else None,

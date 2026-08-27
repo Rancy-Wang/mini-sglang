@@ -6,6 +6,8 @@ import pytest
 import torch
 
 import minisgl.core as core
+from minisgl.attention.base import build_context_attention_batch
+from minisgl.attention.fa import is_fa_context_mask_supported
 from minisgl.core import SamplingParams
 from minisgl.scheduler.cache import CacheManager, ContextMatchResult, FullMatchResult
 from minisgl.scheduler.prefill import PrefillAdder, PrefillManager, _mask_free_context_reason
@@ -114,7 +116,7 @@ def test_drop_aware_full_match_derives_active_pages_across_dropped_holes() -> No
 
 class _PlanCache:
     def __init__(self, active_cached_len: int):
-        self.handle = object()
+        self.handle = SimpleNamespace(physical_cached_len=4)
         self.full_match = FullMatchResult(
             handle=self.handle,
             full_match_indices=torch.tensor([20, 21, 22, 23], dtype=torch.int32),
@@ -168,7 +170,8 @@ def test_context_prefill_plan_executes_direct_or_mask_from_same_full_lookup() ->
     assert not direct.use_context_mask
     assert direct.cached_indices.tolist() == [20, 23]
     assert direct.true_positions.tolist() == [0, 3, 4]
-    assert direct.drop_skipped_tokens == 2
+    assert direct.radix_cached_tokens == 4
+    assert direct.usage_cached_tokens == 2
 
     mask_cache = _PlanCache(active_cached_len=1)
     mask_adder = PrefillAdder(
@@ -185,7 +188,8 @@ def test_context_prefill_plan_executes_direct_or_mask_from_same_full_lookup() ->
     assert fallback.cached_len == 4
     assert fallback.true_positions.tolist() == [0, 1, 2, 3, 4]
     assert fallback.reason == "visibility_changes_within_extend"
-    assert fallback.drop_skipped_tokens == 0
+    assert fallback.radix_cached_tokens == 4
+    assert fallback.usage_cached_tokens is None
 
 
 def test_context_prefill_fast_path_can_be_disabled_for_ablation() -> None:
@@ -202,7 +206,37 @@ def test_context_prefill_fast_path_can_be_disabled_for_ablation() -> None:
     assert plan is not None
     assert plan.use_context_mask
     assert plan.reason == "mask_free_disabled"
-    assert plan.drop_skipped_tokens == 0
+    assert plan.radix_cached_tokens == 4
+    assert plan.usage_cached_tokens is None
+
+
+def test_exact_context_schedule_records_metadata_usage(monkeypatch) -> None:
+    monkeypatch.setattr(torch.Tensor, "pin_memory", lambda self: self)
+    cache = _PlanCache(active_cached_len=1)
+    table = SimpleNamespace(
+        available_size=4,
+        token_pool=torch.zeros((4, 16), dtype=torch.int32),
+        page_table=torch.full((4, 16), -1, dtype=torch.int32),
+    )
+    table.allocate = lambda: 0
+    table.free = lambda _idx: None
+    manager = PrefillManager(
+        cache_manager=cache,
+        table_manager=table,
+        decode_manager=SimpleNamespace(inflight_tokens=0),
+    )
+    manager.pending_list.append(_pending_req())
+
+    batch = manager.schedule_next_batch(prefill_budget=16)
+
+    assert batch is not None
+    req = batch.reqs[0]
+    assert req.use_context_mask
+    assert req.usage_cached_tokens is None
+    context = build_context_attention_batch(batch.reqs)
+    req.record_context_cache_usage(context.cached_tokens[0])
+    assert req.reported_cached_tokens == 2
+    assert req.drop_skipped_tokens == 2
 
 
 def test_two_eligible_context_warmups_batch_as_ordinary_extend(monkeypatch) -> None:
@@ -232,5 +266,49 @@ def test_two_eligible_context_warmups_batch_as_ordinary_extend(monkeypatch) -> N
     assert len(batch.reqs) == 2
     assert all(not req.use_context_mask for req in batch.reqs)
     assert all(req.full_input_ids is None for req in batch.reqs)
+    assert [req.reported_cached_tokens for req in batch.reqs] == [2, 2]
     assert [req.drop_skipped_tokens for req in batch.reqs] == [2, 2]
     assert [req.true_positions.tolist() for req in batch.reqs] == [[0, 3, 4], [0, 3, 4]]
+
+
+def _exact_attention_req(*, full_len: int, cached_len: int, drop_at: int):
+    visible_until = torch.full(
+        (full_len,), torch.iinfo(torch.int32).max, dtype=torch.int32
+    )
+    visible_until[:25] = drop_at
+    return SimpleNamespace(
+        table_idx=0,
+        cached_len=cached_len,
+        extend_len=full_len - cached_len,
+        device_len=full_len,
+        full_token_visible_until=visible_until,
+    )
+
+
+def test_exact_context_usage_counts_only_cached_positions_in_attention_metadata() -> None:
+    req = _exact_attention_req(full_len=93, cached_len=49, drop_at=49)
+
+    context = build_context_attention_batch([req])
+
+    assert context.cached_tokens == (24,)
+    first_key_end = int(context.cu_seqlens_k[1])
+    first_keys = context.key_positions[:first_key_end]
+    assert not bool(torch.any(first_keys < 25).item())
+    assert first_keys[:24].tolist() == list(range(25, 49))
+
+
+def test_exact_context_counts_cached_tokens_used_before_a_later_drop() -> None:
+    req = _exact_attention_req(full_len=93, cached_len=46, drop_at=49)
+
+    context = build_context_attention_batch([req])
+
+    assert context.cached_tokens == (46,)
+    assert context.num_segments == 2
+
+
+@pytest.mark.parametrize("major, expected", [(8, True), (9, True), (10, False), (11, False)])
+def test_context_mask_flash_attention_is_fa3_only(monkeypatch, major, expected) -> None:
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device=None: (major, 0))
+
+    assert is_fa_context_mask_supported() is expected
