@@ -55,6 +55,151 @@ class CompiledContextPageTables:
     padded_page_table: torch.Tensor
 
 
+def validate_active_true_positions(
+    true_positions: torch.Tensor,
+    *,
+    device_len: int,
+) -> torch.Tensor:
+    """Validate and return the active absolute token positions as int64 on CPU."""
+
+    if true_positions.ndim != 1 or not true_positions.is_cpu:
+        raise ValueError("true_positions must be a one-dimensional CPU tensor.")
+    if device_len < 1 or device_len != len(true_positions):
+        raise ValueError(
+            "true_positions must contain exactly device_len active positions, got "
+            f"{len(true_positions)} positions for device_len={device_len}."
+        )
+    active_positions = true_positions.to(dtype=torch.int64)
+    if len(active_positions) > 1 and bool(
+        torch.any(active_positions[1:] <= active_positions[:-1]).item()
+    ):
+        raise ValueError("true_positions must be strictly increasing.")
+    return active_positions
+
+
+def sliding_window_crosses_gap(
+    true_positions: torch.Tensor,
+    *,
+    device_len: int,
+    sliding_window: int,
+) -> bool:
+    """Whether the last decode query's absolute window crosses a dropped span."""
+
+    if sliding_window < 1:
+        raise ValueError("sliding_window must be positive.")
+    if true_positions.ndim != 1 or not true_positions.is_cpu:
+        raise ValueError("true_positions must be a one-dimensional CPU tensor.")
+    if device_len < 1 or device_len != len(true_positions):
+        raise ValueError(
+            "true_positions must contain exactly device_len active positions, got "
+            f"{len(true_positions)} positions for device_len={device_len}."
+        )
+    token_count = min(sliding_window, device_len)
+    recent_positions = true_positions[device_len - token_count : device_len].to(dtype=torch.int64)
+    if len(recent_positions) > 1 and bool(
+        torch.any(recent_positions[1:] <= recent_positions[:-1]).item()
+    ):
+        raise ValueError("true_positions must be strictly increasing.")
+    return int(recent_positions[-1] - recent_positions[0]) + 1 != token_count
+
+
+def batch_needs_gap_aware_sliding_window(
+    reqs: Sequence,
+    *,
+    sliding_window: int | None,
+    decode_only: bool = False,
+) -> bool:
+    """Whether any request/query cannot use a compact-index kernel window."""
+
+    if sliding_window is None:
+        return False
+    if sliding_window < 1:
+        raise ValueError("sliding_window must be positive.")
+
+    if decode_only:
+        return any(
+            sliding_window_crosses_gap(
+                req.true_positions,
+                device_len=req.device_len,
+                sliding_window=sliding_window,
+            )
+            for req in reqs
+        )
+
+    for req in reqs:
+        active_positions = validate_active_true_positions(
+            req.true_positions,
+            device_len=req.device_len,
+        )
+        query_start = req.cached_len
+        if not 0 <= query_start < req.device_len:
+            raise ValueError("Sliding-window queries must satisfy 0 <= query_start < device_len.")
+        for query_idx in range(query_start, req.device_len):
+            token_count = min(sliding_window, query_idx + 1)
+            first_idx = query_idx + 1 - token_count
+            if int(active_positions[query_idx] - active_positions[first_idx]) + 1 != token_count:
+                return True
+    return False
+
+
+def build_sliding_window_attention_batch(
+    reqs: Sequence,
+    *,
+    sliding_window: int,
+) -> ContextAttentionBatch:
+    """Build exact absolute-position windows over compact active KV slots."""
+
+    if not reqs:
+        raise ValueError("Sliding-window batching requires at least one request.")
+    if sliding_window < 1:
+        raise ValueError("sliding_window must be positive.")
+
+    segment_table_indices = []
+    key_positions = []
+    key_lengths = []
+    cached_tokens = []
+    expected_query_count = 0
+    window_left = sliding_window - 1
+    for req in reqs:
+        active_positions = validate_active_true_positions(
+            req.true_positions,
+            device_len=req.device_len,
+        )
+        if not 0 <= req.cached_len < req.device_len:
+            raise ValueError("Sliding-window requests must satisfy 0 <= cached_len < device_len.")
+        first_key_count = None
+        for query_idx in range(req.cached_len, req.device_len):
+            query_position = active_positions[query_idx]
+            left_idx = int(
+                torch.searchsorted(
+                    active_positions[: query_idx + 1],
+                    query_position - window_left,
+                    side="left",
+                ).item()
+            )
+            compact_keys = torch.arange(left_idx, query_idx + 1, dtype=torch.int32)
+            if first_key_count is None:
+                first_key_count = len(compact_keys)
+            segment_table_indices.append(req.table_idx)
+            key_positions.append(compact_keys)
+            key_lengths.append(len(compact_keys))
+            expected_query_count += 1
+        assert first_key_count is not None
+        cached_tokens.append(first_key_count - 1)
+
+    cu_seqlens_q = torch.arange(expected_query_count + 1, dtype=torch.int32)
+    cu_seqlens_k = torch.tensor([0] + key_lengths, dtype=torch.int32).cumsum_(dim=0)
+    return ContextAttentionBatch(
+        cached_tokens=tuple(cached_tokens),
+        segment_table_indices=torch.tensor(segment_table_indices, dtype=torch.int32),
+        key_positions=torch.cat(key_positions),
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=1,
+        max_seqlen_k=max(key_lengths),
+    )
+
+
 if triton is not None:
 
     @triton.jit
@@ -300,6 +445,9 @@ class BaseAttnMetadata(ABC):
 
 
 class BaseAttnBackend(ABC):
+    def can_use_cuda_graph(self, batch: Batch) -> bool:
+        return True
+
     def validate_context_mask_prefill(self, device: torch.device | int | None = None) -> None:
         raise ValueError(
             f"Context-mask Prefill is not supported by {type(self).__name__}. "
@@ -352,6 +500,9 @@ class HybridBackend(BaseAttnBackend):
 
     def validate_context_mask_prefill(self, device: torch.device | int | None = None) -> None:
         self.prefill_backend.validate_context_mask_prefill(device)
+
+    def can_use_cuda_graph(self, batch: Batch) -> bool:
+        return self.decode_backend.can_use_cuda_graph(batch)
 
     def forward(
         self,
