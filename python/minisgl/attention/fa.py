@@ -9,7 +9,9 @@ from minisgl.core import Batch, get_global_ctx
 from .base import (
     BaseAttnBackend,
     BaseAttnMetadata,
+    batch_needs_gap_aware_sliding_window,
     build_context_attention_batch,
+    build_sliding_window_attention_batch,
     compile_context_page_tables,
 )
 from .utils import BaseCaptureData
@@ -95,6 +97,13 @@ class FlashAttentionBackend(BaseAttnBackend):
     def supports_multi_context_mask_prefill(self) -> bool:
         return True
 
+    def can_use_cuda_graph(self, batch: Batch) -> bool:
+        return not batch_needs_gap_aware_sliding_window(
+            batch.reqs,
+            sliding_window=self.config.sliding_window,
+            decode_only=True,
+        )
+
     def forward(
         self,
         q: torch.Tensor,
@@ -109,17 +118,20 @@ class FlashAttentionBackend(BaseAttnBackend):
         metadata = batch.attn_metadata
         assert isinstance(metadata, FAMetadata)
         self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
-        if metadata.context_segments is not None:
-            segments = metadata.context_segments
-            window_size = (sliding_window, 0) if sliding_window is not None else (-1, -1)
+        segments = None
+        window_size = (sliding_window, 0) if sliding_window is not None else (-1, -1)
+        if sliding_window is not None and metadata.sliding_context_segments is not None:
+            segments = metadata.sliding_context_segments
+            window_size = (-1, -1)
+        elif metadata.context_segments is not None:
             if sliding_window is not None:
-                if metadata.sliding_context_segments is None:
-                    raise RuntimeError(
-                        "FlashAttention context-mask metadata is missing absolute-position "
-                        "sliding segments."
-                    )
-                segments = metadata.sliding_context_segments
-                window_size = (-1, -1)
+                raise RuntimeError(
+                    "FlashAttention context-mask metadata is missing absolute-position "
+                    "sliding segments."
+                )
+            segments = metadata.context_segments
+
+        if segments is not None:
             return _fa3_context_mask_impl(
                 q=q,
                 k_cache=self.kvcache.k_cache(layer_id),
@@ -182,11 +194,27 @@ class FlashAttentionBackend(BaseAttnBackend):
 
         context_segments = None
         sliding_context_segments = None
+
+        def _compile_fa_segments(context_batch):
+            compiled = compile_context_page_tables(page_table, context_batch)
+            context_cu_q = context_batch.cu_seqlens_q.pin_memory().to(device, non_blocking=True)
+            context_cu_k = context_batch.cu_seqlens_k.pin_memory().to(device, non_blocking=True)
+            return FAContextSegmentMetadata(
+                query_start=0,
+                query_end=context_batch.num_queries,
+                page_table=compiled.padded_page_table,
+                cache_seqlens=(context_cu_k[1:] - context_cu_k[:-1]),
+                cu_seqlens_q=context_cu_q,
+                cu_seqlens_k=context_cu_k,
+                max_seqlen_q=context_batch.max_seqlen_q,
+            )
+
         if masked_reqs:
             if self.page_size != 1:
                 raise RuntimeError(
                     "FlashAttention context-mask Prefill currently requires page_size=1."
                 )
+
             def _compile_fa_context(sliding_window: int | None):
                 context_batch = build_context_attention_batch(
                     masked_reqs, sliding_window=sliding_window
@@ -197,28 +225,26 @@ class FlashAttentionBackend(BaseAttnBackend):
                     ):
                         if req.usage_cached_tokens is None:
                             req.record_context_cache_usage(cached_tokens)
-                compiled = compile_context_page_tables(page_table, context_batch)
-                context_cu_q = context_batch.cu_seqlens_q.pin_memory().to(
-                    device, non_blocking=True
-                )
-                context_cu_k = context_batch.cu_seqlens_k.pin_memory().to(
-                    device, non_blocking=True
-                )
-                return FAContextSegmentMetadata(
-                    query_start=0,
-                    query_end=context_batch.num_queries,
-                    page_table=compiled.padded_page_table,
-                    cache_seqlens=(context_cu_k[1:] - context_cu_k[:-1]),
-                    cu_seqlens_q=context_cu_q,
-                    cu_seqlens_k=context_cu_k,
-                    max_seqlen_q=context_batch.max_seqlen_q,
-                )
+                return _compile_fa_segments(context_batch)
 
             context_segments = _compile_fa_context(None)
             if self.config.sliding_window is not None:
-                sliding_context_segments = _compile_fa_context(
-                    self.config.sliding_window - 1
+                sliding_context_segments = _compile_fa_context(self.config.sliding_window - 1)
+        elif batch_needs_gap_aware_sliding_window(
+            reqs,
+            sliding_window=self.config.sliding_window,
+            decode_only=batch.is_decode,
+        ):
+            if self.page_size != 1:
+                raise RuntimeError(
+                    "Gap-aware FlashAttention sliding windows currently require page_size=1."
                 )
+            assert self.config.sliding_window is not None
+            sliding_batch = build_sliding_window_attention_batch(
+                reqs,
+                sliding_window=self.config.sliding_window,
+            )
+            sliding_context_segments = _compile_fa_segments(sliding_batch)
         batch.attn_metadata = FAMetadata(
             cu_seqlens_k=cu_seqlens_k,
             cu_seqlens_q=cu_seqlens_q,
@@ -348,9 +374,7 @@ def _fa_sgl_impl(
                 "Unexpected FA3 LSE shape while applying GPT-OSS attention sinks: "
                 f"output={tuple(out.shape)}, lse={tuple(lse.shape)}."
             )
-        sink_scale = torch.sigmoid(
-            lse.float() - sinks.float().reshape(-1, 1)
-        ).transpose(0, 1)
+        sink_scale = torch.sigmoid(lse.float() - sinks.float().reshape(-1, 1)).transpose(0, 1)
         return (out.float() * sink_scale.unsqueeze(-1)).to(out.dtype)
 
     return flash_attn_with_kvcache(  # type: ignore

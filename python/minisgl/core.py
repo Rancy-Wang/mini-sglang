@@ -102,6 +102,12 @@ class Req:
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu
         assert self.true_positions.is_cpu
+        if self.true_positions.ndim != 1:
+            raise ValueError("true_positions must be one-dimensional.")
+        if len(self.true_positions) > 1 and bool(
+            torch.any(self.true_positions[1:] <= self.true_positions[:-1]).item()
+        ):
+            raise ValueError("true_positions must be strictly increasing.")
         assert self.radix_input_ids.is_cpu
         assert self.radix_match_ids.is_cpu
         if self.use_context_mask and not self.is_warmup:
