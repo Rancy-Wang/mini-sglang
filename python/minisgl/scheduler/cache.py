@@ -163,6 +163,14 @@ class CacheManager:
         full_match_indices = key_match_indices[
             (~matched_virtual_mask).to(device=key_match_indices.device, non_blocking=True)
         ]
+        return self._derive_active_match(req, handle, full_match_indices)
+
+    def _derive_active_match(
+        self,
+        req: PendingReq,
+        handle: BaseCacheHandle,
+        full_match_indices: torch.Tensor,
+    ) -> ContextMatchResult:
         active_match_indices = full_match_indices
         if req.prefix_keep_mask is not None and len(full_match_indices) > 0:
             if len(req.prefix_keep_mask) < len(full_match_indices):
@@ -199,6 +207,17 @@ class CacheManager:
             full_cached_len=len(full_match_indices),
             active_match_indices=active_match_indices,
             active_cached_len=len(active_match_indices),
+        )
+
+    def derive_active_match(
+        self, req: PendingReq, full_match: FullMatchResult
+    ) -> ContextMatchResult:
+        """Reuse one full Radix lookup to derive the resident active-token prefix."""
+
+        return self._derive_active_match(
+            req,
+            full_match.handle,
+            full_match.full_match_indices,
         )
 
     def match_full_req(self, req: PendingReq) -> FullMatchResult | None:

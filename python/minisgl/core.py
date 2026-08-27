@@ -85,8 +85,10 @@ class Req:
     stop_token_seqs: List[List[int]] | None = None
     prefix_keep_mask: torch.Tensor | None = None  # cpu tensor for full->active prefix filtering
     is_warmup: bool = False
-    cache_hit_ratio: float = 1.0
     cache_reuse_ratio: float = 1.0
+    radix_cached_tokens: int = 0
+    usage_cached_tokens: int | None = None
+    drop_skipped_tokens: int = 0
     full_input_ids: torch.Tensor | None = None
     full_token_visible_until: torch.Tensor | None = None
     full_keep_mask: torch.Tensor | None = None
@@ -156,6 +158,10 @@ class Req:
         self.max_device_len = len(self.input_ids) + self.output_len
         assert 0 <= self.cached_len < self.device_len <= self.max_device_len
         assert 0 <= self.initial_active_cached_len <= self.cached_len
+        if self.radix_cached_tokens < 0:
+            raise ValueError("radix_cached_tokens must be non-negative.")
+        if self.usage_cached_tokens is not None:
+            self._validate_context_cache_usage(self.usage_cached_tokens)
         assert self.true_seq_len >= int(self.true_positions[self.device_len - 1].item()) + 1
 
         context_tensors = (
@@ -197,6 +203,33 @@ class Req:
                 raise ValueError("A token cannot become invisible before it has been computed.")
         if self.use_context_mask and not all(tensor is not None for tensor in context_tensors):
             raise ValueError("Context-mask Prefill requires complete context metadata.")
+
+    def _validate_context_cache_usage(self, cached_tokens: int) -> None:
+        if not 0 <= cached_tokens <= self.radix_cached_tokens:
+            raise ValueError(
+                "Attention cache usage must satisfy 0 <= cached <= Radix-matched, got "
+                f"{cached_tokens}, {self.radix_cached_tokens}."
+            )
+
+    def record_context_cache_usage(self, cached_tokens: int) -> None:
+        """Record distinct Radix-hit tokens that enter full Context attention."""
+
+        self._validate_context_cache_usage(cached_tokens)
+        if self.usage_cached_tokens is not None:
+            if self.usage_cached_tokens != cached_tokens:
+                raise RuntimeError(
+                    "Context cache usage changed after it was recorded: "
+                    f"{self.usage_cached_tokens} != {cached_tokens}."
+                )
+            return
+        self.usage_cached_tokens = cached_tokens
+        self.drop_skipped_tokens = self.radix_cached_tokens - cached_tokens
+
+    @property
+    def reported_cached_tokens(self) -> int:
+        if self.usage_cached_tokens is None:
+            raise RuntimeError("Context cache usage was not recorded before reporting.")
+        return self.usage_cached_tokens
 
     @property
     def remain_len(self) -> int:

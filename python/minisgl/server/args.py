@@ -298,6 +298,12 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
             "backend-specific mask names are deprecated aliases for 'mask'."
         ),
     )
+    parser.add_argument(
+        "--disable-mask-free-context-prefill",
+        action="store_false",
+        dest="mask_free_context_prefill",
+        help="Force contextual warmups to use the exact mask Prefill path for ablation.",
+    )
 
     parser.add_argument(
         "--shell-mode",

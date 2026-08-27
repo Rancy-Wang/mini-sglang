@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, List, Tuple
 
 import torch
 from minisgl.core import Batch, Req, get_global_ctx
+from minisgl.kernel.context_plan import first_mask_free_conflict_event
 from minisgl.utils import init_logger
 
 from .utils import PendingReq
@@ -18,30 +19,19 @@ if TYPE_CHECKING:
     from .table import TableManager
 
 logger = init_logger(__name__)
+_sparse_kernel_failure_logged = False
 
 
-def _calculate_cache_ratios(
+def _calculate_cache_reuse_ratio(
     cached_len: int,
-    full_matchable_prefix_len: int,
-    active_matchable_prefix_len: int,
-    total_prompt_len: int,
-) -> tuple[float, float]:
-    if not (
-        0 <= cached_len <= active_matchable_prefix_len <= full_matchable_prefix_len <= total_prompt_len
-    ):
+    matchable_prefix_len: int,
+) -> float:
+    if not 0 <= cached_len <= matchable_prefix_len:
         raise ValueError(
-            "Cache ratio lengths must satisfy "
-            "0 <= cached <= active_matchable <= full_matchable <= total_prompt, got "
-            f"{cached_len}, {active_matchable_prefix_len}, {full_matchable_prefix_len}, "
-            f"{total_prompt_len}."
+            "Cache reuse lengths must satisfy 0 <= cached <= matchable, got "
+            f"{cached_len}, {matchable_prefix_len}."
         )
-    # Public metric: reusable, non-Dropped token hits divided by every prompt
-    # token. The active-only denominator remains an internal warmup metric.
-    cache_hit_ratio = 1.0 if total_prompt_len == 0 else cached_len / total_prompt_len
-    cache_reuse_ratio = (
-        1.0 if active_matchable_prefix_len == 0 else cached_len / active_matchable_prefix_len
-    )
-    return cache_hit_ratio, cache_reuse_ratio
+    return 1.0 if matchable_prefix_len == 0 else cached_len / matchable_prefix_len
 
 
 def _supports_multi_context_mask_prefill() -> bool:
@@ -61,20 +51,241 @@ class ChunkedReq(Req):
         return False  # avoid being added to decode manager
 
 
+@dataclass(frozen=True)
+class ContextPrefillPlan:
+    use_context_mask: bool
+    input_ids: torch.Tensor
+    true_positions: torch.Tensor
+    radix_input_ids: torch.Tensor
+    cache_handle: BaseCacheHandle
+    cached_indices: torch.Tensor
+    cached_len: int
+    initial_full_match_indices: torch.Tensor
+    reason: str
+    radix_cached_tokens: int
+    usage_cached_tokens: int | None
+
+
+def _mask_free_context_reason_reference(
+    req: PendingReq,
+    *,
+    active_cached_len: int,
+    has_sliding_window: bool,
+) -> str | None:
+    """Return None only when compact causal Extend exactly equals the Drop mask."""
+
+    if has_sliding_window:
+        return "sliding_window_requires_absolute_key_selection"
+    if (
+        req.full_input_ids is None
+        or req.full_token_visible_until is None
+        or req.full_keep_mask is None
+    ):
+        return "missing_context_metadata"
+
+    full_len = len(req.full_input_ids)
+    if not len(req.full_token_visible_until) == len(req.full_keep_mask) == full_len:
+        return "invalid_context_metadata_length"
+
+    keep_mask = req.full_keep_mask != 0
+    active_positions = req.true_positions.to(dtype=torch.int64, device="cpu")
+    expected_positions = torch.nonzero(keep_mask, as_tuple=False).view(-1).to(torch.int64)
+    if not torch.equal(active_positions, expected_positions):
+        return "active_stream_does_not_match_keep_mask"
+    if not 0 <= active_cached_len < len(active_positions):
+        return "no_uncached_active_token"
+
+    query_positions = active_positions[active_cached_len:]
+    visible_until = req.full_token_visible_until.to(dtype=torch.int64, device="cpu")
+    full_positions = torch.arange(full_len, dtype=torch.int64, device="cpu")
+    if bool(torch.any(visible_until <= full_positions).item()):
+        return "invalid_visibility_lifetime"
+
+    # For every new active query q, ordinary compact causal attention exposes
+    # exactly the final keep-set prefix. It is equivalent to the Drop mask iff
+    # every dropped prefix token has expired and every kept prefix token remains
+    # visible at q. Prefix extrema make this proof linear in the full token count.
+    never_expires = torch.iinfo(torch.int64).max
+    dropped_expiry = torch.where(
+        keep_mask,
+        torch.full_like(visible_until, -1),
+        visible_until,
+    )
+    kept_expiry = torch.where(
+        keep_mask,
+        visible_until,
+        torch.full_like(visible_until, never_expires),
+    )
+    max_dropped_expiry = torch.cummax(dropped_expiry, dim=0).values[query_positions]
+    min_kept_expiry = torch.cummin(kept_expiry, dim=0).values[query_positions]
+    if bool(
+        torch.any(
+            (max_dropped_expiry > query_positions)
+            | (min_kept_expiry <= query_positions)
+        ).item()
+    ):
+        return "visibility_changes_within_extend"
+    return None
+
+
+def _mask_free_context_reason(
+    req: PendingReq,
+    *,
+    active_cached_len: int,
+    has_sliding_window: bool,
+) -> str | None:
+    """Use the sparse CPU kernel, falling back to the proven O(N) reference."""
+
+    if has_sliding_window:
+        return "sliding_window_requires_absolute_key_selection"
+    drop_wire = (
+        req.drop_event_positions,
+        req.drop_range_offsets,
+        req.drop_position_ranges,
+    )
+    if not all(tensor is not None for tensor in drop_wire):
+        return "missing_sparse_drop_metadata"
+    if not 0 <= active_cached_len < len(req.true_positions):
+        return "no_uncached_active_token"
+    if req.drop_effective_event_count < 0:
+        return _mask_free_context_reason_reference(
+            req,
+            active_cached_len=active_cached_len,
+            has_sliding_window=False,
+        )
+    event_positions, range_offsets, position_ranges = drop_wire
+    assert event_positions is not None
+    assert range_offsets is not None
+    assert position_ranges is not None
+    try:
+        conflict = first_mask_free_conflict_event(
+            req.true_positions,
+            event_positions,
+            range_offsets,
+            position_ranges,
+            active_cached_len=active_cached_len,
+            effective_event_count=req.drop_effective_event_count,
+        )
+    except Exception:
+        global _sparse_kernel_failure_logged
+        if not _sparse_kernel_failure_logged:
+            logger.warning(
+                "Sparse Context planner kernel failed; using the O(N) reference.",
+                exc_info=True,
+            )
+            _sparse_kernel_failure_logged = True
+        return _mask_free_context_reason_reference(
+            req,
+            active_cached_len=active_cached_len,
+            has_sliding_window=False,
+        )
+    return None if conflict is None else "visibility_changes_within_extend"
+
+
 @dataclass
 class PrefillAdder:
     token_budget: int
     reserved_size: int
     cache_manager: CacheManager
     table_manager: TableManager
+    has_sliding_window: bool = False
+    enable_mask_free_context_prefill: bool = True
+
+    def plan_context_prefill(self, req: PendingReq) -> ContextPrefillPlan | None:
+        if not req.use_context_mask or req.chunked_req is not None:
+            return None
+        full_match = self.cache_manager.match_full_req(req)
+        if full_match is None:
+            return None
+        active_match = self.cache_manager.derive_active_match(req, full_match)
+        fallback_reason = (
+            _mask_free_context_reason(
+                req,
+                active_cached_len=active_match.active_cached_len,
+                has_sliding_window=self.has_sliding_window,
+            )
+            if self.enable_mask_free_context_prefill
+            else "mask_free_disabled"
+        )
+        if fallback_reason is None:
+            radix_cached_tokens = full_match.handle.physical_cached_len
+            if active_match.active_cached_len > radix_cached_tokens:
+                raise RuntimeError("Active cache usage exceeds resident Radix matches.")
+            logger.debug(
+                "Context warmup %s selected mask-free Extend with %d active cache hits.",
+                req.uid,
+                active_match.active_cached_len,
+            )
+            return ContextPrefillPlan(
+                use_context_mask=False,
+                input_ids=req.input_ids,
+                true_positions=req.true_positions,
+                radix_input_ids=req.radix_input_ids,
+                cache_handle=active_match.handle,
+                cached_indices=active_match.active_match_indices,
+                cached_len=active_match.active_cached_len,
+                initial_full_match_indices=active_match.full_match_indices,
+                reason="mask_free_visibility_equivalent",
+                radix_cached_tokens=radix_cached_tokens,
+                usage_cached_tokens=active_match.active_cached_len,
+            )
+
+        assert req.full_input_ids is not None
+        full_positions = torch.arange(
+            len(req.full_input_ids), dtype=torch.int32, device="cpu"
+        )
+        full_radix_input_ids = (
+            req.radix_match_ids[req.radix_token_to_key]
+            if req.radix_token_to_key is not None
+            else req.radix_match_ids
+        )
+        assert full_radix_input_ids is not None
+        logger.debug(
+            "Context warmup %s retained mask Prefill: %s.",
+            req.uid,
+            fallback_reason,
+        )
+        return ContextPrefillPlan(
+            use_context_mask=True,
+            input_ids=req.full_input_ids,
+            true_positions=full_positions,
+            radix_input_ids=full_radix_input_ids,
+            cache_handle=full_match.handle,
+            cached_indices=full_match.safe_match_indices,
+            cached_len=full_match.safe_cached_len,
+            initial_full_match_indices=full_match.full_match_indices,
+            reason=fallback_reason,
+            radix_cached_tokens=full_match.handle.physical_cached_len,
+            usage_cached_tokens=None,
+        )
 
     def _try_allocate_one(
-        self, req: PendingReq
-    ) -> Tuple[BaseCacheHandle, int, float, float, torch.Tensor, int] | None:
+        self,
+        req: PendingReq,
+        context_plan: ContextPrefillPlan | None = None,
+    ) -> Tuple[BaseCacheHandle, int, float, torch.Tensor, int, int, int | None] | None:
         if self.table_manager.available_size == 0:
             return None
 
-        if req.use_context_mask:
+        original_stream = None
+        if context_plan is not None:
+            original_stream = (
+                req.input_ids,
+                req.true_positions,
+                req.radix_input_ids,
+                req.use_context_mask,
+            )
+            req.input_ids = context_plan.input_ids
+            req.true_positions = context_plan.true_positions
+            req.radix_input_ids = context_plan.radix_input_ids
+            req.use_context_mask = context_plan.use_context_mask
+            cache_handle = context_plan.cache_handle
+            cached_len = context_plan.cached_len
+            cached_indices = context_plan.cached_indices
+            initial_full_match_indices = context_plan.initial_full_match_indices
+            radix_cached_tokens = context_plan.radix_cached_tokens
+            usage_cached_tokens = context_plan.usage_cached_tokens
+        elif req.use_context_mask:
             match = self.cache_manager.match_full_req(req)
             if match is None:
                 return None
@@ -82,6 +293,8 @@ class PrefillAdder:
             cached_len = match.safe_cached_len
             cached_indices = match.safe_match_indices
             initial_full_match_indices = match.full_match_indices
+            radix_cached_tokens = match.handle.physical_cached_len
+            usage_cached_tokens = None
         else:
             match = self.cache_manager.match_req(req)
             if match is None:
@@ -90,22 +303,36 @@ class PrefillAdder:
             cached_len = match.active_cached_len
             cached_indices = match.active_match_indices
             initial_full_match_indices = match.full_match_indices[: match.full_cached_len]
+            radix_cached_tokens = cached_len
+            usage_cached_tokens = cached_len
         full_prefix_len, active_prefix_len = self.cache_manager.matchable_prefix_lens(req)
-        cache_hit_ratio, cache_reuse_ratio = _calculate_cache_ratios(
+        cache_reuse_ratio = _calculate_cache_reuse_ratio(
             cached_len,
-            full_prefix_len,
-            active_prefix_len,
-            req.prompt_tokens,
+            full_prefix_len if req.use_context_mask else active_prefix_len,
         )
         # TODO: better estimate policy
         extend_len = req.input_len - cached_len
         estimated_len = extend_len + req.output_len
 
         if estimated_len + self.reserved_size > self.cache_manager.available_size:
+            if original_stream is not None:
+                (
+                    req.input_ids,
+                    req.true_positions,
+                    req.radix_input_ids,
+                    req.use_context_mask,
+                ) = original_stream
             return None
         self.cache_manager.lock(cache_handle)
         if estimated_len + self.reserved_size > self.cache_manager.available_size:
             self.cache_manager.unlock(cache_handle)
+            if original_stream is not None:
+                (
+                    req.input_ids,
+                    req.true_positions,
+                    req.radix_input_ids,
+                    req.use_context_mask,
+                ) = original_stream
             return None
 
         table_idx = self.table_manager.allocate()
@@ -118,15 +345,23 @@ class PrefillAdder:
         except Exception:
             self.table_manager.free(table_idx)
             self.cache_manager.unlock(cache_handle)
+            if original_stream is not None:
+                (
+                    req.input_ids,
+                    req.true_positions,
+                    req.radix_input_ids,
+                    req.use_context_mask,
+                ) = original_stream
             raise
 
         return (
             cache_handle,
             table_idx,
-            cache_hit_ratio,
             cache_reuse_ratio,
             initial_full_match_indices.clone(),
             cached_len,
+            radix_cached_tokens,
+            usage_cached_tokens,
         )
 
     def _add_one_req(
@@ -135,10 +370,11 @@ class PrefillAdder:
         cache_handle: BaseCacheHandle,
         table_idx: int,
         cached_len: int,
-        cache_hit_ratio: float,
         cache_reuse_ratio: float,
         initial_full_match_indices: torch.Tensor,
         initial_active_cached_len: int,
+        radix_cached_tokens: int,
+        usage_cached_tokens: int | None,
     ) -> Req:
         remain_len = pending_req.input_len - cached_len
         chunk_size = min(self.token_budget, remain_len)
@@ -173,11 +409,19 @@ class PrefillAdder:
             stop_token_seqs=pending_req.stop_token_seqs,
             prefix_keep_mask=pending_req.prefix_keep_mask,
             is_warmup=pending_req.is_warmup,
-            cache_hit_ratio=cache_hit_ratio,
             cache_reuse_ratio=cache_reuse_ratio,
-            full_input_ids=pending_req.full_input_ids,
-            full_token_visible_until=pending_req.full_token_visible_until,
-            full_keep_mask=pending_req.full_keep_mask,
+            radix_cached_tokens=radix_cached_tokens,
+            usage_cached_tokens=usage_cached_tokens,
+            drop_skipped_tokens=(
+                radix_cached_tokens - usage_cached_tokens
+                if usage_cached_tokens is not None
+                else 0
+            ),
+            full_input_ids=(pending_req.full_input_ids if pending_req.use_context_mask else None),
+            full_token_visible_until=(
+                pending_req.full_token_visible_until if pending_req.use_context_mask else None
+            ),
+            full_keep_mask=(pending_req.full_keep_mask if pending_req.use_context_mask else None),
             use_context_mask=pending_req.use_context_mask,
             radix_key_virtual_mask=pending_req.radix_key_virtual_mask,
             radix_key_to_token=pending_req.radix_key_to_token,
@@ -186,7 +430,11 @@ class PrefillAdder:
             radix_marker_ids=pending_req.radix_marker_ids,
         )
 
-    def try_add_one(self, pending_req: PendingReq) -> Req | None:
+    def try_add_one(
+        self,
+        pending_req: PendingReq,
+        context_plan: ContextPrefillPlan | None = None,
+    ) -> Req | None:
         if self.token_budget <= 0:
             return None
 
@@ -196,30 +444,33 @@ class PrefillAdder:
                 cache_handle=chunked_req.cache_handle,
                 table_idx=chunked_req.table_idx,
                 cached_len=chunked_req.cached_len,
-                cache_hit_ratio=chunked_req.cache_hit_ratio,
                 cache_reuse_ratio=chunked_req.cache_reuse_ratio,
                 initial_full_match_indices=chunked_req.initial_full_match_indices,
                 initial_active_cached_len=chunked_req.initial_active_cached_len,
+                radix_cached_tokens=chunked_req.radix_cached_tokens,
+                usage_cached_tokens=chunked_req.usage_cached_tokens,
             )
 
-        if resource := self._try_allocate_one(pending_req):
+        if resource := self._try_allocate_one(pending_req, context_plan):
             (
                 cache_handle,
                 table_idx,
-                cache_hit_ratio,
                 cache_reuse_ratio,
                 initial_full_match_indices,
                 initial_active_cached_len,
+                radix_cached_tokens,
+                usage_cached_tokens,
             ) = resource
             return self._add_one_req(
                 pending_req=pending_req,
                 cache_handle=cache_handle,
                 table_idx=table_idx,
                 cached_len=initial_active_cached_len,
-                cache_hit_ratio=cache_hit_ratio,
                 cache_reuse_ratio=cache_reuse_ratio,
                 initial_full_match_indices=initial_full_match_indices,
                 initial_active_cached_len=initial_active_cached_len,
+                radix_cached_tokens=radix_cached_tokens,
+                usage_cached_tokens=usage_cached_tokens,
             )
 
         return None
@@ -230,12 +481,11 @@ class PrefillManager:
     cache_manager: CacheManager
     table_manager: TableManager
     decode_manager: DecodeManager
+    has_sliding_window: bool = False
+    enable_mask_free_context_prefill: bool = True
     pending_list: List[PendingReq] = field(default_factory=list)
 
     def add_one_req(self, req: UserMsg) -> None:
-        input_ids = req.input_ids
-        true_positions = req.true_positions
-        radix_input_ids = req.radix_input_ids
         if req.use_context_mask:
             if not req.is_warmup:
                 raise ValueError("Context-mask Prefill is restricted to warmup requests.")
@@ -243,22 +493,15 @@ class PrefillManager:
                 raise ValueError(
                     "Context-mask Prefill requires a full token stream and Radix keys."
                 )
-            input_ids = req.full_input_ids
-            true_positions = torch.arange(len(input_ids), dtype=torch.int32, device="cpu")
-            radix_input_ids = (
-                req.radix_match_ids[req.radix_token_to_key]
-                if req.radix_token_to_key is not None
-                else req.radix_match_ids
-            )
         self.pending_list.append(
             PendingReq(
                 uid=req.uid,
-                input_ids=input_ids,
-                true_positions=true_positions,
-                radix_input_ids=radix_input_ids,
+                input_ids=req.input_ids,
+                true_positions=req.true_positions,
+                radix_input_ids=req.radix_input_ids,
                 radix_match_ids=req.radix_match_ids,
                 sampling_params=req.sampling_params,
-                prompt_tokens=req.prompt_tokens or len(input_ids),
+                prompt_tokens=req.prompt_tokens or len(req.input_ids),
                 stop=req.stop,
                 stop_token_seqs=req.stop_token_seqs,
                 is_warmup=req.is_warmup,
@@ -267,6 +510,10 @@ class PrefillManager:
                 full_input_ids=req.full_input_ids,
                 full_token_visible_until=req.full_token_visible_until,
                 full_keep_mask=req.full_keep_mask,
+                drop_event_positions=req.drop_event_positions,
+                drop_range_offsets=req.drop_range_offsets,
+                drop_position_ranges=req.drop_position_ranges,
+                drop_effective_event_count=req.drop_effective_event_count,
                 use_context_mask=req.use_context_mask,
                 radix_key_virtual_mask=req.radix_key_virtual_mask,
                 radix_key_to_token=req.radix_key_to_token,
@@ -286,18 +533,31 @@ class PrefillManager:
             reserved_size=self.decode_manager.inflight_tokens,
             cache_manager=self.cache_manager,
             table_manager=self.table_manager,
+            has_sliding_window=self.has_sliding_window,
+            enable_mask_free_context_prefill=self.enable_mask_free_context_prefill,
         )
         reqs: List[Req] = []
         chunked_list: List[PendingReq] = []
         supports_multi_context_mask = _supports_multi_context_mask_prefill()
         for pending_req in self.pending_list:
+            context_plan = (
+                adder.plan_context_prefill(pending_req)
+                if pending_req.use_context_mask and pending_req.chunked_req is None
+                else None
+            )
+            if pending_req.use_context_mask and pending_req.chunked_req is None:
+                if context_plan is None:
+                    break
+                planned_context_mask = context_plan.use_context_mask
+            else:
+                planned_context_mask = pending_req.use_context_mask
             if len(reqs) > 0:
                 first_uses_context_mask = reqs[0].use_context_mask
-                if pending_req.use_context_mask != first_uses_context_mask:
+                if planned_context_mask != first_uses_context_mask:
                     break
-                if pending_req.use_context_mask and not supports_multi_context_mask:
+                if planned_context_mask and not supports_multi_context_mask:
                     break
-            if req := adder.try_add_one(pending_req):
+            if req := adder.try_add_one(pending_req, context_plan):
                 pending_req.chunked_req = None
                 if isinstance(req, ChunkedReq):
                     pending_req.chunked_req = req

@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAl
 import torch
 from minisgl.core import Batch, Req
 from minisgl.env import ENV
+from minisgl.kernel.context_plan import preload_context_plan_kernel
 from minisgl.message import (
     AbortBackendMsg,
     BaseBackendMsg,
@@ -112,7 +113,11 @@ class Scheduler(SchedulerIOMixin):
             self.cache_manager.bind_delta_marker_registry(self.delta_marker_registry)
         self.decode_manager = DecodeManager(config.page_size)
         self.prefill_manager = PrefillManager(
-            self.cache_manager, self.table_manager, self.decode_manager
+            self.cache_manager,
+            self.table_manager,
+            self.decode_manager,
+            has_sliding_window=config.model_config.sliding_window is not None,
+            enable_mask_free_context_prefill=config.mask_free_context_prefill,
         )
         if config.contextual_prefill_mode not in {"staged", "mask"}:
             raise ValueError(
@@ -123,6 +128,15 @@ class Scheduler(SchedulerIOMixin):
             if config.page_size != 1:
                 raise ValueError("Context-mask Prefill currently requires --page-size 1.")
             self.engine.attn_backend.validate_context_mask_prefill(self.device)
+            if config.mask_free_context_prefill:
+                try:
+                    preload_context_plan_kernel()
+                except Exception:
+                    logger.warning(
+                        "Could not preload the sparse Context planner kernel; "
+                        "the O(N) reference remains available.",
+                        exc_info=True,
+                    )
 
         # some alias for easy access
         self.finished_reqs: Set[Req] = set()
@@ -228,6 +242,8 @@ class Scheduler(SchedulerIOMixin):
                         WarmupAckMsg(
                             uid=req.uid,
                             hit_ratio=req.cache_reuse_ratio,
+                            cached_tokens=req.reported_cached_tokens,
+                            drop_skipped_tokens=req.drop_skipped_tokens,
                             finished=finished,
                         )
                     )
@@ -252,7 +268,9 @@ class Scheduler(SchedulerIOMixin):
                             finished=finished,
                             finish_reason=finish_reason if finished else None,
                             matched_stop=matched_stop,
-                            cache_hit_ratio=req.cache_hit_ratio if finished else None,
+                            cached_tokens=(
+                                req.reported_cached_tokens if finished else None
+                            ),
                             prompt_tokens=req.prompt_tokens if finished else None,
                             completion_tokens=req.completion_tokens if finished else None,
                         )
