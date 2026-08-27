@@ -114,17 +114,8 @@ def main() -> None:
         drop_rule=DROP_RULE,
     )
 
-    print(
-        json.dumps(
-            {
-                "model": model,
-                "primer_drop": args.drop_primer,
-                "request1_usage": checked_usage(primer),
-                "request2_usage": checked_usage(target),
-            },
-            indent=2,
-        )
-    )
+    checked_usage(primer)
+    print(json.dumps(checked_usage(target), indent=2))
 
 
 if __name__ == "__main__":
