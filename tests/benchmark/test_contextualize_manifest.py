@@ -5,11 +5,13 @@ from pydantic import ValidationError
 
 from minisgl.benchmark.contextualize.manifest import (
     MESSAGE_SHAPES,
+    CaptureRecord,
     CaseMetadata,
     ManifestCase,
     classify_assistant_message,
     coverage_matrix,
     dump_jsonl,
+    load_full_trajectories,
     load_manifest,
     request_hash,
 )
@@ -42,6 +44,20 @@ def _case(case_id: str, shape: str, *, method: str = "full", summary_triggered=N
             summary_triggered=summary_triggered,
             target_message_index=0,
         ),
+    )
+
+
+def _trajectory_turn(task_id: int, turn_id: int, messages):
+    request = {
+        "model": f"model-{task_id}",
+        "messages": messages,
+        "stream": True,
+    }
+    return CaptureRecord(
+        capture_id=f"task-{task_id}-turn-{turn_id}",
+        captured_at_ns=turn_id,
+        request=request,
+        request_sha256=request_hash(request),
     )
 
 
@@ -149,3 +165,71 @@ def test_manifest_jsonl_round_trip(tmp_path):
     dump_jsonl(path, cases)
 
     assert load_manifest(path) == cases
+
+
+def test_load_full_trajectories_recurses_sorts_and_validates_history(tmp_path):
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    for task_id, path in ((2, tmp_path / "z.jsonl"), (1, nested / "a.jsonl")):
+        messages = [{"role": "user", "content": f"question-{task_id}"}]
+        turns = [_trajectory_turn(task_id, 1, list(messages))]
+        messages.extend(
+            [
+                {
+                    "role": "assistant",
+                    "reasoning_content": "reason-1",
+                    "content": "answer-1",
+                },
+                {"role": "user", "content": "next-1"},
+            ]
+        )
+        turns.append(_trajectory_turn(task_id, 2, list(messages)))
+        messages.extend(
+            [
+                {
+                    "role": "assistant",
+                    "reasoning_content": "reason-2",
+                    "content": "answer-2",
+                },
+                {"role": "user", "content": "next-2"},
+            ]
+        )
+        turns.append(_trajectory_turn(task_id, 3, list(messages)))
+        dump_jsonl(path, turns)
+
+    tasks = load_full_trajectories(tmp_path, max_turns=3, min_tasks=2)
+
+    assert [task.task_id for task in tasks] == ["nested/a", "z"]
+    assert all(len(task.turns) == 3 for task in tasks)
+
+
+def test_load_full_trajectories_rejects_short_drop_and_non_prefix_inputs(tmp_path):
+    short = tmp_path / "short"
+    short.mkdir()
+    dump_jsonl(
+        short / "task.jsonl",
+        [_trajectory_turn(1, 1, [{"role": "user", "content": "question"}])],
+    )
+    with pytest.raises(ValueError, match="at least 2"):
+        load_full_trajectories(short, max_turns=2, min_tasks=1)
+
+    with_drop = tmp_path / "with-drop"
+    with_drop.mkdir()
+    record = _trajectory_turn(1, 1, [{"role": "user", "content": "question"}])
+    record.request["drop_rule"] = {"type": "thinking_drop"}
+    record.request_sha256 = request_hash(record.request)
+    dump_jsonl(with_drop / "task.jsonl", [record])
+    with pytest.raises(ValueError, match="contains a Drop payload"):
+        load_full_trajectories(with_drop, max_turns=1, min_tasks=1)
+
+    non_prefix = tmp_path / "non-prefix"
+    non_prefix.mkdir()
+    dump_jsonl(
+        non_prefix / "task.jsonl",
+        [
+            _trajectory_turn(1, 1, [{"role": "user", "content": "question"}]),
+            _trajectory_turn(1, 2, [{"role": "user", "content": "summary"}]),
+        ],
+    )
+    with pytest.raises(ValueError, match="not a full-history extension"):
+        load_full_trajectories(non_prefix, max_turns=2, min_tasks=1)

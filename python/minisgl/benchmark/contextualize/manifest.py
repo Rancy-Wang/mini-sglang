@@ -93,6 +93,14 @@ class CaptureRecord(BaseModel):
         return self
 
 
+class TrajectoryTask(BaseModel):
+    """One full-history task whose captured requests are ordered by turn."""
+
+    task_id: str
+    source_path: str
+    turns: List[CaptureRecord]
+
+
 class ManifestCase(BaseModel):
     case_id: str
     request: Dict[str, Any]
@@ -201,6 +209,75 @@ def _load_jsonl(path: str | Path) -> List[Dict[str, Any]]:
 
 def load_capture_records(path: str | Path) -> List[CaptureRecord]:
     return [CaptureRecord.model_validate(record) for record in _load_jsonl(path)]
+
+
+def load_full_trajectories(
+    directory: str | Path,
+    *,
+    max_turns: int,
+    min_tasks: int,
+) -> List[TrajectoryTask]:
+    """Load one full-history trajectory per JSONL file under ``directory``."""
+
+    root = Path(directory)
+    if not root.is_dir():
+        raise ValueError(f"Trajectory directory does not exist or is not a directory: {root}")
+    if max_turns <= 0:
+        raise ValueError("max_turns must be positive.")
+    if min_tasks <= 0:
+        raise ValueError("min_tasks must be positive.")
+
+    paths = sorted(root.rglob("*.jsonl"), key=lambda path: path.relative_to(root).as_posix())
+    if not paths:
+        raise ValueError(f"Trajectory directory contains no JSONL files: {root}")
+
+    tasks: List[TrajectoryTask] = []
+    for path in paths:
+        relative = path.relative_to(root)
+        records = load_capture_records(path)
+        if len(records) < max_turns:
+            raise ValueError(
+                f"Trajectory {relative.as_posix()!r} has {len(records)} turns; "
+                f"at least {max_turns} are required."
+            )
+
+        previous_messages: List[Dict[str, Any]] | None = None
+        for turn_id, record in enumerate(records[:max_turns], start=1):
+            request = record.request
+            if request.get("drop_rule") is not None or request.get("drop_message") is not None:
+                raise ValueError(
+                    f"Trajectory {relative.as_posix()!r} turn {turn_id} contains a Drop payload; "
+                    "bench-trajectories requires full no-drop captures."
+                )
+            messages = request.get("messages")
+            if not isinstance(messages, list) or not messages:
+                raise ValueError(
+                    f"Trajectory {relative.as_posix()!r} turn {turn_id} requires a non-empty "
+                    "messages list."
+                )
+            if (
+                previous_messages is not None
+                and messages[: len(previous_messages)] != previous_messages
+            ):
+                raise ValueError(
+                    f"Trajectory {relative.as_posix()!r} turn {turn_id} is not a full-history "
+                    "extension of the previous turn."
+                )
+            previous_messages = messages
+
+        tasks.append(
+            TrajectoryTask(
+                task_id=relative.with_suffix("").as_posix(),
+                source_path=relative.as_posix(),
+                turns=records[:max_turns],
+            )
+        )
+
+    if len(tasks) < min_tasks:
+        raise ValueError(
+            f"Trajectory directory has {len(tasks)} tasks; at least {min_tasks} are required."
+        )
+    return tasks
 
 
 def load_manifest(path: str | Path) -> List[ManifestCase]:

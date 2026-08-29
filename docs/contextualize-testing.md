@@ -40,9 +40,9 @@ Contextualize 只在准备阶段生成真实 post-policy workload；正式性能
 warmup 属于 serving engine 工作，计入服务器 TTFT 和 E2E。
 
 冻结、正确性范围门禁和覆盖矩阵分别由
-`python/minisgl/benchmark/contextualize/manifest.py:44-184` 的 `request_hash`、
+`python/minisgl/benchmark/contextualize/manifest.py:44-192` 的 `request_hash`、
 `ManifestCase.ensure_correctness_scope`、`ManifestCase.ensure_performance_scope` 和同文件
-`:223-262` 的 `coverage_matrix` 实现。
+`:300-339` 的 `coverage_matrix` 实现。
 
 ## 三、Serving 端指标
 
@@ -176,7 +176,7 @@ python -m minisgl.benchmark.contextualize coverage \
 通过。
 
 capture 到 manifest 的转换见
-`python/minisgl/benchmark/contextualize/runner.py:246-273` 的 `prepare_manifest`。
+`python/minisgl/benchmark/contextualize/runner.py:256-283` 的 `prepare_manifest`。
 
 ## 六、生成 oracle 与验证
 
@@ -219,8 +219,8 @@ prefix 以 reference 的前 N 个字符为准，适用于中文和无空格文�
 在 target reasoning/content 的合并文本中。
 
 matcher、oracle 记录和 target 重放入口见
-`python/minisgl/benchmark/contextualize/runner.py:83-118` 的 `compare_messages`、同文件
-`:276-306` 的 `record_oracles` 与 `:309-360` 的 `verify_cases`。
+`python/minisgl/benchmark/contextualize/runner.py:87-121` 的 `compare_messages`、同文件
+`:286-316` 的 `record_oracles` 与 `:319-370` 的 `verify_cases`。
 
 ## 七、性能测试
 
@@ -282,10 +282,163 @@ Radix 热缓存。正式比较四种 method 和并发 1/4/8 时，应为每个 m
 对比结果。
 
 server sample 派生与并发汇总见
-`python/minisgl/benchmark/contextualize/runner.py:378-425` 的 `_distribution`、
-`_derive_server_sample` 和同文件 `:428-569` 的 `benchmark_cases`。
+`python/minisgl/benchmark/contextualize/runner.py:388-435` 的 `_distribution`、
+`_derive_server_sample` 和同文件 `:438-578` 的 `benchmark_cases`。
 
-## 八、限制与结果解释
+## 八、完整多轮 trajectory 性能测试
+
+`bench-trajectories` 用于比较同一批完整多轮任务在 `no_drop` 和 `thinking_drop` 下的逐 turn
+serving 性能。它与上一节的 `bench` 是两个独立入口：`bench` 把 manifest case 当作互相独立的
+请求并发，`bench-trajectories` 则保证同一个 task 的请求严格按照 turn 顺序发送，同时让不同
+task 并发。
+
+### 8.1 输入目录
+
+`--trajectory-dir` 下递归查找 `*.jsonl`，每个文件代表一个 task，每行继续使用 capture proxy
+产生的 `CaptureRecord` 格式，文件行序就是 turn 序：
+
+```text
+full-trajectories/
+├── task-001.jsonl
+├── task-002.jsonl
+└── subset/
+    └── task-003.jsonl
+```
+
+```json
+{"capture_id":"...","captured_at_ns":123,"request":{"model":"...","messages":[]},"request_sha256":"..."}
+```
+
+loader 会重新检查每一行的 SHA-256，并执行 fail-closed 门禁：请求必须有非空 `messages`，不能
+携带 `drop_rule` 或 `drop_message`，后一 turn 的 `messages` 必须以前一 turn 的完整
+`messages` 为前缀，每个 task 必须至少有 `--max-turns` 行，并且 task 数不能少于最大并发数。
+因此 Summary 或 Summary-Drop 记录不能混入该目录。
+
+目录读取与上述门禁见
+`python/minisgl/benchmark/contextualize/manifest.py:214-280` 的 `load_full_trajectories`。
+
+### 8.2 命令和采样参数
+
+默认运行方式是：
+
+```bash
+python -m minisgl.benchmark.contextualize bench-trajectories \
+  --trajectory-dir artifacts/full-trajectories \
+  --base-url http://127.0.0.1:30000/v1 \
+  --output artifacts/trajectory-performance.json
+```
+
+默认参数等价于：
+
+```text
+--concurrency 1 2 4 8
+--variants no_drop thinking_drop
+--max-turns 10
+--max-tokens 2048
+--temperature 0.0
+--top-p 1.0
+--top-k -1
+```
+
+参数默认值见 `python/minisgl/benchmark/contextualize/runner.py:1055-1074` 的
+`bench-trajectories` parser。
+
+`temperature=0.0, top_p=1.0, top_k=-1` 是当前服务的 greedy 组合。runner 深拷贝每条冻结请求
+后覆盖这些 sampling 字段，并固定 `n=1`、`ignore_eos=true`、`stop=null`，同时移除优先级更高
+的 `max_completion_tokens`。原 capture 和原 hash 不会改变；报告同时保存 source hash 与实际
+wire request 的 effective hash。
+
+固定长度指 `server_metrics.generated_tokens == max_tokens`，不是最终可见文本的重新分词长度。
+如果服务端因为最大序列长度或其他限制没有生成满，原始样本仍写入报告，但
+`fixed_length_ok=false`、`passed=false`，且不会进入该 turn 的可比统计样本。
+
+不带 `--preserve-stream` 时强制非流式；带该选项时保留原始 `stream` 字段，并自动设置
+`stream_options.include_usage=true`。流式 usage 是 `choices=[]` 的独立末尾 chunk，runner 会
+单独读取该 chunk，不依赖普通 delta choice。
+
+采样覆盖、ThinkingDrop payload 和 stream usage 请求由
+`python/minisgl/benchmark/contextualize/runner.py:674-719` 的 `_build_trajectory_request`
+构造；响应解析见同文件 `:144-226` 的 `_parse_nonstream` 与 `_post_streaming`。
+
+### 8.3 逐 task 调度与 ThinkingDrop
+
+并发单位是 task trajectory，而不是单条 HTTP 请求：
+
+```text
+semaphore(concurrency)
+├── task A: turn 1 -> 等待响应 -> turn 2 -> ... -> turn N
+├── task B: turn 1 -> 等待响应 -> turn 2 -> ... -> turn N
+└── task C: turn 1 -> 等待响应 -> turn 2 -> ... -> turn N
+```
+
+因此 `--concurrency 4` 表示最多同时推进四个 task；同一个 task 永远只有一个在途请求。后续
+turn 仍然重放冻结的完整 history，不会把本次 benchmark 的响应改写回下一个捕获请求。
+
+`no_drop` 不添加 Drop payload。`thinking_drop` 的 turn 1 作为两种模式共同的 bootstrap，也
+不添加 Drop；从 turn 2 开始添加：
+
+```json
+{"drop_rule":{"type":"thinking_drop"}}
+```
+
+为避免把无效 Drop 静默当成对照结果，运行前要求 thinking-drop 的 turn 2 到 N 都至少含一条
+历史 assistant `reasoning_content` 或合法的前置 `<think>...</think>`。不满足条件时在发送任何
+请求前拒绝整个 workload。
+
+预检、task 级 semaphore 和逐 turn 顺序执行见
+`python/minisgl/benchmark/contextualize/runner.py:766-960` 的 `benchmark_trajectories`。
+
+### 8.4 报告格式
+
+顶层 `cells` 的每一项对应一个 `variant × concurrency` 实验单元。`requests` 保存逐 task、逐
+turn 的 source/effective hash、TTFT、E2E、TPOT、客户端 E2E、原始 `server_metrics`、标准
+OpenAI usage、Drop 是否请求/生效以及固定长度检查。usage 统一为：
+
+```json
+{
+  "prompt_tokens": 8000,
+  "completion_tokens": 2048,
+  "total_tokens": 10048,
+  "prompt_tokens_details": {
+    "cached_tokens": 7200,
+    "drop_skipped_tokens": 350
+  }
+}
+```
+
+服务端未返回 `prompt_tokens_details` 时，两个 detail 数值在报告中规范化为 0，同时
+`usage_details_reported=false`，以区分“服务端没有报告细节”和“服务端明确报告了零”。
+
+每个 cell 的 `turns` 对同一 turn 的所有有效 task 样本分别汇总 TTFT、TPOT、E2E、客户端 E2E
+以及五项 usage 计数，输出 mean、P50、P95、P99。`sample_count` 是真正进入分布计算的固定长度
+样本数；只有八个 task 时，P95/P99 只能视作小样本长尾信号。
+
+usage 校验和规范化见 `python/minisgl/benchmark/contextualize/runner.py:585-624` 的
+`_normalize_usage`；逐 turn 汇总见同文件 `:722-763` 的 `_aggregate_trajectory_turn`。
+
+### 8.5 Cache 隔离
+
+runner 不会重启服务，也不会清空 Radix cache。一次命令运行多个 cell 时，报告明确标记
+`cache_isolation=shared_endpoint` 并保存 `execution_order`；这种运行适合功能 smoke，不是严格
+冷 cache 性能结论。
+
+报告中的输入参数、cache 隔离状态和执行顺序见
+`python/minisgl/benchmark/contextualize/runner.py:962-987`。
+
+正式对照应在每个 cell 前重启到相同初始状态，并且每次只传一个 variant 和一个并发数，例如：
+
+```bash
+python -m minisgl.benchmark.contextualize bench-trajectories \
+  --trajectory-dir artifacts/full-trajectories \
+  --base-url http://127.0.0.1:30000/v1 \
+  --concurrency 4 \
+  --variants thinking_drop \
+  --output artifacts/thinking-drop-c4.json
+```
+
+完整的正式矩阵需要 `2 variants × 4 concurrencies = 8` 次独立服务运行。
+
+## 九、限制与结果解释
 
 - 标准 SGLang 输出是行为 reference，不是底层数值的绝对真理。exact mismatch 应结合 prefix、
   keywords、tool-call 结构和服务端日志归因。
