@@ -430,8 +430,8 @@ def test_trajectory_benchmark_serializes_turns_and_aggregates_each_cell(monkeypa
             "request_finished_ns": 500,
             "prompt_tokens": 100,
             "active_prompt_tokens": 80 if drop_requested else 100,
-            "generated_tokens": 4,
-            "completion_tokens": 4,
+            "generated_tokens": 3,
+            "completion_tokens": 3,
         }
         usage = {
             "prompt_tokens": 100,
@@ -480,6 +480,7 @@ def test_trajectory_benchmark_serializes_turns_and_aggregates_each_cell(monkeypa
     assert all(cell["requested"] == 12 for cell in report["cells"])
     assert all(cell["failed"] == 0 for cell in report["cells"])
     assert all(cell["fixed_length_failed"] == 0 for cell in report["cells"])
+    assert all(cell["completion_token_throughput_per_second"] > 0 for cell in report["cells"])
     for turns in turns_by_model.values():
         assert turns == [1, 2, 3] * 6
 
@@ -495,6 +496,8 @@ def test_trajectory_benchmark_serializes_turns_and_aggregates_each_cell(monkeypa
     assert thinking["turns"][1]["usage"]["drop_skipped_tokens"]["mean"] == 10.0
     assert thinking["requests"][0]["thinking_drop_applicable"] is False
     assert thinking["requests"][1]["thinking_drop_applicable"] is True
+    assert thinking["requests"][1]["actual_completion_tokens"] == 4
+    assert thinking["requests"][1]["actual_generated_tokens"] == 3
 
 
 def test_trajectory_benchmark_retains_fixed_length_failure(monkeypatch):
@@ -545,4 +548,5 @@ def test_trajectory_benchmark_retains_fixed_length_failure(monkeypatch):
     assert cell["fixed_length_failed"] == 1
     assert cell["turns"][0]["sample_count"] == 0
     assert cell["requests"][0]["passed"] is False
+    assert cell["requests"][0]["actual_completion_tokens"] == 3
     assert cell["requests"][0]["actual_generated_tokens"] == 3

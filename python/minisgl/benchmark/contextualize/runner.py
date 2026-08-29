@@ -860,7 +860,8 @@ async def benchmark_trajectories(
                                     raise ValueError("Target response did not return usage.")
                                 sample = _derive_server_sample(result.server_metrics)
                                 usage, details_reported = _normalize_usage(result.usage)
-                                fixed_length_ok = sample["generated_tokens"] == max_tokens
+                                actual_completion_tokens = usage["completion_tokens"]
+                                fixed_length_ok = actual_completion_tokens == max_tokens
                                 task_results.append(
                                     {
                                         "task_id": task.task_id,
@@ -877,7 +878,7 @@ async def benchmark_trajectories(
                                         "error": (
                                             None
                                             if fixed_length_ok
-                                            else "generated_tokens_did_not_reach_max_tokens"
+                                            else "completion_tokens_did_not_reach_max_tokens"
                                         ),
                                         "finish_reason": result.finish_reason,
                                         "client_started_ns": result.client_started_ns,
@@ -889,7 +890,8 @@ async def benchmark_trajectories(
                                         "server_metrics": result.server_metrics,
                                         "usage": usage,
                                         "usage_details_reported": details_reported,
-                                        "expected_generated_tokens": max_tokens,
+                                        "expected_completion_tokens": max_tokens,
+                                        "actual_completion_tokens": actual_completion_tokens,
                                         "actual_generated_tokens": sample["generated_tokens"],
                                         "fixed_length_ok": fixed_length_ok,
                                         **sample,
@@ -913,7 +915,7 @@ async def benchmark_trajectories(
                                         "request_succeeded": False,
                                         "passed": False,
                                         "error": f"{type(exc).__name__}:{exc}",
-                                        "expected_generated_tokens": max_tokens,
+                                        "expected_completion_tokens": max_tokens,
                                         "fixed_length_ok": None,
                                     }
                                 )
@@ -938,7 +940,7 @@ async def benchmark_trajectories(
                         "duration_seconds": duration_seconds,
                         "request_throughput_per_second": len(responses) / duration_seconds,
                         "completion_token_throughput_per_second": sum(
-                            sample["completion_tokens"] for sample in responses
+                            sample["usage"]["completion_tokens"] for sample in responses
                         )
                         / duration_seconds,
                         "generated_token_throughput_per_second": sum(

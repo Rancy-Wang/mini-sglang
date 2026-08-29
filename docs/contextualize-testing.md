@@ -340,7 +340,7 @@ python -m minisgl.benchmark.contextualize bench-trajectories \
 --top-k -1
 ```
 
-参数默认值见 `python/minisgl/benchmark/contextualize/runner.py:1055-1074` 的
+参数默认值见 `python/minisgl/benchmark/contextualize/runner.py:1057-1076` 的
 `bench-trajectories` parser。
 
 `temperature=0.0, top_p=1.0, top_k=-1` 是当前服务的 greedy 组合。runner 深拷贝每条冻结请求
@@ -348,7 +348,8 @@ python -m minisgl.benchmark.contextualize bench-trajectories \
 的 `max_completion_tokens`。原 capture 和原 hash 不会改变；报告同时保存 source hash 与实际
 wire request 的 effective hash。
 
-固定长度指 `server_metrics.generated_tokens == max_tokens`，不是最终可见文本的重新分词长度。
+固定长度指 OpenAI usage 的 `completion_tokens == max_tokens`，不是最终可见文本的重新分词长度，
+也不是只覆盖内部 scheduler 计时区间的 `server_metrics.generated_tokens`。
 如果服务端因为最大序列长度或其他限制没有生成满，原始样本仍写入报告，但
 `fixed_length_ok=false`、`passed=false`，且不会进入该 turn 的可比统计样本。
 
@@ -386,7 +387,7 @@ turn 仍然重放冻结的完整 history，不会把本次 benchmark 的响应�
 请求前拒绝整个 workload。
 
 预检、task 级 semaphore 和逐 turn 顺序执行见
-`python/minisgl/benchmark/contextualize/runner.py:766-960` 的 `benchmark_trajectories`。
+`python/minisgl/benchmark/contextualize/runner.py:766-962` 的 `benchmark_trajectories`。
 
 ### 8.4 报告格式
 
@@ -423,7 +424,7 @@ runner 不会重启服务，也不会清空 Radix cache。一次命令运行多�
 冷 cache 性能结论。
 
 报告中的输入参数、cache 隔离状态和执行顺序见
-`python/minisgl/benchmark/contextualize/runner.py:962-987`。
+`python/minisgl/benchmark/contextualize/runner.py:964-989`。
 
 正式对照应在每个 cell 前重启到相同初始状态，并且每次只传一个 variant 和一个并发数，例如：
 
