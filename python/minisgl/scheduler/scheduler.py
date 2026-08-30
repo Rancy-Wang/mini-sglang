@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
+import time
+from typing import TYPE_CHECKING, Dict, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
 
 import torch
 from minisgl.core import Batch, Req
@@ -12,6 +13,7 @@ from minisgl.message import (
     BatchBackendMsg,
     DetokenizeMsg,
     ExitMsg,
+    RequestMetricsState,
     RequestRejectMsg,
     UserMsg,
     WarmupAckMsg,
@@ -140,6 +142,7 @@ class Scheduler(SchedulerIOMixin):
 
         # some alias for easy access
         self.finished_reqs: Set[Req] = set()
+        self.request_metrics: Dict[int, RequestMetricsState] = {}
         self.tokenizer = load_tokenizer(config.model_path)
         self.eos_token_id = self.tokenizer.eos_token_id
         eos_values = (
@@ -223,6 +226,7 @@ class Scheduler(SchedulerIOMixin):
 
         batch, (_, next_tokens_cpu, copy_done) = last_data[0].batch, last_data[1]
         copy_done.synchronize()
+        generated_ns = time.perf_counter_ns()
         reply: List[DetokenizeMsg | WarmupAckMsg] = []
         new_finished_reqs: Set[Req] = set()
         with self.cache_manager.lazy_free_region():
@@ -261,6 +265,14 @@ class Scheduler(SchedulerIOMixin):
                     if stop_matched:
                         finished = True
                         finish_reason = "stop"
+                    server_metrics = None
+                    metrics_state = self.request_metrics.get(req.uid)
+                    if metrics_state is not None:
+                        visible = not (finished and next_token in self.eos_token_ids)
+                        metrics_state.observe_token(generated_ns, visible=visible)
+                        if finished:
+                            server_metrics = metrics_state.finish(generated_ns)
+                            self.request_metrics.pop(req.uid, None)
                     reply.append(
                         DetokenizeMsg(
                             uid=req.uid,
@@ -273,6 +285,7 @@ class Scheduler(SchedulerIOMixin):
                             ),
                             prompt_tokens=req.prompt_tokens if finished else None,
                             completion_tokens=req.completion_tokens if finished else None,
+                            server_metrics=server_metrics,
                         )
                     )
 
@@ -400,15 +413,29 @@ class Scheduler(SchedulerIOMixin):
                 logger.warning_rank0(
                     f"Adjust max_tokens to {max_output_len} for request {msg.uid}."
                 )
+            if not msg.is_warmup:
+                request_received_ns = msg.request_received_ns
+                if request_received_ns is None:
+                    request_received_ns = time.perf_counter_ns()
+                prompt_tokens = (
+                    msg.prompt_tokens if msg.prompt_tokens is not None else true_input_len
+                )
+                self.request_metrics[msg.uid] = RequestMetricsState(
+                    request_received_ns=request_received_ns,
+                    prompt_tokens=prompt_tokens,
+                    active_prompt_tokens=len(msg.input_ids),
+                )
             try:
                 self.prefill_manager.add_one_req(msg)
             except Exception:
+                self.request_metrics.pop(msg.uid, None)
                 if self.delta_marker_registry is not None and msg.radix_marker_ids:
                     self.delta_marker_registry.release_request_refs(msg.radix_marker_ids)
                     msg.radix_marker_ids = None
                 raise
         elif isinstance(msg, AbortBackendMsg):
             logger.debug_rank0("Aborting request %d", msg.uid)
+            self.request_metrics.pop(msg.uid, None)
             req_to_free = self.prefill_manager.abort_req(msg.uid)
             req_to_free = req_to_free or self.decode_manager.abort_req(msg.uid)
             if isinstance(req_to_free, PendingReq):

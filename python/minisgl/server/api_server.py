@@ -18,6 +18,7 @@ from minisgl.message import (
     BaseTokenizerMsg,
     BatchFrontendMsg,
     RequestErrorReply,
+    ServerMetrics,
     TokenizeMsg,
     UserReply,
     WarmupReply,
@@ -641,6 +642,7 @@ class FrontendManager:
         )
         prompt_tokens = 0
         completion_tokens = 0
+        server_metrics: ServerMetrics | None = None
         parser = ChatResponseParser(
             model_path=self.config.model_path,
             tools=tools if _tool_choice_mode(tool_choice) != "none" else None,
@@ -693,8 +695,15 @@ class FrontendManager:
                     prompt_tokens = ack.prompt_tokens
                 if ack.completion_tokens is not None:
                     completion_tokens = ack.completion_tokens
-                if ack.incremental_output:
-                    encoded = encode_piece(parser.feed(ack.incremental_output))
+                if ack.server_metrics is not None:
+                    server_metrics = ack.server_metrics
+                if ack.incremental_output or ack.incremental_token_ids:
+                    encoded = encode_piece(
+                        parser.feed(
+                            ack.incremental_output,
+                            token_ids=ack.incremental_token_ids or None,
+                        )
+                    )
                     if encoded is not None:
                         yield encoded
 
@@ -726,6 +735,8 @@ class FrontendManager:
                 }
             ],
         }
+        if server_metrics is not None:
+            end_chunk["server_metrics"] = server_metrics.as_api_dict()
         yield f"data: {json.dumps(end_chunk)}\n\n".encode()
         if include_usage:
             usage_chunk = {
@@ -815,6 +826,7 @@ async def v1_root():
 
 @app.post("/v1/chat/completions")
 async def v1_completions(req: OpenAICompletionRequest, request: Request):
+    request_received_ns = time.perf_counter_ns()
     state = get_global_state()
     wire_drop_rule: dict[str, Any] | None = None
     normalized_tool_choice: str | Dict[str, Any] = "none"
@@ -904,6 +916,7 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
             tools=req.tools,
             tool_choice=normalized_tool_choice,
             stop=effective_stop,
+            request_received_ns=request_received_ns,
         )
     )
 
@@ -931,6 +944,7 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
 
     # Non-streaming: collect all chunks and return a single JSON response
     full_content = ""
+    full_token_ids: List[int] = []
     finish_reason = "stop"
     cached_tokens: int | None = cache_report.cached_tokens if cache_report is not None else None
     drop_skipped_tokens = (
@@ -938,11 +952,13 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
     )
     prompt_tokens = 0
     completion_tokens = 0
+    server_metrics: ServerMetrics | None = None
     try:
         async for ack in state.wait_for_ack(uid):
             if not isinstance(ack, UserReply):
                 continue
             full_content += ack.incremental_output
+            full_token_ids.extend(ack.incremental_token_ids)
             if ack.finish_reason is not None:
                 finish_reason = ack.finish_reason
             if cached_tokens is None and ack.cached_tokens is not None:
@@ -951,6 +967,8 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
                 prompt_tokens = ack.prompt_tokens
             if ack.completion_tokens is not None:
                 completion_tokens = ack.completion_tokens
+            if ack.server_metrics is not None:
+                server_metrics = ack.server_metrics
             if ack.finished:
                 break
     except RequestRejected as exc:
@@ -968,7 +986,7 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
         enable_thinking=req.enable_thinking,
         separate_reasoning=req.separate_reasoning,
     )
-    parsed = parser.parse_full(full_content)
+    parsed = parser.parse_full(full_content, token_ids=full_token_ids or None)
     response_message: Dict[str, Any] = {"role": "assistant", "content": parsed.content}
     if parsed.reasoning_content:
         response_message["reasoning_content"] = parsed.reasoning_content
@@ -996,6 +1014,8 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
             drop_skipped_tokens=drop_skipped_tokens,
         ),
     }
+    if server_metrics is not None:
+        response["server_metrics"] = server_metrics.as_api_dict()
     return response
 
 

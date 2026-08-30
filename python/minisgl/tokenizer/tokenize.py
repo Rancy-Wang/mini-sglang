@@ -336,12 +336,56 @@ class TokenizeManager:
                 continue
             raise ValueError(f"Unsupported GPT-OSS Harmony role: {role}")
 
-        return _HarmonyPrompt(
+        prompt = _HarmonyPrompt(
             conversation=Conversation.from_messages(harmony_messages),
             components=harmony_messages,
             ownership=ownership,
             thinking_components=thinking_components,
             has_function_tools=bool(descriptions),
+        )
+        return (
+            prompt
+            if self._preserve_harmony_thinking
+            else self._drop_harmony_analysis_before_last_final(prompt)
+        )
+
+    @staticmethod
+    def _drop_harmony_analysis_before_last_final(prompt: _HarmonyPrompt) -> _HarmonyPrompt:
+        """Match vLLM's long-history cleanup while retaining component ownership."""
+
+        from openai_harmony import Conversation
+
+        last_final = -1
+        for component_id in range(len(prompt.components) - 1, -1, -1):
+            component = prompt.components[component_id]
+            role = getattr(getattr(component, "author", None), "role", None)
+            role = getattr(role, "value", role)
+            if str(role).lower() == "assistant" and component.channel == "final":
+                last_final = component_id
+                break
+        if last_final < 0:
+            return prompt
+
+        keep_ids = [
+            component_id
+            for component_id, component in enumerate(prompt.components)
+            if not (component_id < last_final and component.channel == "analysis")
+        ]
+        if len(keep_ids) == len(prompt.components):
+            return prompt
+
+        remap = {old_id: new_id for new_id, old_id in enumerate(keep_ids)}
+        components = [prompt.components[component_id] for component_id in keep_ids]
+        return _HarmonyPrompt(
+            conversation=Conversation.from_messages(components),
+            components=components,
+            ownership=[prompt.ownership[component_id] for component_id in keep_ids],
+            thinking_components={
+                remap[component_id]: source
+                for component_id, source in prompt.thinking_components.items()
+                if component_id in remap
+            },
+            has_function_tools=prompt.has_function_tools,
         )
 
     def _render_harmony_tokens(
@@ -360,9 +404,8 @@ class TokenizeManager:
             tools=tools,
         )
         encoding = self._get_harmony_encoding()
-        config = None
+        config = RenderConversationConfig(auto_drop_analysis=False)
         if self._preserve_harmony_thinking:
-            config = RenderConversationConfig(auto_drop_analysis=False)
             render_options = RenderOptions(
                 conversation_has_function_tools=prompt.has_function_tools
             )
@@ -419,7 +462,7 @@ class TokenizeManager:
     ) -> tuple[List[int], List[int], int]:
         """Render once and recover message owners from Harmony protocol boundaries."""
 
-        from openai_harmony import Role
+        from openai_harmony import RenderConversationConfig, Role
 
         prompt = self._build_harmony_prompt(
             messages,
@@ -432,6 +475,7 @@ class TokenizeManager:
             for token_id in encoding.render_conversation_for_completion(
                 prompt.conversation,
                 Role.ASSISTANT,
+                RenderConversationConfig(auto_drop_analysis=False),
             )
         ]
 
