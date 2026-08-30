@@ -256,56 +256,24 @@ def _harmony_encoding():
     return load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
 
 
-def _parse_harmony(text: str, tools: List[Dict[str, Any]]) -> ParsedResponse:
-    from openai_harmony import HarmonyError, Role, StreamableParser
-
-    encoding = _harmony_encoding()
-    parser = StreamableParser(encoding, Role.ASSISTANT, strict=False)
-    try:
-        for token in encoding.encode(text, allowed_special="all"):
-            parser.process(int(token))
-    except HarmonyError:
-        # GPT-OSS occasionally places `to=functions.*` after the channel or
-        # content-type field.  The streaming parser accepts that unambiguous
-        # header, so keep non-stream responses behaviorally identical instead
-        # of turning a recoverable tool call into HTTP 500.
-        fallback = _HarmonyStream(tools)
-        pieces = (fallback.feed(text), fallback.finish())
-        calls = [call for piece in pieces for call in piece.tool_calls]
-        return ParsedResponse(
-            content="".join(piece.content for piece in pieces),
-            reasoning_content="".join(piece.reasoning_content for piece in pieces),
-            tool_calls=calls or None,
-        )
-
-    entries: list[tuple[str | None, str | None, str]] = []
-    for message in parser.messages:
-        content = "".join(
-            text
-            for part in getattr(message, "content", ())
-            if isinstance((text := getattr(part, "text", None)), str)
-        )
-        entries.append((message.channel, message.recipient, content))
-    if parser.current_content:
-        entries.append((parser.current_channel, parser.current_recipient, parser.current_content))
-
-    names = {_tool_name(tool) for tool in tools}
-    content_parts, reasoning_parts, calls = [], [], []
-    for channel, recipient, content in entries:
-        if recipient:
-            name = recipient.split(".")[-1]
-            if name not in names:
-                continue
-            try:
-                arguments = json.loads(content) if content.strip() else {}
-            except json.JSONDecodeError:
-                continue
-            calls.append(_tool_call(name, arguments, len(calls)))
-        elif channel == "analysis":
-            reasoning_parts.append(content)
-        elif channel in {"final", "commentary", None}:
-            content_parts.append(content)
-    return ParsedResponse("".join(content_parts), "".join(reasoning_parts), calls or None)
+def _parse_harmony(
+    text: str,
+    tools: List[Dict[str, Any]],
+    token_ids: List[int] | None = None,
+) -> ParsedResponse:
+    stream = _HarmonyTokenStream(tools, stream_reasoning=True)
+    pieces = []
+    if token_ids is not None:
+        pieces.append(stream.feed_tokens(token_ids))
+    else:
+        pieces.append(stream.feed_text(text))
+    pieces.append(stream.finish())
+    calls = [call for piece in pieces for call in piece.tool_calls]
+    return ParsedResponse(
+        content="".join(piece.content for piece in pieces),
+        reasoning_content="".join(piece.reasoning_content for piece in pieces),
+        tool_calls=calls or None,
+    )
 
 
 class _BufferedToolStream:
@@ -385,8 +353,8 @@ class _BufferedToolStream:
         return StreamPiece(content=content)
 
 
-class _HarmonyStream:
-    """Incrementally separate Harmony channels without leaking control tokens."""
+class _HarmonyStringFallback:
+    """Tolerant full-text fallback for legacy non-canonical Harmony headers."""
 
     _TERMINATORS = ("<|end|>", "<|call|>", "<|return|>")
 
@@ -413,13 +381,10 @@ class _HarmonyStream:
         if self.recipient:
             if not terminal:
                 return StreamPiece()
-            name = self.recipient.split(".")[-1]
+            name = self.recipient.removeprefix("functions.")
             if name not in self.names:
                 return StreamPiece()
-            try:
-                arguments = json.loads(content) if content.strip() else {}
-            except json.JSONDecodeError:
-                return StreamPiece()
+            arguments = content if content.strip() else "{}"
             call = _tool_call(name, arguments, self.tool_index)
             self.tool_index += 1
             return StreamPiece(tool_calls=[call])
@@ -459,6 +424,9 @@ class _HarmonyStream:
                     if "<|" not in emitted and not emitted.endswith("assistant"):
                         content_parts.append(emitted)
                     break
+                prefix = self.buffer[:marker]
+                recipient = re.search(r"\bto=([^\s<]+)", prefix)
+                self.recipient = recipient.group(1) if recipient else None
                 self.buffer = self.buffer[marker + len("<|channel|>") :]
                 self.state = "header"
                 continue
@@ -471,7 +439,8 @@ class _HarmonyStream:
                 self.buffer = self.buffer[marker + len("<|message|>") :]
                 self.channel = header.split(None, 1)[0].lower() if header else None
                 recipient = re.search(r"\bto=([^\s<]+)", header)
-                self.recipient = recipient.group(1) if recipient else None
+                if recipient:
+                    self.recipient = recipient.group(1)
                 self.state = "content"
                 continue
 
@@ -501,6 +470,225 @@ class _HarmonyStream:
             piece = StreamPiece()
         self.buffer = ""
         return piece
+
+
+def _harmony_message_text(message: Any) -> str:
+    return "".join(
+        text
+        for part in getattr(message, "content", ())
+        if isinstance((text := getattr(part, "text", None)), str)
+    )
+
+
+def _parsed_harmony_messages(
+    messages: List[Any],
+    tools: List[Dict[str, Any]],
+) -> ParsedResponse:
+    names = {name for tool in tools if (name := _tool_name(tool)) is not None}
+    content_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    calls: list[dict] = []
+    for message in messages:
+        channel = getattr(message, "channel", None)
+        recipient = getattr(message, "recipient", None)
+        content = _harmony_message_text(message)
+        if recipient:
+            name = str(recipient).removeprefix("functions.")
+            if name in names:
+                calls.append(_tool_call(name, content if content.strip() else "{}", len(calls)))
+        elif channel == "analysis":
+            reasoning_parts.append(content)
+        elif channel in {"final", "commentary", None}:
+            content_parts.append(content)
+    return ParsedResponse(
+        content="".join(content_parts),
+        reasoning_content="".join(reasoning_parts),
+        tool_calls=calls or None,
+    )
+
+
+def _parse_harmony_text_compat(text: str, tools: List[Dict[str, Any]]) -> ParsedResponse:
+    """Parse a complete decoded response, with one bounded legacy fallback."""
+
+    from openai_harmony import HarmonyError, Role, StreamableParser
+
+    encoding = _harmony_encoding()
+    completion = text.removeprefix("<|start|>assistant")
+    parser = StreamableParser(encoding, Role.ASSISTANT, strict=False)
+    try:
+        for token in encoding.encode(completion, allowed_special="all"):
+            parser.process(int(token))
+        parser.process_eos()
+        return _parsed_harmony_messages(parser.messages, tools)
+    except HarmonyError:
+        # Older clients and fixtures may place the recipient after the content
+        # type. The reference parser rejects that ordering, but it is
+        # unambiguous, so recover it without making it the production path.
+        fallback = _HarmonyStringFallback(tools)
+        pieces = (fallback.feed(text), fallback.finish())
+        calls = [call for piece in pieces for call in piece.tool_calls]
+        return ParsedResponse(
+            content="".join(piece.content for piece in pieces),
+            reasoning_content="".join(piece.reasoning_content for piece in pieces),
+            tool_calls=calls or None,
+        )
+
+
+class _HarmonyTokenStream:
+    """Token-native GPT-OSS response parser backed by openai-harmony."""
+
+    def __init__(self, tools: List[Dict[str, Any]], stream_reasoning: bool = True) -> None:
+        from openai_harmony import Role, StreamableParser
+
+        self.tools = tools
+        self.names = {name for tool in tools if (name := _tool_name(tool)) is not None}
+        self.stream_reasoning = stream_reasoning
+        self.encoding = _harmony_encoding()
+        self.parser = StreamableParser(self.encoding, Role.ASSISTANT, strict=False)
+        self.mode: str | None = None
+        self.text_buffer = ""
+        self.all_tokens: list[int] = []
+        self.message_count = 0
+        self.tool_index = 0
+        self.emitted_content = ""
+        self.emitted_reasoning = ""
+        self.failed = False
+        self.finished = False
+
+    @staticmethod
+    def _join(pieces: List[StreamPiece]) -> StreamPiece:
+        return StreamPiece(
+            content="".join(piece.content for piece in pieces),
+            reasoning_content="".join(piece.reasoning_content for piece in pieces),
+            tool_calls=[call for piece in pieces for call in piece.tool_calls],
+        )
+
+    def _record(self, piece: StreamPiece) -> StreamPiece:
+        self.emitted_content += piece.content
+        self.emitted_reasoning += piece.reasoning_content
+        return piece
+
+    def _completed_message_piece(self, message: Any) -> StreamPiece:
+        channel = getattr(message, "channel", None)
+        recipient = getattr(message, "recipient", None)
+        content = _harmony_message_text(message)
+        if recipient:
+            name = str(recipient).removeprefix("functions.")
+            if name not in self.names:
+                return StreamPiece()
+            call = _tool_call(
+                name,
+                content if content.strip() else "{}",
+                self.tool_index,
+            )
+            self.tool_index += 1
+            return StreamPiece(tool_calls=[call])
+        if channel == "analysis" and not self.stream_reasoning:
+            return StreamPiece(reasoning_content=content)
+        return StreamPiece()
+
+    def _collect_completed(self) -> StreamPiece:
+        messages = self.parser.messages
+        pieces = [
+            self._completed_message_piece(message)
+            for message in messages[self.message_count :]
+        ]
+        self.message_count = len(messages)
+        return self._join(pieces)
+
+    def _process_token(self, token: int) -> StreamPiece:
+        from openai_harmony import HarmonyError
+
+        if self.failed:
+            return StreamPiece()
+        try:
+            self.parser.process(int(token))
+        except HarmonyError:
+            self.failed = True
+            return StreamPiece()
+
+        pieces: list[StreamPiece] = []
+        delta = self.parser.last_content_delta
+        if delta:
+            channel = self.parser.current_channel
+            recipient = self.parser.current_recipient
+            if recipient is None and channel == "analysis" and self.stream_reasoning:
+                pieces.append(StreamPiece(reasoning_content=delta))
+            elif recipient is None and channel in {"final", "commentary", None}:
+                pieces.append(StreamPiece(content=delta))
+        pieces.append(self._collect_completed())
+        return self._record(self._join(pieces))
+
+    def feed_tokens(self, token_ids: List[int]) -> StreamPiece:
+        if self.finished:
+            raise RuntimeError("Cannot feed Harmony tokens after finish().")
+        if self.mode == "text":
+            buffered = self.encoding.encode(self.text_buffer, allowed_special="all")
+            self.text_buffer = ""
+            self.mode = "tokens"
+            prefix = self.feed_tokens([int(token) for token in buffered])
+        else:
+            self.mode = "tokens"
+            prefix = StreamPiece()
+
+        pieces = [prefix]
+        for token in token_ids:
+            value = int(token)
+            self.all_tokens.append(value)
+            pieces.append(self._process_token(value))
+        return self._join(pieces)
+
+    def feed_text(self, text: str) -> StreamPiece:
+        if self.finished:
+            raise RuntimeError("Cannot feed Harmony text after finish().")
+        if self.mode == "tokens":
+            # Production replies carry both the token id and its decoded delta.
+            # Once token mode is active, the decoded copy must not be parsed twice.
+            return StreamPiece()
+        self.mode = "text"
+        self.text_buffer += text
+        return StreamPiece()
+
+    @staticmethod
+    def _remaining(value: str, emitted: str) -> str:
+        if not emitted:
+            return value
+        return value[len(emitted) :] if value.startswith(emitted) else ""
+
+    def _fallback_remaining(self) -> StreamPiece:
+        decoded = self.encoding.decode_utf8(self.all_tokens)
+        parsed = _parse_harmony_text_compat(decoded, self.tools)
+        calls = list(parsed.tool_calls or [])[self.tool_index :]
+        return StreamPiece(
+            content=self._remaining(parsed.content, self.emitted_content),
+            reasoning_content=self._remaining(
+                parsed.reasoning_content,
+                self.emitted_reasoning,
+            ),
+            tool_calls=calls,
+        )
+
+    def finish(self) -> StreamPiece:
+        from openai_harmony import HarmonyError
+
+        if self.finished:
+            return StreamPiece()
+        self.finished = True
+        if self.mode != "tokens":
+            parsed = _parse_harmony_text_compat(self.text_buffer, self.tools)
+            return StreamPiece(
+                content=parsed.content,
+                reasoning_content=parsed.reasoning_content,
+                tool_calls=list(parsed.tool_calls or []),
+            )
+        if self.failed:
+            return self._fallback_remaining()
+        try:
+            self.parser.process_eos()
+        except HarmonyError:
+            self.failed = True
+            return self._fallback_remaining()
+        return self._record(self._collect_completed())
 
 
 class ChatResponseParser:
@@ -538,15 +726,19 @@ class ChatResponseParser:
             else None
         )
         self.harmony_stream = (
-            _HarmonyStream(self.tools, stream_reasoning=stream_reasoning)
+            _HarmonyTokenStream(self.tools, stream_reasoning=stream_reasoning)
             if self.tool_parser == "gpt-oss" or self.reasoning_name == "gpt-oss"
             else None
         )
         self.has_tool_calls = False
 
-    def parse_full(self, text: str) -> ParsedResponse:
+    def parse_full(
+        self,
+        text: str,
+        token_ids: List[int] | None = None,
+    ) -> ParsedResponse:
         if self.tool_parser == "gpt-oss" or self.reasoning_name == "gpt-oss":
-            return _parse_harmony(text, self.tools)
+            return _parse_harmony(text, self.tools, token_ids=token_ids)
         reasoning, content = self.reasoning.parse_full(text)
         calls: list[dict] = []
         if self.tool_parser == "qwen":
@@ -557,10 +749,18 @@ class ChatResponseParser:
             content, calls = _parse_llama(content, self.tools)
         return ParsedResponse(content, reasoning, calls or None)
 
-    def feed(self, text: str) -> StreamPiece:
+    def feed(
+        self,
+        text: str,
+        token_ids: List[int] | None = None,
+    ) -> StreamPiece:
         if self.tool_parser == "gpt-oss" or self.reasoning_name == "gpt-oss":
             assert self.harmony_stream is not None
-            piece = self.harmony_stream.feed(text)
+            piece = (
+                self.harmony_stream.feed_tokens(token_ids)
+                if token_ids is not None
+                else self.harmony_stream.feed_text(text)
+            )
             if piece.tool_calls:
                 self.has_tool_calls = True
             return piece

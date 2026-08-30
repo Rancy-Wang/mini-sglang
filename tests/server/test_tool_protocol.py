@@ -34,10 +34,11 @@ def _parser(
     *,
     thinking: bool = False,
     stream_reasoning: bool = True,
+    tools=TOOLS,
 ) -> ChatResponseParser:
     return ChatResponseParser(
         model_path=model,
-        tools=TOOLS,
+        tools=tools,
         tool_call_parser="auto",
         reasoning_parser="auto",
         enable_thinking=thinking,
@@ -157,6 +158,120 @@ def test_harmony_stream_separates_reasoning_content_and_tool_call() -> None:
     calls = [call for chunk in chunks for call in chunk.tool_calls]
     assert len(calls) == 1
     assert calls[0]["function"]["arguments"] == '{"query":"oss"}'
+
+
+def _harmony_ids(text: str) -> list[int]:
+    from openai_harmony import HarmonyEncodingName, load_harmony_encoding
+
+    encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
+    return [int(token) for token in encoding.encode(text, allowed_special="all")]
+
+
+def _token_stream_result(
+    text: str,
+    *,
+    chunk_size: int,
+    tools=TOOLS,
+) -> tuple[str, str, list[dict]]:
+    parser = _parser("openai/gpt-oss-20b", tools=tools)
+    token_ids = _harmony_ids(text)
+    pieces = [
+        parser.feed("", token_ids=token_ids[start : start + chunk_size])
+        for start in range(0, len(token_ids), chunk_size)
+    ]
+    pieces.append(parser.finish())
+    return (
+        "".join(piece.content for piece in pieces),
+        "".join(piece.reasoning_content for piece in pieces),
+        [call for piece in pieces for call in piece.tool_calls],
+    )
+
+
+def test_harmony_token_stream_accepts_both_recipient_positions_for_every_partition() -> None:
+    variants = (
+        ' to=functions.search<|channel|>commentary json<|message|>{"query":"分块"}<|call|>',
+        '<|channel|>commentary to=functions.search json<|message|>{"query":"分块"}<|call|>',
+    )
+    for text in variants:
+        token_count = len(_harmony_ids(text))
+        for chunk_size in range(1, token_count + 1):
+            content, reasoning, calls = _token_stream_result(
+                text,
+                chunk_size=chunk_size,
+            )
+            assert content == ""
+            assert reasoning == ""
+            assert len(calls) == 1
+            assert calls[0]["function"] == {
+                "name": "search",
+                "arguments": '{"query":"分块"}',
+            }
+
+
+def test_harmony_stream_and_full_token_parsing_are_semantically_identical() -> None:
+    text = (
+        "<|channel|>analysis<|message|>think<|end|>"
+        "<|start|>assistant to=functions.search<|channel|>commentary json"
+        '<|message|>{"query":"same"}<|call|>'
+    )
+    content, reasoning, calls = _token_stream_result(text, chunk_size=1)
+    parsed = _parser("openai/gpt-oss-20b").parse_full(
+        "",
+        token_ids=_harmony_ids(text),
+    )
+
+    assert content == parsed.content == ""
+    assert reasoning == parsed.reasoning_content == "think"
+    assert parsed.tool_calls is not None
+    assert [call["function"] for call in calls] == [
+        call["function"] for call in parsed.tool_calls
+    ]
+
+
+def test_harmony_preserves_dotted_tool_names_and_raw_invalid_arguments() -> None:
+    dotted_tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "math.sum",
+                "description": "Sum values",
+                "parameters": {"type": "object"},
+            },
+        }
+    ]
+    dotted = (
+        " to=functions.math.sum<|channel|>commentary json"
+        '<|message|>{"values":[1,2]}<|call|>'
+    )
+    _, _, dotted_calls = _token_stream_result(
+        dotted,
+        chunk_size=1,
+        tools=dotted_tools,
+    )
+    assert dotted_calls[0]["function"] == {
+        "name": "math.sum",
+        "arguments": '{"values":[1,2]}',
+    }
+
+    invalid = " to=functions.search<|channel|>commentary json<|message|>{bad<|call|>"
+    _, _, invalid_calls = _token_stream_result(invalid, chunk_size=1)
+    assert invalid_calls[0]["function"] == {
+        "name": "search",
+        "arguments": "{bad",
+    }
+
+
+def test_harmony_process_eos_recovers_a_complete_unterminated_tool_body() -> None:
+    text = (
+        " to=functions.search<|channel|>commentary json"
+        '<|message|>{"query":"eos"}'
+    )
+    content, reasoning, calls = _token_stream_result(text, chunk_size=1)
+    assert content == reasoning == ""
+    assert calls[0]["function"] == {
+        "name": "search",
+        "arguments": '{"query":"eos"}',
+    }
 
 
 def test_harmony_stream_accepts_analysis_channel_tool_call() -> None:

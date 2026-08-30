@@ -98,6 +98,67 @@ def test_harmony_accepts_developer_instructions():
     assert "Use the supplied search tool." in rendered
 
 
+def test_harmony_drops_analysis_before_the_latest_completed_final():
+    rendered = _render(
+        [
+            {"role": "user", "content": "first"},
+            {
+                "role": "assistant",
+                "reasoning_content": "ANALYSIS_ONE",
+                "content": "FINAL_ONE",
+            },
+            {"role": "user", "content": "second"},
+            {
+                "role": "assistant",
+                "reasoning_content": "ANALYSIS_TWO",
+                "content": "FINAL_TWO",
+            },
+            {"role": "user", "content": "third"},
+        ]
+    )
+
+    assert "ANALYSIS_ONE" not in rendered
+    assert "ANALYSIS_TWO" not in rendered
+    assert "FINAL_ONE" in rendered
+    assert "FINAL_TWO" in rendered
+
+
+def test_harmony_keeps_analysis_for_the_active_tool_chain_after_latest_final():
+    rendered = _render(
+        [
+            {"role": "user", "content": "first"},
+            {
+                "role": "assistant",
+                "reasoning_content": "STALE_ANALYSIS",
+                "content": "COMPLETED_FINAL",
+            },
+            {"role": "user", "content": "continue"},
+            {
+                "role": "assistant",
+                "reasoning_content": "ACTIVE_ANALYSIS",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call-active",
+                        "type": "function",
+                        "function": {"name": "search", "arguments": '{"query":"x"}'},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call-active",
+                "content": "result",
+            },
+            {"role": "user", "content": "finish"},
+        ]
+    )
+
+    assert "STALE_ANALYSIS" not in rendered
+    assert "ACTIVE_ANALYSIS" in rendered
+    assert "COMPLETED_FINAL" in rendered
+
+
 def test_harmony_partial_text_drop_uses_exact_provenance():
     messages = [
         {"role": "user", "content": "question"},

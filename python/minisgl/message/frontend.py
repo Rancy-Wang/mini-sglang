@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List
 
 from .metrics import ServerMetrics
@@ -28,6 +28,7 @@ class UserReply(BaseFrontendMsg):
     uid: int
     incremental_output: str
     finished: bool
+    incremental_token_ids: List[int] = field(default_factory=list)
     finish_reason: str | None = None
     matched_stop: str | None = None
     cached_tokens: int | None = None

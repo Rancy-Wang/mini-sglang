@@ -4,7 +4,13 @@ from typing import List
 
 from minisgl.core import SamplingParams
 import torch
-from minisgl.message import BatchBackendMsg, UserMsg, WarmupAckMsg
+from minisgl.message import (
+    BaseFrontendMsg,
+    BatchBackendMsg,
+    UserMsg,
+    UserReply,
+    WarmupAckMsg,
+)
 from minisgl.message.utils import serialize_type, deserialize_type
 from minisgl.utils import call_if_main, init_logger
 
@@ -55,3 +61,17 @@ def test_serialize_deserialize():
     )
     restored = WarmupAckMsg.decoder(warmup.encoder(warmup))
     assert restored.drop_skipped_tokens == 7
+
+    reply = UserReply(
+        uid=4,
+        incremental_output="answer",
+        finished=True,
+        incremental_token_ids=[10, 11],
+    )
+    restored_reply = BaseFrontendMsg.decoder(BaseFrontendMsg.encoder(reply))
+    assert restored_reply.incremental_token_ids == [10, 11]
+
+    legacy_reply = BaseFrontendMsg.encoder(reply)
+    legacy_reply.pop("incremental_token_ids")
+    restored_legacy_reply = BaseFrontendMsg.decoder(legacy_reply)
+    assert restored_legacy_reply.incremental_token_ids == []

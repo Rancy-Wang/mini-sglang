@@ -697,8 +697,13 @@ class FrontendManager:
                     completion_tokens = ack.completion_tokens
                 if ack.server_metrics is not None:
                     server_metrics = ack.server_metrics
-                if ack.incremental_output:
-                    encoded = encode_piece(parser.feed(ack.incremental_output))
+                if ack.incremental_output or ack.incremental_token_ids:
+                    encoded = encode_piece(
+                        parser.feed(
+                            ack.incremental_output,
+                            token_ids=ack.incremental_token_ids or None,
+                        )
+                    )
                     if encoded is not None:
                         yield encoded
 
@@ -939,6 +944,7 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
 
     # Non-streaming: collect all chunks and return a single JSON response
     full_content = ""
+    full_token_ids: List[int] = []
     finish_reason = "stop"
     cached_tokens: int | None = cache_report.cached_tokens if cache_report is not None else None
     drop_skipped_tokens = (
@@ -952,6 +958,7 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
             if not isinstance(ack, UserReply):
                 continue
             full_content += ack.incremental_output
+            full_token_ids.extend(ack.incremental_token_ids)
             if ack.finish_reason is not None:
                 finish_reason = ack.finish_reason
             if cached_tokens is None and ack.cached_tokens is not None:
@@ -979,7 +986,7 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
         enable_thinking=req.enable_thinking,
         separate_reasoning=req.separate_reasoning,
     )
-    parsed = parser.parse_full(full_content)
+    parsed = parser.parse_full(full_content, token_ids=full_token_ids or None)
     response_message: Dict[str, Any] = {"role": "assistant", "content": parsed.content}
     if parsed.reasoning_content:
         response_message["reasoning_content"] = parsed.reasoning_content

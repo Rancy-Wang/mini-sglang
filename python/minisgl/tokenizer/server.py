@@ -116,6 +116,7 @@ def tokenize_worker(
                             uid=msg.uid,
                             incremental_output=reply,
                             finished=msg.finished,
+                            incremental_token_ids=[msg.next_token],
                             finish_reason=msg.finish_reason,
                             matched_stop=msg.matched_stop,
                             cached_tokens=msg.cached_tokens,
