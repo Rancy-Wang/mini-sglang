@@ -54,7 +54,6 @@ def test_flash_attention_forwards_sinks_and_window(monkeypatch):
     backend = object.__new__(FlashAttentionBackend)
     backend.kvcache = _FakeKVCache()
     backend.scale = 0.125
-    backend.version = 3
     batch = SimpleNamespace(attn_metadata=_fa_metadata(), out_loc=object())
     q = torch.empty(1, 1, 4)
     k = torch.empty(1, 1, 4)
@@ -70,7 +69,6 @@ def test_flash_attention_forwards_sinks_and_window(monkeypatch):
     call = implementation.call_args.kwargs
     assert call["sinks"] is sinks
     assert call["window_size"] == (127, 0)
-    assert call["context_mask_aux"] is None
 
 
 def test_fa3_kernel_receives_sinks_and_window(monkeypatch):
@@ -96,7 +94,6 @@ def test_fa3_kernel_receives_sinks_and_window(monkeypatch):
         cu_seqlens_k=tensor,
         max_seqlen_q=1,
         softmax_scale=0.125,
-        version=3,
         window_size=(127, 0),
         sinks=sinks,
     )
@@ -104,6 +101,7 @@ def test_fa3_kernel_receives_sinks_and_window(monkeypatch):
     call = kernel.call_args.kwargs
     assert call["sinks"] is None
     assert call["return_softmax_lse"] is True
+    assert call["ver"] == 3
     assert call["window_size"] == (127, 0)
     assert torch.equal(corrected, torch.full_like(output, 0.5))
 
@@ -248,7 +246,6 @@ def test_flash_attention_uses_preclipped_context_segments_for_sliding(monkeypatc
     backend = object.__new__(FlashAttentionBackend)
     backend.kvcache = _FakeKVCache()
     backend.scale = 0.125
-    backend.version = 3
     metadata = _fa_metadata()
     metadata.context_segments = (object(),)
     metadata.sliding_context_segments = (object(), object())
@@ -294,7 +291,6 @@ def test_fa3_context_segments_preserve_window_and_sinks(monkeypatch):
     assert output.shape == q.shape
     kernel.assert_called_once()
     call = kernel.call_args
-    assert call.kwargs["version"] == 3
     assert call.kwargs["window_size"] == (127, 0)
     assert call.kwargs["sinks"] is sinks
     assert call.kwargs["max_seqlen_q"] == 2
