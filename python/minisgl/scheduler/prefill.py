@@ -371,7 +371,7 @@ class PrefillAdder:
             return None
 
         table_idx = self.table_manager.allocate()
-        retry_pages = torch.empty(0, dtype=torch.int32, device=self.cache_manager.device)
+        retry_pages = torch.empty(0, dtype=torch.int32, device=cached_indices.device)
         retry_inactive_positions = None
         retry_inactive_pages = None
         try:

@@ -67,7 +67,7 @@ class RadixTreeNode:
     def set_parent(self, parent: RadixTreeNode) -> None:
         self._parent = parent
         parent.children[_edge_key(self.key_fn, self._key, self._virtual_mask)] = self
-        parent._refresh_reachable_depth()
+        self._refresh_reachable_depth()
 
     def _refresh_reachable_depth(self) -> None:
         own_length = 0 if self.is_root() else getattr(self, "_length", 0)
