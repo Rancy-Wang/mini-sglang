@@ -52,6 +52,10 @@ class RotaryEmbedding(StateLessOP):
         )
         return query, key
 
+    @property
+    def cos_sin_cache(self) -> torch.Tensor:
+        return self._cos_sin_cache
+
 
 def _get_rope(
     head_dim: int,

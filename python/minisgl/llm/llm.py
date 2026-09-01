@@ -63,6 +63,7 @@ class LLM(Scheduler):
                     uid=uid,
                     input_ids=input_ids,
                     true_positions=true_positions,
+                    raw_positions=true_positions,
                     radix_input_ids=input_ids.to(torch.int64, device="cpu"),
                     sampling_params=sampling_params,
                     prefix_keep_mask=torch.ones(

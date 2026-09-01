@@ -30,6 +30,7 @@ def _pending_req() -> PendingReq:
         uid=7,
         input_ids=full_ids[active_positions.to(torch.int64)],
         true_positions=active_positions,
+        raw_positions=active_positions,
         radix_input_ids=full_ids[active_positions.to(torch.int64)].to(torch.int64),
         radix_match_ids=full_ids.to(torch.int64),
         sampling_params=SamplingParams(max_tokens=1),
@@ -131,6 +132,10 @@ class _PlanCache:
             full_cached_len=4,
             active_match_indices=active_indices,
             active_cached_len=active_cached_len,
+            initial_active_cached_len=active_cached_len,
+            active_full_positions=torch.tensor([0, 3], dtype=torch.int64)[
+                :active_cached_len
+            ],
         )
 
     def match_full_req(self, req):

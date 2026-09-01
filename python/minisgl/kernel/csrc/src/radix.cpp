@@ -22,6 +22,12 @@ auto _is_1d_cpu_bool_tensor(const tvm::ffi::TensorView tensor) -> bool {
          tensor.dtype().code == kDLBool && tensor.dtype().bits == 8;
 }
 
+auto _is_radix_record_tensor(const tvm::ffi::TensorView tensor) -> bool {
+  return tensor.ndim() == 2 && tensor.size(1) == 4 && tensor.is_contiguous() &&
+         tensor.device().device_type == kDLCPU &&
+         tensor.dtype().code == kDLInt && tensor.dtype().bits == 32;
+}
+
 auto fast_compare_key(const tvm::ffi::TensorView a,
                       const tvm::ffi::TensorView b) -> size_t {
   host::RuntimeCheck(_is_1d_cpu_int_tensor(a) && _is_1d_cpu_int_tensor(b),
@@ -85,8 +91,52 @@ auto fast_compare_radix_key(const tvm::ffi::TensorView a,
   return common_len;
 }
 
+auto fast_compare_radix_records(const tvm::ffi::TensorView a,
+                                const tvm::ffi::TensorView b) -> size_t {
+  host::RuntimeCheck(_is_radix_record_tensor(a) && _is_radix_record_tensor(b),
+                     "Both Radix records must be contiguous CPU int32 [N, 4] tensors.");
+  const auto common_len = std::min(a.size(0), b.size(0));
+  const auto *a_ptr = static_cast<const int32_t *>(a.data_ptr());
+  const auto *b_ptr = static_cast<const int32_t *>(b.data_ptr());
+  const auto diff = std::mismatch(a_ptr, a_ptr + common_len * 4, b_ptr);
+  return static_cast<size_t>((diff.first - a_ptr) / 4);
+}
+
+auto fast_compare_retry_radix_records(const tvm::ffi::TensorView cached,
+                                      const tvm::ffi::TensorView target) -> size_t {
+  host::RuntimeCheck(
+      _is_radix_record_tensor(cached) && _is_radix_record_tensor(target),
+      "Both Retry Radix records must be contiguous CPU int32 [N, 4] tensors.");
+  const auto common_len = std::min(cached.size(0), target.size(0));
+  const auto *cached_ptr = static_cast<const int32_t *>(cached.data_ptr());
+  const auto *target_ptr = static_cast<const int32_t *>(target.data_ptr());
+  for (size_t row = 0; row < common_len; ++row) {
+    const auto offset = row * 4;
+    const auto kind = cached_ptr[offset];
+    if (kind != target_ptr[offset]) {
+      return row;
+    }
+    if (kind == 0) {
+      if (cached_ptr[offset + 1] != target_ptr[offset + 1]) {
+        return row;
+      }
+      continue;
+    }
+    if (cached_ptr[offset + 1] != target_ptr[offset + 1] ||
+        cached_ptr[offset + 2] != target_ptr[offset + 2] ||
+        cached_ptr[offset + 3] != target_ptr[offset + 3]) {
+      return row;
+    }
+  }
+  return common_len;
+}
+
 } // namespace
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fast_compare_key, fast_compare_key);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fast_compare_radix_key,
                               fast_compare_radix_key);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(fast_compare_radix_records,
+                              fast_compare_radix_records);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(fast_compare_retry_radix_records,
+                              fast_compare_retry_radix_records);

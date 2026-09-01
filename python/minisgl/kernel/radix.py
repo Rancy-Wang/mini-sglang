@@ -29,3 +29,15 @@ def fast_compare_radix_key(
     """Return the first key or virtual-kind mismatch without Python temporaries."""
 
     return _load_radix_module().fast_compare_radix_key(x, y, x_virtual_mask, y_virtual_mask)
+
+
+def fast_compare_radix_records(x: torch.Tensor, y: torch.Tensor) -> int:
+    """Return the first exact structured-record mismatch."""
+
+    return _load_radix_module().fast_compare_radix_records(x, y)
+
+
+def fast_compare_retry_radix_records(cached: torch.Tensor, target: torch.Tensor) -> int:
+    """Return the first Retry mismatch, ignoring position fields on real tokens."""
+
+    return _load_radix_module().fast_compare_retry_radix_records(cached, target)

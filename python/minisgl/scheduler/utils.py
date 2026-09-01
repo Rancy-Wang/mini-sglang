@@ -16,6 +16,7 @@ class PendingReq:
     uid: int
     input_ids: torch.Tensor
     true_positions: torch.Tensor
+    raw_positions: torch.Tensor
     radix_input_ids: torch.Tensor
     radix_match_ids: torch.Tensor | None
     sampling_params: SamplingParams
@@ -40,6 +41,11 @@ class PendingReq:
     radix_token_to_key: torch.Tensor | None = None
     radix_commit_key_len: int | None = None
     radix_marker_ids: tuple[int, ...] = ()
+    radix_positions: torch.Tensor | None = None
+    radix_repos_info: torch.Tensor | None = None
+    radix_materialized_stage: torch.Tensor | None = None
+    radix_next_position: int | None = None
+    radix_current_reposition: int = -1
     chunked_req: ChunkedReq | None = None
 
     @property

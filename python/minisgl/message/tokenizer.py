@@ -83,6 +83,7 @@ class TokenizeMsg(BaseTokenizerMsg):
     target_msg_id: int | None = None
     drop_message: Dict[int, List[int]] | None = None
     drop_rule: Dict[str, Any] | None = None
+    reposition: List[int] | None = None
     enable_thinking: bool | None = None
     reasoning_effort: str | None = None
     tools: List[Dict[str, Any]] | None = None

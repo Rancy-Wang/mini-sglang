@@ -34,7 +34,7 @@ from minisgl.tokenizer.drop_rules import (
 from minisgl.utils import ZmqAsyncPullQueue, ZmqAsyncPushQueue, init_logger
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import WordCompleter
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictInt
 from starlette.background import BackgroundTask
 
 from .args import ServerArgs
@@ -133,20 +133,52 @@ def _validate_drop_message(
             # Future schedules are intentionally accepted. For an event that
             # already applies to this prompt, however, every referenced message
             # must already exist.
-            if message_count is not None and n < message_count:
-                if msg_id >= message_count:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=(
-                            f"drop_message id {msg_id} is outside the current message "
-                            f"range [0, {message_count - 1}] for trigger {n}"
-                        ),
-                    )
+            if message_count is not None and n < message_count and msg_id >= message_count:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"drop_message id {msg_id} is outside the current message "
+                        f"range [0, {message_count - 1}] for trigger {n}"
+                    ),
+                )
             if msg_id > n:
                 raise HTTPException(
                     status_code=400,
                     detail=f"drop_message event {n} cannot drop future message {msg_id}",
                 )
+
+
+def _validate_reposition(
+    reposition: List[int] | None,
+    *,
+    message_count: int | None,
+    radix_drop_key_mode: str,
+) -> None:
+    if not reposition:
+        return
+    if radix_drop_key_mode != "delta-marker":
+        raise HTTPException(
+            status_code=400,
+            detail="reposition requires radix_drop_key_mode='delta-marker'.",
+        )
+    if message_count is None:
+        raise HTTPException(
+            status_code=400, detail="reposition is only supported with chat `messages` input."
+        )
+    if reposition != sorted(set(reposition)):
+        raise HTTPException(
+            status_code=400,
+            detail="reposition must contain strictly increasing unique message IDs.",
+        )
+    for message_id in reposition:
+        if message_id < 0 or message_id >= message_count:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"reposition message ID {message_id} is outside the current message "
+                    f"range [0, {message_count - 1}]."
+                ),
+            )
 
 
 def _to_wire_drop_message(drop_message: Dict[int, List[int]] | None) -> Dict[str, List[int]] | None:
@@ -380,6 +412,7 @@ class OpenAICompletionRequest(BaseModel):
     ignore_eos: bool = False
     drop_message: Dict[int, List[int]] | None = None
     drop_rule: Dict[str, Any] | None = None
+    reposition: List[StrictInt] | None = None
     enable_thinking: bool | None = None
     reasoning_effort: Literal["low", "medium", "high"] | None = None
     tools: List[Dict[str, Any]] | None = None
@@ -528,7 +561,8 @@ class FrontendManager:
     async def run_contextual_warmup(
         self,
         messages: List[Dict[str, Any]],
-        drop_rule: Dict[str, Any],
+        drop_rule: Dict[str, Any] | None,
+        reposition: List[int] | None,
         enable_thinking: bool | None,
         reasoning_effort: str | None,
         tools: List[Dict[str, Any]] | None,
@@ -536,7 +570,11 @@ class FrontendManager:
     ) -> CacheUsageReport | None:
         # Event n changes visibility only for messages after n. A future event
         # therefore needs no special warmup for the current generation prompt.
-        parsed_rule = parse_drop_rule(drop_rule, messages, allow_internal=True)
+        parsed_rule = (
+            parse_drop_rule(drop_rule, messages, allow_internal=True)
+            if drop_rule is not None
+            else None
+        )
         if isinstance(parsed_rule, MessageDropRule):
             has_current_drop = any(
                 trigger < len(messages) and bool(message_ids)
@@ -550,9 +588,56 @@ class FrontendManager:
             has_current_drop = isinstance(parsed_rule, ThinkingDropRule) and bool(
                 parsed_rule.thinking_by_message
             )
-        if not has_current_drop:
+        if not has_current_drop and not reposition:
             return None
-        use_context_mask = self.config.contextual_prefill_mode == "mask"
+        if reposition:
+            final_ack: WarmupReply | None = None
+            for end in range(1, len(messages) + 1):
+                staged_rule = (
+                    project_drop_rule_for_prefix(drop_rule, end)
+                    if drop_rule is not None
+                    else None
+                )
+                if staged_rule is not None and staged_rule.get("type") == "thinking_drop":
+                    try:
+                        parse_drop_rule(staged_rule, messages[:end], allow_internal=True)
+                    except ValueError:
+                        staged_rule = None
+                staged_reposition = [
+                    message_id for message_id in reposition if message_id < end
+                ]
+                reposition_stages = [staged_reposition]
+                if staged_reposition and staged_reposition[-1] == end - 1:
+                    # Materialize the post-Drop, pre-R KV at this boundary first.
+                    # Retry then rotates those pages into the target R layout.
+                    reposition_stages.insert(0, staged_reposition[:-1])
+                for stage_reposition in reposition_stages:
+                    staged_uid = self.new_user()
+                    await self.send_one(
+                        TokenizeMsg(
+                            uid=staged_uid,
+                            text=messages[:end],
+                            sampling_params=SamplingParams(max_tokens=1, ignore_eos=True),
+                            target_msg_id=end,
+                            drop_rule=staged_rule,
+                            reposition=stage_reposition,
+                            enable_thinking=enable_thinking,
+                            reasoning_effort=reasoning_effort,
+                            tools=tools,
+                            tool_choice=tool_choice,
+                            is_warmup=True,
+                            internal_uid=staged_uid,
+                        )
+                    )
+                    final_ack = await self.wait_for_warmup(staged_uid)
+            if final_ack is None:
+                return None
+            return CacheUsageReport(
+                cached_tokens=final_ack.cached_tokens,
+                drop_skipped_tokens=final_ack.drop_skipped_tokens,
+            )
+
+        use_context_mask = self.config.contextual_prefill_mode == "mask" and not reposition
         warmup_target = len(messages) if use_context_mask else max(len(messages) - 1, 0)
         warmup_uid = self.new_user()
         await self.send_one(
@@ -562,6 +647,7 @@ class FrontendManager:
                 sampling_params=SamplingParams(max_tokens=1, ignore_eos=True),
                 target_msg_id=warmup_target,
                 drop_rule=drop_rule,
+                reposition=reposition,
                 enable_thinking=enable_thinking,
                 reasoning_effort=reasoning_effort,
                 tools=tools,
@@ -583,7 +669,11 @@ class FrontendManager:
         # Fallback: staged prefill by message prefixes.
         for end in range(1, len(messages)):
             staged_uid = self.new_user()
-            staged_rule = project_drop_rule_for_prefix(drop_rule, end)
+            staged_rule = (
+                project_drop_rule_for_prefix(drop_rule, end)
+                if drop_rule is not None
+                else None
+            )
             if staged_rule is not None and staged_rule.get("type") == "thinking_drop":
                 try:
                     parse_drop_rule(staged_rule, messages[:end], allow_internal=True)
@@ -596,6 +686,7 @@ class FrontendManager:
                     sampling_params=SamplingParams(max_tokens=1, ignore_eos=True),
                     target_msg_id=end - 1,
                     drop_rule=staged_rule,
+                    reposition=None,
                     enable_thinking=enable_thinking,
                     reasoning_effort=reasoning_effort,
                     tools=tools,
@@ -852,9 +943,10 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
     else:
         assert req.prompt is not None, "Either 'messages' or 'prompt' must be provided"
         prompt = req.prompt
-        if req.drop_message is not None or req.drop_rule is not None:
+        if req.drop_message is not None or req.drop_rule is not None or req.reposition:
             raise HTTPException(
-                status_code=400, detail="drop_rule is only supported with chat `messages` input."
+                status_code=400,
+                detail="drop_rule and reposition are only supported with chat `messages` input.",
             )
         if req.tools is not None:
             raise HTTPException(
@@ -873,6 +965,11 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
             messages=prompt,
             radix_drop_key_mode=state.config.radix_drop_key_mode,
         )
+        _validate_reposition(
+            req.reposition,
+            message_count=len(prompt),
+            radix_drop_key_mode=state.config.radix_drop_key_mode,
+        )
 
     effective_stop = _normalize_stop(req.stop)
     max_tokens = (
@@ -882,11 +979,12 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
     )
 
     cache_report: CacheUsageReport | None = None
-    if wire_drop_rule is not None and isinstance(prompt, list):
+    if (wire_drop_rule is not None or req.reposition) and isinstance(prompt, list):
         try:
             cache_report = await state.run_contextual_warmup(
                 prompt,
                 wire_drop_rule,
+                req.reposition,
                 req.enable_thinking,
                 req.reasoning_effort,
                 req.tools,
@@ -911,6 +1009,7 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
             ),
             target_msg_id=(len(prompt) if isinstance(prompt, list) else None),
             drop_rule=wire_drop_rule,
+            reposition=req.reposition or None,
             enable_thinking=req.enable_thinking,
             reasoning_effort=req.reasoning_effort,
             tools=req.tools,
@@ -1035,6 +1134,11 @@ async def shell_completion(req: OpenAICompletionRequest):
         messages=prompt,
         radix_drop_key_mode=state.config.radix_drop_key_mode,
     )
+    _validate_reposition(
+        req.reposition,
+        message_count=len(prompt),
+        radix_drop_key_mode=state.config.radix_drop_key_mode,
+    )
     normalized_tool_choice = _normalize_tool_choice(req.tools, req.tool_choice)
     effective_stop = _normalize_stop(req.stop)
 
@@ -1058,6 +1162,7 @@ async def shell_completion(req: OpenAICompletionRequest):
             ),
             target_msg_id=len(prompt),
             drop_rule=wire_drop_rule,
+            reposition=req.reposition or None,
             enable_thinking=req.enable_thinking,
             reasoning_effort=req.reasoning_effort,
             tools=req.tools,

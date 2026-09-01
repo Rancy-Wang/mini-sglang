@@ -114,6 +114,7 @@ def test_sparse_kernel_matches_full_visibility_reference() -> None:
             uid=1,
             input_ids=full_ids[active_positions.to(torch.int64)],
             true_positions=active_positions,
+            raw_positions=active_positions,
             radix_input_ids=full_ids[active_positions.to(torch.int64)].to(torch.int64),
             radix_match_ids=full_ids.to(torch.int64),
             sampling_params=SamplingParams(max_tokens=1),

@@ -33,7 +33,8 @@ class ExitMsg(BaseBackendMsg):
 class UserMsg(BaseBackendMsg):
     uid: int
     input_ids: torch.Tensor  # CPU 1D int32 tensor
-    true_positions: torch.Tensor  # CPU 1D int32 tensor (absolute positions)
+    true_positions: torch.Tensor  # CPU 1D int32 tensor (current KV positions)
+    raw_positions: torch.Tensor  # CPU 1D int32 tensor (immutable full-token positions)
     radix_input_ids: torch.Tensor  # CPU 1D int64 tensor for radix match
     sampling_params: SamplingParams
     prompt_tokens: int | None = None
@@ -47,6 +48,13 @@ class UserMsg(BaseBackendMsg):
     drop_range_offsets: torch.Tensor | None = None  # CPU 1D int32 CSR offsets
     drop_position_ranges: torch.Tensor | None = None  # CPU 1D int32 flattened [start, end, ...]
     drop_effective_event_count: int = 0  # target-effective prefix of drop events
+    reposition_raw_boundaries: torch.Tensor | None = None  # CPU 1D int32
+    reposition_insert_offsets: torch.Tensor | None = None  # CPU 1D int32
+    radix_positions: torch.Tensor | None = None  # CPU 1D int32, full-token final KV position
+    radix_repos_info: torch.Tensor | None = None  # CPU 1D int32, last effective R boundary
+    radix_materialized_stage: torch.Tensor | None = None  # CPU 1D int32
+    radix_next_position: int | None = None
+    radix_current_reposition: int = -1
     radix_commit_token_len: int | None = None  # full-token warmup commit boundary
     enable_thinking: bool | None = None
     stop: List[str] | None = None

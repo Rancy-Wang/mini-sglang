@@ -101,6 +101,7 @@ class Engine:
         self.dummy_req = Req(
             input_ids=torch.tensor([0], dtype=torch.int32, device="cpu"),
             true_positions=torch.tensor([0], dtype=torch.int32, device="cpu"),
+            raw_positions=torch.tensor([0], dtype=torch.int32, device="cpu"),
             radix_input_ids=torch.tensor([0], dtype=torch.int64, device="cpu"),
             radix_match_ids=torch.tensor([0], dtype=torch.int64, device="cpu"),
             initial_full_match_indices=torch.empty(0, dtype=torch.int32, device=self.device),

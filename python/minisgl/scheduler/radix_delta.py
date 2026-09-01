@@ -73,8 +73,8 @@ class DeltaMarkerRegistry:
         existing = self._markers.get(canonical)
         if existing is not None:
             return existing
-        if self._next_marker < -(1 << 63):
-            raise RuntimeError("Exhausted signed int64 delta-marker namespace.")
+        if self._next_marker < -(1 << 31):
+            raise RuntimeError("Exhausted signed int32 delta-marker namespace.")
         marker = self._next_marker
         self._next_marker -= 1
         self._markers[canonical] = marker
@@ -331,3 +331,36 @@ def inject_delta_markers(
         token_to_key=token_to_key,
         marker_ids=tuple(marker_ids),
     )
+
+
+def acquire_delta_marker_ids(
+    full_token_count: int,
+    event_positions: torch.Tensor,
+    range_offsets: torch.Tensor,
+    position_ranges: torch.Tensor,
+    registry: DeltaMarkerRegistry,
+) -> tuple[int, ...]:
+    """Acquire one canonical marker per token-granular Drop event."""
+
+    _validate_position_wire(
+        full_token_count, event_positions, range_offsets, position_ranges
+    )
+    ranges = position_ranges.view(-1, 2)
+    marker_ids: list[int] = []
+    try:
+        for event_idx, insertion_pos in enumerate(event_positions.tolist()):
+            range_start = int(range_offsets[event_idx])
+            range_end = int(range_offsets[event_idx + 1])
+            canonical = canonicalize_delta_ranges(ranges[range_start:range_end].tolist())
+            if not canonical:
+                raise ValueError("A token-position Drop event must contain a range.")
+            if canonical[-1][1] > int(insertion_pos):
+                raise ValueError(
+                    "A Drop event cannot hide tokens before they are computed: "
+                    f"position={insertion_pos}, ranges={canonical}"
+                )
+            marker_ids.append(registry.acquire_canonical(canonical))
+    except Exception:
+        registry.release_request_refs(marker_ids)
+        raise
+    return tuple(marker_ids)

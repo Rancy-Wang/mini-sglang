@@ -41,6 +41,7 @@ def test_serialize_deserialize():
                 uid=0,
                 input_ids=t,
                 true_positions=torch.arange(len(t), dtype=torch.int32),
+                raw_positions=torch.arange(len(t), dtype=torch.int32),
                 radix_input_ids=t.to(torch.int64),
                 sampling_params=SamplingParams(),
                 drop_effective_event_count=2,

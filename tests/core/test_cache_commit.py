@@ -53,6 +53,7 @@ def _delta_req(
     return SimpleNamespace(
         input_ids=input_ids,
         true_positions=true_positions,
+        raw_positions=true_positions,
         radix_input_ids=input_ids.to(torch.int64),
         radix_match_ids=layout.keys,
         radix_key_virtual_mask=layout.virtual_mask,

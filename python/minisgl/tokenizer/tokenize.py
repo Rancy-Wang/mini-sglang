@@ -29,6 +29,7 @@ from transformers import PreTrainedTokenizerBase
 class TokenizedResult:
     input_ids: torch.Tensor
     true_positions: torch.Tensor
+    raw_positions: torch.Tensor
     radix_input_ids: torch.Tensor
     radix_match_ids: torch.Tensor | None
     prefix_keep_mask: torch.Tensor
@@ -40,6 +41,8 @@ class TokenizedResult:
     drop_range_offsets: torch.Tensor | None = None
     drop_position_ranges: torch.Tensor | None = None
     drop_effective_event_count: int = 0
+    reposition_raw_boundaries: torch.Tensor | None = None
+    reposition_insert_offsets: torch.Tensor | None = None
     radix_commit_token_len: int | None = None
     stop_token_seqs: List[List[int]] | None = None
     message_meta: dict | None = None
@@ -1597,6 +1600,37 @@ class TokenizeManager:
             events[owner] = self._canonicalize_position_ranges(ranges)
         return events
 
+    @staticmethod
+    def _resolve_reposition_boundaries(
+        reposition: List[int] | None,
+        *,
+        owner_ranges: dict[int, List[tuple[int, int]]],
+        target_offset: int,
+        normalized_message_count: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        raw_ids = reposition or []
+        if raw_ids != sorted(set(raw_ids)):
+            raise ValueError("reposition must contain strictly increasing unique message IDs.")
+        boundaries: list[int] = []
+        for raw_id in raw_ids:
+            owner = raw_id + target_offset
+            if raw_id < 0 or owner >= normalized_message_count:
+                raise ValueError(
+                    f"reposition message ID {raw_id} is outside the conversation."
+                )
+            ranges = owner_ranges.get(owner)
+            if not ranges:
+                raise ValueError(
+                    f"Cannot map reposition message ID {raw_id} into the token stream."
+                )
+            boundaries.append(max(end for _, end in ranges) - 1)
+        if boundaries != sorted(set(boundaries)):
+            raise ValueError(
+                "Chat template ownership does not preserve Reposition boundary order."
+            )
+        raw_boundaries = torch.tensor(boundaries, dtype=torch.int32, device="cpu")
+        return raw_boundaries, raw_boundaries + 1
+
     @classmethod
     def _ranges_effective_for_target(
         cls,
@@ -1639,9 +1673,10 @@ class TokenizeManager:
             legacy_drop_message=msg.drop_message,
             allow_internal=True,
         )
-        if drop_rule is not None and self.radix_drop_key_mode != "delta-marker":
+        has_reposition = bool(msg.reposition)
+        if (drop_rule is not None or has_reposition) and self.radix_drop_key_mode != "delta-marker":
             raise ValueError(
-                "Token-position Drop requires radix_drop_key_mode='delta-marker'; "
+                "Token-position Drop/Reposition requires radix_drop_key_mode='delta-marker'; "
                 f"got {self.radix_drop_key_mode!r}."
             )
         tool_choice_mode, forced_tool_name = self._normalize_tool_choice(msg.tool_choice)
@@ -1676,7 +1711,7 @@ class TokenizeManager:
         effective_tools = template_tools
         provenance: TemplateTokenProvenance | None = None
         cross_owner_tokens = 0
-        if isinstance(drop_rule, (MessageDropRule, KeepTextDropRule)) or (
+        if has_reposition or isinstance(drop_rule, (MessageDropRule, KeepTextDropRule)) or (
             self.is_gpt_oss and isinstance(drop_rule, TextDropRule)
         ):
             if self.is_gpt_oss:
@@ -1802,6 +1837,18 @@ class TokenizeManager:
         next_assistant_id = len(messages)
 
         owner_ranges = self._build_owner_position_ranges(owner_with_gen)
+        if msg.reposition is None:
+            reposition_raw_boundaries = None
+            reposition_insert_offsets = None
+        else:
+            reposition_raw_boundaries, reposition_insert_offsets = (
+                self._resolve_reposition_boundaries(
+                    msg.reposition,
+                    owner_ranges=owner_ranges,
+                    target_offset=target_offset,
+                    normalized_message_count=len(messages),
+                )
+            )
         event_ranges = (
             self._compile_rule_position_events(
                 drop_rule,
@@ -1823,7 +1870,7 @@ class TokenizeManager:
             target_offset=target_offset,
         )
         warmup_commit_token_len = (
-            bisect_right(query_epoch_with_gen, target_msg_id)
+            bisect_right(query_epoch_with_gen, len(messages) - 1)
             if msg.is_warmup and not msg.use_context_mask
             else None
         )
@@ -1919,6 +1966,7 @@ class TokenizeManager:
         return TokenizedResult(
             input_ids=input_ids,
             true_positions=true_positions,
+            raw_positions=true_positions,
             radix_input_ids=radix_input_ids,
             radix_match_ids=radix_match_ids,
             prefix_keep_mask=prefix_keep_mask,
@@ -1930,7 +1978,9 @@ class TokenizeManager:
                 else None
             ),
             full_keep_mask=(
-                keep_mask.to(dtype=torch.int32).contiguous() if event_ranges else None
+                keep_mask.to(dtype=torch.int32).contiguous()
+                if event_ranges
+                else None
             ),
             drop_event_positions=(
                 position_drop_plan.event_positions if position_drop_plan is not None else None
@@ -1946,6 +1996,8 @@ class TokenizeManager:
                 if position_drop_plan is not None
                 else 0
             ),
+            reposition_raw_boundaries=reposition_raw_boundaries,
+            reposition_insert_offsets=reposition_insert_offsets,
             radix_commit_token_len=warmup_commit_token_len,
             stop_token_seqs=self._build_stop_token_seqs(msg.stop),
             message_meta={
@@ -1986,6 +2038,7 @@ class TokenizeManager:
                     TokenizedResult(
                         input_ids=input_ids,
                         true_positions=torch.arange(len(input_ids), dtype=torch.int32),
+                        raw_positions=torch.arange(len(input_ids), dtype=torch.int32),
                         radix_input_ids=input_ids.to(torch.int64),
                         radix_match_ids=input_ids.to(torch.int64),
                         prefix_keep_mask=torch.ones(

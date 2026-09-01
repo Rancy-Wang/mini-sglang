@@ -16,6 +16,8 @@ KEY_FN: TypeAlias = Callable[[torch.Tensor], Any]
 
 
 def _edge_key(key_fn: KEY_FN, key: torch.Tensor, virtual_mask: torch.Tensor) -> tuple[Any, bool]:
+    if key.ndim == 2:
+        return ("records", *map(int, key[0].tolist())), bool(virtual_mask[0].item())
     return key_fn(key), bool(virtual_mask[0].item())
 
 
@@ -33,6 +35,7 @@ class RadixTreeNode:
         self.uuid = RadixTreeNode.counter
         RadixTreeNode.counter += 1
         self.timestamp = tic or time.monotonic_ns()
+        self.max_reachable_depth = 0
 
         # these fields should be updated later
         self._key: torch.Tensor
@@ -58,15 +61,26 @@ class RadixTreeNode:
         self._page_length = int(torch.count_nonzero(~virtual_mask).item())
         real_value_mask = (~virtual_mask).to(device=value.device, non_blocking=True)
         real_values = value[real_value_mask]
-        if len(real_values) == 0:
-            self._resident = False
-        else:
-            all_resident = bool(torch.all(real_values >= 0).item())
-            self._resident = all_resident
+        self._resident = len(real_values) > 0 and bool(torch.all(real_values >= 0).item())
+        self._refresh_reachable_depth()
 
     def set_parent(self, parent: RadixTreeNode) -> None:
         self._parent = parent
         parent.children[_edge_key(self.key_fn, self._key, self._virtual_mask)] = self
+        parent._refresh_reachable_depth()
+
+    def _refresh_reachable_depth(self) -> None:
+        own_length = 0 if self.is_root() else getattr(self, "_length", 0)
+        child_depth = max(
+            (child.max_reachable_depth for child in self.children.values()),
+            default=0,
+        )
+        updated = own_length + child_depth
+        if updated == self.max_reachable_depth:
+            return
+        self.max_reachable_depth = updated
+        if self._parent is not None:
+            self._parent._refresh_reachable_depth()
 
     @property
     def length(self) -> int:
@@ -104,8 +118,10 @@ class RadixTreeNode:
         return len(self.children) == 0
 
     def get_match_len(self, input_ids: torch.Tensor, virtual_mask: torch.Tensor) -> int:
-        from minisgl.kernel.radix import fast_compare_radix_key
+        from minisgl.kernel.radix import fast_compare_radix_key, fast_compare_radix_records
 
+        if self._key.ndim == 2:
+            return fast_compare_radix_records(self._key, input_ids)
         return fast_compare_radix_key(self._key, input_ids, self._virtual_mask, virtual_mask)
 
     def split_at(self, pos: int) -> RadixTreeNode:
@@ -150,6 +166,15 @@ class RadixCacheHandle(BaseCacheHandle):
         mask_list.reverse()
         return torch.cat(mask_list)
 
+    def get_matched_keys(self) -> torch.Tensor:
+        node = self.node
+        keys: List[torch.Tensor] = []
+        while not node.is_root():
+            keys.append(node._key)
+            node = node.parent
+        keys.reverse()
+        return torch.cat(keys)
+
     @property
     def physical_cached_len(self) -> int:
         node = self.node
@@ -185,6 +210,7 @@ class RadixPrefixCache(BasePrefixCache):
         self.drop_aware_eviction = False
         self._slot_owner: Dict[int, RadixTreeNode] = {}
         self._slot_pin_count: Counter[int] = Counter()
+        self._ordinary_slot_nodes: Dict[int, set[RadixTreeNode]] = {}
 
     def enable_drop_aware_eviction(self) -> None:
         if self.root_node.children:
@@ -202,6 +228,9 @@ class RadixPrefixCache(BasePrefixCache):
     def _marker_ids(key: torch.Tensor, virtual_mask: torch.Tensor) -> List[int]:
         if not bool(torch.any(virtual_mask).item()):
             return []
+        if key.ndim == 2:
+            delta_mask = virtual_mask & (key[:, 0] == 1)
+            return [int(value) for value in key[delta_mask, 1].tolist()]
         return [int(value) for value in key[virtual_mask].tolist()]
 
     @staticmethod
@@ -269,6 +298,17 @@ class RadixPrefixCache(BasePrefixCache):
                 raise RuntimeError(f"Radix owner mismatch while releasing KV slot {slot}.")
 
     def _split_node(self, node: RadixTreeNode, pos: int) -> RadixTreeNode:
+        if not self.drop_aware_eviction:
+            prefix_slots = self._real_slots_from_slice(node, slice(0, pos))
+            new_node = node.split_at(pos)
+            for slot in prefix_slots:
+                owners = self._ordinary_slot_nodes.get(slot)
+                if owners is None or node not in owners:
+                    raise RuntimeError(f"Radix shared-slot owner mismatch while splitting {slot}.")
+                owners.remove(node)
+                owners.add(new_node)
+            return new_node
+
         self._remove_size(node)
         old_need_count = node.kv_need_leaf_count
         new_node = node.split_at(pos)
@@ -286,6 +326,67 @@ class RadixPrefixCache(BasePrefixCache):
         self._add_size(new_node)
         self._add_size(node)
         return new_node
+
+    @staticmethod
+    def _real_slots_from_slice(node: RadixTreeNode, span: slice) -> List[int]:
+        values = node.value[span]
+        virtual = node.virtual_mask[span]
+        real_mask = (~virtual).to(device=values.device, non_blocking=True)
+        return [int(slot) for slot in values[real_mask].tolist()]
+
+    def _register_ordinary_node(self, node: RadixTreeNode) -> None:
+        for slot in self._real_slots(node):
+            owners = self._ordinary_slot_nodes.setdefault(slot, set())
+            if node in owners:
+                raise RuntimeError(f"Radix node registered KV slot {slot} twice.")
+            was_protected = any(owner.ref_count > 0 for owner in owners)
+            if not owners:
+                if node.ref_count > 0:
+                    self.protected_size += 1
+                else:
+                    self.evictable_size += 1
+            owners.add(node)
+            if not was_protected and node.ref_count > 0 and len(owners) > 1:
+                self.evictable_size -= 1
+                self.protected_size += 1
+
+    def _unregister_ordinary_node(self, node: RadixTreeNode) -> torch.Tensor:
+        released: list[int] = []
+        for slot in self._real_slots(node):
+            owners = self._ordinary_slot_nodes.get(slot)
+            if owners is None or node not in owners:
+                raise RuntimeError(f"Radix shared-slot owner mismatch while releasing {slot}.")
+            was_protected = any(owner.ref_count > 0 for owner in owners)
+            owners.remove(node)
+            if not owners:
+                del self._ordinary_slot_nodes[slot]
+                if was_protected:
+                    self.protected_size -= 1
+                else:
+                    self.evictable_size -= 1
+                released.append(slot)
+                continue
+            is_protected = any(owner.ref_count > 0 for owner in owners)
+            if was_protected and not is_protected:
+                self.protected_size -= 1
+                self.evictable_size += 1
+        if not released:
+            return self.empty_tensor
+        return torch.tensor(released, dtype=torch.int32, device=self.device)
+
+    def _ordinary_node_became_protected(self, node: RadixTreeNode) -> None:
+        for slot in set(self._real_slots(node)):
+            owners = self._ordinary_slot_nodes[slot]
+            if not any(owner is not node and owner.ref_count > 0 for owner in owners):
+                self.evictable_size -= 1
+                self.protected_size += 1
+
+    def _ordinary_node_became_evictable(self, node: RadixTreeNode) -> None:
+        for slot in set(self._real_slots(node)):
+            owners = self._ordinary_slot_nodes[slot]
+            if not any(owner is not node and owner.ref_count > 0 for owner in owners):
+                self.protected_size -= 1
+                self.evictable_size += 1
 
     def lock_handle(self, handle: BaseCacheHandle, unlock: bool = False) -> None:
         assert isinstance(handle, RadixCacheHandle)
@@ -333,17 +434,15 @@ class RadixPrefixCache(BasePrefixCache):
         node = handle.node
         if unlock:
             while not node.is_root():
+                if node.ref_count == 1:
+                    self._ordinary_node_became_evictable(node)
                 node.ref_count -= 1
                 assert node.ref_count >= 0
-                if node.ref_count == 0:
-                    self.evictable_size += node.page_length
-                    self.protected_size -= node.page_length
                 node = node.parent
         else:
             while not node.is_root():
                 if node.ref_count == 0:
-                    self.evictable_size -= node.page_length
-                    self.protected_size += node.page_length
+                    self._ordinary_node_became_protected(node)
                 node.ref_count += 1
                 node = node.parent
 
@@ -353,6 +452,53 @@ class RadixPrefixCache(BasePrefixCache):
         virtual_mask = self._normalize_virtual_mask(input_ids, virtual_mask)
         node, prefix_len = self._tree_walk(input_ids, virtual_mask)
         return MatchResult(RadixCacheHandle(prefix_len, node))
+
+    def match_retry_prefix(
+        self,
+        target: torch.Tensor,
+        virtual_mask: torch.Tensor,
+        exact_handle: RadixCacheHandle,
+    ) -> RadixCacheHandle:
+        """Greedily extend one structured source branch after exact matching."""
+
+        from minisgl.kernel.radix import fast_compare_retry_radix_records
+
+        if target.ndim != 2 or target.shape[1] != 4:
+            return exact_handle
+        node = exact_handle.node
+        cursor = exact_handle.cached_len
+        tic = time.monotonic_ns()
+        while cursor < len(target):
+            target_row = target[cursor]
+            candidates: list[RadixTreeNode] = []
+            for child in node.children.values():
+                source_row = child._key[0]
+                same_kind = int(source_row[0]) == int(target_row[0])
+                token_compatible = same_kind and int(source_row[0]) == 0 and int(
+                    source_row[1]
+                ) == int(target_row[1])
+                marker_compatible = same_kind and int(source_row[0]) != 0 and torch.equal(
+                    source_row, target_row
+                )
+                if token_compatible or marker_compatible:
+                    candidates.append(child)
+            if not candidates:
+                break
+            child = max(
+                candidates,
+                key=lambda candidate: (candidate.max_reachable_depth, -candidate.uuid),
+            )
+            match_len = fast_compare_retry_radix_records(child._key, target[cursor:])
+            if match_len == 0:
+                break
+            cursor += match_len
+            node = child
+            if match_len != child.length:
+                node = self._split_node(child, match_len)
+                node.timestamp = tic
+                break
+            node.timestamp = tic
+        return RadixCacheHandle(cursor, node)
 
     def _leaf_keep_mask(self, leaf: RadixTreeNode) -> torch.Tensor:
         path_nodes = self._path_nodes(leaf)
@@ -629,7 +775,7 @@ class RadixPrefixCache(BasePrefixCache):
                 virtual_mask[prefix_len:].clone(),
             )
             new_node.set_parent(node)
-            self.evictable_size += new_node.page_length
+            self._register_ordinary_node(new_node)
             if self.delta_marker_registry is not None:
                 self.delta_marker_registry.add_tree_refs(
                     self._marker_ids(new_node._key, new_node.virtual_mask)
@@ -669,7 +815,7 @@ class RadixPrefixCache(BasePrefixCache):
             if span < child.length:
                 if child.ref_count > 0:
                     return None
-                boundary = child.split_at(span)
+                boundary = self._split_node(child, span)
             else:
                 boundary = child
             cursor += span
@@ -692,22 +838,15 @@ class RadixPrefixCache(BasePrefixCache):
             subtree.append(node)
             stack.extend(node.children.values())
 
-        page_count = sum(node.page_length for node in subtree)
-        pages = [
-            node.value[(~node.virtual_mask).to(device=node.value.device, non_blocking=True)]
-            for node in subtree
-            if node.page_length > 0
-        ]
         del boundary.children[stale_key]
+        boundary._refresh_reachable_depth()
+        released = [self._unregister_ordinary_node(node) for node in subtree]
         if self.delta_marker_registry is not None:
             for stale_node in subtree:
                 self.delta_marker_registry.remove_tree_refs(
                     self._marker_ids(stale_node._key, stale_node.virtual_mask)
                 )
-        self.evictable_size -= page_count
-        if self.evictable_size < 0:
-            raise RuntimeError("Radix evictable-size accounting underflow during prune.")
-
+        pages = [slots for slots in released if len(slots) > 0]
         if not pages:
             return self.empty_tensor
         return torch.cat(pages)
@@ -732,13 +871,13 @@ class RadixPrefixCache(BasePrefixCache):
             ), f"Cannot evict enough cache, need {size}, only {evicted_size} evicted"
             node = heapq.heappop(leave_nodes)
             assert node.ref_count == 0 and node.is_leaf() and not node.is_root()
-            evicted_size += node.page_length
-            if node.page_length > 0:
-                real_mask = (~node.virtual_mask).to(device=node.value.device, non_blocking=True)
-                evicted_indices.append(node.value[real_mask])
-            self.evictable_size -= node.page_length
             parent = node.parent
             del parent.children[_edge_key(self.key_fn, node._key, node.virtual_mask)]
+            parent._refresh_reachable_depth()
+            released = self._unregister_ordinary_node(node)
+            if len(released) > 0:
+                evicted_indices.append(released)
+                evicted_size += len(released)
             if self.delta_marker_registry is not None:
                 self.delta_marker_registry.remove_tree_refs(
                     self._marker_ids(node._key, node.virtual_mask)
@@ -780,6 +919,7 @@ class RadixPrefixCache(BasePrefixCache):
             self._unregister_node_slots(node)
         parent = node.parent
         del parent.children[_edge_key(self.key_fn, node._key, node.virtual_mask)]
+        parent._refresh_reachable_depth()
         if self.delta_marker_registry is not None:
             self.delta_marker_registry.remove_tree_refs(
                 self._marker_ids(node._key, node.virtual_mask)
@@ -863,6 +1003,7 @@ class RadixPrefixCache(BasePrefixCache):
     def check_integrity(self) -> None:
         expected_evictable = 0
         expected_protected = 0
+        expected_ordinary_owners: Dict[int, set[RadixTreeNode]] = {}
         actual_marker_refs: Counter[int] = Counter()
         stack: List[RadixTreeNode] = [self.root_node]
         while stack:
@@ -882,16 +1023,24 @@ class RadixPrefixCache(BasePrefixCache):
                         "RadixPrefixCache integrity check failed: a real key has a negative page."
                     )
                 actual_marker_refs.update(self._marker_ids(child._key, child.virtual_mask))
-                resident_size = (
-                    child.resident_page_length
-                    if self.drop_aware_eviction
-                    else child.page_length
-                )
-                if self._is_evictable(child):
-                    expected_evictable += resident_size
+                if self.drop_aware_eviction:
+                    resident_size = child.resident_page_length
+                    if self._is_evictable(child):
+                        expected_evictable += resident_size
+                    else:
+                        expected_protected += resident_size
                 else:
-                    expected_protected += resident_size
+                    for slot in self._real_slots(child):
+                        expected_ordinary_owners.setdefault(slot, set()).add(child)
                 stack.append(child)
+        if not self.drop_aware_eviction:
+            for owners in expected_ordinary_owners.values():
+                if any(owner.ref_count > 0 for owner in owners):
+                    expected_protected += 1
+                else:
+                    expected_evictable += 1
+            if expected_ordinary_owners != self._ordinary_slot_nodes:
+                raise RuntimeError("Radix shared-slot owner index is inconsistent.")
         if expected_evictable != self.evictable_size or expected_protected != self.protected_size:
             raise RuntimeError(
                 "RadixPrefixCache integrity check failed:"
@@ -1048,11 +1197,7 @@ class RadixPrefixCache(BasePrefixCache):
 
             # need to split the node if not fully matched
             if match_len != node.length:
-                node = (
-                    self._split_node(node, match_len)
-                    if self.drop_aware_eviction
-                    else node.split_at(match_len)
-                )
+                node = self._split_node(node, match_len)
                 node.timestamp = tic
                 return node, prefix_len
 

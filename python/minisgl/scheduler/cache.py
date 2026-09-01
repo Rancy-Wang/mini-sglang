@@ -22,6 +22,10 @@ class ContextMatchResult:
     full_cached_len: int
     active_match_indices: torch.Tensor
     active_cached_len: int
+    initial_active_cached_len: int
+    active_full_positions: torch.Tensor
+    retry_old_positions: torch.Tensor | None = None
+    retry_new_positions: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -130,7 +134,7 @@ class CacheManager:
             return req.radix_match_ids[:-1], None
         if req.radix_key_virtual_mask is None:
             raise ValueError("Delta-marker key mapping requires a virtual mask.")
-        last_token_pos = int(req.true_positions[-1].item())
+        last_token_pos = int(req.raw_positions[-1].item())
         if last_token_pos < 0 or last_token_pos >= len(req.radix_token_to_key):
             raise ValueError("The final input token is outside radix_token_to_key.")
         key_prefix_len = int(req.radix_token_to_key[last_token_pos].item())
@@ -149,7 +153,7 @@ class CacheManager:
             return prefix_len, prefix_len
         full_token_prefix_len = int(torch.count_nonzero(~query_virtual_mask).item())
         active_token_prefix_len = int(
-            torch.count_nonzero(req.true_positions < full_token_prefix_len).item()
+            torch.count_nonzero(req.raw_positions < full_token_prefix_len).item()
         )
         return full_token_prefix_len, active_token_prefix_len
 
@@ -160,10 +164,59 @@ class CacheManager:
         if matched is None:
             return None
         handle, key_match_indices, matched_virtual_mask = matched
+        used_retry = False
+        if req.radix_match_ids is not None and req.radix_match_ids.ndim == 2:
+            from minisgl.kvcache.radix_cache import RadixCacheHandle, RadixPrefixCache
+
+            if not isinstance(self.prefix_cache, RadixPrefixCache) or not isinstance(
+                handle, RadixCacheHandle
+            ):
+                raise RuntimeError("Structured Retry requires the Radix prefix cache.")
+            retry_handle = self.prefix_cache.match_retry_prefix(
+                radix_query,
+                query_virtual_mask
+                if query_virtual_mask is not None
+                else torch.zeros(len(radix_query), dtype=torch.bool, device="cpu"),
+                handle,
+            )
+            if retry_handle.cached_len > handle.cached_len:
+                retry_indices = self._matched_indices(retry_handle)[: retry_handle.cached_len]
+                retry_virtual = retry_handle.get_matched_virtual_mask()[
+                    : retry_handle.cached_len
+                ]
+                value_virtual = retry_virtual.to(
+                    device=retry_indices.device, non_blocking=True
+                )
+                if not bool(torch.any((retry_indices < 0) & (~value_virtual)).item()):
+                    handle = retry_handle
+                    key_match_indices = retry_indices
+                    matched_virtual_mask = retry_virtual
+                    used_retry = True
         full_match_indices = key_match_indices[
             (~matched_virtual_mask).to(device=key_match_indices.device, non_blocking=True)
         ]
-        return self._derive_active_match(req, handle, full_match_indices)
+        result = self._derive_active_match(req, handle, full_match_indices)
+        if not used_retry:
+            return result
+
+        source_records = handle.get_matched_keys()[: handle.cached_len]
+        source_real = source_records[~matched_virtual_mask]
+        target_real = radix_query[: handle.cached_len][~matched_virtual_mask]
+        old_positions = source_real[:, 3]
+        new_positions = target_real[:, 3]
+        if len(old_positions) != result.full_cached_len:
+            raise RuntimeError("Retry position plan does not align with full cache pages.")
+        return ContextMatchResult(
+            handle=result.handle,
+            full_match_indices=result.full_match_indices,
+            full_cached_len=result.full_cached_len,
+            active_match_indices=result.active_match_indices,
+            active_cached_len=result.active_cached_len,
+            initial_active_cached_len=result.active_cached_len,
+            active_full_positions=result.active_full_positions,
+            retry_old_positions=old_positions,
+            retry_new_positions=new_positions,
+        )
 
     def _derive_active_match(
         self,
@@ -172,6 +225,9 @@ class CacheManager:
         full_match_indices: torch.Tensor,
     ) -> ContextMatchResult:
         active_match_indices = full_match_indices
+        active_full_positions = torch.arange(
+            len(full_match_indices), dtype=torch.int64, device="cpu"
+        )
         if req.prefix_keep_mask is not None and len(full_match_indices) > 0:
             if len(req.prefix_keep_mask) < len(full_match_indices):
                 raise RuntimeError(
@@ -190,12 +246,17 @@ class CacheManager:
                     int(kept_holes[0].item()) if len(kept_holes) > 0 else len(kept_indices)
                 )
                 active_match_indices = kept_indices[:active_cached_len]
+                active_full_positions = torch.nonzero(
+                    keep_mask, as_tuple=False
+                ).view(-1)[:active_cached_len]
             else:
                 active_match_indices = full_match_indices[keep_mask]
+                active_full_positions = torch.nonzero(keep_mask, as_tuple=False).view(-1)
         elif self.drop_aware_eviction and len(full_match_indices) > 0:
             holes = torch.nonzero(full_match_indices < 0, as_tuple=False).view(-1)
             active_cached_len = int(holes[0].item()) if len(holes) > 0 else len(full_match_indices)
             active_match_indices = full_match_indices[:active_cached_len]
+            active_full_positions = active_full_positions[:active_cached_len]
         if self.drop_aware_eviction:
             from minisgl.kvcache.radix_cache import RadixPrefixCache
 
@@ -207,7 +268,24 @@ class CacheManager:
             full_cached_len=len(full_match_indices),
             active_match_indices=active_match_indices,
             active_cached_len=len(active_match_indices),
+            initial_active_cached_len=len(active_match_indices),
+            active_full_positions=active_full_positions,
         )
+
+    def allocate_retry_pages(self, count: int) -> torch.Tensor:
+        if self.page_size != 1:
+            raise RuntimeError("Retry Reposition requires page_size=1.")
+        if count < 0:
+            raise ValueError("Retry Reposition page count must be non-negative.")
+        if count > self.available_size:
+            raise RuntimeError(
+                f"Retry Reposition needs {count} KV pages, but only {self.available_size} "
+                "pages can be made available."
+            )
+        return self._allocate(count)
+
+    def free_retry_pages(self, indices: torch.Tensor) -> None:
+        self._free(indices)
 
     def derive_active_match(
         self, req: PendingReq, full_match: FullMatchResult
@@ -309,7 +387,7 @@ class CacheManager:
 
         old_handle = req.cache_handle
         all_active_indices = self.page_table[req.table_idx, : req.cached_len]
-        all_active_positions = req.true_positions[: req.cached_len].to(
+        all_active_positions = req.raw_positions[: req.cached_len].to(
             dtype=torch.int64, device="cpu"
         )
         key_prefix_len = self._delta_key_prefix_len(req)
@@ -473,12 +551,12 @@ class CacheManager:
     def _delta_key_prefix_len(req: Req) -> int:
         assert req.radix_token_to_key is not None
         if req.cached_len < len(req.input_ids):
-            next_token_pos = int(req.true_positions[req.cached_len].item())
+            next_token_pos = int(req.raw_positions[req.cached_len].item())
             if next_token_pos < 0 or next_token_pos >= len(req.radix_token_to_key):
                 raise RuntimeError("The next active token is outside radix_token_to_key.")
             key_prefix_len = int(req.radix_token_to_key[next_token_pos].item())
         else:
-            last_token_pos = int(req.true_positions[len(req.input_ids) - 1].item())
+            last_token_pos = int(req.raw_positions[len(req.input_ids) - 1].item())
             if last_token_pos < 0 or last_token_pos >= len(req.radix_token_to_key):
                 raise RuntimeError("The final active token is outside radix_token_to_key.")
             token_boundary = last_token_pos + 1
@@ -500,7 +578,7 @@ class CacheManager:
 
         old_handle = req.cache_handle
         all_active_indices = self.page_table[req.table_idx, : req.cached_len]
-        all_active_positions = req.true_positions[: req.cached_len].to(
+        all_active_positions = req.raw_positions[: req.cached_len].to(
             dtype=torch.int64, device="cpu"
         )
         key_prefix_len = self._delta_key_prefix_len(req)
@@ -661,10 +739,29 @@ class CacheManager:
         )
         active_slots = torch.arange(len(candidates), dtype=torch.int64, device=candidates.device)
         newly_allocated = active_slots >= req.initial_active_cached_len
+        if req.retry_transformed_mask is not None:
+            transformed = req.retry_transformed_mask.to(
+                device=candidates.device, dtype=torch.bool, non_blocking=True
+            )
+            if len(transformed) > len(newly_allocated):
+                raise RuntimeError("Retry transformed-page mask exceeds the active cache prefix.")
+            newly_allocated[: len(transformed)] |= transformed
         adopted = (candidate_key_positions >= insert_result.cached_len) & (
             candidate_key_positions < insert_result.handle.cached_len
         )
         released = candidates[newly_allocated & (~adopted)]
+        inactive_positions = req.retry_inactive_transformed_positions
+        inactive_pages = req.retry_inactive_transformed_pages
+        if inactive_positions is not None and inactive_pages is not None:
+            if req.radix_token_to_key is None:
+                raise RuntimeError("Inactive Retry pages require a structured Radix mapping.")
+            inactive_key_positions = req.radix_token_to_key[inactive_positions].to(
+                device=inactive_pages.device, dtype=torch.int64, non_blocking=True
+            )
+            inactive_adopted = (inactive_key_positions >= insert_result.cached_len) & (
+                inactive_key_positions < insert_result.handle.cached_len
+            )
+            released = torch.cat([released, inactive_pages[~inactive_adopted]])
         if excluded is not None:
             released = torch.cat([released, excluded])
         self._free(released)
@@ -674,7 +771,7 @@ class CacheManager:
             raise RuntimeError("Drop-message sparse caching currently requires page_size=1.")
         old_handle = req.cache_handle
         active_indices = self.page_table[req.table_idx, : req.cached_len]
-        active_positions = req.true_positions[: req.cached_len]
+        active_positions = req.raw_positions[: req.cached_len]
         old_full_cached_len = old_handle.cached_len
         try:
             if len(active_indices) != len(active_positions):

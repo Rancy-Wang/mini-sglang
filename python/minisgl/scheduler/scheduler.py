@@ -7,6 +7,8 @@ import torch
 from minisgl.core import Batch, Req
 from minisgl.env import ENV
 from minisgl.kernel.context_plan import preload_context_plan_kernel
+from minisgl.kernel.radix_reposition import compile_radix_reposition_layout
+from minisgl.layers import get_rope
 from minisgl.message import (
     AbortBackendMsg,
     BaseBackendMsg,
@@ -28,6 +30,7 @@ from .io import SchedulerIOMixin
 from .prefill import ChunkedReq, PrefillManager
 from .radix_delta import (
     DeltaMarkerRegistry,
+    acquire_delta_marker_ids,
     inject_delta_markers,
     key_prefix_len_for_token_boundary,
     select_effective_delta_events,
@@ -114,12 +117,24 @@ class Scheduler(SchedulerIOMixin):
         if self.delta_marker_registry is not None:
             self.cache_manager.bind_delta_marker_registry(self.delta_marker_registry)
         self.decode_manager = DecodeManager(config.page_size)
+        rotary_config = config.model_config.rotary_config
+        retry_rope = get_rope(
+            head_dim=rotary_config.head_dim,
+            rotary_dim=rotary_config.rotary_dim,
+            max_position=rotary_config.max_position,
+            base=rotary_config.base,
+            rope_scaling=(
+                tuple(rotary_config.scaling.items()) if rotary_config.scaling else None
+            ),
+        )
         self.prefill_manager = PrefillManager(
             self.cache_manager,
             self.table_manager,
             self.decode_manager,
             has_sliding_window=config.model_config.sliding_window is not None,
             enable_mask_free_context_prefill=config.mask_free_context_prefill,
+            kv_cache=self.engine.kv_cache,
+            retry_rope_cache=retry_rope.cos_sin_cache,
         )
         if config.contextual_prefill_mode not in {"staged", "mask"}:
             raise ValueError(
@@ -307,31 +322,6 @@ class Scheduler(SchedulerIOMixin):
             raise KeyboardInterrupt
         elif isinstance(msg, UserMsg):
             logger.debug_rank0("Received user msg: %s", msg)
-            true_input_len = (
-                len(msg.full_input_ids)
-                if msg.use_context_mask and msg.full_input_ids is not None
-                else int(msg.true_positions[-1].item()) + 1 if len(msg.true_positions) > 0 else 0
-            )
-            max_seq_len = self.engine.max_seq_len
-            max_output_len = max_seq_len - true_input_len
-            if max_output_len <= 0:
-                detail = (
-                    f"Input true sequence length {true_input_len} exceeds the usable "
-                    f"context length {max_seq_len - 1}; at least one output token is required."
-                )
-                logger.warning_rank0("Rejecting request %s: %s", msg.uid, detail)
-                self.send_result(
-                    [
-                        RequestRejectMsg(
-                            uid=msg.uid,
-                            status_code=413,
-                            error_code="context_length_exceeded",
-                            detail=detail,
-                        )
-                    ]
-                )
-                return
-
             if self.radix_symbol_registry is not None and msg.message_meta is not None:
                 state_starts = msg.message_meta.get(
                     "radix_state_starts", msg.message_meta.get("message_starts", [])
@@ -382,6 +372,118 @@ class Scheduler(SchedulerIOMixin):
                                 msg.full_keep_mask,
                             )
                         )
+                else:
+                    event_positions = torch.empty(0, dtype=torch.int32, device="cpu")
+                    range_offsets = torch.zeros(1, dtype=torch.int32, device="cpu")
+                    position_ranges = torch.empty(0, dtype=torch.int32, device="cpu")
+
+                structured_key = msg.reposition_raw_boundaries is not None
+                if structured_key:
+                    if msg.full_keep_mask is not None and msg.drop_effective_event_count < 0:
+                        event_positions, range_offsets, position_ranges = (
+                            select_effective_delta_events(
+                                event_positions,
+                                range_offsets,
+                                position_ranges,
+                                msg.full_keep_mask,
+                            )
+                        )
+                    elif 0 <= msg.drop_effective_event_count < len(event_positions):
+                        event_count = msg.drop_effective_event_count
+                        range_count = int(range_offsets[event_count])
+                        event_positions = event_positions[:event_count]
+                        range_offsets = range_offsets[: event_count + 1]
+                        position_ranges = position_ranges[: 2 * range_count]
+
+                    reposition_boundaries = msg.reposition_raw_boundaries
+                    reposition_offsets = msg.reposition_insert_offsets
+                    if reposition_boundaries is None:
+                        reposition_boundaries = torch.empty(
+                            0, dtype=torch.int32, device="cpu"
+                        )
+                    if reposition_offsets is None:
+                        reposition_offsets = torch.empty(0, dtype=torch.int32, device="cpu")
+                    marker_ids: tuple[int, ...] = ()
+                    try:
+                        if (
+                            len(reposition_boundaries) > 0
+                            and self.cache_manager.drop_aware_eviction
+                        ):
+                            raise ValueError(
+                                "Reposition currently supports ordinary Radix eviction only; "
+                                "disable Drop-aware eviction."
+                            )
+                        marker_ids = acquire_delta_marker_ids(
+                            len(msg.radix_match_ids),
+                            event_positions,
+                            range_offsets,
+                            position_ranges,
+                            self.delta_marker_registry,
+                        )
+                        layout = compile_radix_reposition_layout(
+                            msg.radix_match_ids,
+                            event_positions,
+                            range_offsets,
+                            position_ranges,
+                            torch.tensor(marker_ids, dtype=torch.int32, device="cpu"),
+                            reposition_boundaries,
+                            reposition_offsets,
+                        )
+                        active_raw = torch.nonzero(layout.keep_mask, as_tuple=False).view(-1)
+                        expected_raw = msg.raw_positions.to(dtype=torch.int64)
+                        if not torch.equal(active_raw, expected_raw):
+                            raise ValueError(
+                                "Drop compiler keep state disagrees with tokenizer active tokens."
+                            )
+                        msg.true_positions = layout.positions[active_raw]
+                        msg.raw_positions = active_raw.to(dtype=torch.int32)
+                        msg.radix_match_ids = layout.records
+                        msg.radix_input_ids = layout.records[
+                            layout.token_to_key[active_raw]
+                        ].contiguous()
+                        msg.radix_key_virtual_mask = layout.virtual_mask
+                        msg.radix_key_to_token = layout.key_to_token
+                        msg.radix_token_to_key = layout.token_to_key
+                        msg.radix_marker_ids = list(marker_ids)
+                        msg.radix_positions = layout.positions
+                        msg.radix_repos_info = layout.repos_info
+                        msg.radix_materialized_stage = layout.materialized_stage
+                        msg.radix_next_position = layout.next_position
+                        msg.radix_current_reposition = layout.current_reposition
+                        ignored = reposition_boundaries[layout.ignored_repositions]
+                        if len(ignored) > 0:
+                            logger.warning_rank0(
+                                "Ignoring no-op Reposition boundaries for request %s: %s",
+                                msg.uid,
+                                ignored.tolist(),
+                            )
+                        if msg.radix_commit_token_len is not None:
+                            msg.radix_commit_key_len = key_prefix_len_for_token_boundary(
+                                layout, msg.radix_commit_token_len
+                            )
+                    except ValueError as exc:
+                        if marker_ids:
+                            self.delta_marker_registry.release_request_refs(marker_ids)
+                            msg.radix_marker_ids = None
+                        detail = str(exc)
+                        logger.warning_rank0("Rejecting request %s: %s", msg.uid, detail)
+                        self.send_result(
+                            [
+                                RequestRejectMsg(
+                                    uid=msg.uid,
+                                    status_code=400,
+                                    error_code="invalid_context_events",
+                                    detail=detail,
+                                )
+                            ]
+                        )
+                        return
+                    except Exception:
+                        if marker_ids:
+                            self.delta_marker_registry.release_request_refs(marker_ids)
+                            msg.radix_marker_ids = None
+                        raise
+                elif len(event_positions) > 0:
                     marker_ids: tuple[int, ...] = ()
                     try:
                         layout = inject_delta_markers(
@@ -407,6 +509,37 @@ class Scheduler(SchedulerIOMixin):
                             self.delta_marker_registry.release_request_refs(marker_ids)
                             msg.radix_marker_ids = None
                         raise
+
+            if msg.use_context_mask and msg.full_input_ids is not None:
+                true_input_len = len(msg.full_input_ids)
+            elif msg.radix_next_position is not None:
+                true_input_len = msg.radix_next_position
+            elif len(msg.true_positions) > 0:
+                true_input_len = int(msg.true_positions[-1].item()) + 1
+            else:
+                true_input_len = 0
+            max_seq_len = self.engine.max_seq_len
+            max_output_len = max_seq_len - true_input_len
+            if max_output_len <= 0:
+                detail = (
+                    f"Input true sequence length {true_input_len} exceeds the usable "
+                    f"context length {max_seq_len - 1}; at least one output token is required."
+                )
+                logger.warning_rank0("Rejecting request %s: %s", msg.uid, detail)
+                self.send_result(
+                    [
+                        RequestRejectMsg(
+                            uid=msg.uid,
+                            status_code=413,
+                            error_code="context_length_exceeded",
+                            detail=detail,
+                        )
+                    ]
+                )
+                if self.delta_marker_registry is not None and msg.radix_marker_ids:
+                    self.delta_marker_registry.release_request_refs(msg.radix_marker_ids)
+                    msg.radix_marker_ids = None
+                return
 
             if msg.sampling_params.max_tokens > max_output_len:
                 msg.sampling_params.max_tokens = max_output_len
