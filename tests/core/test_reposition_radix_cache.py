@@ -8,8 +8,8 @@ import torch
 pytest.importorskip("tvm_ffi")
 
 import minisgl.core as core
-from minisgl.kvcache.radix_cache import RadixPrefixCache
 from minisgl.kernel.radix_reposition import DELTA_KIND, REPOSITION_KIND, TOKEN_KIND
+from minisgl.kvcache.radix_cache import RadixPrefixCache
 from minisgl.scheduler.cache import CacheManager
 
 

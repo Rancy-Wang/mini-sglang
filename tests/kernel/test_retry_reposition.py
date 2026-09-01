@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import pytest
 import torch
-
 from minisgl.kernel.retry_reposition import retry_reposition_kv
 
 

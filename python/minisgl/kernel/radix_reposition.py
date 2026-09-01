@@ -7,7 +7,6 @@ import torch
 
 from .utils import load_aot
 
-
 TOKEN_KIND = 0
 DELTA_KIND = 1
 REPOSITION_KIND = 2

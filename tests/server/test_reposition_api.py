@@ -7,14 +7,13 @@ import pytest
 from fastapi import HTTPException
 from minisgl.core import SamplingParams
 from minisgl.message import TokenizeMsg, WarmupReply
-from minisgl.tokenizer.tokenize import TokenizeManager
-from pydantic import ValidationError
-
 from minisgl.server.api_server import (
     FrontendManager,
     OpenAICompletionRequest,
     _validate_reposition,
 )
+from minisgl.tokenizer.tokenize import TokenizeManager
+from pydantic import ValidationError
 
 
 def _request(reposition) -> OpenAICompletionRequest:
