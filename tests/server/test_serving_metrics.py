@@ -4,9 +4,8 @@ import asyncio
 import json
 from types import SimpleNamespace
 
-import pytest
-
 import minisgl.server.api_server as api_server
+import pytest
 from minisgl.message import (
     BaseTokenizerMsg,
     DetokenizeMsg,

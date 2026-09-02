@@ -5,7 +5,6 @@ import json
 
 import httpx
 import pytest
-
 from minisgl.benchmark.contextualize.manifest import (
     CaptureRecord,
     CaseMetadata,

@@ -6,8 +6,8 @@ from typing import TYPE_CHECKING, List
 import torch
 
 if TYPE_CHECKING:
-    from minisgl.kvcache import BaseCacheHandle
     from minisgl.core import SamplingParams
+    from minisgl.kvcache import BaseCacheHandle
 
     from .prefill import ChunkedReq
 
