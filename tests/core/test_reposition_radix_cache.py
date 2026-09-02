@@ -211,6 +211,7 @@ def test_retry_position_plan_keeps_changed_pages_that_are_dropped_later() -> Non
         input_len=2,
         radix_match_ids=target,
         radix_token_to_key=torch.tensor([0, 1, 4, 6], dtype=torch.int64),
+        radix_key_to_token=torch.tensor([0, 1, -1, -1, 2, -1, 3], dtype=torch.int64),
         radix_key_virtual_mask=torch.tensor(
             [False, False, True, True, False, True, False], dtype=torch.bool
         ),
@@ -264,6 +265,7 @@ def test_concurrent_commit_adopts_inactive_retry_page_and_frees_duplicate() -> N
         input_len=2,
         radix_match_ids=target,
         radix_token_to_key=token_to_key,
+        radix_key_to_token=key_to_token,
         radix_key_virtual_mask=target_virtual,
         radix_commit_key_len=None,
         raw_positions=torch.tensor([2, 3], dtype=torch.int32),
