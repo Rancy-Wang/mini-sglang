@@ -296,3 +296,29 @@ def test_concurrent_commit_adopts_inactive_retry_page_and_frees_duplicate() -> N
     assert set(allocated[1].tolist()).issubset(set(manager.free_slots.tolist()))
     assert not set(allocated[0].tolist()) & set(manager.free_slots.tolist())
     manager.check_integrity()
+
+
+def test_finished_candidate_requires_canonical_slot_not_only_insert_range() -> None:
+    page_table = torch.full((1, 4), -1, dtype=torch.int32, device="cpu")
+    manager = CacheManager(4, 1, page_table, "radix")
+    candidate, canonical = manager._allocate(2)
+    key = _records([[TOKEN_KIND, 10, -1, 0]])
+    insert_result = manager.prefix_cache.insert_prefix(key, canonical.view(1), _mask(1))
+    req = SimpleNamespace(
+        initial_active_cached_len=0,
+        retry_transformed_mask=None,
+        retry_inactive_transformed_positions=None,
+        retry_inactive_transformed_pages=None,
+        radix_token_to_key=None,
+    )
+
+    manager._free_finished_candidates(
+        req,
+        candidate.view(1),
+        torch.tensor([0], dtype=torch.int64),
+        insert_result,
+    )
+
+    assert int(candidate) in manager.free_slots.tolist()
+    assert int(canonical) not in manager.free_slots.tolist()
+    manager.check_integrity()

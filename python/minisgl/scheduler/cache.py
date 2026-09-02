@@ -742,6 +742,24 @@ class CacheManager:
         candidate_key_positions = candidate_key_positions.to(
             device=candidates.device, dtype=torch.int64, non_blocking=True
         )
+        canonical_indices = insert_result.handle.get_matched_indices()
+
+        def adopted_pages(
+            pages: torch.Tensor, key_positions: torch.Tensor
+        ) -> torch.Tensor:
+            key_positions = key_positions.to(
+                device=pages.device, dtype=torch.int64, non_blocking=True
+            )
+            in_committed_key = (key_positions >= 0) & (
+                key_positions < insert_result.handle.cached_len
+            )
+            adopted = torch.zeros(len(pages), dtype=torch.bool, device=pages.device)
+            selected_positions = key_positions[in_committed_key]
+            adopted[in_committed_key] = (
+                canonical_indices[selected_positions] == pages[in_committed_key]
+            )
+            return adopted
+
         active_slots = torch.arange(len(candidates), dtype=torch.int64, device=candidates.device)
         newly_allocated = active_slots >= req.initial_active_cached_len
         if req.retry_transformed_mask is not None:
@@ -751,9 +769,7 @@ class CacheManager:
             if len(transformed) > len(newly_allocated):
                 raise RuntimeError("Retry transformed-page mask exceeds the active cache prefix.")
             newly_allocated[: len(transformed)] |= transformed
-        adopted = (candidate_key_positions >= insert_result.cached_len) & (
-            candidate_key_positions < insert_result.handle.cached_len
-        )
+        adopted = adopted_pages(candidates, candidate_key_positions)
         released = candidates[newly_allocated & (~adopted)]
         inactive_positions = req.retry_inactive_transformed_positions
         inactive_pages = req.retry_inactive_transformed_pages
@@ -763,9 +779,7 @@ class CacheManager:
             inactive_key_positions = req.radix_token_to_key[inactive_positions].to(
                 device=inactive_pages.device, dtype=torch.int64, non_blocking=True
             )
-            inactive_adopted = (inactive_key_positions >= insert_result.cached_len) & (
-                inactive_key_positions < insert_result.handle.cached_len
-            )
+            inactive_adopted = adopted_pages(inactive_pages, inactive_key_positions)
             released = torch.cat([released, inactive_pages[~inactive_adopted]])
         if excluded is not None:
             released = torch.cat([released, excluded])
