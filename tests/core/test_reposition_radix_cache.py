@@ -241,6 +241,7 @@ def test_concurrent_commit_adopts_inactive_retry_page_and_frees_duplicate() -> N
     for match in matches:
         assert match is not None
         assert match.full_cached_len == 3
+        assert match.active_full_positions.device.type == "cpu"
         assert match.active_full_positions.tolist() == [2]
         assert match.retry_old_positions.tolist() == [0, 1, 2]
         assert match.retry_new_positions.tolist() == [0, 0, 1]

@@ -234,7 +234,10 @@ class CacheManager:
                     "prefix_keep_mask is shorter than matched full-token prefix:"
                     f" {len(req.prefix_keep_mask)} < {len(full_match_indices)}"
                 )
-            keep_mask = (req.prefix_keep_mask[: len(full_match_indices)] != 0).to(
+            keep_mask_cpu = (req.prefix_keep_mask[: len(full_match_indices)] != 0).to(
+                device="cpu", dtype=torch.bool
+            )
+            keep_mask = keep_mask_cpu.to(
                 device=full_match_indices.device,
                 dtype=torch.bool,
                 non_blocking=True,
@@ -247,11 +250,13 @@ class CacheManager:
                 )
                 active_match_indices = kept_indices[:active_cached_len]
                 active_full_positions = torch.nonzero(
-                    keep_mask, as_tuple=False
+                    keep_mask_cpu, as_tuple=False
                 ).view(-1)[:active_cached_len]
             else:
                 active_match_indices = full_match_indices[keep_mask]
-                active_full_positions = torch.nonzero(keep_mask, as_tuple=False).view(-1)
+                active_full_positions = torch.nonzero(
+                    keep_mask_cpu, as_tuple=False
+                ).view(-1)
         elif self.drop_aware_eviction and len(full_match_indices) > 0:
             holes = torch.nonzero(full_match_indices < 0, as_tuple=False).view(-1)
             active_cached_len = int(holes[0].item()) if len(holes) > 0 else len(full_match_indices)
