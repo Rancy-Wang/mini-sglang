@@ -654,8 +654,9 @@ class CacheManager:
                 device=active_indices.device,
             )
 
-            if req.staged_full_page_indices is not None:
-                staged_len = min(len(req.staged_full_page_indices), full_token_prefix_len)
+            staged_full_page_indices = getattr(req, "staged_full_page_indices", None)
+            if staged_full_page_indices is not None:
+                staged_len = min(len(staged_full_page_indices), full_token_prefix_len)
                 staged_active = active_positions < staged_len
                 if bool(torch.any(staged_active).item()):
                     staged_active_device = staged_active.to(
@@ -668,10 +669,10 @@ class CacheManager:
                         dtype=torch.int64,
                         non_blocking=True,
                     )
-                    req.staged_full_page_indices[staged_positions_device] = active_indices[
+                    staged_full_page_indices[staged_positions_device] = active_indices[
                         staged_active_device
                     ]
-                staged_pages = req.staged_full_page_indices[:staged_len]
+                staged_pages = staged_full_page_indices[:staged_len]
                 if bool(torch.any(staged_pages < 0).item()):
                     missing = torch.nonzero(staged_pages < 0, as_tuple=False).view(-1)
                     raise RuntimeError(
@@ -743,7 +744,7 @@ class CacheManager:
                 key_indices,
                 commit_virtual_mask,
             )
-            if req.staged_full_page_indices is not None:
+            if staged_full_page_indices is not None:
                 full_positions = torch.arange(cacheable_full_len, dtype=torch.int64, device="cpu")
                 self._free_finished_candidates(
                     req,

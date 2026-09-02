@@ -38,9 +38,9 @@ def _calculate_cache_reuse_ratio(
 def _supports_multi_context_mask_prefill() -> bool:
     try:
         backend = get_global_ctx().attn_backend
-    except AssertionError:
+    except (AssertionError, AttributeError):
         return False
-    return backend.supports_multi_context_mask_prefill
+    return bool(getattr(backend, "supports_multi_context_mask_prefill", False))
 
 
 class ChunkedReq(Req):
