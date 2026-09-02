@@ -22,9 +22,12 @@ def retry_reposition_kv_kernel(
     half_dim: tl.constexpr,
     BLOCK_HALF: tl.constexpr,
 ):
-    token = tl.program_id(0)
-    layer = tl.program_id(1)
-    head = tl.program_id(2)
+    # Production KV buffers can exceed 2**31 elements even when every individual
+    # stride fits in int32.  Promote the grid coordinates before multiplying by
+    # those strides so high-layer addresses cannot wrap around.
+    token = tl.program_id(0).to(tl.int64)
+    layer = tl.program_id(1).to(tl.int64)
+    head = tl.program_id(2).to(tl.int64)
 
     source = tl.load(source_slots + token).to(tl.int64)
     destination = tl.load(destination_slots + token).to(tl.int64)
