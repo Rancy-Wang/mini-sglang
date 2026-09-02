@@ -153,14 +153,24 @@ def _manager() -> tuple[PrefillManager, CacheManager, TableManager, _RecordingKV
     return manager, cache, table, kv_cache
 
 
-def _materialize_batch(manager: PrefillManager, cache: CacheManager):
-    batch = manager.schedule_next_batch(prefill_budget=64)
+def _materialize_batch(
+    manager: PrefillManager,
+    cache: CacheManager,
+    *,
+    prefill_budget: int = 64,
+    lazy_free: bool = False,
+):
+    batch = manager.schedule_next_batch(prefill_budget=prefill_budget)
     assert batch is not None and len(batch.reqs) == 1
     req = batch.reqs[0]
     cache.allocate_paged(batch.reqs)
     req.complete_one()
     if isinstance(req, ChunkedReq):
-        manager.complete_chunk(req)
+        if lazy_free:
+            with cache.lazy_free_region():
+                manager.complete_chunk(req)
+        else:
+            manager.complete_chunk(req)
     return req
 
 
@@ -249,4 +259,34 @@ def test_drop_timeline_stages_when_requested_reposition_is_noop(monkeypatch) -> 
     cache.cache_req(final, finished=True)
     assert bool(torch.all(final.staged_full_page_indices >= 0).item())
     table.free(final.table_idx)
+    cache.check_integrity()
+
+
+def test_multichunk_staged_decode_preserves_every_page_under_lazy_free(monkeypatch) -> None:
+    monkeypatch.setattr(torch.Tensor, "pin_memory", lambda self: self)
+    manager, cache, table, _ = _manager()
+    pending = _pending()
+    pending.sampling_params.max_tokens = 12
+    manager.pending_list.append(pending)
+
+    while True:
+        req = _materialize_batch(
+            manager,
+            cache,
+            prefill_budget=2,
+            lazy_free=True,
+        )
+        if not isinstance(req, ChunkedReq):
+            break
+
+    req.append_host(torch.tensor([90], dtype=torch.int32))
+    for token_id in range(91, 102):
+        cache.allocate_paged([req])
+        req.complete_one()
+        req.append_host(torch.tensor([token_id], dtype=torch.int32))
+    assert not req.can_decode
+
+    with cache.lazy_free_region():
+        cache.cache_req(req, finished=True)
+    table.free(req.table_idx)
     cache.check_integrity()
