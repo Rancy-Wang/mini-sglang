@@ -332,11 +332,13 @@ class Req:
         self.true_seq_len = max(self.true_seq_len, position + 1)
         if self.radix_next_position is not None:
             self.radix_next_position += 1
-        raw_position = (
-            len(self.radix_token_to_key)
-            if self.radix_token_to_key is not None
-            else int(self.raw_positions[-1]) + 1
-        )
+        if self.radix_token_to_key is not None:
+            pending_host_tokens = len(self.raw_positions) - len(self.input_ids)
+            if pending_host_tokens < 0:
+                raise RuntimeError("Raw positions fell behind the host token stream.")
+            raw_position = len(self.radix_token_to_key) + pending_host_tokens
+        else:
+            raw_position = int(self.raw_positions[-1]) + 1
         self.raw_positions = torch.cat(
             [
                 self.raw_positions,
@@ -345,7 +347,20 @@ class Req:
         )
 
     def append_host(self, next_token: torch.Tensor) -> None:
-        # Position is already appended in `complete_one`.
+        # Overlap scheduling can finish the following decode before this sampled
+        # token reaches the CPU. Pair it with its own queued position instead of
+        # the newest (possibly one-token-ahead) position.
+        host_token_index = len(self.input_ids)
+        if host_token_index >= len(self.true_positions) or host_token_index >= len(
+            self.raw_positions
+        ):
+            raise RuntimeError("A sampled token arrived before its position metadata.")
+        host_true_position = int(self.true_positions[host_token_index])
+        host_raw_position = int(self.raw_positions[host_token_index])
+        if self.radix_token_to_key is not None and host_raw_position != len(
+            self.radix_token_to_key
+        ):
+            raise RuntimeError("Generated-token raw positions are not contiguous.")
         self.input_ids = torch.cat([self.input_ids, next_token])
         if self.radix_match_ids.ndim == 2:
             next_token_key = torch.tensor(
@@ -354,7 +369,7 @@ class Req:
                         0,
                         int(next_token[0]),
                         self.radix_current_reposition,
-                        int(self.true_positions[-1]),
+                        host_true_position,
                     ]
                 ],
                 dtype=torch.int32,
@@ -366,7 +381,10 @@ class Req:
         self.radix_match_ids = torch.cat([self.radix_match_ids, next_token_key])
         if self.radix_positions is not None:
             self.radix_positions = torch.cat(
-                [self.radix_positions, self.true_positions[-1:].clone()]
+                [
+                    self.radix_positions,
+                    torch.tensor([host_true_position], dtype=torch.int32, device="cpu"),
+                ]
             )
         if self.radix_repos_info is not None:
             self.radix_repos_info = torch.cat(

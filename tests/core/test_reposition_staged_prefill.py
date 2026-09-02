@@ -286,6 +286,8 @@ def test_multichunk_staged_overlap_stop_preserves_every_page(monkeypatch) -> Non
     assert req.can_decode
     generated_raw = req.raw_positions[len(req.input_ids) - 2 : len(req.input_ids)]
     assert generated_raw.tolist() == [6, 7]
+    assert req.radix_positions[-2:].tolist() == [4, 5]
+    assert req.radix_match_ids[-2:, 3].tolist() == [4, 5]
 
     with cache.lazy_free_region():
         cache.cache_req(req, finished=True)
