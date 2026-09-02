@@ -1807,8 +1807,7 @@ class TokenizeManager:
                 sorted(
                     self._build_drop_set(
                         {
-                            trigger
-                            + target_offset: [
+                            trigger + target_offset: [
                                 message_id + target_offset for message_id in message_ids
                             ]
                             for trigger, message_ids in drop_rule.drop_messages.items()

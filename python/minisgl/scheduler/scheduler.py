@@ -550,8 +550,7 @@ class Scheduler(SchedulerIOMixin):
                     if drop_aware_eviction:
                         if msg.full_keep_mask is None:
                             raise ValueError(
-                                "Drop-aware delta markers require a target-specific "
-                                "full_keep_mask."
+                                "Drop-aware delta markers require a target-specific full_keep_mask."
                             )
                         event_positions, range_offsets, position_ranges = (
                             select_effective_delta_events(
