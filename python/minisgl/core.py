@@ -102,11 +102,23 @@ class Req:
     radix_positions: torch.Tensor | None = None
     radix_repos_info: torch.Tensor | None = None
     radix_materialized_stage: torch.Tensor | None = None
+    reposition_transition_offsets: torch.Tensor | None = None
+    staged_full_page_indices: torch.Tensor | None = None
+    staged_reposition: bool = False
+    radix_actual_materialized_stage: int = 0
     radix_next_position: int | None = None
     radix_current_reposition: int = -1
     retry_transformed_mask: torch.Tensor | None = None
     retry_inactive_transformed_positions: torch.Tensor | None = None
     retry_inactive_transformed_pages: torch.Tensor | None = None
+    tokenize_invocations: int = 1
+    context_stage_count: int = 0
+    radix_compile_ns: int = 0
+    radix_match_ns: int = 0
+    retry_plan_ns: int = 0
+    reposition_transition_count: int = 0
+    reposition_h2d_bytes: int = 0
+    reposition_d2h_bytes: int = 0
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu
@@ -183,6 +195,14 @@ class Req:
                 raise ValueError("radix_commit_key_len requires a delta-marker Radix layout.")
             if not 0 <= self.radix_commit_key_len <= len(self.radix_match_ids):
                 raise ValueError("radix_commit_key_len is outside the Radix key stream.")
+        if self.radix_materialized_stage is not None:
+            if self.radix_actual_materialized_stage < 0:
+                raise ValueError("radix_actual_materialized_stage must be non-negative.")
+            required = self.radix_materialized_stage[self.raw_positions.to(torch.int64)]
+            if bool(torch.any(required > self.radix_actual_materialized_stage).item()):
+                raise ValueError(
+                    "A Reposition token would execute before its required stage is materialized."
+                )
         self.device_len = len(self.input_ids)
         self.max_device_len = len(self.input_ids) + self.output_len
         assert 0 <= self.cached_len < self.device_len <= self.max_device_len
@@ -305,9 +325,7 @@ class Req:
         self.cached_len = self.device_len
         self.device_len += 1
         position = (
-            self.radix_next_position
-            if self.radix_next_position is not None
-            else self.true_seq_len
+            self.radix_next_position if self.radix_next_position is not None else self.true_seq_len
         )
         next_pos = torch.tensor([position], dtype=torch.int32, device="cpu")
         self.true_positions = torch.cat([self.true_positions, next_pos])
@@ -354,9 +372,7 @@ class Req:
             self.radix_repos_info = torch.cat(
                 [
                     self.radix_repos_info,
-                    torch.tensor(
-                        [self.radix_current_reposition], dtype=torch.int32, device="cpu"
-                    ),
+                    torch.tensor([self.radix_current_reposition], dtype=torch.int32, device="cpu"),
                 ]
             )
         if self.radix_materialized_stage is not None:

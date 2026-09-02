@@ -48,6 +48,10 @@ class BenchmarkResult:
     exact_throughput_ratio: float
     retry_plan: Timing
     retry_changed_pages: int
+    context_stage_count: int
+    timeline_transition_count: int
+    timeline_metadata_bytes: int
+    dense_stage_snapshot_bytes: int
     host_to_device_bytes: int
     device_to_host_bytes: int
     compile_match_p95_ttft_percent: float | None
@@ -230,6 +234,22 @@ def benchmark_case(
     retry_plan = _measure(compile_retry_plan, repeats)
     compile_retry_plan()
     changed_pages = len(retry_plan_holder[0])
+    context_stage_count = len(layout.transition_offsets)
+    transition_count = len(layout.transition_raw_tokens)
+    timeline_bytes = sum(
+        tensor.numel() * tensor.element_size()
+        for tensor in (
+            layout.birth_positions,
+            layout.birth_stages,
+            layout.transition_offsets,
+            layout.transition_raw_tokens,
+            layout.transition_old_positions,
+            layout.transition_new_positions,
+            layout.effective_reposition_stages,
+        )
+    )
+    int32_bytes = torch.empty((), dtype=torch.int32).element_size()
+    dense_snapshot_bytes = token_count * context_stage_count * int32_bytes
     exact_ratio = legacy_flat.p50_ms / max(exact_structured.p50_ms, 1e-9)
     speedup = compile_python.p50_ms / max(compile_aot.p50_ms, 1e-9)
     combined_p95 = compile_aot.p95_ms + exact_structured.p95_ms
@@ -246,6 +266,10 @@ def benchmark_case(
         exact_throughput_ratio=exact_ratio,
         retry_plan=retry_plan,
         retry_changed_pages=changed_pages,
+        context_stage_count=context_stage_count,
+        timeline_transition_count=transition_count,
+        timeline_metadata_bytes=timeline_bytes,
+        dense_stage_snapshot_bytes=dense_snapshot_bytes,
         host_to_device_bytes=0,
         device_to_host_bytes=0,
         compile_match_p95_ttft_percent=ttft_percent,
@@ -271,14 +295,40 @@ def run_benchmark(
         for token_count in token_counts
         for concurrency in concurrencies
     ]
+    thresholds = {
+        "compiler_speedup_min": 5.0,
+        "exact_throughput_ratio_min": 0.60,
+        "compile_match_p95_ttft_percent_max": 2.0,
+        "no_reposition_ttft_overhead_percent_max": 3.0,
+    }
+    threshold_failures: list[dict[str, object]] = []
+    for result in results:
+        failures: list[str] = []
+        if result.compile_speedup < thresholds["compiler_speedup_min"]:
+            failures.append("compiler_speedup")
+        if result.exact_throughput_ratio < thresholds["exact_throughput_ratio_min"]:
+            failures.append("exact_throughput_ratio")
+        if (
+            result.compile_match_p95_ttft_percent is not None
+            and result.compile_match_p95_ttft_percent
+            > thresholds["compile_match_p95_ttft_percent_max"]
+        ):
+            failures.append("compile_match_p95_ttft_percent")
+        if failures:
+            threshold_failures.append(
+                {
+                    "token_count": result.token_count,
+                    "concurrency": result.concurrency,
+                    "failed": failures,
+                }
+            )
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "compare_backend": radix_record_compare_backend(),
-        "thresholds": {
-            "compiler_speedup_min": 5.0,
-            "exact_throughput_ratio_min": 0.60,
-            "compile_match_p95_ttft_percent_max": 2.0,
-            "no_reposition_ttft_overhead_percent_max": 3.0,
+        "thresholds": thresholds,
+        "threshold_evaluation": {
+            "passed": not threshold_failures,
+            "failures": threshold_failures,
         },
         "measurement_notes": {
             "compile_match_p95_ttft_percent": (
@@ -304,6 +354,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--repeats", type=int, default=7)
     parser.add_argument("--ttft-ms", type=float)
     parser.add_argument("--output", type=Path)
+    parser.add_argument(
+        "--enforce-thresholds",
+        action="store_true",
+        help="Exit non-zero when any measured CPU threshold fails.",
+    )
     args = parser.parse_args(argv)
     report = run_benchmark(
         _parse_ints(args.token_counts),
@@ -316,6 +371,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     if args.output is not None:
         args.output.write_text(rendered + "\n", encoding="utf-8")
     print(rendered)
+    if args.enforce_thresholds and not report["threshold_evaluation"]["passed"]:
+        raise SystemExit(2)
 
 
 if __name__ == "__main__":

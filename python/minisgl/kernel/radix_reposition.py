@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Sequence
@@ -24,10 +25,18 @@ class RadixRepositionLayout:
     repos_info: torch.Tensor
     keep_mask: torch.Tensor
     materialized_stage: torch.Tensor
+    birth_positions: torch.Tensor
+    birth_stages: torch.Tensor
+    transition_offsets: torch.Tensor
+    transition_raw_tokens: torch.Tensor
+    transition_old_positions: torch.Tensor
+    transition_new_positions: torch.Tensor
+    effective_reposition_stages: torch.Tensor
     effective_repositions: torch.Tensor
     ignored_repositions: torch.Tensor
     next_position: int
     current_reposition: int
+    compile_ns: int
 
     @property
     def keys(self) -> torch.Tensor:
@@ -80,8 +89,25 @@ def compile_radix_reposition_layout(
         device="cpu", dtype=torch.int32
     ).contiguous()
 
+    compile_started_ns = time.perf_counter_ns()
     token_count = len(token_ids)
     reposition_count = len(reposition_raw_boundaries)
+    transition_counts = torch.zeros(reposition_count, dtype=torch.int32, device="cpu")
+    count_status = torch.zeros(2, dtype=torch.int64, device="cpu")
+    _load_module().count_radix_reposition_transitions(
+        token_count,
+        drop_insert_offsets,
+        drop_range_offsets,
+        drop_ranges,
+        reposition_raw_boundaries,
+        reposition_insert_offsets,
+        transition_counts,
+        count_status,
+    )
+    if int(count_status[0]) == 1:
+        boundary = int(count_status[1])
+        raise ValueError(f"Reposition at raw boundary {boundary} has no active tokens.")
+    transition_count = int(transition_counts.sum().item())
     capacity = token_count + len(drop_insert_offsets) + reposition_count
     records = torch.empty((capacity, 4), dtype=torch.int32, device="cpu")
     virtual_mask = torch.empty(capacity, dtype=torch.bool, device="cpu")
@@ -91,6 +117,15 @@ def compile_radix_reposition_layout(
     repos_info = torch.empty(token_count, dtype=torch.int32, device="cpu")
     keep_mask = torch.empty(token_count, dtype=torch.bool, device="cpu")
     materialized_stage = torch.empty(token_count, dtype=torch.int32, device="cpu")
+    birth_positions = torch.empty(token_count, dtype=torch.int32, device="cpu")
+    birth_stages = torch.empty(token_count, dtype=torch.int32, device="cpu")
+    transition_offsets = torch.empty(reposition_count + 1, dtype=torch.int32, device="cpu")
+    transition_raw_tokens = torch.empty(transition_count, dtype=torch.int32, device="cpu")
+    transition_old_positions = torch.empty(transition_count, dtype=torch.int32, device="cpu")
+    transition_new_positions = torch.empty(transition_count, dtype=torch.int32, device="cpu")
+    effective_reposition_stages = torch.full(
+        (reposition_count,), -1, dtype=torch.int32, device="cpu"
+    )
     effective = torch.zeros(reposition_count, dtype=torch.bool, device="cpu")
     ignored = torch.zeros(reposition_count, dtype=torch.bool, device="cpu")
     status = torch.zeros(6, dtype=torch.int64, device="cpu")
@@ -111,6 +146,13 @@ def compile_radix_reposition_layout(
         repos_info,
         keep_mask,
         materialized_stage,
+        birth_positions,
+        birth_stages,
+        transition_offsets,
+        transition_raw_tokens,
+        transition_old_positions,
+        transition_new_positions,
+        effective_reposition_stages,
         effective,
         ignored,
         status,
@@ -126,6 +168,7 @@ def compile_radix_reposition_layout(
         )
 
     key_len = int(status[1])
+    effective_stage_count = int(status[2])
     return RadixRepositionLayout(
         records=records[:key_len],
         virtual_mask=virtual_mask[:key_len],
@@ -135,10 +178,18 @@ def compile_radix_reposition_layout(
         repos_info=repos_info,
         keep_mask=keep_mask,
         materialized_stage=materialized_stage,
+        birth_positions=birth_positions,
+        birth_stages=birth_stages,
+        transition_offsets=transition_offsets[: effective_stage_count + 1],
+        transition_raw_tokens=transition_raw_tokens,
+        transition_old_positions=transition_old_positions,
+        transition_new_positions=transition_new_positions,
+        effective_reposition_stages=effective_reposition_stages,
         effective_repositions=effective,
         ignored_repositions=ignored,
         next_position=int(status[3]),
         current_reposition=int(status[5]),
+        compile_ns=time.perf_counter_ns() - compile_started_ns,
     )
 
 

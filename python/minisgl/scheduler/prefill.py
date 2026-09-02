@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Tuple
 
@@ -79,6 +80,7 @@ class PrefillAllocation:
     retry_transformed_mask: torch.Tensor | None
     retry_inactive_transformed_positions: torch.Tensor | None
     retry_inactive_transformed_pages: torch.Tensor | None
+    radix_actual_materialized_stage: int = 0
 
 
 def _mask_free_context_reason_reference(
@@ -207,6 +209,172 @@ class PrefillAdder:
     kv_cache: BaseKVCachePool | None = None
     retry_rope_cache: torch.Tensor | None = None
 
+    @classmethod
+    def _has_reposition_timeline(cls, req: PendingReq) -> bool:
+        return (
+            req.reposition_input_ids is not None
+            and req.reposition_raw_boundaries is not None
+            and len(req.reposition_raw_boundaries) > 0
+            and (
+                cls._effective_drop_count(req) > 0
+                or (
+                    req.reposition_transition_offsets is not None
+                    and len(req.reposition_transition_offsets) > 1
+                )
+            )
+        )
+
+    @staticmethod
+    def _effective_drop_count(req: PendingReq) -> int:
+        if req.drop_event_positions is None:
+            return 0
+        if req.drop_effective_event_count < 0:
+            return len(req.drop_event_positions)
+        return min(req.drop_effective_event_count, len(req.drop_event_positions))
+
+    @classmethod
+    def _next_staged_event_boundary(cls, req: PendingReq) -> int | None:
+        candidates: list[int] = []
+        drop_count = cls._effective_drop_count(req)
+        if req.drop_event_positions is not None and req.staged_drop_cursor < drop_count:
+            candidates.append(int(req.drop_event_positions[req.staged_drop_cursor]))
+        if (
+            req.reposition_insert_offsets is not None
+            and req.reposition_effective_stages is not None
+        ):
+            for index in range(req.staged_reposition_cursor, len(req.reposition_insert_offsets)):
+                if int(req.reposition_effective_stages[index]) > 0:
+                    candidates.append(int(req.reposition_insert_offsets[index]))
+                    break
+        return min(candidates) if candidates else None
+
+    @classmethod
+    def _prepare_staged_segment(cls, req: PendingReq) -> None:
+        if (
+            req.reposition_input_ids is None
+            or req.reposition_birth_positions is None
+            or req.reposition_birth_stages is None
+            or req.staged_active_raw is None
+            or req.staged_current_positions is None
+            or req.radix_match_ids is None
+            or req.radix_token_to_key is None
+        ):
+            raise RuntimeError("Reposition staged-prefill metadata is incomplete.")
+        raw_count = len(req.reposition_input_ids)
+        next_event = cls._next_staged_event_boundary(req)
+        segment_end = raw_count if next_event is None else next_event
+        if not req.staged_raw_cursor < segment_end <= raw_count:
+            raise RuntimeError(
+                "Reposition timeline did not leave an uncached token before its next event."
+            )
+        new_raw = torch.arange(req.staged_raw_cursor, segment_end, dtype=torch.int32, device="cpu")
+        expected_birth_stage = req.reposition_birth_stages[new_raw.to(torch.int64)]
+        if bool(torch.any(expected_birth_stage != req.staged_actual_stage).item()):
+            raise RuntimeError(
+                "Reposition token birth stage disagrees with the scheduler stage cursor."
+            )
+        input_raw = torch.cat([req.staged_active_raw, new_raw])
+        raw_index = input_raw.to(torch.int64)
+        req.input_ids = req.reposition_input_ids[raw_index].contiguous()
+        req.true_positions = req.staged_current_positions[raw_index].contiguous()
+        req.raw_positions = input_raw.contiguous()
+        req.radix_input_ids = req.radix_match_ids[req.radix_token_to_key[raw_index]].contiguous()
+        req.staged_segment_end = segment_end
+        req.staged_final_segment = next_event is None
+        if req.staged_final_segment and segment_end == req.staged_raw_cursor:
+            raise RuntimeError("Final Reposition stage must contain an uncached prompt token.")
+
+    @classmethod
+    def _initialize_staged_state(cls, req: PendingReq) -> None:
+        if (
+            req.reposition_input_ids is None
+            or req.reposition_birth_positions is None
+            or req.reposition_birth_stages is None
+            or req.reposition_transition_offsets is None
+            or req.reposition_transition_raw_tokens is None
+            or req.reposition_transition_old_positions is None
+            or req.reposition_transition_new_positions is None
+            or req.reposition_effective_stages is None
+        ):
+            raise RuntimeError("Reposition compiler did not provide a complete staged timeline.")
+        raw_count = len(req.reposition_input_ids)
+        if len(req.reposition_birth_positions) != raw_count:
+            raise RuntimeError("Reposition birth positions do not cover the raw token stream.")
+        req.staged_raw_cursor = 0
+        req.staged_drop_cursor = 0
+        req.staged_reposition_cursor = 0
+        next_event = cls._next_staged_event_boundary(req)
+        if next_event is not None and next_event >= raw_count:
+            raise RuntimeError(
+                "Reposition/Drop after the final prompt token cannot produce valid generation logits."
+            )
+        req.staged_reposition = True
+        req.staged_ready = True
+        req.staged_actual_stage = 0
+        req.staged_active_raw = torch.empty(0, dtype=torch.int32, device="cpu")
+        req.staged_current_positions = req.reposition_birth_positions.clone()
+        cls._prepare_staged_segment(req)
+
+    @classmethod
+    def _staged_transition_count_at_segment_end(cls, req: PendingReq) -> int:
+        if (
+            req.reposition_insert_offsets is None
+            or req.reposition_effective_stages is None
+            or req.reposition_transition_offsets is None
+        ):
+            return 0
+        count = 0
+        for index in range(req.staged_reposition_cursor, len(req.reposition_insert_offsets)):
+            boundary = int(req.reposition_insert_offsets[index])
+            if boundary > req.staged_segment_end:
+                break
+            if boundary != req.staged_segment_end:
+                continue
+            stage = int(req.reposition_effective_stages[index])
+            if stage > 0:
+                count += int(
+                    req.reposition_transition_offsets[stage]
+                    - req.reposition_transition_offsets[stage - 1]
+                )
+        return count
+
+    def _allocate_staged(self, req: PendingReq) -> PrefillAllocation | None:
+        if req.staged_cache_handle is not None or req.staged_table_idx is not None:
+            raise RuntimeError("Reposition staged resources were allocated twice.")
+        if self.table_manager.available_size == 0:
+            return None
+        transition_count = self._staged_transition_count_at_segment_end(req)
+        needed = len(req.input_ids) + transition_count + req.output_len
+        if needed + self.reserved_size > self.cache_manager.available_size:
+            return None
+        root_match = self.cache_manager.match_empty_req(req)
+        self.cache_manager.lock(root_match.handle)
+        if needed + self.reserved_size > self.cache_manager.available_size:
+            self.cache_manager.unlock(root_match.handle)
+            return None
+        table_idx = self.table_manager.allocate()
+        req.staged_cache_handle = root_match.handle
+        req.staged_table_idx = table_idx
+        req.staged_full_page_indices = torch.full(
+            (len(req.reposition_input_ids),),
+            -1,
+            dtype=torch.int32,
+            device=self.cache_manager.device,
+        )
+        return PrefillAllocation(
+            cache_handle=root_match.handle,
+            table_idx=table_idx,
+            cache_reuse_ratio=0.0,
+            initial_full_match_indices=root_match.full_match_indices,
+            cached_len=0,
+            radix_cached_tokens=0,
+            usage_cached_tokens=0,
+            retry_transformed_mask=None,
+            retry_inactive_transformed_positions=None,
+            retry_inactive_transformed_pages=None,
+            radix_actual_materialized_stage=0,
+        )
+
     def plan_context_prefill(self, req: PendingReq) -> ContextPrefillPlan | None:
         if not req.use_context_mask or req.chunked_req is not None:
             return None
@@ -316,9 +484,19 @@ class PrefillAdder:
             radix_cached_tokens = match.handle.physical_cached_len
             usage_cached_tokens = None
         else:
+            match_started_ns = time.perf_counter_ns()
             match = self.cache_manager.match_req(req)
+            match_elapsed_ns = time.perf_counter_ns() - match_started_ns
+            match_retry_plan_ns = 0 if match is None else match.retry_plan_ns
+            req.radix_match_ns += max(0, match_elapsed_ns - match_retry_plan_ns)
             if match is None:
                 return None
+            req.retry_plan_ns += match.retry_plan_ns
+            if self._has_reposition_timeline(req) and match.active_cached_len < max(
+                req.input_len - 1, 0
+            ):
+                self._initialize_staged_state(req)
+                return self._allocate_staged(req)
             cache_handle = match.handle
             cached_len = match.active_cached_len
             cached_indices = match.active_match_indices
@@ -403,6 +581,8 @@ class PrefillAdder:
                     .pin_memory()
                     .to(device=self.cache_manager.device, non_blocking=True)
                 )
+                req.reposition_h2d_bytes += retry_metadata.numel() * retry_metadata.element_size()
+                req.reposition_transition_count += retry_page_count
                 source_full_device = retry_metadata[:, 0].to(torch.int64)
                 target_full_device = retry_metadata[:, 1].to(torch.int64)
                 source_pages = initial_full_match_indices[source_full_device]
@@ -458,6 +638,11 @@ class PrefillAdder:
             retry_transformed_mask=retry_transformed_mask,
             retry_inactive_transformed_positions=retry_inactive_positions,
             retry_inactive_transformed_pages=retry_inactive_pages,
+            radix_actual_materialized_stage=(
+                len(req.reposition_transition_offsets) - 1
+                if req.reposition_transition_offsets is not None
+                else 0
+            ),
         )
 
     def _add_one_req(
@@ -477,10 +662,14 @@ class PrefillAdder:
     ) -> Req:
         remain_len = pending_req.input_len - cached_len
         chunk_size = min(self.token_budget, remain_len)
-        is_chunked = chunk_size < remain_len
+        is_chunked = chunk_size < remain_len or (
+            pending_req.staged_reposition and not pending_req.staged_final_segment
+        )
         CLS = ChunkedReq if is_chunked else Req
         self.token_budget -= chunk_size
         self.reserved_size += remain_len + pending_req.output_len
+        if pending_req.staged_reposition:
+            self.reserved_size += self._staged_transition_count_at_segment_end(pending_req)
         # NOTE: update the tokens ids only; new pages will be allocated in the scheduler
         _slice = slice(cached_len, cached_len + chunk_size)
         device_ids = self.table_manager.token_pool[table_idx, _slice]
@@ -500,6 +689,7 @@ class PrefillAdder:
             true_seq_len=(
                 pending_req.radix_next_position
                 if pending_req.radix_next_position is not None
+                and (not pending_req.staged_reposition or pending_req.staged_final_segment)
                 else int(pending_req.true_positions[cached_len + chunk_size - 1].item()) + 1
             ),
             table_idx=table_idx,
@@ -532,12 +722,44 @@ class PrefillAdder:
             radix_marker_ids=pending_req.radix_marker_ids,
             radix_positions=pending_req.radix_positions,
             radix_repos_info=pending_req.radix_repos_info,
-            radix_materialized_stage=pending_req.radix_materialized_stage,
-            radix_next_position=pending_req.radix_next_position,
+            radix_materialized_stage=(
+                pending_req.radix_materialized_stage
+                if not pending_req.staged_reposition or pending_req.staged_final_segment
+                else None
+            ),
+            reposition_transition_offsets=pending_req.reposition_transition_offsets,
+            staged_full_page_indices=(
+                pending_req.staged_full_page_indices
+                if pending_req.staged_reposition and pending_req.staged_final_segment
+                else None
+            ),
+            staged_reposition=pending_req.staged_reposition,
+            radix_actual_materialized_stage=(
+                pending_req.staged_actual_stage
+                if pending_req.staged_reposition
+                else (
+                    len(pending_req.reposition_transition_offsets) - 1
+                    if pending_req.reposition_transition_offsets is not None
+                    else 0
+                )
+            ),
+            radix_next_position=(
+                pending_req.radix_next_position
+                if not pending_req.staged_reposition or pending_req.staged_final_segment
+                else None
+            ),
             radix_current_reposition=pending_req.radix_current_reposition,
             retry_transformed_mask=retry_transformed_mask,
             retry_inactive_transformed_positions=retry_inactive_transformed_positions,
             retry_inactive_transformed_pages=retry_inactive_transformed_pages,
+            tokenize_invocations=pending_req.tokenize_invocations,
+            context_stage_count=pending_req.context_stage_count,
+            radix_compile_ns=pending_req.radix_compile_ns,
+            radix_match_ns=pending_req.radix_match_ns,
+            retry_plan_ns=pending_req.retry_plan_ns,
+            reposition_transition_count=pending_req.reposition_transition_count,
+            reposition_h2d_bytes=pending_req.reposition_h2d_bytes,
+            reposition_d2h_bytes=pending_req.reposition_d2h_bytes,
         )
 
     def try_add_one(
@@ -548,8 +770,53 @@ class PrefillAdder:
         if self.token_budget <= 0:
             return None
 
+        if pending_req.staged_reposition and not pending_req.staged_ready:
+            return None
+
+        if pending_req.staged_reposition and pending_req.chunked_req is None:
+            if pending_req.staged_cache_handle is None or pending_req.staged_table_idx is None:
+                resource = self._allocate_staged(pending_req)
+                if resource is None:
+                    return None
+                cache_handle = resource.cache_handle
+                table_idx = resource.table_idx
+                initial_full = resource.initial_full_match_indices
+            else:
+                cache_handle = pending_req.staged_cache_handle
+                table_idx = pending_req.staged_table_idx
+                initial_full = torch.empty(0, dtype=torch.int32, device=self.cache_manager.device)
+            cached_len = (
+                len(pending_req.staged_active_raw)
+                if pending_req.staged_active_raw is not None
+                else 0
+            )
+            transition_count = self._staged_transition_count_at_segment_end(pending_req)
+            remain_len = pending_req.input_len - cached_len
+            if (
+                remain_len + transition_count + pending_req.output_len + self.reserved_size
+                > self.cache_manager.available_size
+            ):
+                return None
+            result = self._add_one_req(
+                pending_req=pending_req,
+                cache_handle=cache_handle,
+                table_idx=table_idx,
+                cached_len=cached_len,
+                cache_reuse_ratio=0.0,
+                initial_full_match_indices=initial_full,
+                initial_active_cached_len=0,
+                radix_cached_tokens=0,
+                usage_cached_tokens=0,
+                retry_transformed_mask=None,
+                retry_inactive_transformed_positions=None,
+                retry_inactive_transformed_pages=None,
+            )
+            if isinstance(result, ChunkedReq):
+                pending_req.staged_ready = False
+            return result
+
         if chunked_req := pending_req.chunked_req:
-            return self._add_one_req(
+            result = self._add_one_req(
                 pending_req=pending_req,
                 cache_handle=chunked_req.cache_handle,
                 table_idx=chunked_req.table_idx,
@@ -565,9 +832,12 @@ class PrefillAdder:
                 ),
                 retry_inactive_transformed_pages=chunked_req.retry_inactive_transformed_pages,
             )
+            if pending_req.staged_reposition and isinstance(result, ChunkedReq):
+                pending_req.staged_ready = False
+            return result
 
         if resource := self._try_allocate_one(pending_req, context_plan):
-            return self._add_one_req(
+            result = self._add_one_req(
                 pending_req=pending_req,
                 cache_handle=resource.cache_handle,
                 table_idx=resource.table_idx,
@@ -583,6 +853,9 @@ class PrefillAdder:
                 ),
                 retry_inactive_transformed_pages=resource.retry_inactive_transformed_pages,
             )
+            if pending_req.staged_reposition and isinstance(result, ChunkedReq):
+                pending_req.staged_ready = False
+            return result
 
         return None
 
@@ -597,6 +870,7 @@ class PrefillManager:
     kv_cache: BaseKVCachePool | None = None
     retry_rope_cache: torch.Tensor | None = None
     pending_list: List[PendingReq] = field(default_factory=list)
+    aborted_staged_chunks: dict[int, PendingReq] = field(default_factory=dict)
 
     def add_one_req(self, req: UserMsg) -> None:
         if req.use_context_mask:
@@ -637,10 +911,182 @@ class PrefillManager:
                 radix_positions=req.radix_positions,
                 radix_repos_info=req.radix_repos_info,
                 radix_materialized_stage=req.radix_materialized_stage,
+                reposition_raw_boundaries=req.reposition_raw_boundaries,
+                reposition_insert_offsets=req.reposition_insert_offsets,
+                reposition_input_ids=req.reposition_input_ids,
+                reposition_birth_positions=req.reposition_birth_positions,
+                reposition_birth_stages=req.reposition_birth_stages,
+                reposition_transition_offsets=req.reposition_transition_offsets,
+                reposition_transition_raw_tokens=req.reposition_transition_raw_tokens,
+                reposition_transition_old_positions=req.reposition_transition_old_positions,
+                reposition_transition_new_positions=req.reposition_transition_new_positions,
+                reposition_effective_stages=req.reposition_effective_stages,
                 radix_next_position=req.radix_next_position,
                 radix_current_reposition=req.radix_current_reposition,
+                tokenize_invocations=req.tokenize_invocations,
+                context_stage_count=req.context_stage_count,
+                radix_compile_ns=req.radix_compile_ns,
             )
         )
+
+    def _pending_for_chunk(self, chunk: ChunkedReq) -> PendingReq | None:
+        for pending in self.pending_list:
+            if pending.chunked_req is chunk:
+                return pending
+        return None
+
+    def complete_chunk(self, chunk: ChunkedReq) -> None:
+        aborted = self.aborted_staged_chunks.pop(id(chunk), None)
+        pending = aborted or self._pending_for_chunk(chunk)
+        if pending is None or not pending.staged_reposition:
+            return
+        if pending.staged_full_page_indices is None:
+            raise RuntimeError("Staged Reposition lost its full raw-to-page map.")
+        materialized_len = chunk.cached_len
+        raw_positions = chunk.raw_positions[:materialized_len]
+        pages = self.table_manager.page_table[chunk.table_idx, :materialized_len]
+        raw_device = raw_positions.pin_memory().to(
+            device=pages.device, dtype=torch.int64, non_blocking=True
+        )
+        pending.staged_full_page_indices[raw_device] = pages
+        pending.radix_match_ns = chunk.radix_match_ns
+        pending.retry_plan_ns = chunk.retry_plan_ns
+        pending.reposition_transition_count = chunk.reposition_transition_count
+        pending.reposition_h2d_bytes = chunk.reposition_h2d_bytes
+        pending.reposition_d2h_bytes = chunk.reposition_d2h_bytes
+        pending.reposition_h2d_bytes += raw_positions.numel() * raw_positions.element_size()
+
+        if aborted is not None:
+            pending.chunked_req = None
+            self.release_staged(pending)
+            return
+
+        if materialized_len < pending.input_len:
+            pending.staged_ready = True
+            return
+
+        pending.staged_raw_cursor = pending.staged_segment_end
+        pending.staged_active_raw = raw_positions.clone()
+
+        drop_count = PrefillAdder._effective_drop_count(pending)
+        if (
+            pending.drop_event_positions is not None
+            and pending.drop_range_offsets is not None
+            and pending.drop_position_ranges is not None
+        ):
+            while (
+                pending.staged_drop_cursor < drop_count
+                and int(pending.drop_event_positions[pending.staged_drop_cursor])
+                == pending.staged_raw_cursor
+            ):
+                event = pending.staged_drop_cursor
+                keep = torch.ones(len(pending.staged_active_raw), dtype=torch.bool, device="cpu")
+                start_offset = int(pending.drop_range_offsets[event])
+                end_offset = int(pending.drop_range_offsets[event + 1])
+                for range_index in range(start_offset, end_offset):
+                    start = int(pending.drop_position_ranges[2 * range_index])
+                    end = int(pending.drop_position_ranges[2 * range_index + 1])
+                    keep &= ~(
+                        (pending.staged_active_raw >= start) & (pending.staged_active_raw < end)
+                    )
+                pending.staged_active_raw = pending.staged_active_raw[keep]
+                pending.staged_drop_cursor += 1
+
+        if (
+            pending.reposition_insert_offsets is not None
+            and pending.reposition_effective_stages is not None
+            and pending.reposition_transition_offsets is not None
+            and pending.reposition_transition_raw_tokens is not None
+            and pending.reposition_transition_old_positions is not None
+            and pending.reposition_transition_new_positions is not None
+            and pending.staged_current_positions is not None
+        ):
+            while pending.staged_reposition_cursor < len(pending.reposition_insert_offsets):
+                event = pending.staged_reposition_cursor
+                boundary = int(pending.reposition_insert_offsets[event])
+                if boundary > pending.staged_raw_cursor:
+                    break
+                stage = int(pending.reposition_effective_stages[event])
+                pending.staged_reposition_cursor += 1
+                if stage < 0:
+                    continue
+                if boundary != pending.staged_raw_cursor:
+                    raise RuntimeError(
+                        "An effective Reposition stage was skipped by staged Prefill."
+                    )
+                if stage != pending.staged_actual_stage + 1:
+                    raise RuntimeError("Reposition stage mapping is not contiguous.")
+                begin = int(pending.reposition_transition_offsets[stage - 1])
+                end = int(pending.reposition_transition_offsets[stage])
+                raw_tokens = pending.reposition_transition_raw_tokens[begin:end]
+                old_positions = pending.reposition_transition_old_positions[begin:end]
+                new_positions = pending.reposition_transition_new_positions[begin:end]
+                if len(raw_tokens) > 0:
+                    if self.kv_cache is None or self.retry_rope_cache is None:
+                        raise RuntimeError("Staged Reposition KV transform is not configured.")
+                    rope_cache_len = len(self.retry_rope_cache)
+                    if (
+                        int(torch.min(old_positions).item()) < 0
+                        or int(torch.min(new_positions).item()) < 0
+                        or int(torch.max(old_positions).item()) >= rope_cache_len
+                        or int(torch.max(new_positions).item()) >= rope_cache_len
+                    ):
+                        raise RuntimeError("Staged Reposition position exceeds the RoPE cache.")
+                    active_lookup = torch.zeros(
+                        len(pending.reposition_input_ids), dtype=torch.bool, device="cpu"
+                    )
+                    active_lookup[pending.staged_active_raw.to(torch.int64)] = True
+                    if not bool(torch.all(active_lookup[raw_tokens.to(torch.int64)]).item()):
+                        raise RuntimeError("Reposition transition references an inactive token.")
+                    transition_cpu = torch.column_stack(
+                        (raw_tokens, old_positions, new_positions)
+                    ).pin_memory()
+                    transition_device = transition_cpu.to(
+                        device=self.cache_manager.device, non_blocking=True
+                    )
+                    raw_token_device = transition_device[:, 0].to(torch.int64)
+                    source_pages = pending.staged_full_page_indices[raw_token_device]
+                    destination_pages = self.cache_manager.allocate_retry_pages(len(raw_tokens))
+                    self.kv_cache.retry_reposition(
+                        source_pages,
+                        destination_pages,
+                        transition_device[:, 1:],
+                        self.retry_rope_cache,
+                    )
+                    pending.staged_full_page_indices[raw_token_device] = destination_pages
+                    self.cache_manager.free_retry_pages(source_pages)
+                    pending.reposition_transition_count += len(raw_tokens)
+                    pending.reposition_h2d_bytes += (
+                        transition_device.numel() * transition_device.element_size()
+                    )
+                    pending.staged_current_positions[raw_tokens.to(torch.int64)] = new_positions
+                pending.staged_actual_stage = stage
+
+        active_device = pending.staged_active_raw.pin_memory().to(
+            device=self.cache_manager.device, dtype=torch.int64, non_blocking=True
+        )
+        pending.reposition_h2d_bytes += (
+            pending.staged_active_raw.numel() * pending.staged_active_raw.element_size()
+        )
+        active_pages = pending.staged_full_page_indices[active_device]
+        self.table_manager.page_table[chunk.table_idx, : len(pending.staged_active_raw)].copy_(
+            active_pages
+        )
+        pending.chunked_req = None
+        PrefillAdder._prepare_staged_segment(pending)
+        pending.staged_ready = True
+
+    def release_staged(self, pending: PendingReq) -> None:
+        if pending.staged_full_page_indices is not None:
+            valid = pending.staged_full_page_indices[pending.staged_full_page_indices >= 0]
+            self.cache_manager.free_retry_pages(valid)
+            pending.staged_full_page_indices = None
+        if pending.staged_cache_handle is not None:
+            self.cache_manager.unlock(pending.staged_cache_handle)
+            pending.staged_cache_handle = None
+        if pending.staged_table_idx is not None:
+            self.table_manager.free(pending.staged_table_idx)
+            pending.staged_table_idx = None
 
     def schedule_next_batch(self, prefill_budget: int) -> Batch | None:
         if len(self.pending_list) == 0:
@@ -697,6 +1143,12 @@ class PrefillManager:
         for i, req in enumerate(self.pending_list):
             if req.uid == uid:
                 self.pending_list.pop(i)
+                if req.staged_reposition:
+                    if req.chunked_req is not None:
+                        self.aborted_staged_chunks[id(req.chunked_req)] = req
+                    else:
+                        self.release_staged(req)
+                    return req
                 return req.chunked_req or req
         return None
 

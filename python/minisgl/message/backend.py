@@ -50,9 +50,17 @@ class UserMsg(BaseBackendMsg):
     drop_effective_event_count: int = 0  # target-effective prefix of drop events
     reposition_raw_boundaries: torch.Tensor | None = None  # CPU 1D int32
     reposition_insert_offsets: torch.Tensor | None = None  # CPU 1D int32
+    reposition_input_ids: torch.Tensor | None = None  # CPU 1D int32 immutable raw stream
     radix_positions: torch.Tensor | None = None  # CPU 1D int32, full-token final KV position
     radix_repos_info: torch.Tensor | None = None  # CPU 1D int32, last effective R boundary
     radix_materialized_stage: torch.Tensor | None = None  # CPU 1D int32
+    reposition_birth_positions: torch.Tensor | None = None  # CPU 1D int32
+    reposition_birth_stages: torch.Tensor | None = None  # CPU 1D int32
+    reposition_transition_offsets: torch.Tensor | None = None  # CPU 1D int32
+    reposition_transition_raw_tokens: torch.Tensor | None = None  # CPU 1D int32
+    reposition_transition_old_positions: torch.Tensor | None = None  # CPU 1D int32
+    reposition_transition_new_positions: torch.Tensor | None = None  # CPU 1D int32
+    reposition_effective_stages: torch.Tensor | None = None  # CPU 1D int32 per requested R
     radix_next_position: int | None = None
     radix_current_reposition: int = -1
     radix_commit_token_len: int | None = None  # full-token warmup commit boundary
@@ -68,6 +76,9 @@ class UserMsg(BaseBackendMsg):
     full_keep_mask: torch.Tensor | None = None  # CPU 1D int32 final full-to-active mask
     use_context_mask: bool = False  # internal warmup: Prefill the full stream with a custom mask
     request_received_ns: int | None = None  # frontend monotonic clock, public requests only
+    tokenize_invocations: int = 1
+    context_stage_count: int = 0
+    radix_compile_ns: int = 0
 
 
 @dataclass

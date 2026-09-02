@@ -56,10 +56,17 @@ def _reference(
     }
     keep = [False] * len(token_ids)
     positions = [-1] * len(token_ids)
+    birth_positions = [-1] * len(token_ids)
+    birth_stages = [-1] * len(token_ids)
     repos_info = [-1] * len(token_ids)
     materialized_stage = [-1] * len(token_ids)
+    transition_offsets = [0]
+    transition_raw_tokens: list[int] = []
+    transition_old_positions: list[int] = []
+    transition_new_positions: list[int] = []
     active: list[int] = []
     effective = [False] * len(repositions)
+    effective_stages = [-1] * len(repositions)
     ignored = [False] * len(repositions)
     current_reposition = -1
     next_position = 0
@@ -85,12 +92,17 @@ def _reference(
             else:
                 stage += 1
                 effective[reposition_idx] = True
+                effective_stages[reposition_idx] = stage
                 for rank, token in enumerate(active):
                     if positions[token] == rank:
                         continue
+                    transition_raw_tokens.append(token)
+                    transition_old_positions.append(positions[token])
+                    transition_new_positions.append(rank)
                     positions[token] = rank
                     repos_info[token] = boundary
                     materialized_stage[token] = stage
+                transition_offsets.append(len(transition_raw_tokens))
                 current_reposition = boundary
                 next_position = len(active)
 
@@ -98,6 +110,8 @@ def _reference(
             continue
         keep[insertion] = True
         positions[insertion] = next_position
+        birth_positions[insertion] = next_position
+        birth_stages[insertion] = stage
         repos_info[insertion] = current_reposition
         materialized_stage[insertion] = stage
         active.append(insertion)
@@ -139,6 +153,13 @@ def _reference(
         "repos_info": repos_info,
         "keep_mask": keep,
         "materialized_stage": materialized_stage,
+        "birth_positions": birth_positions,
+        "birth_stages": birth_stages,
+        "transition_offsets": transition_offsets,
+        "transition_raw_tokens": transition_raw_tokens,
+        "transition_old_positions": transition_old_positions,
+        "transition_new_positions": transition_new_positions,
+        "effective_reposition_stages": effective_stages,
         "effective_repositions": effective,
         "ignored_repositions": ignored,
         "next_position": next_position,
@@ -156,6 +177,13 @@ def _assert_layout_matches_reference(layout, expected) -> None:
         "repos_info",
         "keep_mask",
         "materialized_stage",
+        "birth_positions",
+        "birth_stages",
+        "transition_offsets",
+        "transition_raw_tokens",
+        "transition_old_positions",
+        "transition_new_positions",
+        "effective_reposition_stages",
         "effective_repositions",
         "ignored_repositions",
     )
@@ -195,6 +223,12 @@ def test_same_boundary_applies_drop_before_reposition() -> None:
     ]
     assert layout.positions.tolist() == [0, 1, 0, 1, 2, 3]
     assert layout.repos_info.tolist() == [-1, -1, 5, 5, 5, 5]
+    assert layout.birth_positions.tolist() == [0, 1, 2, 3, 4, 5]
+    assert layout.birth_stages.tolist() == [0, 0, 0, 0, 0, 0]
+    assert layout.transition_offsets.tolist() == [0, 4]
+    assert layout.transition_raw_tokens.tolist() == [2, 3, 4, 5]
+    assert layout.transition_old_positions.tolist() == [2, 3, 4, 5]
+    assert layout.transition_new_positions.tolist() == [0, 1, 2, 3]
 
 
 def test_noop_reposition_is_ignored_without_metadata_change() -> None:
@@ -204,6 +238,8 @@ def test_noop_reposition_is_ignored_without_metadata_change() -> None:
         [TOKEN_KIND, 11, -1, 1],
     ]
     assert layout.effective_repositions.tolist() == [False]
+    assert layout.effective_reposition_stages.tolist() == [-1]
+    assert layout.transition_offsets.tolist() == [0]
     assert layout.ignored_repositions.tolist() == [True]
     assert layout.current_reposition == -1
 
@@ -314,6 +350,8 @@ def test_bounded_batch_compiler_preserves_request_order() -> None:
 
     assert [layout.records[0, 1].item() for layout in layouts] == [10, 20, 30, 40]
     assert all(layout.next_position == 2 for layout in layouts)
+    assert all(layout.transition_offsets.tolist() == [0, 2] for layout in layouts)
+    assert all(layout.compile_ns > 0 for layout in layouts)
 
 
 def test_compiler_rejects_token_id_narrowing() -> None:

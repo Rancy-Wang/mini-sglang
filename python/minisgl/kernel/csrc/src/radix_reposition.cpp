@@ -25,6 +25,136 @@ auto is_cpu_tensor(const tvm::ffi::TensorView tensor, int ndim, int bits,
          tensor.dtype().code == code && tensor.dtype().bits == bits;
 }
 
+auto count_radix_reposition_transitions(
+    int64_t token_count, const tvm::ffi::TensorView drop_insert_offsets,
+    const tvm::ffi::TensorView drop_range_offsets,
+    const tvm::ffi::TensorView drop_ranges,
+    const tvm::ffi::TensorView reposition_raw_boundaries,
+    const tvm::ffi::TensorView reposition_insert_offsets,
+    const tvm::ffi::TensorView transition_counts,
+    const tvm::ffi::TensorView status) -> void {
+  host::RuntimeCheck(token_count >= 0 &&
+                         token_count <= std::numeric_limits<int32_t>::max(),
+                     "token_count exceeds the int32 Reposition limit");
+  host::RuntimeCheck(is_cpu_tensor(drop_insert_offsets, 1, 32) &&
+                         is_cpu_tensor(drop_range_offsets, 1, 32) &&
+                         is_cpu_tensor(drop_ranges, 1, 32) &&
+                         is_cpu_tensor(reposition_raw_boundaries, 1, 32) &&
+                         is_cpu_tensor(reposition_insert_offsets, 1, 32) &&
+                         is_cpu_tensor(transition_counts, 1, 32) &&
+                         is_cpu_tensor(status, 1, 64),
+                     "Reposition transition-count tensors must be contiguous CPU vectors");
+  const int64_t drop_count = drop_insert_offsets.size(0);
+  const int64_t reposition_count = reposition_raw_boundaries.size(0);
+  host::RuntimeCheck(drop_range_offsets.size(0) == drop_count + 1 &&
+                         drop_ranges.size(0) % 2 == 0 &&
+                         reposition_insert_offsets.size(0) == reposition_count &&
+                         transition_counts.size(0) == reposition_count && status.size(0) >= 2,
+                     "Reposition transition-count tensor lengths are inconsistent");
+
+  const auto *drops = static_cast<const int32_t *>(drop_insert_offsets.data_ptr());
+  const auto *drop_offsets = static_cast<const int32_t *>(drop_range_offsets.data_ptr());
+  const auto *ranges = static_cast<const int32_t *>(drop_ranges.data_ptr());
+  const auto *raw_boundaries =
+      static_cast<const int32_t *>(reposition_raw_boundaries.data_ptr());
+  const auto *reposition_offsets =
+      static_cast<const int32_t *>(reposition_insert_offsets.data_ptr());
+  auto *counts = static_cast<int32_t *>(transition_counts.data_ptr());
+  auto *result_status = static_cast<int64_t *>(status.data_ptr());
+  std::fill(counts, counts + reposition_count, 0);
+  result_status[0] = 0;
+  result_status[1] = -1;
+
+  const int64_t range_count = drop_ranges.size(0) / 2;
+  host::RuntimeCheck(drop_offsets[0] == 0 && drop_offsets[drop_count] == range_count,
+                     "drop_range_offsets does not cover drop_ranges");
+  for (int64_t i = 0; i < drop_count; ++i) {
+    host::RuntimeCheck(drops[i] >= 0 && drops[i] <= token_count &&
+                           (i == 0 || drops[i - 1] < drops[i]) &&
+                           drop_offsets[i] < drop_offsets[i + 1],
+                       "Invalid Drop event metadata");
+  }
+  for (int64_t i = 0; i < reposition_count; ++i) {
+    host::RuntimeCheck(reposition_offsets[i] == raw_boundaries[i] + 1 &&
+                           reposition_offsets[i] > 0 &&
+                           reposition_offsets[i] <= token_count &&
+                           (i == 0 || raw_boundaries[i - 1] < raw_boundaries[i]),
+                       "Invalid Reposition event metadata");
+  }
+
+  std::vector<int32_t> previous(token_count, -1);
+  std::vector<int32_t> next(token_count, -1);
+  std::vector<int32_t> positions(token_count, -1);
+  std::vector<uint8_t> kept(token_count, 0);
+  int32_t tail = -1;
+  int32_t first_noncompact = -1;
+  int32_t active_count = 0;
+  int32_t next_position = 0;
+  int64_t drop_idx = 0;
+  int64_t reposition_idx = 0;
+  for (int32_t insertion = 0; insertion <= token_count; ++insertion) {
+    if (drop_idx < drop_count && drops[drop_idx] == insertion) {
+      int32_t previous_end = -1;
+      for (int32_t range_idx = drop_offsets[drop_idx];
+           range_idx < drop_offsets[drop_idx + 1]; ++range_idx) {
+        const int32_t start = ranges[2 * range_idx];
+        const int32_t end = ranges[2 * range_idx + 1];
+        host::RuntimeCheck(start >= 0 && start < end && end <= insertion &&
+                               (range_idx == drop_offsets[drop_idx] || previous_end < start),
+                           "Drop ranges must be ordered, disjoint, and already materialized");
+        previous_end = end;
+        for (int32_t token = start; token < end; ++token) {
+          if (!kept[token]) continue;
+          const int32_t before = previous[token];
+          const int32_t after = next[token];
+          if (before >= 0) next[before] = after;
+          if (after < 0) tail = before;
+          else previous[after] = before;
+          kept[token] = 0;
+          --active_count;
+          if (first_noncompact == token) first_noncompact = after;
+          if (after >= 0 && (first_noncompact < 0 || after < first_noncompact))
+            first_noncompact = after;
+        }
+      }
+      if (active_count == 0) first_noncompact = -1;
+      ++drop_idx;
+    }
+    if (reposition_idx < reposition_count &&
+        reposition_offsets[reposition_idx] == insertion) {
+      if (active_count == 0) {
+        result_status[0] = 1;
+        result_status[1] = raw_boundaries[reposition_idx];
+        return;
+      }
+      if (first_noncompact >= 0) {
+        int32_t rank = previous[first_noncompact] < 0
+                           ? 0
+                           : positions[previous[first_noncompact]] + 1;
+        for (int32_t token = first_noncompact; token >= 0; token = next[token]) {
+          host::RuntimeCheck(positions[token] > rank,
+                             "Non-compact active suffix invariant was violated");
+          positions[token] = rank++;
+          ++counts[reposition_idx];
+        }
+        next_position = active_count;
+        first_noncompact = -1;
+      }
+      ++reposition_idx;
+    }
+    if (insertion == token_count) continue;
+    const int32_t token = insertion;
+    const int32_t rank = active_count;
+    kept[token] = 1;
+    positions[token] = next_position++;
+    previous[token] = tail;
+    if (tail >= 0) next[tail] = token;
+    tail = token;
+    ++active_count;
+    if (first_noncompact < 0 && positions[token] != rank) first_noncompact = token;
+  }
+}
+
 auto compile_radix_reposition_layout(
     const tvm::ffi::TensorView token_ids,
     const tvm::ffi::TensorView drop_insert_offsets,
@@ -41,6 +171,13 @@ auto compile_radix_reposition_layout(
     const tvm::ffi::TensorView repos_info,
     const tvm::ffi::TensorView keep_mask,
     const tvm::ffi::TensorView materialized_stage,
+    const tvm::ffi::TensorView birth_positions,
+    const tvm::ffi::TensorView birth_stages,
+    const tvm::ffi::TensorView transition_offsets,
+    const tvm::ffi::TensorView transition_raw_tokens,
+    const tvm::ffi::TensorView transition_old_positions,
+    const tvm::ffi::TensorView transition_new_positions,
+    const tvm::ffi::TensorView effective_reposition_stages,
     const tvm::ffi::TensorView effective_repositions,
     const tvm::ffi::TensorView ignored_repositions,
     const tvm::ffi::TensorView status) -> void {
@@ -68,7 +205,14 @@ auto compile_radix_reposition_layout(
                      "mapping/status outputs must be contiguous CPU int64 vectors");
   host::RuntimeCheck(is_cpu_tensor(positions, 1, 32) &&
                          is_cpu_tensor(repos_info, 1, 32) &&
-                         is_cpu_tensor(materialized_stage, 1, 32),
+                         is_cpu_tensor(materialized_stage, 1, 32) &&
+                         is_cpu_tensor(birth_positions, 1, 32) &&
+                         is_cpu_tensor(birth_stages, 1, 32) &&
+                         is_cpu_tensor(transition_offsets, 1, 32) &&
+                         is_cpu_tensor(transition_raw_tokens, 1, 32) &&
+                         is_cpu_tensor(transition_old_positions, 1, 32) &&
+                         is_cpu_tensor(transition_new_positions, 1, 32) &&
+                         is_cpu_tensor(effective_reposition_stages, 1, 32),
                      "token metadata outputs must be contiguous CPU int32 vectors");
 
   const int64_t token_count = token_ids.size(0);
@@ -92,10 +236,16 @@ auto compile_radix_reposition_layout(
                          positions.size(0) == token_count &&
                          repos_info.size(0) == token_count &&
                          keep_mask.size(0) == token_count &&
-                         materialized_stage.size(0) == token_count,
+                         materialized_stage.size(0) == token_count &&
+                         birth_positions.size(0) == token_count &&
+                         birth_stages.size(0) == token_count,
                      "Per-token output lengths are inconsistent");
   host::RuntimeCheck(effective_repositions.size(0) == reposition_count &&
                          ignored_repositions.size(0) == reposition_count &&
+                         effective_reposition_stages.size(0) == reposition_count &&
+                         transition_offsets.size(0) >= reposition_count + 1 &&
+                         transition_raw_tokens.size(0) == transition_old_positions.size(0) &&
+                         transition_raw_tokens.size(0) == transition_new_positions.size(0) &&
                          status.size(0) >= 6,
                      "Reposition output lengths are inconsistent");
 
@@ -132,11 +282,22 @@ auto compile_radix_reposition_layout(
   auto *repos = static_cast<int32_t *>(repos_info.data_ptr());
   auto *kept = static_cast<bool *>(keep_mask.data_ptr());
   auto *ready = static_cast<int32_t *>(materialized_stage.data_ptr());
+  auto *birth_position = static_cast<int32_t *>(birth_positions.data_ptr());
+  auto *birth_stage = static_cast<int32_t *>(birth_stages.data_ptr());
+  auto *transition_offset = static_cast<int32_t *>(transition_offsets.data_ptr());
+  auto *transition_token = static_cast<int32_t *>(transition_raw_tokens.data_ptr());
+  auto *transition_old = static_cast<int32_t *>(transition_old_positions.data_ptr());
+  auto *transition_new = static_cast<int32_t *>(transition_new_positions.data_ptr());
+  auto *reposition_stage =
+      static_cast<int32_t *>(effective_reposition_stages.data_ptr());
   auto *effective = static_cast<bool *>(effective_repositions.data_ptr());
   auto *ignored = static_cast<bool *>(ignored_repositions.data_ptr());
   auto *result_status = static_cast<int64_t *>(status.data_ptr());
   std::fill(effective, effective + reposition_count, false);
   std::fill(ignored, ignored + reposition_count, false);
+  std::fill(reposition_stage, reposition_stage + reposition_count, -1);
+  transition_offset[0] = 0;
+  int32_t transition_cursor = 0;
 
   std::vector<int32_t> previous(token_count, -1);
   std::vector<int32_t> next(token_count, -1);
@@ -206,19 +367,29 @@ auto compile_radix_reposition_layout(
       } else {
         ++stage;
         effective[reposition_idx] = true;
+        reposition_stage[reposition_idx] = stage;
         int32_t rank = previous[first_noncompact] < 0
                            ? 0
                            : position[previous[first_noncompact]] + 1;
         for (int32_t token = first_noncompact; token >= 0; token = next[token]) {
           host::RuntimeCheck(position[token] > rank,
                              "Non-compact active suffix invariant was violated");
-          position[token] = rank++;
+          const int32_t old_position = position[token];
+          const int32_t new_position = rank++;
+          host::RuntimeCheck(transition_cursor < transition_raw_tokens.size(0),
+                             "Reposition transition output capacity is too small");
+          transition_token[transition_cursor] = token;
+          transition_old[transition_cursor] = old_position;
+          transition_new[transition_cursor] = new_position;
+          ++transition_cursor;
+          position[token] = new_position;
           repos[token] = raw_boundaries[reposition_idx];
           ready[token] = stage;
         }
         current_reposition = raw_boundaries[reposition_idx];
         next_position = active_count;
         first_noncompact = -1;
+        transition_offset[stage] = transition_cursor;
       }
       ++reposition_idx;
     }
@@ -230,6 +401,8 @@ auto compile_radix_reposition_layout(
     const int32_t rank = active_count;
     kept[token] = true;
     position[token] = next_position++;
+    birth_position[token] = position[token];
+    birth_stage[token] = stage;
     repos[token] = current_reposition;
     ready[token] = stage;
     previous[token] = tail;
@@ -305,6 +478,8 @@ auto compile_radix_reposition_layout(
   result_status[3] = next_position;
   result_status[4] = -1;
   result_status[5] = current_reposition;
+  host::RuntimeCheck(transition_cursor == transition_raw_tokens.size(0),
+                     "Reposition transition count/fill passes disagree");
   (void)head;
 }
 
@@ -312,3 +487,5 @@ auto compile_radix_reposition_layout(
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(compile_radix_reposition_layout,
                               compile_radix_reposition_layout);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(count_radix_reposition_transitions,
+                              count_radix_reposition_transitions);

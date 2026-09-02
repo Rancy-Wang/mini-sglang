@@ -116,10 +116,13 @@ def test_tokenizer_preserves_none_vs_empty_reposition() -> None:
     assert retry_source.reposition_raw_boundaries.numel() == 0
     assert retry_source.reposition_insert_offsets is not None
     assert retry_source.reposition_insert_offsets.numel() == 0
+    assert retry_source.reposition_input_ids is not None
+    assert retry_source.reposition_input_ids.tolist() == [10, 11, 12]
+    assert retry_source.tokenize_invocations == 1
     assert boundary_warmup.radix_commit_token_len == 2
 
 
-def test_reposition_warmup_materializes_same_boundary_source_before_target() -> None:
+def test_reposition_uses_one_public_tokenization_without_frontend_warmups() -> None:
     manager = FrontendManager(
         config=SimpleNamespace(contextual_prefill_mode="mask"),
         send_tokenizer=None,
@@ -130,17 +133,7 @@ def test_reposition_warmup_materializes_same_boundary_source_before_target() -> 
     async def send_one(msg) -> None:
         sent.append(msg)
 
-    async def wait_for_warmup(uid: int) -> WarmupReply:
-        return WarmupReply(
-            uid=uid,
-            hit_ratio=1.0,
-            cached_tokens=0,
-            drop_skipped_tokens=0,
-            finished=True,
-        )
-
     manager.send_one = send_one
-    manager.wait_for_warmup = wait_for_warmup
     messages = [
         {"role": "system", "content": "rules"},
         {"role": "user", "content": "question"},
@@ -163,14 +156,8 @@ def test_reposition_warmup_materializes_same_boundary_source_before_target() -> 
         )
     )
 
-    assert report is not None
-    assert [(msg.target_msg_id, msg.reposition) for msg in sent] == [
-        (1, []),
-        (2, []),
-        (2, [1]),
-        (3, [1]),
-    ]
-    assert sent[1].drop_rule == sent[2].drop_rule
+    assert report is None
+    assert sent == []
 
 
 def test_drop_only_staged_warmup_preserves_legacy_key_mode() -> None:

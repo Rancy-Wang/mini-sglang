@@ -69,6 +69,14 @@ def _server_metrics(offset=0):
         "active_prompt_tokens": 12,
         "generated_tokens": 4,
         "completion_tokens": 3,
+        "tokenize_invocations": 1,
+        "context_stage_count": 0,
+        "radix_compile_ns": 0,
+        "radix_match_ns": 0,
+        "retry_plan_ns": 0,
+        "reposition_transition_count": 0,
+        "reposition_h2d_bytes": 0,
+        "reposition_d2h_bytes": 0,
     }
 
 
@@ -125,16 +133,22 @@ def test_matchers_support_exact_prefix_keywords_and_structured_tool_calls():
 
     assert compare_messages(reference, target, MatchConfig()) == []
     target["content"] = "alpha beta changed"
-    assert compare_messages(
-        reference,
-        target,
-        MatchConfig(mode="prefix", prefix_chars=10),
-    ) == []
-    assert compare_messages(
-        reference,
-        target,
-        MatchConfig(mode="keywords", keywords=["alpha", "reason"]),
-    ) == []
+    assert (
+        compare_messages(
+            reference,
+            target,
+            MatchConfig(mode="prefix", prefix_chars=10),
+        )
+        == []
+    )
+    assert (
+        compare_messages(
+            reference,
+            target,
+            MatchConfig(mode="keywords", keywords=["alpha", "reason"]),
+        )
+        == []
+    )
 
 
 def test_server_metric_derivation_and_linear_percentile():
@@ -146,6 +160,8 @@ def test_server_metric_derivation_and_linear_percentile():
     assert sample["dropped_prompt_tokens"] == 8
     assert sample["prompt_retention_ratio"] == 0.6
     assert sample["drop_effective"] is True
+    assert sample["tokenize_invocations"] == 1
+    assert sample["reposition_d2h_bytes"] == 0
     assert _percentile([1.0, 2.0, 3.0, 4.0], 95) == pytest.approx(3.85)
 
 
@@ -346,6 +362,7 @@ def test_benchmark_uses_server_metrics_for_concurrency_summaries(monkeypatch):
     assert all(group["completion_token_throughput_per_second"] > 0 for group in report["groups"])
     assert all(group["drop_requested"] is True for group in report["groups"])
     assert all(group["drop_effective_requests"] == 8 for group in report["groups"])
+    assert all(group["reposition_thresholds_passed"] for group in report["groups"])
 
 
 def test_benchmark_accepts_no_summary_no_drop_baseline(monkeypatch):
@@ -424,15 +441,13 @@ def test_trajectory_benchmark_serializes_turns_and_aggregates_each_cell(monkeypa
         active_models.remove(model)
 
         drop_requested = request.get("drop_rule") == {"type": "thinking_drop"}
-        metrics = {
-            "request_received_ns": 100,
-            "first_token_generated_ns": 200,
-            "request_finished_ns": 500,
-            "prompt_tokens": 100,
-            "active_prompt_tokens": 80 if drop_requested else 100,
-            "generated_tokens": 3,
-            "completion_tokens": 3,
-        }
+        metrics = _server_metrics()
+        metrics.update(
+            prompt_tokens=100,
+            active_prompt_tokens=80 if drop_requested else 100,
+            generated_tokens=3,
+            completion_tokens=3,
+        )
         usage = {
             "prompt_tokens": 100,
             "completion_tokens": 4,
@@ -502,15 +517,13 @@ def test_trajectory_benchmark_serializes_turns_and_aggregates_each_cell(monkeypa
 
 def test_trajectory_benchmark_retains_fixed_length_failure(monkeypatch):
     async def fake_post_chat(*args, **kwargs):
-        metrics = {
-            "request_received_ns": 100,
-            "first_token_generated_ns": 200,
-            "request_finished_ns": 500,
-            "prompt_tokens": 10,
-            "active_prompt_tokens": 10,
-            "generated_tokens": 3,
-            "completion_tokens": 3,
-        }
+        metrics = _server_metrics()
+        metrics.update(
+            prompt_tokens=10,
+            active_prompt_tokens=10,
+            generated_tokens=3,
+            completion_tokens=3,
+        )
         return ChatResult(
             message={"role": "assistant", "content": "short"},
             finish_reason="length",

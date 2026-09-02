@@ -403,6 +403,14 @@ def _derive_server_sample(metrics: Dict[str, int]) -> Dict[str, Any]:
         "active_prompt_tokens",
         "generated_tokens",
         "completion_tokens",
+        "tokenize_invocations",
+        "context_stage_count",
+        "radix_compile_ns",
+        "radix_match_ns",
+        "retry_plan_ns",
+        "reposition_transition_count",
+        "reposition_h2d_bytes",
+        "reposition_d2h_bytes",
     }
     missing = sorted(required - metrics.keys())
     if missing:
@@ -414,15 +422,38 @@ def _derive_server_sample(metrics: Dict[str, int]) -> Dict[str, Any]:
     completion = int(metrics["completion_tokens"])
     prompt = int(metrics["prompt_tokens"])
     active_prompt = int(metrics["active_prompt_tokens"])
+    tokenize_invocations = int(metrics["tokenize_invocations"])
+    context_stage_count = int(metrics["context_stage_count"])
+    radix_compile_ns = int(metrics["radix_compile_ns"])
+    radix_match_ns = int(metrics["radix_match_ns"])
+    retry_plan_ns = int(metrics["retry_plan_ns"])
+    transition_count = int(metrics["reposition_transition_count"])
+    h2d_bytes = int(metrics["reposition_h2d_bytes"])
+    d2h_bytes = int(metrics["reposition_d2h_bytes"])
     if not 0 <= received <= first <= finished:
         raise ValueError("server_metrics timestamps are not monotonic.")
     if generated <= 0 or not 0 <= completion <= generated:
         raise ValueError("server_metrics token counts are invalid.")
     if not 0 <= active_prompt <= prompt:
         raise ValueError("server_metrics prompt token counts are invalid.")
+    if tokenize_invocations < 1 or any(
+        value < 0
+        for value in (
+            context_stage_count,
+            radix_compile_ns,
+            radix_match_ns,
+            retry_plan_ns,
+            transition_count,
+            h2d_bytes,
+            d2h_bytes,
+        )
+    ):
+        raise ValueError("server_metrics Reposition counters are invalid.")
     dropped_prompt = prompt - active_prompt
+    reposition_cpu_ms = (radix_compile_ns + radix_match_ns + retry_plan_ns) / 1e6
+    ttft_ms = (first - received) / 1e6
     return {
-        "ttft_ms": (first - received) / 1e6,
+        "ttft_ms": ttft_ms,
         "e2e_ms": (finished - received) / 1e6,
         "tpot_ms": (finished - first) / (generated - 1) / 1e6 if generated > 1 else None,
         "prompt_tokens": prompt,
@@ -432,6 +463,16 @@ def _derive_server_sample(metrics: Dict[str, int]) -> Dict[str, Any]:
         "drop_effective": dropped_prompt > 0,
         "generated_tokens": generated,
         "completion_tokens": completion,
+        "tokenize_invocations": tokenize_invocations,
+        "context_stage_count": context_stage_count,
+        "radix_compile_ms": radix_compile_ns / 1e6,
+        "radix_match_ms": radix_match_ns / 1e6,
+        "retry_plan_ms": retry_plan_ns / 1e6,
+        "reposition_cpu_ms": reposition_cpu_ms,
+        "reposition_cpu_ttft_percent": (100 * reposition_cpu_ms / ttft_ms if ttft_ms > 0 else None),
+        "reposition_transition_count": transition_count,
+        "reposition_h2d_bytes": h2d_bytes,
+        "reposition_d2h_bytes": d2h_bytes,
     }
 
 
@@ -460,6 +501,7 @@ async def benchmark_cases(
     method = next(iter(methods))
     summary_triggered = cases[0].metadata.summary_triggered
     drop_requested = cases[0].has_drop_payload()
+    reposition_requested = any(case.request.get("reposition") for case in cases)
     if any(concurrency <= 0 for concurrency in concurrencies):
         raise ValueError("Concurrency values must be positive.")
     request_count = num_requests or len(cases)
@@ -501,17 +543,29 @@ async def benchmark_cases(
                         if result.server_metrics is None:
                             raise ValueError("Target response did not return server_metrics.")
                         sample = _derive_server_sample(result.server_metrics)
+                        request_reposition = bool(case.request.get("reposition"))
+                        if request_reposition and sample["tokenize_invocations"] != 1:
+                            raise ValueError(
+                                "Reposition request did not use exactly one tokenization."
+                            )
+                        if request_reposition and sample["context_stage_count"] < 1:
+                            raise ValueError(
+                                "Reposition request did not report its context stages."
+                            )
+                        if request_reposition and sample["reposition_d2h_bytes"] != 0:
+                            raise ValueError(
+                                "Reposition request performed a metadata D2H transfer."
+                            )
                         return {
                             "case_id": case.case_id,
                             "method": case.metadata.method,
                             "summary_triggered": case.metadata.summary_triggered,
                             "drop_requested": case.has_drop_payload(),
+                            "reposition_requested": request_reposition,
                             "passed": True,
                             "client_started_ns": result.client_started_ns,
                             "client_finished_ns": result.client_finished_ns,
-                            "client_e2e_ms": (
-                                result.client_finished_ns - result.client_started_ns
-                            )
+                            "client_e2e_ms": (result.client_finished_ns - result.client_started_ns)
                             / 1e6,
                             **sample,
                         }
@@ -541,11 +595,27 @@ async def benchmark_cases(
                 for sample in successful
                 if sample["prompt_retention_ratio"] is not None
             ]
+            reposition_cpu_percent = [
+                sample["reposition_cpu_ttft_percent"]
+                for sample in successful
+                if sample["reposition_requested"]
+                and sample["reposition_cpu_ttft_percent"] is not None
+            ]
+            reposition_samples = [sample for sample in successful if sample["reposition_requested"]]
+            reposition_cpu_p95 = _percentile(reposition_cpu_percent, 95)
+            threshold_failures: list[str] = []
+            if reposition_cpu_p95 is not None and reposition_cpu_p95 > 2.0:
+                threshold_failures.append("reposition_cpu_p95_exceeds_2_percent_ttft")
+            if any(sample["tokenize_invocations"] != 1 for sample in reposition_samples):
+                threshold_failures.append("reposition_tokenize_invocations_not_one")
+            if any(sample["reposition_d2h_bytes"] != 0 for sample in reposition_samples):
+                threshold_failures.append("reposition_metadata_d2h_nonzero")
             report_groups.append(
                 {
                     "method": method,
                     "summary_triggered": summary_triggered,
                     "drop_requested": drop_requested,
+                    "reposition_requested": reposition_requested,
                     "concurrency": concurrency,
                     "requested": len(raw),
                     "succeeded": len(successful),
@@ -562,6 +632,33 @@ async def benchmark_cases(
                     "active_prompt_tokens": _distribution(active_prompt_tokens),
                     "dropped_prompt_tokens": _distribution(dropped_prompt_tokens),
                     "prompt_retention_ratio": _distribution(retention_ratios),
+                    "tokenize_invocations": _distribution(
+                        [sample["tokenize_invocations"] for sample in successful]
+                    ),
+                    "context_stage_count": _distribution(
+                        [sample["context_stage_count"] for sample in successful]
+                    ),
+                    "radix_compile_ms": _distribution(
+                        [sample["radix_compile_ms"] for sample in successful]
+                    ),
+                    "radix_match_ms": _distribution(
+                        [sample["radix_match_ms"] for sample in successful]
+                    ),
+                    "retry_plan_ms": _distribution(
+                        [sample["retry_plan_ms"] for sample in successful]
+                    ),
+                    "reposition_cpu_ttft_percent": _distribution(reposition_cpu_percent),
+                    "reposition_transition_count": _distribution(
+                        [sample["reposition_transition_count"] for sample in successful]
+                    ),
+                    "reposition_h2d_bytes": _distribution(
+                        [sample["reposition_h2d_bytes"] for sample in successful]
+                    ),
+                    "reposition_d2h_bytes": _distribution(
+                        [sample["reposition_d2h_bytes"] for sample in successful]
+                    ),
+                    "reposition_thresholds_passed": not threshold_failures,
+                    "reposition_threshold_failures": threshold_failures,
                     "drop_effective_requests": sum(
                         bool(sample["drop_effective"]) for sample in successful
                     ),
@@ -574,6 +671,12 @@ async def benchmark_cases(
         "method": method,
         "summary_triggered": summary_triggered,
         "drop_requested": drop_requested,
+        "reposition_requested": reposition_requested,
+        "reposition_thresholds": {
+            "tokenize_invocations": 1,
+            "metadata_d2h_bytes": 0,
+            "cpu_p95_ttft_percent_max": 2.0,
+        },
         "warmup_requests": warmup_requests,
         "groups": report_groups,
     }

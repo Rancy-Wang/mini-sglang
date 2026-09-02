@@ -591,51 +591,10 @@ class FrontendManager:
         if not has_current_drop and not reposition:
             return None
         if reposition:
-            final_ack: WarmupReply | None = None
-            for end in range(1, len(messages) + 1):
-                staged_rule = (
-                    project_drop_rule_for_prefix(drop_rule, end)
-                    if drop_rule is not None
-                    else None
-                )
-                if staged_rule is not None and staged_rule.get("type") == "thinking_drop":
-                    try:
-                        parse_drop_rule(staged_rule, messages[:end], allow_internal=True)
-                    except ValueError:
-                        staged_rule = None
-                staged_reposition = [
-                    message_id for message_id in reposition if message_id < end
-                ]
-                reposition_stages = [staged_reposition]
-                if staged_reposition and staged_reposition[-1] == end - 1:
-                    # Materialize the post-Drop, pre-R KV at this boundary first.
-                    # Retry then rotates those pages into the target R layout.
-                    reposition_stages.insert(0, staged_reposition[:-1])
-                for stage_reposition in reposition_stages:
-                    staged_uid = self.new_user()
-                    await self.send_one(
-                        TokenizeMsg(
-                            uid=staged_uid,
-                            text=messages[:end],
-                            sampling_params=SamplingParams(max_tokens=1, ignore_eos=True),
-                            target_msg_id=end,
-                            drop_rule=staged_rule,
-                            reposition=stage_reposition,
-                            enable_thinking=enable_thinking,
-                            reasoning_effort=reasoning_effort,
-                            tools=tools,
-                            tool_choice=tool_choice,
-                            is_warmup=True,
-                            internal_uid=staged_uid,
-                        )
-                    )
-                    final_ack = await self.wait_for_warmup(staged_uid)
-            if final_ack is None:
-                return None
-            return CacheUsageReport(
-                cached_tokens=final_ack.cached_tokens,
-                drop_skipped_tokens=final_ack.drop_skipped_tokens,
-            )
+            # Reposition is materialized by the scheduler from the single complete
+            # token/provenance result.  Frontend prefix warmups would repeat the chat
+            # template and make stage sources independently evictable.
+            return None
 
         use_context_mask = self.config.contextual_prefill_mode == "mask" and not reposition
         warmup_target = len(messages) if use_context_mask else max(len(messages) - 1, 0)
@@ -670,9 +629,7 @@ class FrontendManager:
         for end in range(1, len(messages)):
             staged_uid = self.new_user()
             staged_rule = (
-                project_drop_rule_for_prefix(drop_rule, end)
-                if drop_rule is not None
-                else None
+                project_drop_rule_for_prefix(drop_rule, end) if drop_rule is not None else None
             )
             if staged_rule is not None and staged_rule.get("type") == "thinking_drop":
                 try:
@@ -725,12 +682,8 @@ class FrontendManager:
     ):
         final_finish_reason = "stop"
         matched_stop: str | None = None
-        cached_tokens: int | None = (
-            cache_report.cached_tokens if cache_report is not None else None
-        )
-        drop_skipped_tokens = (
-            cache_report.drop_skipped_tokens if cache_report is not None else 0
-        )
+        cached_tokens: int | None = cache_report.cached_tokens if cache_report is not None else None
+        drop_skipped_tokens = cache_report.drop_skipped_tokens if cache_report is not None else 0
         prompt_tokens = 0
         completion_tokens = 0
         server_metrics: ServerMetrics | None = None
@@ -928,9 +881,7 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
         if (
             req.tools
             and _tool_choice_mode(normalized_tool_choice) != "none"
-            and infer_tool_call_parser(
-                state.config.model_path, state.config.tool_call_parser
-            )
+            and infer_tool_call_parser(state.config.model_path, state.config.tool_call_parser)
             is None
         ):
             raise HTTPException(
@@ -973,13 +924,11 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
 
     effective_stop = _normalize_stop(req.stop)
     max_tokens = (
-        req.max_completion_tokens
-        if req.max_completion_tokens is not None
-        else req.max_tokens
+        req.max_completion_tokens if req.max_completion_tokens is not None else req.max_tokens
     )
 
     cache_report: CacheUsageReport | None = None
-    if (wire_drop_rule is not None or req.reposition) and isinstance(prompt, list):
+    if wire_drop_rule is not None and not req.reposition and isinstance(prompt, list):
         try:
             cache_report = await state.run_contextual_warmup(
                 prompt,
@@ -1046,9 +995,7 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
     full_token_ids: List[int] = []
     finish_reason = "stop"
     cached_tokens: int | None = cache_report.cached_tokens if cache_report is not None else None
-    drop_skipped_tokens = (
-        cache_report.drop_skipped_tokens if cache_report is not None else 0
-    )
+    drop_skipped_tokens = cache_report.drop_skipped_tokens if cache_report is not None else 0
     prompt_tokens = 0
     completion_tokens = 0
     server_metrics: ServerMetrics | None = None

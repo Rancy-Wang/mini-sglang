@@ -45,9 +45,11 @@ class TokenizedResult:
     drop_effective_event_count: int = 0
     reposition_raw_boundaries: torch.Tensor | None = None
     reposition_insert_offsets: torch.Tensor | None = None
+    reposition_input_ids: torch.Tensor | None = None
     radix_commit_token_len: int | None = None
     stop_token_seqs: List[List[int]] | None = None
     message_meta: dict | None = None
+    tokenize_invocations: int = 1
 
 
 @dataclass(frozen=True)
@@ -1870,6 +1872,7 @@ class TokenizeManager:
             ),
             reposition_raw_boundaries=reposition_raw_boundaries,
             reposition_insert_offsets=reposition_insert_offsets,
+            reposition_input_ids=(full_with_gen_tensor if msg.reposition is not None else None),
             radix_commit_token_len=warmup_commit_token_len,
             stop_token_seqs=self._build_stop_token_seqs(msg.stop),
             message_meta={

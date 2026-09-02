@@ -26,6 +26,14 @@ def _metrics() -> ServerMetrics:
         active_prompt_tokens=8,
         generated_tokens=4,
         completion_tokens=3,
+        tokenize_invocations=1,
+        context_stage_count=3,
+        radix_compile_ns=10,
+        radix_match_ns=20,
+        retry_plan_ns=5,
+        reposition_transition_count=7,
+        reposition_h2d_bytes=84,
+        reposition_d2h_bytes=0,
     )
 
 
@@ -57,6 +65,33 @@ def test_request_metrics_state_rejects_nonmonotonic_token_timestamps():
 
     with pytest.raises(ValueError, match="monotonic"):
         state.observe_token(399, visible=True)
+
+
+def test_request_metrics_state_exposes_cumulative_reposition_counters():
+    state = RequestMetricsState(
+        request_received_ns=100,
+        prompt_tokens=12,
+        active_prompt_tokens=8,
+        context_stage_count=3,
+        radix_compile_ns=10,
+    )
+    state.observe_reposition(
+        radix_match_ns=20,
+        retry_plan_ns=5,
+        transition_count=7,
+        h2d_bytes=84,
+    )
+    state.observe_token(250, visible=True)
+
+    metrics = state.finish(250)
+
+    assert metrics.context_stage_count == 3
+    assert metrics.radix_compile_ns == 10
+    assert metrics.radix_match_ns == 20
+    assert metrics.retry_plan_ns == 5
+    assert metrics.reposition_transition_count == 7
+    assert metrics.reposition_h2d_bytes == 84
+    assert metrics.reposition_d2h_bytes == 0
 
 
 def test_server_metrics_round_trip_through_tokenizer_message_serialization():

@@ -193,6 +193,7 @@ def tokenize_worker(
                                 drop_effective_event_count=t.drop_effective_event_count,
                                 reposition_raw_boundaries=t.reposition_raw_boundaries,
                                 reposition_insert_offsets=t.reposition_insert_offsets,
+                                reposition_input_ids=t.reposition_input_ids,
                                 radix_commit_token_len=t.radix_commit_token_len,
                                 enable_thinking=msg.enable_thinking,
                                 stop=msg.stop,
@@ -206,6 +207,7 @@ def tokenize_worker(
                                 full_keep_mask=t.full_keep_mask,
                                 use_context_mask=msg.use_context_mask,
                                 request_received_ns=msg.request_received_ns,
+                                tokenize_invocations=t.tokenize_invocations,
                             )
                             for msg, t in tokenized_pairs
                         ]

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Tuple
@@ -25,6 +26,7 @@ class ContextMatchResult:
     initial_active_cached_len: int
     active_full_positions: torch.Tensor
     retry_plan: torch.Tensor | None = None
+    retry_plan_ns: int = 0
 
 
 @dataclass(frozen=True)
@@ -205,12 +207,14 @@ class CacheManager:
         source_key_to_token[~matched_virtual_mask] = torch.arange(
             result.full_cached_len, dtype=torch.int64, device="cpu"
         )
+        retry_started_ns = time.perf_counter_ns()
         matched_len, retry_plan = fast_compare_retry_radix_records_plan(
             source_records,
             radix_query[: handle.cached_len],
             source_key_to_token,
             req.radix_key_to_token[: handle.cached_len],
         )
+        retry_plan_ns = time.perf_counter_ns() - retry_started_ns
         if matched_len != handle.cached_len:
             raise RuntimeError("Retry plan compiler disagrees with the selected Radix path.")
         return ContextMatchResult(
@@ -222,6 +226,33 @@ class CacheManager:
             initial_active_cached_len=result.active_cached_len,
             active_full_positions=result.active_full_positions,
             retry_plan=retry_plan,
+            retry_plan_ns=retry_plan_ns,
+        )
+
+    def match_empty_req(self, req: PendingReq) -> ContextMatchResult:
+        """Return the protected empty-root handle for scheduler-owned cold staging."""
+
+        if req.radix_match_ids is None:
+            raise ValueError("Cold Reposition staging requires radix_match_ids.")
+        empty_query = req.radix_match_ids[:0]
+        empty_virtual = (
+            req.radix_key_virtual_mask[:0] if req.radix_key_virtual_mask is not None else None
+        )
+        matched = self._match_and_prune_legacy_holes(empty_query, empty_virtual)
+        if matched is None:
+            raise RuntimeError("Prefix cache did not return an empty-root match.")
+        handle, indices, _ = matched
+        if handle.cached_len != 0 or len(indices) != 0:
+            raise RuntimeError("Cold Reposition staging did not resolve to the empty root.")
+        empty_cpu = torch.empty(0, dtype=torch.int64, device="cpu")
+        return ContextMatchResult(
+            handle=handle,
+            full_match_indices=indices,
+            full_cached_len=0,
+            active_match_indices=indices,
+            active_cached_len=0,
+            initial_active_cached_len=0,
+            active_full_positions=empty_cpu,
         )
 
     def _derive_active_match(
@@ -623,6 +654,33 @@ class CacheManager:
                 device=active_indices.device,
             )
 
+            if req.staged_full_page_indices is not None:
+                staged_len = min(len(req.staged_full_page_indices), full_token_prefix_len)
+                staged_active = active_positions < staged_len
+                if bool(torch.any(staged_active).item()):
+                    staged_active_device = staged_active.to(
+                        device=active_indices.device,
+                        dtype=torch.bool,
+                        non_blocking=True,
+                    )
+                    staged_positions_device = active_positions[staged_active].to(
+                        device=active_indices.device,
+                        dtype=torch.int64,
+                        non_blocking=True,
+                    )
+                    req.staged_full_page_indices[staged_positions_device] = active_indices[
+                        staged_active_device
+                    ]
+                staged_pages = req.staged_full_page_indices[:staged_len]
+                if bool(torch.any(staged_pages < 0).item()):
+                    missing = torch.nonzero(staged_pages < 0, as_tuple=False).view(-1)
+                    raise RuntimeError(
+                        "Staged Reposition is missing raw KV pages at final commit: "
+                        f"{missing[:16].tolist()}"
+                    )
+                full_indices[:staged_len] = staged_pages
+                filled[:staged_len] = True
+
             old_full_cached_len = old_handle.physical_cached_len
             if old_full_cached_len > 0:
                 if len(req.initial_full_match_indices) < old_full_cached_len:
@@ -685,14 +743,24 @@ class CacheManager:
                 key_indices,
                 commit_virtual_mask,
             )
-            active_key_positions = req.radix_token_to_key[active_positions]
-            self._free_finished_candidates(
-                req,
-                active_indices,
-                active_key_positions,
-                insert_result,
-                excluded_indices,
-            )
+            if req.staged_full_page_indices is not None:
+                full_positions = torch.arange(cacheable_full_len, dtype=torch.int64, device="cpu")
+                self._free_finished_candidates(
+                    req,
+                    full_indices[:cacheable_full_len],
+                    req.radix_token_to_key[full_positions],
+                    insert_result,
+                    excluded_indices,
+                )
+            else:
+                active_key_positions = req.radix_token_to_key[active_positions]
+                self._free_finished_candidates(
+                    req,
+                    active_indices,
+                    active_key_positions,
+                    insert_result,
+                    excluded_indices,
+                )
         finally:
             self.unlock(old_handle)
 
