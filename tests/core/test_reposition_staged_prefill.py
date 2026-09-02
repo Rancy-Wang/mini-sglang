@@ -262,7 +262,7 @@ def test_drop_timeline_stages_when_requested_reposition_is_noop(monkeypatch) -> 
     cache.check_integrity()
 
 
-def test_multichunk_staged_decode_preserves_every_page_under_lazy_free(monkeypatch) -> None:
+def test_multichunk_staged_overlap_stop_preserves_every_page(monkeypatch) -> None:
     monkeypatch.setattr(torch.Tensor, "pin_memory", lambda self: self)
     manager, cache, table, _ = _manager()
     pending = _pending()
@@ -279,12 +279,13 @@ def test_multichunk_staged_decode_preserves_every_page_under_lazy_free(monkeypat
         if not isinstance(req, ChunkedReq):
             break
 
-    req.append_host(torch.tensor([90], dtype=torch.int32))
-    for token_id in range(91, 102):
+    for token_id in (90, 91):
         cache.allocate_paged([req])
         req.complete_one()
         req.append_host(torch.tensor([token_id], dtype=torch.int32))
-    assert not req.can_decode
+    assert req.can_decode
+    generated_raw = req.raw_positions[len(req.input_ids) - 2 : len(req.input_ids)]
+    assert generated_raw.tolist() == [6, 7]
 
     with cache.lazy_free_region():
         cache.cache_req(req, finished=True)
