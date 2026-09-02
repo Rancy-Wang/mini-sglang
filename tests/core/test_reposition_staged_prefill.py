@@ -196,6 +196,7 @@ def test_cold_reposition_prefill_materializes_each_stage_before_final_request(
         [[1, 0], [2, 1], [3, 2]],
     ]
 
+    final.append_host(torch.tensor([99], dtype=torch.int32))
     cache.cache_req(final, finished=True)
     assert bool(torch.all(final.staged_full_page_indices >= 0).item())
     table.free(final.table_idx)
