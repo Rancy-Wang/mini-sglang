@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import functools
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from typing import Sequence
 
 import torch
 
@@ -30,6 +32,19 @@ class RadixRepositionLayout:
     @property
     def keys(self) -> torch.Tensor:
         return self.records
+
+
+@dataclass(frozen=True)
+class RadixRepositionInput:
+    """One request for the bounded CPU Radix compiler batch entry point."""
+
+    token_ids: torch.Tensor
+    drop_insert_offsets: torch.Tensor
+    drop_range_offsets: torch.Tensor
+    drop_ranges: torch.Tensor
+    delta_marker_ids: torch.Tensor
+    reposition_raw_boundaries: torch.Tensor
+    reposition_insert_offsets: torch.Tensor
 
 
 @functools.cache
@@ -100,6 +115,7 @@ def compile_radix_reposition_layout(
         ignored,
         status,
     )
+
     if int(status[0]) == 1:
         boundary = int(status[4])
         raise ValueError(f"Reposition at raw boundary {boundary} has no active tokens.")
@@ -126,10 +142,47 @@ def compile_radix_reposition_layout(
     )
 
 
+def compile_radix_reposition_layout_batch(
+    requests: Sequence[RadixRepositionInput],
+    *,
+    max_workers: int = 4,
+) -> tuple[RadixRepositionLayout, ...]:
+    """Compile independent requests concurrently with bounded CPU workers."""
+
+    if max_workers <= 0:
+        raise ValueError("max_workers must be positive.")
+    if not requests:
+        return ()
+
+    _load_module()
+
+    def compile_one(request: RadixRepositionInput) -> RadixRepositionLayout:
+        return compile_radix_reposition_layout(
+            request.token_ids,
+            request.drop_insert_offsets,
+            request.drop_range_offsets,
+            request.drop_ranges,
+            request.delta_marker_ids,
+            request.reposition_raw_boundaries,
+            request.reposition_insert_offsets,
+        )
+
+    worker_count = min(len(requests), max_workers)
+    if worker_count == 1:
+        return tuple(compile_one(request) for request in requests)
+    with ThreadPoolExecutor(
+        max_workers=worker_count,
+        thread_name_prefix="radix-reposition",
+    ) as executor:
+        return tuple(executor.map(compile_one, requests))
+
+
 __all__ = [
     "DELTA_KIND",
     "REPOSITION_KIND",
     "TOKEN_KIND",
+    "RadixRepositionInput",
     "RadixRepositionLayout",
     "compile_radix_reposition_layout",
+    "compile_radix_reposition_layout_batch",
 ]

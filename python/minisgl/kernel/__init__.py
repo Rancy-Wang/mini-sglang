@@ -6,6 +6,10 @@ from .radix import (
     fast_compare_key,
     fast_compare_radix_records,
     fast_compare_retry_radix_records,
+    fast_compare_retry_radix_records_plan,
+    radix_record_compare_backend,
+    radix_record_edge_hash,
+    radix_record_retry_token,
 )
 from .retry_reposition import retry_reposition_kv
 from .store import store_cache
@@ -18,6 +22,10 @@ __all__ = [
     "fast_compare_key",
     "fast_compare_radix_records",
     "fast_compare_retry_radix_records",
+    "fast_compare_retry_radix_records_plan",
+    "radix_record_compare_backend",
+    "radix_record_edge_hash",
+    "radix_record_retry_token",
     "retry_reposition_kv",
     "store_cache",
     "test_tensor",

@@ -10,12 +10,16 @@ pytest.importorskip("tvm_ffi")
 from minisgl.kernel.radix import (
     fast_compare_radix_records,
     fast_compare_retry_radix_records,
+    fast_compare_retry_radix_records_plan,
+    radix_record_compare_backend,
 )
 from minisgl.kernel.radix_reposition import (
     DELTA_KIND,
     REPOSITION_KIND,
     TOKEN_KIND,
+    RadixRepositionInput,
     compile_radix_reposition_layout,
+    compile_radix_reposition_layout_batch,
 )
 
 
@@ -265,6 +269,51 @@ def test_structured_comparators_use_exact_and_retry_semantics() -> None:
     target[2, 1] = -7
     target[3, 1] = 9
     assert fast_compare_retry_radix_records(cached, target) == 3
+
+
+def test_retry_comparator_emits_only_changed_token_pages() -> None:
+    cached = torch.tensor(
+        [
+            [TOKEN_KIND, 10, -1, 0],
+            [DELTA_KIND, -7, -1, -1],
+            [TOKEN_KIND, 11, 2, 3],
+            [TOKEN_KIND, 12, 2, 4],
+        ],
+        dtype=torch.int32,
+    )
+    target = cached.clone()
+    target[2, 2:] = torch.tensor([8, 1], dtype=torch.int32)
+    target[3, 2:] = torch.tensor([8, 4], dtype=torch.int32)
+    matched, plan = fast_compare_retry_radix_records_plan(
+        cached,
+        target,
+        torch.tensor([0, -1, 1, 2], dtype=torch.int64),
+        torch.tensor([3, -1, 7, 9], dtype=torch.int64),
+    )
+
+    assert matched == len(cached)
+    assert plan.tolist() == [[1, 7, 3, 1]]
+    assert radix_record_compare_backend() in {"portable", "neon", "avx2", "avx512"}
+
+
+def test_bounded_batch_compiler_preserves_request_order() -> None:
+    inputs = tuple(
+        RadixRepositionInput(
+            token_ids=torch.tensor([base, base + 1, base + 2], dtype=torch.int64),
+            drop_insert_offsets=torch.tensor([3], dtype=torch.int32),
+            drop_range_offsets=torch.tensor([0, 1], dtype=torch.int32),
+            drop_ranges=torch.tensor([0, 1], dtype=torch.int32),
+            delta_marker_ids=torch.tensor([-base], dtype=torch.int32),
+            reposition_raw_boundaries=torch.tensor([2], dtype=torch.int32),
+            reposition_insert_offsets=torch.tensor([3], dtype=torch.int32),
+        )
+        for base in (10, 20, 30, 40)
+    )
+
+    layouts = compile_radix_reposition_layout_batch(inputs, max_workers=2)
+
+    assert [layout.records[0, 1].item() for layout in layouts] == [10, 20, 30, 40]
+    assert all(layout.next_position == 2 for layout in layouts)
 
 
 def test_compiler_rejects_token_id_narrowing() -> None:

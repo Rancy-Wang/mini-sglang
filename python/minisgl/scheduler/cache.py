@@ -24,8 +24,7 @@ class ContextMatchResult:
     active_cached_len: int
     initial_active_cached_len: int
     active_full_positions: torch.Tensor
-    retry_old_positions: torch.Tensor | None = None
-    retry_new_positions: torch.Tensor | None = None
+    retry_plan: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -174,19 +173,17 @@ class CacheManager:
                 raise RuntimeError("Structured Retry requires the Radix prefix cache.")
             retry_handle = self.prefix_cache.match_retry_prefix(
                 radix_query,
-                query_virtual_mask
-                if query_virtual_mask is not None
-                else torch.zeros(len(radix_query), dtype=torch.bool, device="cpu"),
+                (
+                    query_virtual_mask
+                    if query_virtual_mask is not None
+                    else torch.zeros(len(radix_query), dtype=torch.bool, device="cpu")
+                ),
                 handle,
             )
             if retry_handle.cached_len > handle.cached_len:
                 retry_indices = self._matched_indices(retry_handle)[: retry_handle.cached_len]
-                retry_virtual = retry_handle.get_matched_virtual_mask()[
-                    : retry_handle.cached_len
-                ]
-                value_virtual = retry_virtual.to(
-                    device=retry_indices.device, non_blocking=True
-                )
+                retry_virtual = retry_handle.get_matched_virtual_mask()[: retry_handle.cached_len]
+                value_virtual = retry_virtual.to(device=retry_indices.device, non_blocking=True)
                 if not bool(torch.any((retry_indices < 0) & (~value_virtual)).item()):
                     handle = retry_handle
                     key_match_indices = retry_indices
@@ -199,13 +196,23 @@ class CacheManager:
         if not used_retry:
             return result
 
+        if req.radix_key_to_token is None:
+            raise RuntimeError("Structured Retry requires a target key-to-token mapping.")
+        from minisgl.kernel.radix import fast_compare_retry_radix_records_plan
+
         source_records = handle.get_matched_keys()[: handle.cached_len]
-        source_real = source_records[~matched_virtual_mask]
-        target_real = radix_query[: handle.cached_len][~matched_virtual_mask]
-        old_positions = source_real[:, 3]
-        new_positions = target_real[:, 3]
-        if len(old_positions) != result.full_cached_len:
-            raise RuntimeError("Retry position plan does not align with full cache pages.")
+        source_key_to_token = torch.full((handle.cached_len,), -1, dtype=torch.int64, device="cpu")
+        source_key_to_token[~matched_virtual_mask] = torch.arange(
+            result.full_cached_len, dtype=torch.int64, device="cpu"
+        )
+        matched_len, retry_plan = fast_compare_retry_radix_records_plan(
+            source_records,
+            radix_query[: handle.cached_len],
+            source_key_to_token,
+            req.radix_key_to_token[: handle.cached_len],
+        )
+        if matched_len != handle.cached_len:
+            raise RuntimeError("Retry plan compiler disagrees with the selected Radix path.")
         return ContextMatchResult(
             handle=result.handle,
             full_match_indices=result.full_match_indices,
@@ -214,8 +221,7 @@ class CacheManager:
             active_cached_len=result.active_cached_len,
             initial_active_cached_len=result.active_cached_len,
             active_full_positions=result.active_full_positions,
-            retry_old_positions=old_positions,
-            retry_new_positions=new_positions,
+            retry_plan=retry_plan,
         )
 
     def _derive_active_match(
@@ -249,14 +255,12 @@ class CacheManager:
                     int(kept_holes[0].item()) if len(kept_holes) > 0 else len(kept_indices)
                 )
                 active_match_indices = kept_indices[:active_cached_len]
-                active_full_positions = torch.nonzero(
-                    keep_mask_cpu, as_tuple=False
-                ).view(-1)[:active_cached_len]
+                active_full_positions = torch.nonzero(keep_mask_cpu, as_tuple=False).view(-1)[
+                    :active_cached_len
+                ]
             else:
                 active_match_indices = full_match_indices[keep_mask]
-                active_full_positions = torch.nonzero(
-                    keep_mask_cpu, as_tuple=False
-                ).view(-1)
+                active_full_positions = torch.nonzero(keep_mask_cpu, as_tuple=False).view(-1)
         elif self.drop_aware_eviction and len(full_match_indices) > 0:
             holes = torch.nonzero(full_match_indices < 0, as_tuple=False).view(-1)
             active_cached_len = int(holes[0].item()) if len(holes) > 0 else len(full_match_indices)
@@ -425,13 +429,9 @@ class CacheManager:
                 dtype=torch.int32,
                 device=active_indices.device,
             )
-            initial_full_len = min(
-                len(req.initial_full_match_indices), full_token_prefix_len
-            )
+            initial_full_len = min(len(req.initial_full_match_indices), full_token_prefix_len)
             if initial_full_len > 0:
-                full_indices[:initial_full_len] = req.initial_full_match_indices[
-                    :initial_full_len
-                ]
+                full_indices[:initial_full_len] = req.initial_full_match_indices[:initial_full_len]
 
             active_positions_device = active_positions.to(
                 device=active_indices.device, non_blocking=True
@@ -444,9 +444,7 @@ class CacheManager:
                 matched_positions = active_positions_device[initially_matched]
                 previous = full_indices[matched_positions]
                 current = active_indices[initially_matched]
-                if bool(torch.any(previous < 0).item()) or not torch.equal(
-                    previous, current
-                ):
+                if bool(torch.any(previous < 0).item()) or not torch.equal(previous, current):
                     raise RuntimeError("Matched Drop-aware tokens use different KV slots.")
             newly_computed = ~initially_matched
             if bool(torch.any(newly_computed).item()):
@@ -455,9 +453,7 @@ class CacheManager:
                 missing = full_indices[computed_positions] < 0
                 full_indices[computed_positions[missing]] = computed_indices[missing]
 
-            keep_mask = torch.ones(
-                full_token_prefix_len, dtype=torch.bool, device="cpu"
-            )
+            keep_mask = torch.ones(full_token_prefix_len, dtype=torch.bool, device="cpu")
             if req.full_keep_mask is not None:
                 # Context metadata describes the original prompt only. Decode
                 # appends generated tokens to the Radix/token axes, and those
@@ -474,9 +470,7 @@ class CacheManager:
             # stale snapshot during the finished commit. Existing resident nodes
             # remain canonical inside commit_drop_prefix; holes stay holes.
             full_indices[~kept_device] = -1
-            missing_kept = torch.nonzero(
-                kept_device & (full_indices < 0), as_tuple=False
-            ).view(-1)
+            missing_kept = torch.nonzero(kept_device & (full_indices < 0), as_tuple=False).view(-1)
             if len(missing_kept) > 0:
                 raise RuntimeError(
                     "Kept Drop-aware tokens are missing KV slots at commit: "
@@ -744,9 +738,7 @@ class CacheManager:
         )
         canonical_indices = insert_result.handle.get_matched_indices()
 
-        def adopted_pages(
-            pages: torch.Tensor, key_positions: torch.Tensor
-        ) -> torch.Tensor:
+        def adopted_pages(pages: torch.Tensor, key_positions: torch.Tensor) -> torch.Tensor:
             key_positions = key_positions.to(
                 device=pages.device, dtype=torch.int64, non_blocking=True
             )

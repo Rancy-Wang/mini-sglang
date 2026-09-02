@@ -94,6 +94,41 @@ def test_retry_greedily_selects_largest_reachable_source_branch() -> None:
     assert retry.get_matched_indices()[:3].tolist() == [2, 3, 4]
 
 
+def test_structured_exact_index_survives_edge_split() -> None:
+    cache = _cache()
+    first = _records(
+        [
+            [TOKEN_KIND, 10, -1, 0],
+            [TOKEN_KIND, 11, -1, 1],
+            [TOKEN_KIND, 12, -1, 2],
+        ]
+    )
+    second = first.clone()
+    second[2, 1] = 99
+
+    cache.insert_prefix(first, torch.tensor([0, 1, 2], dtype=torch.int32), _mask(3))
+    cache.insert_prefix(second, torch.tensor([0, 1, 3], dtype=torch.int32), _mask(3))
+
+    assert cache.match_prefix(first, _mask(3)).cuda_handle.cached_len == 3
+    assert cache.match_prefix(second, _mask(3)).cuda_handle.cached_len == 3
+    assert cache.root_node.max_reachable_depth == 3
+    cache.check_integrity()
+
+
+def test_ordinary_radix_index_survives_edge_split() -> None:
+    cache = _cache()
+    first = torch.tensor([10, 11, 12], dtype=torch.int32)
+    second = torch.tensor([10, 11, 99], dtype=torch.int32)
+
+    cache.insert_prefix(first, torch.tensor([0, 1, 2], dtype=torch.int32))
+    cache.insert_prefix(second, torch.tensor([0, 1, 3], dtype=torch.int32))
+
+    assert cache.match_prefix(first).cuda_handle.cached_len == 3
+    assert cache.match_prefix(second).cuda_handle.cached_len == 3
+    assert cache.root_node.max_reachable_depth == 3
+    cache.check_integrity()
+
+
 def test_shared_retry_pages_are_counted_and_normally_evicted_once() -> None:
     cache = _cache()
     source = _records(
@@ -189,8 +224,7 @@ def test_retry_position_plan_keeps_changed_pages_that_are_dropped_later() -> Non
     assert match is not None
     assert match.full_cached_len == 2
     assert match.active_cached_len == 0
-    assert match.retry_old_positions.tolist() == [0, 1]
-    assert match.retry_new_positions.tolist() == [0, 0]
+    assert match.retry_plan.tolist() == [[1, 1, 1, 0]]
 
 
 def test_concurrent_commit_adopts_inactive_retry_page_and_frees_duplicate() -> None:
@@ -243,8 +277,10 @@ def test_concurrent_commit_adopts_inactive_retry_page_and_frees_duplicate() -> N
         assert match.full_cached_len == 3
         assert match.active_full_positions.device.type == "cpu"
         assert match.active_full_positions.tolist() == [2]
-        assert match.retry_old_positions.tolist() == [0, 1, 2]
-        assert match.retry_new_positions.tolist() == [0, 0, 1]
+        assert match.retry_plan.tolist() == [
+            [1, 1, 1, 0],
+            [2, 2, 2, 1],
+        ]
         manager.lock(match.handle)
 
     allocated = manager._allocate(6).view(2, 3)

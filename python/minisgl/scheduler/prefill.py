@@ -135,8 +135,7 @@ def _mask_free_context_reason_reference(
     min_kept_expiry = torch.cummin(kept_expiry, dim=0).values[query_positions]
     if bool(
         torch.any(
-            (max_dropped_expiry > query_positions)
-            | (min_kept_expiry <= query_positions)
+            (max_dropped_expiry > query_positions) | (min_kept_expiry <= query_positions)
         ).item()
     ):
         return "visibility_changes_within_extend"
@@ -249,9 +248,7 @@ class PrefillAdder:
             )
 
         assert req.full_input_ids is not None
-        full_positions = torch.arange(
-            len(req.full_input_ids), dtype=torch.int32, device="cpu"
-        )
+        full_positions = torch.arange(len(req.full_input_ids), dtype=torch.int32, device="cpu")
         full_radix_input_ids = (
             req.radix_match_ids[req.radix_token_to_key]
             if req.radix_token_to_key is not None
@@ -287,8 +284,7 @@ class PrefillAdder:
             return None
 
         original_stream = None
-        retry_old_positions = None
-        retry_new_positions = None
+        retry_plan = None
         retry_active_full_positions = None
         if context_plan is not None:
             original_stream = (
@@ -329,8 +325,7 @@ class PrefillAdder:
             initial_full_match_indices = match.full_match_indices[: match.full_cached_len]
             radix_cached_tokens = cached_len
             usage_cached_tokens = cached_len
-            retry_old_positions = match.retry_old_positions
-            retry_new_positions = match.retry_new_positions
+            retry_plan = match.retry_plan
             retry_active_full_positions = match.active_full_positions
         full_prefix_len, active_prefix_len = self.cache_manager.matchable_prefix_lens(req)
         cache_reuse_ratio = _calculate_cache_reuse_ratio(
@@ -340,11 +335,7 @@ class PrefillAdder:
         # TODO: better estimate policy
         extend_len = req.input_len - cached_len
         retry_transformed_mask = None
-        retry_full_transformed_mask = None
-        retry_page_count = 0
-        if retry_old_positions is not None and retry_new_positions is not None:
-            retry_full_transformed_mask = retry_old_positions != retry_new_positions
-            retry_page_count = int(torch.count_nonzero(retry_full_transformed_mask).item())
+        retry_page_count = 0 if retry_plan is None else len(retry_plan)
         estimated_len = extend_len + req.output_len + retry_page_count
 
         if estimated_len + self.reserved_size > self.cache_manager.available_size:
@@ -378,15 +369,10 @@ class PrefillAdder:
             if retry_page_count > 0:
                 if self.kv_cache is None or self.retry_rope_cache is None:
                     raise RuntimeError("Retry Reposition KV transform is not configured.")
-                assert retry_full_transformed_mask is not None
-                assert retry_old_positions is not None
-                assert retry_new_positions is not None
-                assert retry_active_full_positions is not None
-                changed = torch.nonzero(
-                    retry_full_transformed_mask, as_tuple=False
-                ).view(-1)
-                changed_old_positions = retry_old_positions[changed]
-                changed_new_positions = retry_new_positions[changed]
+                if retry_plan is None or retry_active_full_positions is None:
+                    raise RuntimeError("Retry Reposition plan metadata is incomplete.")
+                changed_old_positions = retry_plan[:, 2]
+                changed_new_positions = retry_plan[:, 3]
                 rope_cache_len = len(self.retry_rope_cache)
                 if (
                     int(torch.min(changed_old_positions).item()) < 0
@@ -395,46 +381,53 @@ class PrefillAdder:
                     or int(torch.max(changed_new_positions).item()) >= rope_cache_len
                 ):
                     raise RuntimeError("Retry Reposition position exceeds the RoPE cache.")
+                if req.radix_token_to_key is None:
+                    raise RuntimeError("Retry Reposition requires a structured token mapping.")
                 full_to_active = torch.full(
-                    (len(retry_old_positions),), -1, dtype=torch.int32, device="cpu"
+                    (len(req.radix_token_to_key),), -1, dtype=torch.int32, device="cpu"
                 )
                 full_to_active[retry_active_full_positions] = torch.arange(
                     len(retry_active_full_positions), dtype=torch.int32, device="cpu"
                 )
-                changed_active_indices = full_to_active[changed]
-                retry_metadata = torch.stack(
-                    (
-                        changed.to(torch.int32),
-                        changed_active_indices,
-                        changed_old_positions.to(torch.int32),
-                        changed_new_positions.to(torch.int32),
-                    ),
-                    dim=1,
-                ).pin_memory().to(device=self.cache_manager.device, non_blocking=True)
-                changed_full_device = retry_metadata[:, 0].to(torch.int64)
-                source_pages = initial_full_match_indices[changed_full_device]
+                changed_active_indices = full_to_active[retry_plan[:, 1].to(torch.int64)]
+                retry_metadata = (
+                    torch.column_stack(
+                        (
+                            retry_plan[:, 0],
+                            retry_plan[:, 1],
+                            changed_active_indices,
+                            changed_old_positions,
+                            changed_new_positions,
+                        ),
+                    )
+                    .pin_memory()
+                    .to(device=self.cache_manager.device, non_blocking=True)
+                )
+                source_full_device = retry_metadata[:, 0].to(torch.int64)
+                target_full_device = retry_metadata[:, 1].to(torch.int64)
+                source_pages = initial_full_match_indices[source_full_device]
                 retry_pages = self.cache_manager.allocate_retry_pages(retry_page_count)
                 self.kv_cache.retry_reposition(
                     source_pages,
                     retry_pages,
-                    retry_metadata[:, 2:],
+                    retry_metadata[:, 3:],
                     self.retry_rope_cache,
                 )
                 initial_full_match_indices = initial_full_match_indices.clone()
-                initial_full_match_indices[changed_full_device] = retry_pages
+                initial_full_match_indices[target_full_device] = retry_pages
                 active_rows_cpu = changed_active_indices >= 0
+                retry_transformed_mask = torch.zeros(cached_len, dtype=torch.bool, device="cpu")
+                changed_active = changed_active_indices[active_rows_cpu].to(torch.int64)
+                retry_transformed_mask[changed_active] = True
                 if bool(torch.any(active_rows_cpu).item()):
-                    active_rows = retry_metadata[:, 1] >= 0
+                    active_rows = retry_metadata[:, 2] >= 0
                     cached_indices = cached_indices.clone()
-                    active_indices = retry_metadata[active_rows, 1].to(torch.int64)
+                    active_indices = retry_metadata[active_rows, 2].to(torch.int64)
                     cached_indices[active_indices] = retry_pages[active_rows]
-                retry_transformed_mask = retry_full_transformed_mask[
-                    retry_active_full_positions
-                ].clone()
                 inactive_rows_cpu = changed_active_indices < 0
                 if bool(torch.any(inactive_rows_cpu).item()):
-                    retry_inactive_positions = changed[inactive_rows_cpu].clone()
-                    retry_inactive_pages = retry_pages[retry_metadata[:, 1] < 0]
+                    retry_inactive_positions = retry_plan[inactive_rows_cpu, 1].to(torch.int64)
+                    retry_inactive_pages = retry_pages[retry_metadata[:, 2] < 0]
             if cached_len > 0:  # NOTE: set the cached part
                 device_ids = self.table_manager.token_pool[table_idx][:cached_len]
                 page_entry = self.table_manager.page_table[table_idx][:cached_len]
@@ -524,9 +517,7 @@ class PrefillAdder:
             radix_cached_tokens=radix_cached_tokens,
             usage_cached_tokens=usage_cached_tokens,
             drop_skipped_tokens=(
-                radix_cached_tokens - usage_cached_tokens
-                if usage_cached_tokens is not None
-                else 0
+                radix_cached_tokens - usage_cached_tokens if usage_cached_tokens is not None else 0
             ),
             full_input_ids=(pending_req.full_input_ids if pending_req.use_context_mask else None),
             full_token_visible_until=(
