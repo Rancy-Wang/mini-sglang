@@ -202,6 +202,95 @@ def compile_radix_reposition_layout(
     )
 
 
+def validate_radix_reposition_records(
+    records: torch.Tensor,
+    *,
+    token_count: int | None = None,
+    require_materialized: bool = False,
+) -> None:
+    """Batch-validate direct structured records without Python row iteration."""
+
+    if (
+        records.device.type != "cpu"
+        or records.dtype != torch.int32
+        or records.ndim != 2
+        or records.shape[1] != 4
+    ):
+        raise ValueError("Structured Radix records must be CPU int32 [N, 4].")
+    if token_count is not None and token_count < 0:
+        raise ValueError("Structured Radix token_count must be non-negative.")
+
+    kinds = records[:, 0]
+    is_token = kinds == TOKEN_KIND
+    is_delta = kinds == DELTA_KIND
+    is_reposition = kinds == REPOSITION_KIND
+    known = is_token | is_delta | is_reposition
+
+    def first_bad(mask: torch.Tensor) -> int:
+        return int(torch.nonzero(mask, as_tuple=False)[0].item())
+
+    if bool(torch.any(~known)):
+        row = first_bad(~known)
+        raise ValueError(f"Unknown structured Radix record kind at row {row}: {int(kinds[row])}")
+
+    invalid_token = is_token & (records[:, 1] < 0)
+    if bool(torch.any(invalid_token)):
+        raise ValueError("Token records require non-negative token IDs.")
+
+    field_one = records[:, 1].to(dtype=torch.int64)
+    field_two = records[:, 2].to(dtype=torch.int64)
+    delta_start = -field_one - 1
+    delta_end = -field_two - 1
+    invalid_delta = is_delta & (
+        (records[:, 1] >= 0)
+        | (records[:, 2] >= 0)
+        | (records[:, 3] != -1)
+        | (delta_end <= delta_start)
+    )
+    if bool(torch.any(invalid_delta)):
+        row = first_bad(invalid_delta)
+        raise ValueError(f"Invalid direct Delta range record at row {row}.")
+    if token_count is not None:
+        outside = is_delta & (delta_end > token_count)
+        if bool(torch.any(outside)):
+            row = first_bad(outside)
+            raise ValueError(
+                f"Delta range [{int(delta_start[row])}, {int(delta_end[row])}) "
+                f"exceeds token length {token_count}."
+            )
+
+    if len(records) > 1:
+        adjacent_delta = is_delta[:-1] & is_delta[1:]
+        noncanonical = adjacent_delta & (delta_start[1:] <= delta_end[:-1])
+        if bool(torch.any(noncanonical)):
+            raise ValueError("Consecutive Delta ranges must be canonical and disjoint.")
+
+    invalid_reposition = is_reposition & (
+        (records[:, 1] < 0) | (records[:, 2] != -1) | (records[:, 3] != -1)
+    )
+    if bool(torch.any(invalid_reposition)):
+        row = first_bad(invalid_reposition)
+        raise ValueError(f"Invalid Reposition record at row {row}.")
+
+    if require_materialized:
+        token_flags = is_token.to(torch.int64)
+        materialized_before = torch.cumsum(token_flags, dim=0) - token_flags
+        premature_delta = is_delta & (delta_end > materialized_before)
+        if bool(torch.any(premature_delta)):
+            row = first_bad(premature_delta)
+            raise ValueError(
+                f"Delta range [{int(delta_start[row])}, {int(delta_end[row])}) precedes "
+                f"its materialization boundary {int(materialized_before[row])}."
+            )
+        misplaced_reposition = is_reposition & (
+            field_one + 1 != materialized_before
+        )
+        if bool(torch.any(misplaced_reposition)):
+            raise ValueError(
+                "Reposition raw boundary does not match its record insertion point."
+            )
+
+
 def compile_radix_reposition_layout_batch(
     requests: Sequence[RadixRepositionInput],
     *,
@@ -244,4 +333,5 @@ __all__ = [
     "RadixRepositionLayout",
     "compile_radix_reposition_layout",
     "compile_radix_reposition_layout_batch",
+    "validate_radix_reposition_records",
 ]

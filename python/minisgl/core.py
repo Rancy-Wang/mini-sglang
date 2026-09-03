@@ -192,9 +192,11 @@ class Req:
             if not torch.equal(token_to_key, real_key_positions):
                 raise ValueError("radix_token_to_key is not the inverse key mapping.")
             if self.radix_match_ids.ndim == 2:
-                from minisgl.scheduler.radix_delta import validate_delta_records
+                from minisgl.kernel.radix_reposition import (
+                    validate_radix_reposition_records,
+                )
 
-                validate_delta_records(
+                validate_radix_reposition_records(
                     self.radix_match_ids,
                     token_count=len(token_to_key),
                     require_materialized=True,

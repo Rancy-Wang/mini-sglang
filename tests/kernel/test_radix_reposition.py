@@ -22,6 +22,7 @@ from minisgl.kernel.radix_reposition import (
     RadixRepositionInput,
     compile_radix_reposition_layout,
     compile_radix_reposition_layout_batch,
+    validate_radix_reposition_records,
 )
 
 
@@ -44,6 +45,59 @@ def _compile(
         torch.tensor(repositions, dtype=torch.int32),
         torch.tensor([boundary + 1 for boundary in repositions], dtype=torch.int32),
     )
+
+
+def test_structured_record_hot_path_validation_is_batched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    records = torch.tensor(
+        [
+            [TOKEN_KIND, 10, -1, 0],
+            [TOKEN_KIND, 11, -1, 1],
+            [DELTA_KIND, -1, -2, -1],
+            [REPOSITION_KIND, 1, -1, -1],
+            [TOKEN_KIND, 12, 1, 1],
+        ],
+        dtype=torch.int32,
+    )
+
+    def reject_to_list(_self):
+        raise AssertionError("structured record validation converted all rows to Python")
+
+    monkeypatch.setattr(torch.Tensor, "tolist", reject_to_list)
+    validate_radix_reposition_records(
+        records,
+        token_count=3,
+        require_materialized=True,
+    )
+
+
+@pytest.mark.parametrize(
+    ("records", "message"),
+    [
+        ([[TOKEN_KIND, -1, -1, 0]], "non-negative token IDs"),
+        ([[TOKEN_KIND, 1, -1, 0], [DELTA_KIND, -1, -1, -1]], "Invalid direct Delta"),
+        (
+            [
+                [TOKEN_KIND, 1, -1, 0],
+                [TOKEN_KIND, 2, -1, 1],
+                [DELTA_KIND, -1, -2, -1],
+                [DELTA_KIND, -2, -3, -1],
+            ],
+            "canonical and disjoint",
+        ),
+        ([[TOKEN_KIND, 1, -1, 0], [REPOSITION_KIND, 7, -1, -1]], "insertion point"),
+    ],
+)
+def test_structured_record_batch_validation_rejects_invalid_rows(
+    records: list[list[int]], message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        validate_radix_reposition_records(
+            torch.tensor(records, dtype=torch.int32),
+            token_count=sum(row[0] == TOKEN_KIND for row in records),
+            require_materialized=True,
+        )
 
 
 def _reference(
