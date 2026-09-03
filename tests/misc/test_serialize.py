@@ -5,8 +5,10 @@ from typing import List
 from minisgl.core import SamplingParams
 import torch
 from minisgl.message import (
+    BaseBackendMsg,
     BaseFrontendMsg,
     BatchBackendMsg,
+    RepositionOpenMsg,
     UserMsg,
     UserReply,
     WarmupAckMsg,
@@ -52,6 +54,33 @@ def test_serialize_deserialize():
     logger.info(u)
     logger.info(result)
     assert result.data[0].drop_effective_event_count == 2
+
+    records = torch.tensor(
+        [[0, 10, -1, 0], [1, -100, -1, -1], [0, 11, 0, 1]],
+        dtype=torch.int32,
+    )
+    structured = UserMsg(
+        uid=1,
+        input_ids=t,
+        true_positions=torch.arange(len(t), dtype=torch.int32),
+        raw_positions=torch.arange(len(t), dtype=torch.int32),
+        radix_input_ids=records,
+        radix_match_ids=records,
+        sampling_params=SamplingParams(),
+    )
+    restored_structured = BaseBackendMsg.decoder(structured.encoder())
+    assert torch.equal(restored_structured.radix_match_ids, records)
+
+    open_msg = RepositionOpenMsg(
+        uid=2,
+        full_token_count=3,
+        drop_event_positions=torch.tensor([2], dtype=torch.int32),
+        drop_range_offsets=torch.tensor([0, 1], dtype=torch.int32),
+        drop_position_ranges=torch.tensor([0, 1], dtype=torch.int32),
+    )
+    restored_open = BaseBackendMsg.decoder(open_msg.encoder())
+    assert restored_open.full_token_count == 3
+    assert restored_open.drop_position_ranges.tolist() == [0, 1]
 
     warmup = WarmupAckMsg(
         uid=3,

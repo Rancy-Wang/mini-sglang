@@ -30,6 +30,17 @@ class ExitMsg(BaseBackendMsg):
 
 
 @dataclass
+class RepositionOpenMsg(BaseBackendMsg):
+    """Acquire stable scheduler-owned Delta marker IDs before one CPU compile."""
+
+    uid: int
+    full_token_count: int
+    drop_event_positions: torch.Tensor
+    drop_range_offsets: torch.Tensor
+    drop_position_ranges: torch.Tensor
+
+
+@dataclass
 class UserMsg(BaseBackendMsg):
     uid: int
     input_ids: torch.Tensor  # CPU 1D int32 tensor
@@ -48,19 +59,8 @@ class UserMsg(BaseBackendMsg):
     drop_range_offsets: torch.Tensor | None = None  # CPU 1D int32 CSR offsets
     drop_position_ranges: torch.Tensor | None = None  # CPU 1D int32 flattened [start, end, ...]
     drop_effective_event_count: int = 0  # target-effective prefix of drop events
-    reposition_raw_boundaries: torch.Tensor | None = None  # CPU 1D int32
-    reposition_insert_offsets: torch.Tensor | None = None  # CPU 1D int32
-    reposition_input_ids: torch.Tensor | None = None  # CPU 1D int32 immutable raw stream
     radix_positions: torch.Tensor | None = None  # CPU 1D int32, full-token final KV position
     radix_repos_info: torch.Tensor | None = None  # CPU 1D int32, last effective R boundary
-    radix_materialized_stage: torch.Tensor | None = None  # CPU 1D int32
-    reposition_birth_positions: torch.Tensor | None = None  # CPU 1D int32
-    reposition_birth_stages: torch.Tensor | None = None  # CPU 1D int32
-    reposition_transition_offsets: torch.Tensor | None = None  # CPU 1D int32
-    reposition_transition_raw_tokens: torch.Tensor | None = None  # CPU 1D int32
-    reposition_transition_old_positions: torch.Tensor | None = None  # CPU 1D int32
-    reposition_transition_new_positions: torch.Tensor | None = None  # CPU 1D int32
-    reposition_effective_stages: torch.Tensor | None = None  # CPU 1D int32 per requested R
     radix_next_position: int | None = None
     radix_current_reposition: int = -1
     radix_commit_token_len: int | None = None  # full-token warmup commit boundary
@@ -75,10 +75,17 @@ class UserMsg(BaseBackendMsg):
     full_token_visible_until: torch.Tensor | None = None  # CPU 1D int32 first hidden query pos
     full_keep_mask: torch.Tensor | None = None  # CPU 1D int32 final full-to-active mask
     use_context_mask: bool = False  # internal warmup: Prefill the full stream with a custom mask
+    context_compact_stream: bool = False  # mask metadata accompanies an already compact stream
+    context_post_prefill_keep_mask: torch.Tensor | None = None  # final raw keep-set
     request_received_ns: int | None = None  # frontend monotonic clock, public requests only
     tokenize_invocations: int = 1
     context_stage_count: int = 0
     radix_compile_ns: int = 0
+    radix_match_ns: int = 0
+    retry_plan_ns: int = 0
+    reposition_transition_count: int = 0
+    reposition_h2d_bytes: int = 0
+    reposition_d2h_bytes: int = 0
 
 
 @dataclass

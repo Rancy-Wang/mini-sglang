@@ -94,6 +94,8 @@ class Req:
     full_token_visible_until: torch.Tensor | None = None
     full_keep_mask: torch.Tensor | None = None
     use_context_mask: bool = False
+    context_compact_stream: bool = False
+    context_post_prefill_keep_mask: torch.Tensor | None = None
     radix_key_virtual_mask: torch.Tensor | None = None
     radix_key_to_token: torch.Tensor | None = None
     radix_token_to_key: torch.Tensor | None = None
@@ -101,26 +103,18 @@ class Req:
     radix_marker_ids: tuple[int, ...] = ()
     radix_positions: torch.Tensor | None = None
     radix_repos_info: torch.Tensor | None = None
-    radix_materialized_stage: torch.Tensor | None = None
-    reposition_transition_offsets: torch.Tensor | None = None
-    staged_full_page_indices: torch.Tensor | None = None
-    staged_owned_page_mask: torch.Tensor | None = None
-    staged_reposition: bool = False
-    radix_actual_materialized_stage: int = 0
     radix_next_position: int | None = None
     radix_current_reposition: int = -1
     retry_transformed_mask: torch.Tensor | None = None
-    retry_inactive_transformed_positions: torch.Tensor | None = None
-    retry_inactive_transformed_pages: torch.Tensor | None = None
+    inactive_cached_positions: torch.Tensor | None = None
+    inactive_cached_pages: torch.Tensor | None = None
     tokenize_invocations: int = 1
-    context_stage_count: int = 0
     radix_compile_ns: int = 0
     radix_match_ns: int = 0
     retry_plan_ns: int = 0
     reposition_transition_count: int = 0
     reposition_h2d_bytes: int = 0
     reposition_d2h_bytes: int = 0
-    prefill_start_len: int = field(init=False)
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu
@@ -140,11 +134,25 @@ class Req:
         assert self.radix_input_ids.is_cpu
         assert self.radix_match_ids.is_cpu
         if self.use_context_mask and not (
-            self.is_warmup or self.staged_reposition or self.radix_materialized_stage is not None
+            self.is_warmup or self.context_post_prefill_keep_mask is not None
         ):
             raise ValueError(
                 "Context-mask Prefill is restricted to internal warmup or Reposition requests."
             )
+        if self.context_post_prefill_keep_mask is not None:
+            keep_mask = self.context_post_prefill_keep_mask
+            if (
+                not keep_mask.is_cpu
+                or keep_mask.ndim != 1
+                or keep_mask.dtype not in (torch.bool, torch.int32)
+            ):
+                raise ValueError(
+                    "context_post_prefill_keep_mask must be a CPU bool or int32 vector."
+                )
+            if len(self.raw_positions) == 0 or int(self.raw_positions[-1]) >= len(keep_mask):
+                raise ValueError(
+                    "context_post_prefill_keep_mask does not cover the compact raw stream."
+                )
         if self.prefix_keep_mask is not None:
             assert self.prefix_keep_mask.is_cpu
         assert len(self.input_ids) == len(self.true_positions)
@@ -201,27 +209,7 @@ class Req:
                 raise ValueError("radix_commit_key_len requires a delta-marker Radix layout.")
             if not 0 <= self.radix_commit_key_len <= len(self.radix_match_ids):
                 raise ValueError("radix_commit_key_len is outside the Radix key stream.")
-        if self.radix_materialized_stage is not None:
-            if self.radix_actual_materialized_stage < 0:
-                raise ValueError("radix_actual_materialized_stage must be non-negative.")
-            required = self.radix_materialized_stage[self.raw_positions.to(torch.int64)]
-            if bool(torch.any(required > self.radix_actual_materialized_stage).item()):
-                raise ValueError(
-                    "A Reposition token would execute before its required stage is materialized."
-                )
-        if self.staged_owned_page_mask is not None:
-            if self.staged_full_page_indices is None:
-                raise ValueError("Staged page ownership requires a staged raw-to-page map.")
-            if (
-                self.staged_owned_page_mask.dtype != torch.bool
-                or self.staged_owned_page_mask.ndim != 1
-                or self.staged_owned_page_mask.device
-                != self.staged_full_page_indices.device
-                or len(self.staged_owned_page_mask) != len(self.staged_full_page_indices)
-            ):
-                raise ValueError("staged_owned_page_mask must cover the staged raw-to-page map.")
         self.device_len = len(self.input_ids)
-        self.prefill_start_len = self.cached_len
         self.max_device_len = len(self.input_ids) + self.output_len
         assert 0 <= self.cached_len < self.device_len <= self.max_device_len
         assert 0 <= self.initial_active_cached_len <= self.cached_len
@@ -237,12 +225,12 @@ class Req:
                     "active cache prefix."
                 )
         inactive_retry = (
-            self.retry_inactive_transformed_positions,
-            self.retry_inactive_transformed_pages,
+            self.inactive_cached_positions,
+            self.inactive_cached_pages,
         )
         if any(tensor is not None for tensor in inactive_retry):
             if not all(tensor is not None for tensor in inactive_retry):
-                raise ValueError("Inactive Retry positions and pages must be provided together.")
+                raise ValueError("Inactive cached positions and pages must be provided together.")
             inactive_positions, inactive_pages = inactive_retry
             assert inactive_positions is not None
             assert inactive_pages is not None
@@ -254,7 +242,7 @@ class Req:
                 or inactive_pages.ndim != 1
                 or len(inactive_positions) != len(inactive_pages)
             ):
-                raise ValueError("Inactive Retry metadata has an invalid layout.")
+                raise ValueError("Inactive cached metadata has an invalid layout.")
         if self.radix_cached_tokens < 0:
             raise ValueError("radix_cached_tokens must be non-negative.")
         if self.usage_cached_tokens is not None:
@@ -409,18 +397,6 @@ class Req:
                 [
                     self.radix_repos_info,
                     torch.tensor([self.radix_current_reposition], dtype=torch.int32, device="cpu"),
-                ]
-            )
-        if self.radix_materialized_stage is not None:
-            current_stage = (
-                int(self.radix_materialized_stage[-1])
-                if len(self.radix_materialized_stage) > 0
-                else 0
-            )
-            self.radix_materialized_stage = torch.cat(
-                [
-                    self.radix_materialized_stage,
-                    torch.tensor([current_stage], dtype=torch.int32, device="cpu"),
                 ]
             )
         if self.radix_key_virtual_mask is not None:

@@ -229,32 +229,6 @@ class CacheManager:
             retry_plan_ns=retry_plan_ns,
         )
 
-    def match_empty_req(self, req: PendingReq) -> ContextMatchResult:
-        """Return the protected empty-root handle for scheduler-owned cold staging."""
-
-        if req.radix_match_ids is None:
-            raise ValueError("Cold Reposition staging requires radix_match_ids.")
-        empty_query = req.radix_match_ids[:0]
-        empty_virtual = (
-            req.radix_key_virtual_mask[:0] if req.radix_key_virtual_mask is not None else None
-        )
-        matched = self._match_and_prune_legacy_holes(empty_query, empty_virtual)
-        if matched is None:
-            raise RuntimeError("Prefix cache did not return an empty-root match.")
-        handle, indices, _ = matched
-        if handle.cached_len != 0 or len(indices) != 0:
-            raise RuntimeError("Cold Reposition staging did not resolve to the empty root.")
-        empty_cpu = torch.empty(0, dtype=torch.int64, device="cpu")
-        return ContextMatchResult(
-            handle=handle,
-            full_match_indices=indices,
-            full_cached_len=0,
-            active_match_indices=indices,
-            active_cached_len=0,
-            initial_active_cached_len=0,
-            active_full_positions=empty_cpu,
-        )
-
     def _derive_active_match(
         self,
         req: PendingReq,
@@ -638,10 +612,7 @@ class CacheManager:
                     non_blocking=True,
                 )
             ]
-            if (
-                getattr(req, "staged_full_page_indices", None) is None
-                and req.initial_active_cached_len > len(active_indices)
-            ):
+            if req.initial_active_cached_len > len(active_indices):
                 raise RuntimeError(
                     "Matched active prefix exceeds the delta-marker commit boundary."
                 )
@@ -657,42 +628,8 @@ class CacheManager:
                 device=active_indices.device,
             )
 
-            staged_full_page_indices = getattr(req, "staged_full_page_indices", None)
-            staged_owned_page_mask = getattr(req, "staged_owned_page_mask", None)
-            if staged_full_page_indices is not None:
-                if staged_owned_page_mask is None:
-                    raise RuntimeError("Staged Reposition commit lost page ownership metadata.")
-                staged_len = min(len(staged_full_page_indices), full_token_prefix_len)
-                staged_active = active_positions < staged_len
-                if bool(torch.any(staged_active).item()):
-                    staged_active_device = staged_active.to(
-                        device=active_indices.device,
-                        dtype=torch.bool,
-                        non_blocking=True,
-                    )
-                    staged_positions_device = active_positions[staged_active].to(
-                        device=active_indices.device,
-                        dtype=torch.int64,
-                        non_blocking=True,
-                    )
-                    current_active_indices = active_indices[staged_active_device]
-                    previous_indices = staged_full_page_indices[staged_positions_device]
-                    staged_owned_page_mask[staged_positions_device] |= (
-                        (previous_indices < 0) | (previous_indices != current_active_indices)
-                    )
-                    staged_full_page_indices[staged_positions_device] = current_active_indices
-                staged_pages = staged_full_page_indices[:staged_len]
-                if bool(torch.any(staged_pages < 0).item()):
-                    missing = torch.nonzero(staged_pages < 0, as_tuple=False).view(-1)
-                    raise RuntimeError(
-                        "Staged Reposition is missing raw KV pages at final commit: "
-                        f"{missing[:16].tolist()}"
-                    )
-                full_indices[:staged_len] = staged_pages
-                filled[:staged_len] = True
-
             old_full_cached_len = old_handle.physical_cached_len
-            if old_full_cached_len > 0 and staged_full_page_indices is None:
+            if old_full_cached_len > 0:
                 if len(req.initial_full_match_indices) < old_full_cached_len:
                     raise RuntimeError(
                         "Initial full-token match indices are shorter than the cache handle."
@@ -708,15 +645,34 @@ class CacheManager:
                 device=active_indices.device, non_blocking=True
             )
             overlap = active_positions < old_full_cached_len
-            if staged_full_page_indices is None and bool(torch.any(overlap).item()):
-                overlap_device = overlap.to(device=active_indices.device, non_blocking=True)
-                if not torch.equal(
-                    full_indices[active_positions_device[overlap_device]],
-                    active_indices[overlap_device],
+            if bool(torch.any(overlap).item()):
+                transformed = torch.zeros(len(active_indices), dtype=torch.bool, device="cpu")
+                if req.retry_transformed_mask is not None:
+                    transformed[: len(req.retry_transformed_mask)] = req.retry_transformed_mask
+                ordinary_overlap = overlap & (~transformed)
+                ordinary_device = ordinary_overlap.to(
+                    device=active_indices.device, non_blocking=True
+                )
+                if bool(torch.any(ordinary_overlap).item()) and not torch.equal(
+                    full_indices[active_positions_device[ordinary_device]],
+                    active_indices[ordinary_device],
                 ):
                     raise RuntimeError("Matched delta-marker tokens use different KV slots.")
             full_indices[active_positions_device] = active_indices
             filled[active_positions_device] = True
+
+            inactive_positions = req.inactive_cached_positions
+            inactive_pages = req.inactive_cached_pages
+            if inactive_positions is not None and inactive_pages is not None:
+                if bool(torch.any(inactive_positions < 0).item()):
+                    raise RuntimeError("An inactive cached token has a negative raw position.")
+                if bool(torch.any(inactive_positions >= full_token_prefix_len).item()):
+                    raise RuntimeError("An inactive cached token lies outside the commit prefix.")
+                inactive_device = inactive_positions.to(
+                    device=active_indices.device, dtype=torch.int64, non_blocking=True
+                )
+                full_indices[inactive_device] = inactive_pages
+                filled[inactive_device] = True
 
             missing_positions = torch.nonzero(~filled, as_tuple=False).view(-1)
             cacheable_full_len = (
@@ -753,24 +709,14 @@ class CacheManager:
                 key_indices,
                 commit_virtual_mask,
             )
-            if staged_full_page_indices is not None:
-                full_positions = torch.arange(cacheable_full_len, dtype=torch.int64, device="cpu")
-                self._free_finished_candidates(
-                    req,
-                    full_indices[:cacheable_full_len],
-                    req.radix_token_to_key[full_positions],
-                    insert_result,
-                    excluded_indices,
-                )
-            else:
-                active_key_positions = req.radix_token_to_key[active_positions]
-                self._free_finished_candidates(
-                    req,
-                    active_indices,
-                    active_key_positions,
-                    insert_result,
-                    excluded_indices,
-                )
+            active_key_positions = req.radix_token_to_key[active_positions]
+            self._free_finished_candidates(
+                req,
+                active_indices,
+                active_key_positions,
+                insert_result,
+                excluded_indices,
+            )
         finally:
             self.unlock(old_handle)
 
@@ -830,20 +776,8 @@ class CacheManager:
             )
             return adopted
 
-        staged_owned_page_mask = getattr(req, "staged_owned_page_mask", None)
-        if staged_owned_page_mask is not None:
-            # The staged map covers the prompt raw stream. Any later generated
-            # tokens are necessarily request-owned pages.
-            staged_len = min(len(staged_owned_page_mask), len(candidates))
-            newly_allocated = torch.ones(
-                len(candidates), dtype=torch.bool, device=candidates.device
-            )
-            newly_allocated[:staged_len] = staged_owned_page_mask[:staged_len]
-        else:
-            active_slots = torch.arange(
-                len(candidates), dtype=torch.int64, device=candidates.device
-            )
-            newly_allocated = active_slots >= req.initial_active_cached_len
+        active_slots = torch.arange(len(candidates), dtype=torch.int64, device=candidates.device)
+        newly_allocated = active_slots >= req.initial_active_cached_len
         if req.retry_transformed_mask is not None:
             transformed = req.retry_transformed_mask.to(
                 device=candidates.device, dtype=torch.bool, non_blocking=True
@@ -853,11 +787,11 @@ class CacheManager:
             newly_allocated[: len(transformed)] |= transformed
         adopted = adopted_pages(candidates, candidate_key_positions)
         released = candidates[newly_allocated & (~adopted)]
-        inactive_positions = req.retry_inactive_transformed_positions
-        inactive_pages = req.retry_inactive_transformed_pages
+        inactive_positions = req.inactive_cached_positions
+        inactive_pages = req.inactive_cached_pages
         if inactive_positions is not None and inactive_pages is not None:
             if req.radix_token_to_key is None:
-                raise RuntimeError("Inactive Retry pages require a structured Radix mapping.")
+                raise RuntimeError("Inactive cached pages require a structured Radix mapping.")
             inactive_key_positions = req.radix_token_to_key[inactive_positions].to(
                 device=inactive_pages.device, dtype=torch.int64, non_blocking=True
             )

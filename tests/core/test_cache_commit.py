@@ -66,8 +66,8 @@ def _delta_req(
         table_idx=row,
         cache_handle=_root_handle(cache_manager),
         retry_transformed_mask=None,
-        retry_inactive_transformed_positions=None,
-        retry_inactive_transformed_pages=None,
+        inactive_cached_positions=None,
+        inactive_cached_pages=None,
     )
 
 

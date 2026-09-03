@@ -10,10 +10,7 @@ pytest.importorskip("tvm_ffi")
 import minisgl.core as core
 from minisgl.kernel.radix_reposition import DELTA_KIND, REPOSITION_KIND, TOKEN_KIND
 from minisgl.kvcache.radix_cache import RadixPrefixCache
-from minisgl.message import UserMsg
 from minisgl.scheduler.cache import CacheManager
-from minisgl.scheduler.radix_delta import DeltaMarkerRegistry
-from minisgl.scheduler.scheduler import Scheduler
 
 
 @pytest.fixture(autouse=True)
@@ -35,108 +32,6 @@ def _records(rows: list[list[int]]) -> torch.Tensor:
 
 def _mask(length: int) -> torch.Tensor:
     return torch.zeros(length, dtype=torch.bool, device="cpu")
-
-
-def _reposition_user_msg(uid: int) -> UserMsg:
-    return UserMsg(
-        uid=uid,
-        input_ids=torch.tensor([11, 12], dtype=torch.int32),
-        true_positions=torch.tensor([1, 2], dtype=torch.int32),
-        raw_positions=torch.tensor([1, 2], dtype=torch.int32),
-        radix_input_ids=torch.tensor([11, 12], dtype=torch.int64),
-        sampling_params=core.SamplingParams(max_tokens=1),
-        radix_match_ids=torch.tensor([10, 11, 12], dtype=torch.int64),
-        drop_event_positions=torch.tensor([2], dtype=torch.int32),
-        drop_range_offsets=torch.tensor([0, 1], dtype=torch.int32),
-        drop_position_ranges=torch.tensor([0, 1], dtype=torch.int32),
-        drop_effective_event_count=1,
-        reposition_raw_boundaries=torch.tensor([1], dtype=torch.int32),
-        reposition_insert_offsets=torch.tensor([2], dtype=torch.int32),
-        reposition_input_ids=torch.tensor([10, 11, 12], dtype=torch.int32),
-        full_input_ids=torch.tensor([10, 11, 12], dtype=torch.int32),
-        full_keep_mask=torch.tensor([0, 1, 1], dtype=torch.int32),
-        prefix_keep_mask=torch.tensor([0, 1], dtype=torch.int32),
-    )
-
-
-def _noop_reposition_user_msg(uid: int) -> UserMsg:
-    return UserMsg(
-        uid=uid,
-        input_ids=torch.tensor([10, 11, 13], dtype=torch.int32),
-        true_positions=torch.tensor([0, 1, 3], dtype=torch.int32),
-        raw_positions=torch.tensor([0, 1, 3], dtype=torch.int32),
-        radix_input_ids=torch.tensor([10, 11, 13], dtype=torch.int64),
-        sampling_params=core.SamplingParams(max_tokens=1),
-        radix_match_ids=torch.tensor([10, 11, 12, 13], dtype=torch.int64),
-        drop_event_positions=torch.tensor([3], dtype=torch.int32),
-        drop_range_offsets=torch.tensor([0, 1], dtype=torch.int32),
-        drop_position_ranges=torch.tensor([2, 3], dtype=torch.int32),
-        drop_effective_event_count=1,
-        reposition_raw_boundaries=torch.tensor([2], dtype=torch.int32),
-        reposition_insert_offsets=torch.tensor([3], dtype=torch.int32),
-        reposition_input_ids=torch.tensor([10, 11, 12, 13], dtype=torch.int32),
-        full_input_ids=torch.tensor([10, 11, 12, 13], dtype=torch.int32),
-        full_token_visible_until=torch.tensor([5, 5, 3, 5], dtype=torch.int32),
-        full_keep_mask=torch.tensor([1, 1, 0, 1], dtype=torch.int32),
-        prefix_keep_mask=torch.tensor([1, 1, 0], dtype=torch.int32),
-    )
-
-
-def test_scheduler_compiles_reposition_batch_once(monkeypatch: pytest.MonkeyPatch) -> None:
-    import minisgl.scheduler.scheduler as scheduler_module
-
-    scheduler = object.__new__(Scheduler)
-    scheduler.delta_marker_registry = DeltaMarkerRegistry()
-    scheduler.cache_manager = SimpleNamespace(drop_aware_eviction=False)
-    scheduler.send_result = lambda _: None
-    messages = [_reposition_user_msg(101), _reposition_user_msg(102)]
-    real_compile_batch = scheduler_module.compile_radix_reposition_layout_batch
-    calls: list[tuple[int, int]] = []
-
-    def record_compile_batch(requests, *, max_workers: int):
-        calls.append((len(requests), max_workers))
-        return real_compile_batch(requests, max_workers=max_workers)
-
-    monkeypatch.setattr(
-        scheduler_module,
-        "compile_radix_reposition_layout_batch",
-        record_compile_batch,
-    )
-
-    rejected = scheduler._compile_reposition_batch(messages)
-
-    assert rejected == set()
-    assert calls == [(2, 2)]
-    for message in messages:
-        assert message.context_stage_count == 2
-        assert message.radix_compile_ns > 0
-        assert message.true_positions.tolist() == [0, 1]
-        assert message.reposition_transition_offsets.tolist() == [0, 1]
-        assert message.reposition_transition_raw_tokens.tolist() == [1]
-        assert message.radix_match_ids[:, 0].tolist() == [0, 0, 1, 2, 0]
-        assert message.radix_marker_ids is not None
-        assert not message.use_context_mask
-        scheduler.delta_marker_registry.release_request_refs(message.radix_marker_ids)
-        message.radix_marker_ids = None
-    assert scheduler.delta_marker_registry.request_ref_count == 0
-
-
-def test_scheduler_routes_drop_with_noop_reposition_to_mask() -> None:
-    scheduler = object.__new__(Scheduler)
-    scheduler.delta_marker_registry = DeltaMarkerRegistry()
-    scheduler.cache_manager = SimpleNamespace(drop_aware_eviction=False)
-    scheduler.send_result = lambda _: None
-    message = _noop_reposition_user_msg(103)
-
-    rejected = scheduler._compile_reposition_batch([message])
-
-    assert rejected == set()
-    assert message.reposition_transition_offsets.tolist() == [0]
-    assert message.use_context_mask
-    assert message.radix_marker_ids is not None
-    scheduler.delta_marker_registry.release_request_refs(message.radix_marker_ids)
-    message.radix_marker_ids = None
-    assert scheduler.delta_marker_registry.request_ref_count == 0
 
 
 def test_retry_stops_before_target_reposition_missing_from_source() -> None:
@@ -416,8 +311,8 @@ def test_concurrent_commit_adopts_inactive_retry_page_and_frees_duplicate() -> N
             table_idx=row,
             cache_handle=match.handle,
             retry_transformed_mask=torch.tensor([True], dtype=torch.bool),
-            retry_inactive_transformed_positions=torch.tensor([1], dtype=torch.int64),
-            retry_inactive_transformed_pages=retry_inactive.view(1),
+            inactive_cached_positions=torch.tensor([1], dtype=torch.int64),
+            inactive_cached_pages=retry_inactive.view(1),
             use_context_mask=False,
         )
 
@@ -450,8 +345,8 @@ def test_finished_candidate_requires_canonical_slot_not_only_insert_range() -> N
     req = SimpleNamespace(
         initial_active_cached_len=0,
         retry_transformed_mask=None,
-        retry_inactive_transformed_positions=None,
-        retry_inactive_transformed_pages=None,
+        inactive_cached_positions=None,
+        inactive_cached_pages=None,
         radix_token_to_key=None,
     )
 

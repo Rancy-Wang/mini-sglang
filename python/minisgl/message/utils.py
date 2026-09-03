@@ -22,10 +22,13 @@ def serialize_type(self) -> Dict:
     serialized = {}
 
     if isinstance(self, torch.Tensor):
-        assert self.dim() == 1, "we can only serialize 1D tensor for now"
+        if not self.is_cpu:
+            raise ValueError("Message tensors must reside on CPU before serialization.")
+        tensor = self.contiguous()
         serialized["__type__"] = "Tensor"
-        serialized["buffer"] = self.numpy().tobytes()
-        serialized["dtype"] = str(self.dtype)
+        serialized["buffer"] = tensor.numpy().tobytes()
+        serialized["dtype"] = str(tensor.dtype)
+        serialized["shape"] = list(tensor.shape)
         return serialized
 
     # normal type
@@ -51,13 +54,15 @@ def _deserialize_any(cls_map: Dict[str, Type], data: Any) -> Any:
 
 def deserialize_type(cls_map: Dict[str, Type], data: Dict) -> Any:
     type_name = data["__type__"]
-    # we can only serialize 1D tensor for now
     if type_name == "Tensor":
         buffer = data["buffer"]
         dtype_str = data["dtype"].replace("torch.", "")
         np_dtype = getattr(np, dtype_str)
         assert isinstance(buffer, bytes)
         np_tensor = np.frombuffer(buffer, dtype=np_dtype)
+        shape = data.get("shape")
+        if shape is not None:
+            np_tensor = np_tensor.reshape(shape)
         return torch.from_numpy(np_tensor.copy())
 
     cls = cls_map[type_name]

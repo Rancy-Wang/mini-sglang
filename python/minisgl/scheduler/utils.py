@@ -7,7 +7,6 @@ import torch
 
 if TYPE_CHECKING:
     from minisgl.core import SamplingParams
-    from minisgl.kvcache import BaseCacheHandle
 
     from .prefill import ChunkedReq
 
@@ -37,6 +36,8 @@ class PendingReq:
     drop_position_ranges: torch.Tensor | None = None
     drop_effective_event_count: int = 0
     use_context_mask: bool = False
+    context_compact_stream: bool = False
+    context_post_prefill_keep_mask: torch.Tensor | None = None
     radix_key_virtual_mask: torch.Tensor | None = None
     radix_key_to_token: torch.Tensor | None = None
     radix_token_to_key: torch.Tensor | None = None
@@ -44,47 +45,16 @@ class PendingReq:
     radix_marker_ids: tuple[int, ...] = ()
     radix_positions: torch.Tensor | None = None
     radix_repos_info: torch.Tensor | None = None
-    radix_materialized_stage: torch.Tensor | None = None
-    reposition_raw_boundaries: torch.Tensor | None = None
-    reposition_insert_offsets: torch.Tensor | None = None
-    reposition_input_ids: torch.Tensor | None = None
-    reposition_birth_positions: torch.Tensor | None = None
-    reposition_birth_stages: torch.Tensor | None = None
-    reposition_transition_offsets: torch.Tensor | None = None
-    reposition_transition_raw_tokens: torch.Tensor | None = None
-    reposition_transition_old_positions: torch.Tensor | None = None
-    reposition_transition_new_positions: torch.Tensor | None = None
-    reposition_effective_stages: torch.Tensor | None = None
     radix_next_position: int | None = None
     radix_current_reposition: int = -1
     chunked_req: ChunkedReq | None = None
     tokenize_invocations: int = 1
-    context_stage_count: int = 0
     radix_compile_ns: int = 0
     radix_match_ns: int = 0
     retry_plan_ns: int = 0
     reposition_transition_count: int = 0
     reposition_h2d_bytes: int = 0
     reposition_d2h_bytes: int = 0
-    staged_reposition: bool = False
-    staged_ready: bool = True
-    staged_raw_cursor: int = 0
-    staged_drop_cursor: int = 0
-    staged_reposition_cursor: int = 0
-    staged_actual_stage: int = 0
-    staged_segment_end: int = 0
-    staged_final_segment: bool = False
-    staged_active_raw: torch.Tensor | None = None
-    staged_current_positions: torch.Tensor | None = None
-    staged_full_page_indices: torch.Tensor | None = None
-    staged_owned_page_mask: torch.Tensor | None = None
-    staged_initial_full_match_indices: torch.Tensor | None = None
-    staged_matchable_prefix_len: int = 0
-    staged_radix_cached_tokens: int = 0
-    staged_usage_cached_tokens: int = 0
-    staged_cache_reuse_ratio: float = 0.0
-    staged_cache_handle: BaseCacheHandle | None = None
-    staged_table_idx: int | None = None
 
     @property
     def input_len(self) -> int:

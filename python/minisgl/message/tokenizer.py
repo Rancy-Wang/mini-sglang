@@ -63,6 +63,20 @@ class WarmupAckMsg(BaseTokenizerMsg):
     cached_tokens: int
     drop_skipped_tokens: int
     finished: bool
+    radix_match_ns: int = 0
+    retry_plan_ns: int = 0
+    reposition_transition_count: int = 0
+    reposition_h2d_bytes: int = 0
+    reposition_d2h_bytes: int = 0
+
+
+@dataclass
+class RepositionOpenAckMsg(BaseTokenizerMsg):
+    """Stable marker lease plus the Scheduler's per-turn Prefill quantum."""
+
+    uid: int
+    marker_ids: List[int]
+    step_token_budget: int
 
 
 @dataclass
