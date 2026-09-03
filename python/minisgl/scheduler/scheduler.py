@@ -14,10 +14,10 @@ from minisgl.message import (
     BatchBackendMsg,
     DetokenizeMsg,
     ExitMsg,
-    RequestMetricsState,
-    RequestRejectMsg,
     RepositionOpenAckMsg,
     RepositionOpenMsg,
+    RequestMetricsState,
+    RequestRejectMsg,
     UserMsg,
     WarmupAckMsg,
 )

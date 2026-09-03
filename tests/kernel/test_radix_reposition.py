@@ -51,7 +51,7 @@ def _reference(
     drops: list[tuple[int, list[tuple[int, int]]]],
     repositions: list[int],
 ):
-    drop_by_offset = {offset: ranges for offset, ranges in drops}
+    drop_by_offset = dict(drops)
     reposition_by_offset = {
         boundary + 1: (idx, boundary) for idx, boundary in enumerate(repositions)
     }

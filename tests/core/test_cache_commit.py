@@ -2,10 +2,9 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import minisgl.core as core
 import pytest
 import torch
-
-import minisgl.core as core
 from minisgl.kernel.radix_reposition import compile_radix_reposition_layout
 from minisgl.scheduler.cache import CacheManager
 
