@@ -172,7 +172,7 @@ def test_tokenizer_warns_for_ignored_prefix_but_stages_effective_reposition(capl
     )
 
     assert result.reposition_input_ids is not None
-    assert result.reposition_layout.effective_reposition_stages.tolist() == [0, 1]
+    assert result.reposition_layout.effective_reposition_stages.tolist() == [-1, 1]
     assert result.message_meta["ignored_reposition_boundaries"] == [1]
     assert "request 23" in caplog.text
 
