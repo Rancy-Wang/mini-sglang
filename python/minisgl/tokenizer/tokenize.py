@@ -7,6 +7,10 @@ from datetime import date
 from typing import Any, Callable, Dict, List
 
 import torch
+from minisgl.kernel.radix_reposition import (
+    RadixRepositionLayout,
+    compile_radix_reposition_layout,
+)
 from minisgl.kernel.text_match import find_all
 from minisgl.message import TokenizeMsg
 from minisgl.message.tokenizer import get_gpt_oss_terminal_stop_token_ids
@@ -47,6 +51,15 @@ class TokenizedResult:
     reposition_insert_offsets: torch.Tensor | None = None
     reposition_input_ids: torch.Tensor | None = None
     radix_commit_token_len: int | None = None
+    radix_commit_key_len: int | None = None
+    radix_key_virtual_mask: torch.Tensor | None = None
+    radix_key_to_token: torch.Tensor | None = None
+    radix_token_to_key: torch.Tensor | None = None
+    radix_positions: torch.Tensor | None = None
+    radix_repos_info: torch.Tensor | None = None
+    radix_next_position: int | None = None
+    radix_current_reposition: int = -1
+    reposition_layout: RadixRepositionLayout | None = None
     stop_token_seqs: List[List[int]] | None = None
     message_meta: dict | None = None
     tokenize_invocations: int = 1
@@ -134,6 +147,96 @@ class TokenizeManager:
         # Be optimistic: many tokenizers accept extra kwargs via **kwargs even
         # when the explicit signature does not list `enable_thinking`.
         self._supports_enable_thinking = True
+
+    @staticmethod
+    def _empty_context_events() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return (
+            torch.empty(0, dtype=torch.int32, device="cpu"),
+            torch.zeros(1, dtype=torch.int32, device="cpu"),
+            torch.empty(0, dtype=torch.int32, device="cpu"),
+        )
+
+    def _compile_delta_layout(
+        self,
+        token_ids: torch.Tensor,
+        token_drop_events: TokenDropEvents | None,
+        final_keep_mask: torch.Tensor,
+        reposition_raw_boundaries: torch.Tensor | None,
+        reposition_insert_offsets: torch.Tensor | None,
+    ) -> RadixRepositionLayout | None:
+        if self.radix_drop_key_mode != "delta-marker":
+            return None
+        if token_drop_events is None:
+            event_positions, range_offsets, ranges = self._empty_context_events()
+        else:
+            event_positions, range_offsets, ranges = self._select_effective_delta_wire(
+                token_drop_events,
+                final_keep_mask,
+            )
+        empty = torch.empty(0, dtype=torch.int32, device="cpu")
+        return compile_radix_reposition_layout(
+            token_ids,
+            event_positions,
+            range_offsets,
+            ranges,
+            reposition_raw_boundaries if reposition_raw_boundaries is not None else empty,
+            reposition_insert_offsets if reposition_insert_offsets is not None else empty,
+        )
+
+    @staticmethod
+    def _select_effective_delta_wire(
+        events: TokenDropEvents,
+        final_keep_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Select target-effective events before the one CPU Radix compilation."""
+
+        event_count = min(events.effective_event_count, len(events.event_insert_offsets))
+        if event_count >= 0:
+            range_count = int(events.range_offsets[event_count])
+            return (
+                events.event_insert_offsets[:event_count].contiguous(),
+                events.range_offsets[: event_count + 1].contiguous(),
+                events.raw_ranges[: 2 * range_count].contiguous(),
+            )
+
+        keep_mask = final_keep_mask.to(device="cpu", dtype=torch.bool).view(-1)
+        selected_positions: list[int] = []
+        selected_ranges: list[tuple[int, int]] = []
+        selected_offsets = [0]
+        ranges = events.raw_ranges.view(-1, 2)
+        for event_index, insertion in enumerate(events.event_insert_offsets.tolist()):
+            begin = int(events.range_offsets[event_index])
+            end = int(events.range_offsets[event_index + 1])
+            event_ranges = [
+                (int(start), int(finish))
+                for start, finish in ranges[begin:end].tolist()
+            ]
+            effective: list[bool] = []
+            for start, finish in event_ranges:
+                segment = keep_mask[start:finish]
+                all_kept = bool(torch.all(segment).item())
+                all_dropped = bool(torch.all(~segment).item())
+                if not (all_kept or all_dropped):
+                    raise ValueError(
+                        "A target-specific keep mask partially cuts a Drop delta range: "
+                        f"event={insertion}, range=[{start}, {finish})"
+                    )
+                effective.append(all_dropped)
+            if effective and any(state != effective[0] for state in effective[1:]):
+                raise ValueError(
+                    "One Drop event has inconsistent target-specific range visibility: "
+                    f"event={insertion}, effective={effective}"
+                )
+            if effective and effective[0]:
+                selected_positions.append(int(insertion))
+                selected_ranges.extend(event_ranges)
+                selected_offsets.append(len(selected_ranges))
+
+        return (
+            torch.tensor(selected_positions, dtype=torch.int32, device="cpu"),
+            torch.tensor(selected_offsets, dtype=torch.int32, device="cpu"),
+            torch.tensor(selected_ranges, dtype=torch.int32, device="cpu").reshape(-1),
+        )
 
     def _call_chat_template(
         self,
@@ -1836,7 +1939,31 @@ class TokenizeManager:
         # Backward-compatible alias for legacy consumers.
         message_starts = radix_state_starts
 
-        radix_input_ids = radix_match_ids[keep_mask].contiguous()
+        layout = self._compile_delta_layout(
+            full_with_gen_tensor,
+            token_drop_events,
+            keep_mask,
+            reposition_raw_boundaries,
+            reposition_insert_offsets,
+        )
+        if layout is None:
+            radix_input_ids = radix_match_ids[keep_mask].contiguous()
+            radix_commit_key_len = None
+        else:
+            kept_raw = torch.nonzero(keep_mask, as_tuple=False).view(-1)
+            radix_match_ids = layout.records
+            radix_input_ids = layout.records[
+                layout.token_to_key[kept_raw.to(torch.int64)]
+            ].contiguous()
+            radix_commit_key_len = (
+                None
+                if warmup_commit_token_len is None
+                else (
+                    len(layout.records)
+                    if warmup_commit_token_len == len(layout.token_to_key)
+                    else int(layout.token_to_key[warmup_commit_token_len])
+                )
+            )
 
         return TokenizedResult(
             input_ids=input_ids,
@@ -1873,6 +2000,17 @@ class TokenizeManager:
             reposition_insert_offsets=reposition_insert_offsets,
             reposition_input_ids=(full_with_gen_tensor if msg.reposition is not None else None),
             radix_commit_token_len=warmup_commit_token_len,
+            radix_commit_key_len=radix_commit_key_len,
+            radix_key_virtual_mask=(layout.virtual_mask if layout is not None else None),
+            radix_key_to_token=(layout.key_to_token if layout is not None else None),
+            radix_token_to_key=(layout.token_to_key if layout is not None else None),
+            radix_positions=(layout.positions if layout is not None else None),
+            radix_repos_info=(layout.repos_info if layout is not None else None),
+            radix_next_position=(layout.next_position if layout is not None else None),
+            radix_current_reposition=(
+                layout.current_reposition if layout is not None else -1
+            ),
+            reposition_layout=layout,
             stop_token_seqs=self._build_stop_token_seqs(msg.stop),
             message_meta={
                 "raw_len_with_gen": len(full_with_gen_tensor),
@@ -1908,17 +2046,44 @@ class TokenizeManager:
                     self.tokenizer.encode(prompt, return_tensors="pt")
                 )
                 input_ids = input_ids.view(-1).to(torch.int32)
+                layout = self._compile_delta_layout(
+                    input_ids,
+                    None,
+                    torch.ones(len(input_ids), dtype=torch.bool, device="cpu"),
+                    None,
+                    None,
+                )
+                radix_match_ids = (
+                    layout.records if layout is not None else input_ids.to(torch.int64)
+                )
+                radix_input_ids = (
+                    layout.records[layout.token_to_key]
+                    if layout is not None
+                    else input_ids.to(torch.int64)
+                )
                 results.append(
                     TokenizedResult(
                         input_ids=input_ids,
                         true_positions=torch.arange(len(input_ids), dtype=torch.int32),
                         raw_positions=torch.arange(len(input_ids), dtype=torch.int32),
-                        radix_input_ids=input_ids.to(torch.int64),
-                        radix_match_ids=input_ids.to(torch.int64),
+                        radix_input_ids=radix_input_ids,
+                        radix_match_ids=radix_match_ids,
                         prefix_keep_mask=torch.ones(
                             max(len(input_ids) - 1, 0), dtype=torch.int32, device="cpu"
                         ),
                         prompt_tokens=len(input_ids),
+                        radix_key_virtual_mask=(
+                            layout.virtual_mask if layout is not None else None
+                        ),
+                        radix_key_to_token=(layout.key_to_token if layout is not None else None),
+                        radix_token_to_key=(layout.token_to_key if layout is not None else None),
+                        radix_positions=(layout.positions if layout is not None else None),
+                        radix_repos_info=(layout.repos_info if layout is not None else None),
+                        radix_next_position=(layout.next_position if layout is not None else None),
+                        radix_current_reposition=(
+                            layout.current_reposition if layout is not None else -1
+                        ),
+                        reposition_layout=layout,
                         stop_token_seqs=self._build_stop_token_seqs(msg.stop),
                         message_meta=None,
                     )

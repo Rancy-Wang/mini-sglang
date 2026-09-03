@@ -100,7 +100,6 @@ class Req:
     radix_key_to_token: torch.Tensor | None = None
     radix_token_to_key: torch.Tensor | None = None
     radix_commit_key_len: int | None = None
-    radix_marker_ids: tuple[int, ...] = ()
     radix_positions: torch.Tensor | None = None
     radix_repos_info: torch.Tensor | None = None
     radix_next_position: int | None = None
@@ -193,17 +192,16 @@ class Req:
             if not torch.equal(token_to_key, real_key_positions):
                 raise ValueError("radix_token_to_key is not the inverse key mapping.")
             if self.radix_match_ids.ndim == 2:
+                from minisgl.scheduler.radix_delta import validate_delta_records
+
+                validate_delta_records(
+                    self.radix_match_ids,
+                    token_count=len(token_to_key),
+                    require_materialized=True,
+                )
                 expected_virtual = self.radix_match_ids[:, 0] != 0
                 if not torch.equal(virtual_mask, expected_virtual):
                     raise ValueError("Structured Radix virtual kinds disagree with the mask.")
-                delta_mask = virtual_mask & (self.radix_match_ids[:, 0] == 1)
-                virtual_keys = self.radix_match_ids[delta_mask, 1].tolist()
-            else:
-                virtual_keys = self.radix_match_ids[virtual_mask].tolist()
-            if virtual_keys != list(self.radix_marker_ids):
-                raise ValueError("radix_marker_ids do not match the Delta marker stream.")
-        elif self.radix_marker_ids:
-            raise ValueError("radix_marker_ids require a delta-marker Radix layout.")
         if self.radix_commit_key_len is not None:
             if self.radix_key_virtual_mask is None:
                 raise ValueError("radix_commit_key_len requires a delta-marker Radix layout.")

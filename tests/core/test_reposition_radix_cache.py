@@ -115,6 +115,35 @@ def test_structured_exact_index_survives_edge_split() -> None:
     cache.check_integrity()
 
 
+def test_multi_range_delta_edge_uses_the_complete_block_for_child_lookup() -> None:
+    cache = _cache()
+    first = _records(
+        [
+            [TOKEN_KIND, 10, -1, 0],
+            [TOKEN_KIND, 11, -1, 1],
+            [TOKEN_KIND, 12, -1, 2],
+            [TOKEN_KIND, 13, -1, 3],
+            [DELTA_KIND, -1, -2, -1],
+            [DELTA_KIND, -4, -5, -1],
+            [TOKEN_KIND, 14, -1, 4],
+        ]
+    )
+    second = first.clone()
+    second[5] = torch.tensor([DELTA_KIND, -3, -4, -1], dtype=torch.int32)
+    virtual = torch.tensor([False, False, False, False, True, True, False])
+    first_values = torch.tensor([0, 1, 2, 3, -1, -1, 4], dtype=torch.int32)
+    second_values = torch.tensor([0, 1, 2, 3, -1, -1, 5], dtype=torch.int32)
+
+    cache.insert_prefix(first, first_values, virtual)
+    cache.insert_prefix(second, second_values, virtual)
+
+    assert cache.match_prefix(first, virtual).cuda_handle.cached_len == len(first)
+    assert cache.match_prefix(second, virtual).cuda_handle.cached_len == len(second)
+    shared_token_node = next(iter(cache.root_node.children.values()))
+    assert len(shared_token_node.children_exact) == 2
+    cache.check_integrity()
+
+
 def test_ordinary_radix_index_survives_edge_split() -> None:
     cache = _cache()
     first = torch.tensor([10, 11, 12], dtype=torch.int32)
@@ -183,9 +212,9 @@ def test_retry_position_plan_keeps_changed_pages_that_are_dropped_later() -> Non
         [
             [TOKEN_KIND, 10, -1, 0],
             [TOKEN_KIND, 11, -1, 1],
-            [DELTA_KIND, -7, -1, -1],
+            [DELTA_KIND, -1, -2, -1],
             [TOKEN_KIND, 12, -1, 2],
-            [DELTA_KIND, -8, -1, -1],
+            [DELTA_KIND, -2, -3, -1],
             [TOKEN_KIND, 13, -1, 3],
         ]
     )
@@ -200,10 +229,10 @@ def test_retry_position_plan_keeps_changed_pages_that_are_dropped_later() -> Non
         [
             [TOKEN_KIND, 10, -1, 0],
             [TOKEN_KIND, 11, 1, 0],
-            [DELTA_KIND, -7, -1, -1],
+            [DELTA_KIND, -1, -2, -1],
             [REPOSITION_KIND, 1, -1, -1],
             [TOKEN_KIND, 12, 1, 1],
-            [DELTA_KIND, -8, -1, -1],
+            [DELTA_KIND, -2, -3, -1],
             [TOKEN_KIND, 13, 1, 2],
         ]
     )
@@ -237,7 +266,7 @@ def test_concurrent_commit_adopts_inactive_retry_page_and_frees_duplicate() -> N
             [TOKEN_KIND, 10, -1, 0],
             [TOKEN_KIND, 11, -1, 1],
             [TOKEN_KIND, 12, -1, 2],
-            [DELTA_KIND, -7, -1, -1],
+            [DELTA_KIND, -1, -2, -1],
         ]
     )
     source_virtual = torch.tensor([False, False, False, True], dtype=torch.bool)
@@ -252,10 +281,10 @@ def test_concurrent_commit_adopts_inactive_retry_page_and_frees_duplicate() -> N
             [TOKEN_KIND, 10, -1, 0],
             [TOKEN_KIND, 11, 2, 0],
             [TOKEN_KIND, 12, 2, 1],
-            [DELTA_KIND, -7, -1, -1],
+            [DELTA_KIND, -1, -2, -1],
             [REPOSITION_KIND, 2, -1, -1],
             [TOKEN_KIND, 13, 2, 2],
-            [DELTA_KIND, -8, -1, -1],
+            [DELTA_KIND, -2, -3, -1],
         ]
     )
     target_virtual = torch.tensor([False, False, False, True, True, False, True], dtype=torch.bool)

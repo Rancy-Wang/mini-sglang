@@ -160,7 +160,6 @@ auto compile_radix_reposition_layout(
     const tvm::ffi::TensorView drop_insert_offsets,
     const tvm::ffi::TensorView drop_range_offsets,
     const tvm::ffi::TensorView drop_ranges,
-    const tvm::ffi::TensorView delta_marker_ids,
     const tvm::ffi::TensorView reposition_raw_boundaries,
     const tvm::ffi::TensorView reposition_insert_offsets,
     const tvm::ffi::TensorView records,
@@ -178,6 +177,7 @@ auto compile_radix_reposition_layout(
     const tvm::ffi::TensorView transition_old_positions,
     const tvm::ffi::TensorView transition_new_positions,
     const tvm::ffi::TensorView effective_reposition_stages,
+    const tvm::ffi::TensorView drop_event_to_key,
     const tvm::ffi::TensorView effective_repositions,
     const tvm::ffi::TensorView ignored_repositions,
     const tvm::ffi::TensorView status) -> void {
@@ -186,8 +186,7 @@ auto compile_radix_reposition_layout(
                      "token_ids must be a CPU int32/int64 vector");
   host::RuntimeCheck(is_cpu_tensor(drop_insert_offsets, 1, 32) &&
                          is_cpu_tensor(drop_range_offsets, 1, 32) &&
-                         is_cpu_tensor(drop_ranges, 1, 32) &&
-                         is_cpu_tensor(delta_marker_ids, 1, 32),
+                         is_cpu_tensor(drop_ranges, 1, 32),
                      "Drop inputs must be contiguous CPU int32 vectors");
   host::RuntimeCheck(is_cpu_tensor(reposition_raw_boundaries, 1, 32) &&
                          is_cpu_tensor(reposition_insert_offsets, 1, 32),
@@ -201,6 +200,7 @@ auto compile_radix_reposition_layout(
                      "mask outputs must be contiguous CPU bool vectors");
   host::RuntimeCheck(is_cpu_tensor(key_to_token, 1, 64) &&
                          is_cpu_tensor(token_to_key, 1, 64) &&
+                         is_cpu_tensor(drop_event_to_key, 1, 64) &&
                          is_cpu_tensor(status, 1, 64),
                      "mapping/status outputs must be contiguous CPU int64 vectors");
   host::RuntimeCheck(is_cpu_tensor(positions, 1, 32) &&
@@ -222,13 +222,12 @@ auto compile_radix_reposition_layout(
                      "The token stream exceeds the int32 Reposition limit");
   host::RuntimeCheck(drop_range_offsets.size(0) == drop_count + 1,
                      "drop_range_offsets must have E + 1 entries");
-  host::RuntimeCheck(delta_marker_ids.size(0) == drop_count,
-                     "delta_marker_ids must have one entry per Drop event");
   host::RuntimeCheck(drop_ranges.size(0) % 2 == 0,
                      "drop_ranges must contain start/end pairs");
   host::RuntimeCheck(reposition_insert_offsets.size(0) == reposition_count,
                      "Reposition boundaries and offsets must align");
-  host::RuntimeCheck(records.size(0) >= token_count + drop_count + reposition_count &&
+  host::RuntimeCheck(records.size(0) >=
+                         token_count + drop_ranges.size(0) / 2 + reposition_count &&
                          virtual_mask.size(0) >= records.size(0) &&
                          key_to_token.size(0) >= records.size(0),
                      "Radix output capacity is too small");
@@ -243,6 +242,7 @@ auto compile_radix_reposition_layout(
   host::RuntimeCheck(effective_repositions.size(0) == reposition_count &&
                          ignored_repositions.size(0) == reposition_count &&
                          effective_reposition_stages.size(0) == reposition_count &&
+                         drop_event_to_key.size(0) == drop_count &&
                          transition_offsets.size(0) >= reposition_count + 1 &&
                          transition_raw_tokens.size(0) == transition_old_positions.size(0) &&
                          transition_raw_tokens.size(0) == transition_new_positions.size(0) &&
@@ -252,7 +252,6 @@ auto compile_radix_reposition_layout(
   const auto *drops = static_cast<const int32_t *>(drop_insert_offsets.data_ptr());
   const auto *drop_offsets = static_cast<const int32_t *>(drop_range_offsets.data_ptr());
   const auto *ranges = static_cast<const int32_t *>(drop_ranges.data_ptr());
-  const auto *markers = static_cast<const int32_t *>(delta_marker_ids.data_ptr());
   const auto *raw_boundaries =
       static_cast<const int32_t *>(reposition_raw_boundaries.data_ptr());
   const auto *reposition_offsets =
@@ -290,6 +289,7 @@ auto compile_radix_reposition_layout(
   auto *transition_new = static_cast<int32_t *>(transition_new_positions.data_ptr());
   auto *reposition_stage =
       static_cast<int32_t *>(effective_reposition_stages.data_ptr());
+  auto *drop_key = static_cast<int64_t *>(drop_event_to_key.data_ptr());
   auto *effective = static_cast<bool *>(effective_repositions.data_ptr());
   auto *ignored = static_cast<bool *>(ignored_repositions.data_ptr());
   auto *result_status = static_cast<int64_t *>(status.data_ptr());
@@ -433,12 +433,20 @@ auto compile_radix_reposition_layout(
   reposition_idx = 0;
   for (int32_t insertion = 0; insertion <= token_count; ++insertion) {
     if (drop_idx < drop_count && drops[drop_idx] == insertion) {
-      output[key_idx * 4] = kDelta;
-      output[key_idx * 4 + 1] = markers[drop_idx];
-      output[key_idx * 4 + 2] = -1;
-      output[key_idx * 4 + 3] = -1;
-      is_virtual[key_idx] = true;
-      key_token[key_idx++] = -1;
+      drop_key[drop_idx] = key_idx;
+      for (int32_t range_idx = drop_offsets[drop_idx];
+           range_idx < drop_offsets[drop_idx + 1]; ++range_idx) {
+        const int32_t start = ranges[2 * range_idx];
+        const int32_t end = ranges[2 * range_idx + 1];
+        output[key_idx * 4] = kDelta;
+        output[key_idx * 4 + 1] =
+            static_cast<int32_t>(-static_cast<int64_t>(start) - 1);
+        output[key_idx * 4 + 2] =
+            static_cast<int32_t>(-static_cast<int64_t>(end) - 1);
+        output[key_idx * 4 + 3] = -1;
+        is_virtual[key_idx] = true;
+        key_token[key_idx++] = -1;
+      }
       ++drop_idx;
     }
     if (reposition_idx < reposition_count &&

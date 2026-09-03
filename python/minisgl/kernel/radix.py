@@ -77,5 +77,9 @@ def radix_record_edge_hash(records: torch.Tensor) -> int:
     return int(_load_radix_module().radix_record_edge_hash(records))
 
 
+def radix_record_edge_equal(x: torch.Tensor, y: torch.Tensor) -> bool:
+    return bool(_load_radix_module().radix_record_edge_equal(x, y))
+
+
 def radix_record_retry_token(records: torch.Tensor) -> int:
     return int(_load_radix_module().radix_record_retry_token(records))

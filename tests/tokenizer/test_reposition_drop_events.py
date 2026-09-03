@@ -15,7 +15,7 @@ from minisgl.tokenizer.drop_rules import (
     ThinkingDropRule,
     TokenDropEvents,
 )
-from minisgl.tokenizer.tokenize import resolve_reposition_token_boundaries
+from minisgl.tokenizer.tokenize import TokenizeManager, resolve_reposition_token_boundaries
 
 
 def _context() -> DropCompileContext:
@@ -109,6 +109,33 @@ def test_reposition_resolver_uses_explicit_public_owner_mapping() -> None:
 
     assert resolved.raw_boundaries.tolist() == [5, 9]
     assert resolved.insert_offsets.tolist() == [6, 10]
+
+
+def test_tokenizer_filters_nonprefix_effective_drop_events_before_radix_compile() -> None:
+    manager = object.__new__(TokenizeManager)
+    manager.radix_drop_key_mode = "delta-marker"
+    events = TokenDropEvents(
+        event_insert_offsets=torch.tensor([2, 4], dtype=torch.int32),
+        range_offsets=torch.tensor([0, 1, 2], dtype=torch.int32),
+        raw_ranges=torch.tensor([0, 1, 2, 3], dtype=torch.int32),
+        full_token_visible_until=torch.full((4,), 4, dtype=torch.int32),
+        effective_event_count=-1,
+        effective_ranges=((2, 3),),
+    )
+
+    layout = manager._compile_delta_layout(
+        torch.tensor([10, 11, 12, 13], dtype=torch.int32),
+        events,
+        torch.tensor([1, 1, 0, 1], dtype=torch.bool),
+        None,
+        None,
+    )
+
+    assert layout is not None
+    assert layout.drop_insert_offsets.tolist() == [4]
+    assert layout.drop_range_offsets.tolist() == [0, 1]
+    assert layout.drop_ranges.tolist() == [2, 3]
+    assert layout.records[-1].tolist() == [1, -3, -4, -1]
 
 
 @pytest.mark.parametrize("reposition", [[1, 1], [2, 1], [True], [-1]])

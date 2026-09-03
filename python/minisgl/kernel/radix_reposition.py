@@ -17,6 +17,9 @@ REPOSITION_KIND = 2
 
 @dataclass(frozen=True)
 class RadixRepositionLayout:
+    drop_insert_offsets: torch.Tensor
+    drop_range_offsets: torch.Tensor
+    drop_ranges: torch.Tensor
     records: torch.Tensor
     virtual_mask: torch.Tensor
     key_to_token: torch.Tensor
@@ -32,6 +35,7 @@ class RadixRepositionLayout:
     transition_old_positions: torch.Tensor
     transition_new_positions: torch.Tensor
     effective_reposition_stages: torch.Tensor
+    drop_event_to_key: torch.Tensor
     effective_repositions: torch.Tensor
     ignored_repositions: torch.Tensor
     next_position: int
@@ -51,7 +55,6 @@ class RadixRepositionInput:
     drop_insert_offsets: torch.Tensor
     drop_range_offsets: torch.Tensor
     drop_ranges: torch.Tensor
-    delta_marker_ids: torch.Tensor
     reposition_raw_boundaries: torch.Tensor
     reposition_insert_offsets: torch.Tensor
 
@@ -69,7 +72,6 @@ def compile_radix_reposition_layout(
     drop_insert_offsets: torch.Tensor,
     drop_range_offsets: torch.Tensor,
     drop_ranges: torch.Tensor,
-    delta_marker_ids: torch.Tensor,
     reposition_raw_boundaries: torch.Tensor,
     reposition_insert_offsets: torch.Tensor,
 ) -> RadixRepositionLayout:
@@ -81,7 +83,6 @@ def compile_radix_reposition_layout(
     drop_insert_offsets = drop_insert_offsets.to(device="cpu", dtype=torch.int32).contiguous()
     drop_range_offsets = drop_range_offsets.to(device="cpu", dtype=torch.int32).contiguous()
     drop_ranges = drop_ranges.to(device="cpu", dtype=torch.int32).contiguous()
-    delta_marker_ids = delta_marker_ids.to(device="cpu", dtype=torch.int32).contiguous()
     reposition_raw_boundaries = reposition_raw_boundaries.to(
         device="cpu", dtype=torch.int32
     ).contiguous()
@@ -108,7 +109,8 @@ def compile_radix_reposition_layout(
         boundary = int(count_status[1])
         raise ValueError(f"Reposition at raw boundary {boundary} has no active tokens.")
     transition_count = int(transition_counts.sum().item())
-    capacity = token_count + len(drop_insert_offsets) + reposition_count
+    range_count = len(drop_ranges) // 2
+    capacity = token_count + range_count + reposition_count
     records = torch.empty((capacity, 4), dtype=torch.int32, device="cpu")
     virtual_mask = torch.empty(capacity, dtype=torch.bool, device="cpu")
     key_to_token = torch.empty(capacity, dtype=torch.int64, device="cpu")
@@ -126,6 +128,9 @@ def compile_radix_reposition_layout(
     effective_reposition_stages = torch.full(
         (reposition_count,), -1, dtype=torch.int32, device="cpu"
     )
+    drop_event_to_key = torch.full(
+        (len(drop_insert_offsets),), -1, dtype=torch.int64, device="cpu"
+    )
     effective = torch.zeros(reposition_count, dtype=torch.bool, device="cpu")
     ignored = torch.zeros(reposition_count, dtype=torch.bool, device="cpu")
     status = torch.zeros(6, dtype=torch.int64, device="cpu")
@@ -135,7 +140,6 @@ def compile_radix_reposition_layout(
         drop_insert_offsets,
         drop_range_offsets,
         drop_ranges,
-        delta_marker_ids,
         reposition_raw_boundaries,
         reposition_insert_offsets,
         records,
@@ -153,6 +157,7 @@ def compile_radix_reposition_layout(
         transition_old_positions,
         transition_new_positions,
         effective_reposition_stages,
+        drop_event_to_key,
         effective,
         ignored,
         status,
@@ -170,6 +175,9 @@ def compile_radix_reposition_layout(
     key_len = int(status[1])
     effective_stage_count = int(status[2])
     return RadixRepositionLayout(
+        drop_insert_offsets=drop_insert_offsets,
+        drop_range_offsets=drop_range_offsets,
+        drop_ranges=drop_ranges,
         records=records[:key_len],
         virtual_mask=virtual_mask[:key_len],
         key_to_token=key_to_token[:key_len],
@@ -185,6 +193,7 @@ def compile_radix_reposition_layout(
         transition_old_positions=transition_old_positions,
         transition_new_positions=transition_new_positions,
         effective_reposition_stages=effective_reposition_stages,
+        drop_event_to_key=drop_event_to_key,
         effective_repositions=effective,
         ignored_repositions=ignored,
         next_position=int(status[3]),
@@ -213,7 +222,6 @@ def compile_radix_reposition_layout_batch(
             request.drop_insert_offsets,
             request.drop_range_offsets,
             request.drop_ranges,
-            request.delta_marker_ids,
             request.reposition_raw_boundaries,
             request.reposition_insert_offsets,
         )

@@ -111,10 +111,10 @@ class RadixTreeNode:
     ) -> RadixTreeNode | None:
         if key.ndim != 2:
             return self.children.get(_edge_key(self.key_fn, key, virtual_mask))
-        from minisgl.kernel.radix import fast_compare_radix_records, radix_record_edge_hash
+        from minisgl.kernel.radix import radix_record_edge_equal, radix_record_edge_hash
 
         for child in self.children_exact.get(radix_record_edge_hash(key), ()):
-            if fast_compare_radix_records(child._key[:1], key[:1]) == 1:
+            if radix_record_edge_equal(child._key, key):
                 return child
         return None
 
@@ -269,7 +269,6 @@ class RadixPrefixCache(BasePrefixCache):
         self.protected_size = 0
         self.root_node = RadixTreeNode(self.key_fn)
         self.root_node.ref_count = 1  # root is always protected
-        self.delta_marker_registry = None
         self.drop_aware_eviction = False
         self._slot_owner: Dict[int, RadixTreeNode] = {}
         self._slot_pin_count: Counter[int] = Counter()
@@ -281,20 +280,6 @@ class RadixPrefixCache(BasePrefixCache):
         if self.page_size != 1:
             raise ValueError("Drop-aware eviction requires page_size=1.")
         self.drop_aware_eviction = True
-
-    def bind_delta_marker_registry(self, registry) -> None:
-        if self.root_node.children:
-            raise RuntimeError("Delta marker registry must be bound before Radix insertion.")
-        self.delta_marker_registry = registry
-
-    @staticmethod
-    def _marker_ids(key: torch.Tensor, virtual_mask: torch.Tensor) -> List[int]:
-        if not bool(torch.any(virtual_mask).item()):
-            return []
-        if key.ndim == 2:
-            delta_mask = virtual_mask & (key[:, 0] == 1)
-            return [int(value) for value in key[delta_mask, 1].tolist()]
-        return [int(value) for value in key[virtual_mask].tolist()]
 
     @staticmethod
     def _path_nodes(node: RadixTreeNode) -> List[RadixTreeNode]:
@@ -550,16 +535,18 @@ class RadixPrefixCache(BasePrefixCache):
         return RadixCacheHandle(cursor, node)
 
     def _leaf_keep_mask(self, leaf: RadixTreeNode) -> torch.Tensor:
+        from minisgl.scheduler.radix_delta import decode_delta_record
+
         path_nodes = self._path_nodes(leaf)
         token_count = sum(node.page_length for node in path_nodes)
         keep_mask = torch.ones(token_count, dtype=torch.bool, device="cpu")
-        if self.delta_marker_registry is None:
-            return keep_mask
         for path_node in path_nodes:
-            for marker in self._marker_ids(path_node._key, path_node.virtual_mask):
-                for start, end in self.delta_marker_registry.canonical_for(marker):
-                    if start >= token_count:
-                        continue
+            if path_node._key.ndim != 2:
+                continue
+            delta_rows = path_node._key[path_node._key[:, 0] == 1]
+            for record in delta_rows.tolist():
+                start, end = decode_delta_record(record)
+                if start < token_count:
                     keep_mask[start : min(end, token_count)] = False
         return keep_mask
 
@@ -580,7 +567,7 @@ class RadixPrefixCache(BasePrefixCache):
             has_virtual = bool(torch.any(path_node.virtual_mask).item())
             has_real = path_node.page_length > 0
             if has_virtual and has_real:
-                raise RuntimeError("Drop-aware Radix nodes must not mix marker and token keys.")
+                raise RuntimeError("Drop-aware Radix nodes must not mix virtual and token records.")
             if not has_real:
                 continue
             segment = keep_mask[token_cursor : token_cursor + path_node.page_length]
@@ -602,6 +589,7 @@ class RadixPrefixCache(BasePrefixCache):
 
     @staticmethod
     def _segment_ends(
+        input_ids: torch.Tensor,
         indices: torch.Tensor,
         virtual_mask: torch.Tensor,
         key_to_token: torch.Tensor,
@@ -618,9 +606,17 @@ class RadixPrefixCache(BasePrefixCache):
         boundaries[-1] = True
         if key_count > 1:
             adjacent_real = real_mask[:-1] & real_mask[1:]
+            adjacent_virtual = virtual_mask[:-1] & virtual_mask[1:]
+            same_delta_block = (
+                adjacent_virtual
+                & (input_ids[:-1, 0] == 1)
+                & (input_ids[1:, 0] == 1)
+                if input_ids.ndim == 2
+                else torch.zeros(key_count - 1, dtype=torch.bool, device="cpu")
+            )
             boundaries[1:key_count] = (
-                virtual_mask[:-1]
-                | virtual_mask[1:]
+                (virtual_mask[:-1] != virtual_mask[1:])
+                | (adjacent_virtual & ~same_delta_block)
                 | (
                     adjacent_real
                     & (
@@ -662,10 +658,6 @@ class RadixPrefixCache(BasePrefixCache):
             new_node.set_parent(parent)
             self._register_node_slots(new_node)
             self._add_size(new_node)
-            if self.delta_marker_registry is not None:
-                self.delta_marker_registry.add_tree_refs(
-                    self._marker_ids(new_node._key, new_node.virtual_mask)
-                )
             parent = new_node
             cursor = segment_end
         return parent
@@ -680,8 +672,6 @@ class RadixPrefixCache(BasePrefixCache):
     ) -> DropAwareInsertResult:
         if not self.drop_aware_eviction:
             raise RuntimeError("Drop-aware prefix commit is not enabled.")
-        if self.delta_marker_registry is None and bool(torch.any(virtual_mask).item()):
-            raise RuntimeError("Drop-aware marker commit requires a marker registry.")
         if not len(input_ids) == len(indices) == len(virtual_mask) == len(key_to_token):
             raise ValueError("Drop-aware Radix key-axis tensors must have equal lengths.")
         if len(input_ids) == 0:
@@ -702,7 +692,9 @@ class RadixPrefixCache(BasePrefixCache):
             if bool(torch.any(real_candidates[kept_key_mask] < 0).item()):
                 raise RuntimeError("A kept token reached Radix commit without a KV slot.")
 
-        segment_ends = self._segment_ends(indices, virtual_mask, key_to_token, keep_mask)
+        segment_ends = self._segment_ends(
+            input_ids, indices, virtual_mask, key_to_token, keep_mask
+        )
         cursor = 0
         segment_idx = 0
         existing_prefix_len = len(input_ids)
@@ -807,21 +799,50 @@ class RadixPrefixCache(BasePrefixCache):
         indices = indices[:insert_len]
         virtual_mask = virtual_mask[:insert_len]
         node, prefix_len = self._tree_walk(input_ids, virtual_mask)
+        existing_prefix_len = prefix_len
         if prefix_len != insert_len:
-            new_node = RadixTreeNode(self.key_fn)
-            new_node.set_key_value(
-                input_ids[prefix_len:],
-                indices[prefix_len:].clone(),
-                virtual_mask[prefix_len:].clone(),
+            segment_ends = (
+                self._structured_segment_ends(input_ids, virtual_mask)
+                if input_ids.ndim == 2
+                else [insert_len]
             )
-            new_node.set_parent(node)
-            self._register_ordinary_node(new_node)
-            if self.delta_marker_registry is not None:
-                self.delta_marker_registry.add_tree_refs(
-                    self._marker_ids(new_node._key, new_node.virtual_mask)
+            for segment_end in segment_ends:
+                if segment_end <= prefix_len:
+                    continue
+                new_node = RadixTreeNode(self.key_fn)
+                new_node.set_key_value(
+                    input_ids[prefix_len:segment_end],
+                    indices[prefix_len:segment_end].clone(),
+                    virtual_mask[prefix_len:segment_end].clone(),
                 )
-            node = new_node
-        return InsertResult(prefix_len, RadixCacheHandle(insert_len, node))
+                new_node.set_parent(node)
+                self._register_ordinary_node(new_node)
+                node = new_node
+                prefix_len = segment_end
+        return InsertResult(existing_prefix_len, RadixCacheHandle(insert_len, node))
+
+    @staticmethod
+    def _structured_segment_ends(
+        records: torch.Tensor, virtual_mask: torch.Tensor
+    ) -> List[int]:
+        """Keep each complete Delta range block on one Radix child edge."""
+
+        if len(records) == 0:
+            return []
+        boundaries = [
+            index
+            for index in range(1, len(records))
+            if bool(virtual_mask[index - 1]) != bool(virtual_mask[index])
+            or (
+                bool(virtual_mask[index - 1])
+                and bool(virtual_mask[index])
+                and not (
+                    int(records[index - 1, 0]) == 1 and int(records[index, 0]) == 1
+                )
+            )
+        ]
+        boundaries.append(len(records))
+        return boundaries
 
     def prune_suffix(
         self,
@@ -876,11 +897,6 @@ class RadixPrefixCache(BasePrefixCache):
         boundary._remove_child(stale_root)
         boundary._refresh_reachable_depth()
         released = [self._unregister_ordinary_node(node) for node in subtree]
-        if self.delta_marker_registry is not None:
-            for stale_node in subtree:
-                self.delta_marker_registry.remove_tree_refs(
-                    self._marker_ids(stale_node._key, stale_node.virtual_mask)
-                )
         pages = [slots for slots in released if len(slots) > 0]
         if not pages:
             return self.empty_tensor
@@ -913,10 +929,6 @@ class RadixPrefixCache(BasePrefixCache):
             if len(released) > 0:
                 evicted_indices.append(released)
                 evicted_size += len(released)
-            if self.delta_marker_registry is not None:
-                self.delta_marker_registry.remove_tree_refs(
-                    self._marker_ids(node._key, node.virtual_mask)
-                )
             # NOTE: root is always protected, so won't be evicted
             if parent.is_leaf() and parent.ref_count == 0:
                 heapq.heappush(leave_nodes, parent)
@@ -953,10 +965,6 @@ class RadixPrefixCache(BasePrefixCache):
         parent = node.parent
         parent._remove_child(node)
         parent._refresh_reachable_depth()
-        if self.delta_marker_registry is not None:
-            self.delta_marker_registry.remove_tree_refs(
-                self._marker_ids(node._key, node.virtual_mask)
-            )
         if parent.is_leaf() and not parent.is_root():
             self._adjust_leaf_contribution(parent, 1)
         return released, parent
@@ -1035,7 +1043,7 @@ class RadixPrefixCache(BasePrefixCache):
         expected_evictable = 0
         expected_protected = 0
         expected_ordinary_owners: Dict[int, set[RadixTreeNode]] = {}
-        actual_marker_refs: Counter[int] = Counter()
+        structured_leaves: List[RadixTreeNode] = []
         stack: List[RadixTreeNode] = [self.root_node]
         while stack:
             node = stack.pop()
@@ -1053,7 +1061,15 @@ class RadixPrefixCache(BasePrefixCache):
                     raise RuntimeError(
                         "RadixPrefixCache integrity check failed: a real key has a negative page."
                     )
-                actual_marker_refs.update(self._marker_ids(child._key, child.virtual_mask))
+                if child._key.ndim == 2:
+                    from minisgl.scheduler.radix_delta import validate_delta_records
+
+                    validate_delta_records(child._key)
+                    expected_virtual = child._key[:, 0] != 0
+                    if not torch.equal(child.virtual_mask, expected_virtual):
+                        raise RuntimeError(
+                            "Structured Radix record kinds disagree with the virtual mask."
+                        )
                 if self.drop_aware_eviction:
                     resident_size = child.resident_page_length
                     if self._is_evictable(child):
@@ -1063,7 +1079,19 @@ class RadixPrefixCache(BasePrefixCache):
                 else:
                     for slot in self._real_slots(child):
                         expected_ordinary_owners.setdefault(slot, set()).add(child)
+                if child.is_leaf() and child._key.ndim == 2:
+                    structured_leaves.append(child)
                 stack.append(child)
+        if structured_leaves:
+            from minisgl.scheduler.radix_delta import validate_delta_records
+
+            for leaf in structured_leaves:
+                path_records = torch.cat([node._key for node in self._path_nodes(leaf)])
+                validate_delta_records(
+                    path_records,
+                    token_count=sum(node.page_length for node in self._path_nodes(leaf)),
+                    require_materialized=True,
+                )
         if not self.drop_aware_eviction:
             for owners in expected_ordinary_owners.values():
                 if any(owner.ref_count > 0 for owner in owners):
@@ -1078,8 +1106,6 @@ class RadixPrefixCache(BasePrefixCache):
                 f" evictable({self.evictable_size}) != expected({expected_evictable}) or"
                 f" protected({self.protected_size}) != expected({expected_protected})"
             )
-        if self.delta_marker_registry is not None:
-            self.delta_marker_registry.check_tree_refs(actual_marker_refs)
         if self.drop_aware_eviction:
             self._check_drop_aware_integrity()
 
@@ -1096,7 +1122,7 @@ class RadixPrefixCache(BasePrefixCache):
                 has_virtual = bool(torch.any(node.virtual_mask).item())
                 has_real = node.page_length > 0
                 if has_virtual and has_real:
-                    raise RuntimeError("A Drop-aware node mixes marker and real keys.")
+                    raise RuntimeError("A Drop-aware node mixes virtual and real records.")
                 real_mask = (~node.virtual_mask).to(device=node.value.device, non_blocking=True)
                 real_values = node.value[real_mask]
                 all_resident = len(real_values) > 0 and bool(torch.all(real_values >= 0).item())

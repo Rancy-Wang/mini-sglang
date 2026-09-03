@@ -8,6 +8,7 @@ from .radix import (
     fast_compare_retry_radix_records,
     fast_compare_retry_radix_records_plan,
     radix_record_compare_backend,
+    radix_record_edge_equal,
     radix_record_edge_hash,
     radix_record_retry_token,
 )
@@ -24,6 +25,7 @@ __all__ = [
     "fast_compare_retry_radix_records",
     "fast_compare_retry_radix_records_plan",
     "radix_record_compare_backend",
+    "radix_record_edge_equal",
     "radix_record_edge_hash",
     "radix_record_retry_token",
     "retry_reposition_kv",

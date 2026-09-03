@@ -72,10 +72,9 @@ class WarmupAckMsg(BaseTokenizerMsg):
 
 @dataclass
 class RepositionOpenAckMsg(BaseTokenizerMsg):
-    """Stable marker lease plus the Scheduler's per-turn Prefill quantum."""
+    """Scheduler acknowledgement carrying the per-turn Prefill quantum."""
 
     uid: int
-    marker_ids: List[int]
     step_token_budget: int
 
 

@@ -29,13 +29,6 @@ from .config import SchedulerConfig
 from .decode import DecodeManager
 from .io import SchedulerIOMixin
 from .prefill import ChunkedReq, PrefillManager
-from .radix_delta import (
-    DeltaMarkerRegistry,
-    acquire_delta_marker_ids,
-    inject_delta_markers,
-    key_prefix_len_for_token_boundary,
-    select_effective_delta_events,
-)
 from .radix_symbol import RadixSymbolRegistry, inject_radix_symbols
 from .table import TableManager
 from .utils import PendingReq
@@ -105,9 +98,6 @@ class Scheduler(SchedulerIOMixin):
         self.radix_symbol_registry = (
             RadixSymbolRegistry() if self.radix_drop_key_mode == "symbol" else None
         )
-        self.delta_marker_registry = (
-            DeltaMarkerRegistry() if self.radix_drop_key_mode == "delta-marker" else None
-        )
         self.cache_manager = CacheManager(
             self.engine.num_pages,
             config.page_size,
@@ -115,8 +105,6 @@ class Scheduler(SchedulerIOMixin):
             config.cache_type,
             drop_aware_eviction=config.drop_aware_eviction,
         )
-        if self.delta_marker_registry is not None:
-            self.cache_manager.bind_delta_marker_registry(self.delta_marker_registry)
         self.decode_manager = DecodeManager(config.page_size)
         rotary_config = config.model_config.rotary_config
         retry_rope = get_rope(
@@ -157,7 +145,7 @@ class Scheduler(SchedulerIOMixin):
         # some alias for easy access
         self.finished_reqs: Set[Req] = set()
         self.request_metrics: Dict[int, RequestMetricsState] = {}
-        self.context_marker_leases: Dict[int, tuple[int, ...]] = {}
+        self.context_sequence_uids: Set[int] = set()
         self.tokenizer = load_tokenizer(config.model_path)
         self.eos_token_id = self.tokenizer.eos_token_id
         eos_values = (
@@ -407,34 +395,26 @@ class Scheduler(SchedulerIOMixin):
             raise KeyboardInterrupt
         elif isinstance(msg, RepositionOpenMsg):
             try:
-                if self.delta_marker_registry is None:
+                if self.radix_drop_key_mode != "delta-marker":
                     raise ValueError("Reposition requires --radix-drop-key-mode delta-marker.")
                 if self.cache_manager.drop_aware_eviction:
                     raise ValueError(
                         "Reposition currently supports ordinary Radix eviction only; "
                         "disable Drop-aware eviction."
                     )
-                if msg.uid in self.context_marker_leases:
-                    raise ValueError(f"Duplicate Reposition marker lease UID: {msg.uid}")
-                marker_ids = acquire_delta_marker_ids(
-                    msg.full_token_count,
-                    msg.drop_event_positions,
-                    msg.drop_range_offsets,
-                    msg.drop_position_ranges,
-                    self.delta_marker_registry,
-                )
-                self.context_marker_leases[msg.uid] = marker_ids
+                if msg.uid in self.context_sequence_uids:
+                    raise ValueError(f"Duplicate Reposition sequence UID: {msg.uid}")
+                self.context_sequence_uids.add(msg.uid)
                 self.send_result(
                     [
                         RepositionOpenAckMsg(
                             uid=msg.uid,
-                            marker_ids=list(marker_ids),
                             step_token_budget=self.prefill_budget,
                         )
                     ]
                 )
             except ValueError as exc:
-                self._release_context_marker_lease(msg.uid)
+                self._close_context_sequence(msg.uid)
                 self.send_result(
                     [
                         RequestRejectMsg(
@@ -461,84 +441,13 @@ class Scheduler(SchedulerIOMixin):
                     state_starts,
                     self.radix_symbol_registry,
                 )
-            elif self.delta_marker_registry is not None:
+            elif self.radix_drop_key_mode == "delta-marker":
                 if msg.radix_match_ids is None:
                     raise ValueError("Delta-marker Radix mode requires full radix_match_ids.")
-                drop_wire = (
-                    msg.drop_event_positions,
-                    msg.drop_range_offsets,
-                    msg.drop_position_ranges,
-                )
-                if any(tensor is not None for tensor in drop_wire):
-                    if not all(tensor is not None for tensor in drop_wire):
-                        raise ValueError(
-                            "Token-position Drop metadata must be provided as one complete set."
-                        )
-                    event_positions, range_offsets, position_ranges = drop_wire
-                    assert event_positions is not None
-                    assert range_offsets is not None
-                    assert position_ranges is not None
-                    drop_aware_eviction = getattr(
-                        getattr(self, "cache_manager", None),
-                        "drop_aware_eviction",
-                        False,
+                if msg.radix_match_ids.ndim != 2 or msg.radix_match_ids.shape[1] != 4:
+                    raise ValueError(
+                        "Delta-marker Radix keys must be precompiled CPU int32 [N, 4] records."
                     )
-                    if drop_aware_eviction:
-                        if msg.full_keep_mask is None:
-                            raise ValueError(
-                                "Drop-aware delta markers require a target-specific full_keep_mask."
-                            )
-                        event_positions, range_offsets, position_ranges = (
-                            select_effective_delta_events(
-                                event_positions,
-                                range_offsets,
-                                position_ranges,
-                                msg.full_keep_mask,
-                            )
-                        )
-                else:
-                    event_positions = torch.empty(0, dtype=torch.int32, device="cpu")
-                    range_offsets = torch.zeros(1, dtype=torch.int32, device="cpu")
-                    position_ranges = torch.empty(0, dtype=torch.int32, device="cpu")
-
-                structured_key = msg.radix_match_ids.ndim == 2
-                if structured_key:
-                    lease = self.context_marker_leases.get(msg.uid)
-                    if lease is None:
-                        raise ValueError(
-                            "A precompiled Reposition key arrived without a marker lease."
-                        )
-                    step_markers = tuple(msg.radix_marker_ids or ())
-                    if step_markers != lease[: len(step_markers)]:
-                        raise ValueError(
-                            "A precompiled Reposition key does not match its marker lease."
-                        )
-                elif len(event_positions) > 0:
-                    marker_ids: tuple[int, ...] = ()
-                    try:
-                        layout = inject_delta_markers(
-                            msg.radix_match_ids,
-                            event_positions,
-                            range_offsets,
-                            position_ranges,
-                            self.delta_marker_registry,
-                        )
-                        if layout is not None:
-                            marker_ids = layout.marker_ids
-                            msg.radix_match_ids = layout.keys
-                            msg.radix_key_virtual_mask = layout.virtual_mask
-                            msg.radix_key_to_token = layout.key_to_token
-                            msg.radix_token_to_key = layout.token_to_key
-                            msg.radix_marker_ids = list(marker_ids)
-                        if layout is not None and msg.radix_commit_token_len is not None:
-                            msg.radix_commit_key_len = key_prefix_len_for_token_boundary(
-                                layout, msg.radix_commit_token_len
-                            )
-                    except Exception:
-                        if marker_ids:
-                            self.delta_marker_registry.release_request_refs(marker_ids)
-                            msg.radix_marker_ids = None
-                        raise
 
             if msg.radix_next_position is not None:
                 true_input_len = msg.radix_next_position
@@ -563,11 +472,7 @@ class Scheduler(SchedulerIOMixin):
                         )
                     ]
                 )
-                if self._release_context_marker_lease(msg.uid):
-                    msg.radix_marker_ids = None
-                elif self.delta_marker_registry is not None and msg.radix_marker_ids:
-                    self.delta_marker_registry.release_request_refs(msg.radix_marker_ids)
-                    msg.radix_marker_ids = None
+                self._close_context_sequence(msg.uid)
                 return
             max_output_len = max_seq_len - true_input_len
             if max_output_len <= 0:
@@ -586,11 +491,7 @@ class Scheduler(SchedulerIOMixin):
                         )
                     ]
                 )
-                if self._release_context_marker_lease(msg.uid):
-                    msg.radix_marker_ids = None
-                elif self.delta_marker_registry is not None and msg.radix_marker_ids:
-                    self.delta_marker_registry.release_request_refs(msg.radix_marker_ids)
-                    msg.radix_marker_ids = None
+                self._close_context_sequence(msg.uid)
                 return
 
             if msg.sampling_params.max_tokens > max_output_len:
@@ -624,11 +525,7 @@ class Scheduler(SchedulerIOMixin):
                 self.prefill_manager.add_one_req(msg)
             except Exception:
                 self.request_metrics.pop(msg.uid, None)
-                if self._release_context_marker_lease(msg.uid):
-                    msg.radix_marker_ids = None
-                elif self.delta_marker_registry is not None and msg.radix_marker_ids:
-                    self.delta_marker_registry.release_request_refs(msg.radix_marker_ids)
-                    msg.radix_marker_ids = None
+                self._close_context_sequence(msg.uid)
                 raise
         elif isinstance(msg, AbortBackendMsg):
             logger.debug_rank0("Aborting request %d", msg.uid)
@@ -636,29 +533,22 @@ class Scheduler(SchedulerIOMixin):
             req_to_free = self.prefill_manager.abort_req(msg.uid)
             req_to_free = req_to_free or self.decode_manager.abort_req(msg.uid)
             if isinstance(req_to_free, PendingReq):
-                if not self._release_context_marker_lease(msg.uid):
-                    if self.delta_marker_registry is not None and req_to_free.radix_marker_ids:
-                        self.delta_marker_registry.release_request_refs(
-                            req_to_free.radix_marker_ids
-                        )
-                        req_to_free.radix_marker_ids = ()
+                self._close_context_sequence(msg.uid)
             elif req_to_free is not None:
                 self._free_req_resources(req_to_free)
                 # The request may still be present in an overlapping GPU batch.
                 # _process_last_data uses this tombstone to discard that stale result.
                 self.finished_reqs.add(req_to_free)
             else:
-                self._release_context_marker_lease(msg.uid)
+                self._close_context_sequence(msg.uid)
         else:
             logger.error(f"Unknown message type: {type(msg)}")
             raise NotImplementedError
 
-    def _release_context_marker_lease(self, uid: int) -> bool:
-        marker_ids = self.context_marker_leases.pop(uid, None)
-        if marker_ids is None:
+    def _close_context_sequence(self, uid: int) -> bool:
+        if uid not in self.context_sequence_uids:
             return False
-        assert self.delta_marker_registry is not None
-        self.delta_marker_registry.release_request_refs(marker_ids)
+        self.context_sequence_uids.remove(uid)
         return True
 
     def _free_req_resources(self, req: Req) -> None:
@@ -668,13 +558,13 @@ class Scheduler(SchedulerIOMixin):
             try:
                 self.table_manager.free(req.table_idx)
             finally:
-                if req.is_warmup and req.uid in self.context_marker_leases:
+                if (
+                    req.is_warmup
+                    and req.radix_next_position is None
+                    and req.uid in self.context_sequence_uids
+                ):
                     return
-                if self._release_context_marker_lease(req.uid):
-                    req.radix_marker_ids = ()
-                elif self.delta_marker_registry is not None and req.radix_marker_ids:
-                    self.delta_marker_registry.release_request_refs(req.radix_marker_ids)
-                    req.radix_marker_ids = ()
+                self._close_context_sequence(req.uid)
 
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
         self.engine.graph_runner.pad_batch(batch)

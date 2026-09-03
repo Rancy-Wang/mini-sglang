@@ -133,12 +133,39 @@ auto radix_record_edge_hash(const tvm::ffi::TensorView records) -> int64_t {
       _is_radix_record_tensor(records) && records.size(0) > 0,
       "Radix edge hashing requires a non-empty int32 [N, 4] tensor.");
   const auto *record = static_cast<const int32_t *>(records.data_ptr());
+  const size_t rows = record[0] == 1 ? records.size(0) : 1;
   uint64_t hash = 1469598103934665603ULL;
-  for (size_t field = 0; field < 4; ++field) {
-    hash ^= static_cast<uint32_t>(record[field]);
-    hash *= 1099511628211ULL;
+  size_t edge_rows = 0;
+  while (edge_rows < rows && (edge_rows == 0 || record[edge_rows * 4] == 1)) {
+    for (size_t field = 0; field < 4; ++field) {
+      hash ^= static_cast<uint32_t>(record[edge_rows * 4 + field]);
+      hash *= 1099511628211ULL;
+    }
+    ++edge_rows;
   }
+  hash ^= edge_rows;
+  hash *= 1099511628211ULL;
   return static_cast<int64_t>(hash & INT64_MAX);
+}
+
+auto radix_record_edge_equal(const tvm::ffi::TensorView a,
+                             const tvm::ffi::TensorView b) -> bool {
+  host::RuntimeCheck(
+      _is_radix_record_tensor(a) && a.size(0) > 0 &&
+          _is_radix_record_tensor(b) && b.size(0) > 0,
+      "Radix edge comparison requires non-empty int32 [N, 4] tensors.");
+  const auto *a_ptr = static_cast<const int32_t *>(a.data_ptr());
+  const auto *b_ptr = static_cast<const int32_t *>(b.data_ptr());
+  size_t a_rows = 1;
+  size_t b_rows = 1;
+  if (a_ptr[0] == 1) {
+    while (a_rows < a.size(0) && a_ptr[a_rows * 4] == 1) ++a_rows;
+  }
+  if (b_ptr[0] == 1) {
+    while (b_rows < b.size(0) && b_ptr[b_rows * 4] == 1) ++b_rows;
+  }
+  return a_rows == b_rows &&
+         std::memcmp(a_ptr, b_ptr, a_rows * 4 * sizeof(int32_t)) == 0;
 }
 
 auto radix_record_retry_token(const tvm::ffi::TensorView records) -> int64_t {
@@ -319,5 +346,6 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(fast_compare_retry_radix_records_plan,
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(radix_record_compare_backend,
                               radix_record_compare_backend);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(radix_record_edge_hash, radix_record_edge_hash);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(radix_record_edge_equal, radix_record_edge_equal);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(radix_record_retry_token,
                               radix_record_retry_token);

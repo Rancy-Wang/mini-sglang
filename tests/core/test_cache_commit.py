@@ -6,8 +6,8 @@ import pytest
 import torch
 
 import minisgl.core as core
+from minisgl.kernel.radix_reposition import compile_radix_reposition_layout
 from minisgl.scheduler.cache import CacheManager
-from minisgl.scheduler.radix_delta import DeltaMarkerRegistry, inject_delta_markers
 
 
 @pytest.fixture(autouse=True)
@@ -29,17 +29,15 @@ def _root_handle(cache_manager: CacheManager):
 
 
 def _delta_layout(cache_manager: CacheManager, full_ids: torch.Tensor):
-    registry = DeltaMarkerRegistry()
-    cache_manager.bind_delta_marker_registry(registry)
-    layout = inject_delta_markers(
+    del cache_manager
+    return compile_radix_reposition_layout(
         full_ids,
         torch.tensor([4], dtype=torch.int32),
         torch.tensor([0, 1], dtype=torch.int32),
         torch.tensor([2, 4], dtype=torch.int32),
-        registry,
+        torch.empty(0, dtype=torch.int32),
+        torch.empty(0, dtype=torch.int32),
     )
-    assert layout is not None
-    return layout
 
 
 def _delta_req(
@@ -54,8 +52,10 @@ def _delta_req(
         input_ids=input_ids,
         true_positions=true_positions,
         raw_positions=true_positions,
-        radix_input_ids=input_ids.to(torch.int64),
-        radix_match_ids=layout.keys,
+        radix_input_ids=layout.records[
+            layout.token_to_key[true_positions.to(torch.int64)]
+        ],
+        radix_match_ids=layout.records,
         radix_key_virtual_mask=layout.virtual_mask,
         radix_key_to_token=layout.key_to_token,
         radix_token_to_key=layout.token_to_key,
@@ -120,7 +120,9 @@ def test_staged_delta_commit_keeps_inserted_prefix_and_frees_pages_after_drop_ho
 
     cache_manager.cache_req(req, finished=True)
 
-    matched = cache_manager.prefix_cache.match_prefix(full_ids[:2]).cuda_handle
+    matched = cache_manager.prefix_cache.match_prefix(
+        layout.records[:2], layout.virtual_mask[:2]
+    ).cuda_handle
     assert torch.equal(matched.get_matched_indices(), allocated[:2])
     assert set(allocated[2:].tolist()).issubset(set(cache_manager.free_slots.tolist()))
     assert not (set(allocated[:2].tolist()) & set(cache_manager.free_slots.tolist()))
@@ -152,7 +154,9 @@ def test_mask_delta_concurrent_commit_keeps_canonical_and_frees_duplicate_pages(
     cache_manager.cache_req(req_a, finished=True)
     cache_manager.cache_req(req_b, finished=True)
 
-    matched = cache_manager.prefix_cache.match_prefix(layout.keys, layout.virtual_mask).cuda_handle
+    matched = cache_manager.prefix_cache.match_prefix(
+        layout.records, layout.virtual_mask
+    ).cuda_handle
     canonical = matched.get_matched_indices()
     real_mask = ~matched.get_matched_virtual_mask().to(device=canonical.device)
     assert torch.equal(canonical[real_mask], allocated[:6])

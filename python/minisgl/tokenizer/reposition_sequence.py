@@ -8,31 +8,10 @@ from minisgl.kernel.radix_reposition import (
     REPOSITION_KIND,
     TOKEN_KIND,
     RadixRepositionLayout,
-    compile_radix_reposition_layout,
 )
 from minisgl.message import RepositionOpenMsg, TokenizeMsg, UserMsg, WarmupAckMsg
 
 from .tokenize import TokenizedResult
-
-
-def _effective_drop_wire(
-    result: TokenizedResult,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    if result.drop_event_positions is None:
-        return (
-            torch.empty(0, dtype=torch.int32, device="cpu"),
-            torch.zeros(1, dtype=torch.int32, device="cpu"),
-            torch.empty(0, dtype=torch.int32, device="cpu"),
-        )
-    assert result.drop_range_offsets is not None
-    assert result.drop_position_ranges is not None
-    count = min(result.drop_effective_event_count, len(result.drop_event_positions))
-    range_count = int(result.drop_range_offsets[count])
-    return (
-        result.drop_event_positions[:count].contiguous(),
-        result.drop_range_offsets[: count + 1].contiguous(),
-        result.drop_position_ranges[: 2 * range_count].contiguous(),
-    )
 
 
 @dataclass
@@ -50,7 +29,6 @@ class RepositionSequenceState:
     drop_range_offsets: torch.Tensor
     drop_position_ranges: torch.Tensor
     layout: RadixRepositionLayout | None = None
-    marker_ids: tuple[int, ...] = ()
     step_token_budget: int = 0
     raw_cursor: int = 0
     drop_cursor: int = 0
@@ -77,46 +55,29 @@ class RepositionSequenceState:
             raise ValueError("Reposition sequence requires raw Reposition boundaries.")
         if tokenized.reposition_insert_offsets is None:
             raise ValueError("Reposition sequence requires Reposition insertion offsets.")
-        event_positions, range_offsets, position_ranges = _effective_drop_wire(tokenized)
+        if tokenized.reposition_layout is None:
+            raise ValueError("Reposition sequence requires a precompiled Radix layout.")
+        layout = tokenized.reposition_layout
         return cls(
             request=request,
             tokenized=tokenized,
-            drop_event_positions=event_positions,
-            drop_range_offsets=range_offsets,
-            drop_position_ranges=position_ranges,
+            drop_event_positions=layout.drop_insert_offsets,
+            drop_range_offsets=layout.drop_range_offsets,
+            drop_position_ranges=layout.drop_ranges,
+            layout=layout,
         )
 
     def open_msg(self) -> RepositionOpenMsg:
-        assert self.tokenized.reposition_input_ids is not None
-        return RepositionOpenMsg(
-            uid=self.request.uid,
-            full_token_count=len(self.tokenized.reposition_input_ids),
-            drop_event_positions=self.drop_event_positions,
-            drop_range_offsets=self.drop_range_offsets,
-            drop_position_ranges=self.drop_position_ranges,
-        )
+        return RepositionOpenMsg(uid=self.request.uid)
 
-    def compile(self, marker_ids: list[int], *, step_token_budget: int) -> None:
-        if self.layout is not None:
-            raise RuntimeError("A Reposition sequence was compiled more than once.")
+    def activate(self, *, step_token_budget: int) -> None:
         if step_token_budget <= 0:
             raise ValueError("Reposition step token budget must be positive.")
-        if len(marker_ids) != len(self.drop_event_positions):
-            raise ValueError("Scheduler marker lease does not cover the effective Drop events.")
         assert self.tokenized.reposition_input_ids is not None
         assert self.tokenized.reposition_raw_boundaries is not None
         assert self.tokenized.reposition_insert_offsets is not None
-        self.marker_ids = tuple(int(marker) for marker in marker_ids)
+        assert self.layout is not None
         self.step_token_budget = step_token_budget
-        self.layout = compile_radix_reposition_layout(
-            self.tokenized.reposition_input_ids,
-            self.drop_event_positions,
-            self.drop_range_offsets,
-            self.drop_position_ranges,
-            torch.tensor(self.marker_ids, dtype=torch.int32, device="cpu"),
-            self.tokenized.reposition_raw_boundaries,
-            self.tokenized.reposition_insert_offsets,
-        )
         self.active_raw = torch.empty(0, dtype=torch.int32, device="cpu")
         self.current_positions = self.layout.birth_positions.clone()
 
@@ -169,17 +130,13 @@ class RepositionSequenceState:
             ).view(-1)
         else:
             candidates = [
-                self.marker_ids[event]
+                int(self.layout.drop_event_to_key[event])
                 for event, offset in enumerate(self.drop_event_positions.tolist())
                 if event >= self.drop_cursor and int(offset) == insertion
             ]
             if not candidates:
                 return None
-            rows = torch.nonzero(
-                (self.current_records[:, 0] == DELTA_KIND)
-                & (self.current_records[:, 1] == candidates[0]),
-                as_tuple=False,
-            ).view(-1)
+            return candidates[0]
         return int(rows[0]) if len(rows) > 0 else None
 
     def _commit_key_len(self, end: int) -> int:
@@ -196,13 +153,13 @@ class RepositionSequenceState:
         return cap
 
     def _drop_count_before(self, boundary: int) -> int:
-        return int(torch.searchsorted(self.drop_event_positions, boundary, side="left").item())
+        return int(torch.searchsorted(self.drop_event_positions, boundary, side="right").item())
 
     def _drop_inside(self, end: int) -> bool:
         if self.drop_cursor >= len(self.drop_event_positions):
             return False
         positions = self.drop_event_positions[self.drop_cursor :]
-        return bool(torch.any((positions > self.raw_cursor) & (positions < end)).item())
+        return bool(torch.any((positions > self.raw_cursor) & (positions <= end)).item())
 
     def _drop_wire_before(
         self, boundary: int
@@ -244,23 +201,16 @@ class RepositionSequenceState:
         execution_raw = torch.cat((self.active_raw, new_raw))
         execution_raw = torch.unique(execution_raw, sorted=True)
         raw_index = execution_raw.to(torch.int64)
-        commit_key_len = self._commit_key_len(end)
+        is_final = end == raw_count and next_reposition is None
+        commit_key_len = len(self.layout.records) if is_final else self._commit_key_len(end)
         records = self.current_records[:commit_key_len].contiguous()
         virtual_mask = self.layout.virtual_mask[:commit_key_len].contiguous()
         key_to_token = self.layout.key_to_token[:commit_key_len].contiguous()
         token_to_key = self.layout.token_to_key[:end].contiguous()
-        marker_rows = (
-            (records[:, 0] == DELTA_KIND)
-            if len(records) > 0
-            else torch.empty(0, dtype=torch.bool, device="cpu")
-        )
-        step_markers = tuple(int(value) for value in records[marker_rows, 1].tolist())
-
         use_context_mask = self._drop_inside(end)
         execution_mask = torch.zeros(end, dtype=torch.bool, device="cpu")
         execution_mask[raw_index] = True
         drop_positions, drop_offsets, drop_ranges, drop_count = self._drop_wire_before(end)
-        is_final = end == raw_count and next_reposition is None
         post_prefill_keep = None
         if is_final and use_context_mask:
             post_prefill_keep = self._active_after_events(end)
@@ -286,7 +236,6 @@ class RepositionSequenceState:
             radix_key_to_token=key_to_token,
             radix_token_to_key=token_to_key,
             radix_commit_key_len=commit_key_len,
-            radix_marker_ids=list(step_markers),
             drop_event_positions=drop_positions,
             drop_range_offsets=drop_offsets,
             drop_position_ranges=drop_ranges,

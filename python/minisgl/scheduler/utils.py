@@ -42,7 +42,6 @@ class PendingReq:
     radix_key_to_token: torch.Tensor | None = None
     radix_token_to_key: torch.Tensor | None = None
     radix_commit_key_len: int | None = None
-    radix_marker_ids: tuple[int, ...] = ()
     radix_positions: torch.Tensor | None = None
     radix_repos_info: torch.Tensor | None = None
     radix_next_position: int | None = None

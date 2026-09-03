@@ -12,6 +12,8 @@ from minisgl.kernel.radix import (
     fast_compare_retry_radix_records,
     fast_compare_retry_radix_records_plan,
     radix_record_compare_backend,
+    radix_record_edge_equal,
+    radix_record_edge_hash,
 )
 from minisgl.kernel.radix_reposition import (
     DELTA_KIND,
@@ -25,21 +27,20 @@ from minisgl.kernel.radix_reposition import (
 
 def _compile(
     token_ids: list[int],
-    drops: list[tuple[int, list[tuple[int, int]], int]],
+    drops: list[tuple[int, list[tuple[int, int]]]],
     repositions: list[int],
 ):
     flat_ranges: list[int] = []
     range_offsets = [0]
-    for _, ranges, _ in drops:
+    for _, ranges in drops:
         for start, end in ranges:
             flat_ranges.extend((start, end))
         range_offsets.append(len(flat_ranges) // 2)
     return compile_radix_reposition_layout(
         torch.tensor(token_ids, dtype=torch.int64),
-        torch.tensor([offset for offset, _, _ in drops], dtype=torch.int32),
+        torch.tensor([offset for offset, _ in drops], dtype=torch.int32),
         torch.tensor(range_offsets, dtype=torch.int32),
         torch.tensor(flat_ranges, dtype=torch.int32),
-        torch.tensor([marker for _, _, marker in drops], dtype=torch.int32),
         torch.tensor(repositions, dtype=torch.int32),
         torch.tensor([boundary + 1 for boundary in repositions], dtype=torch.int32),
     )
@@ -47,10 +48,10 @@ def _compile(
 
 def _reference(
     token_ids: list[int],
-    drops: list[tuple[int, list[tuple[int, int]], int]],
+    drops: list[tuple[int, list[tuple[int, int]]]],
     repositions: list[int],
 ):
-    drop_by_offset = {offset: (ranges, marker) for offset, ranges, marker in drops}
+    drop_by_offset = {offset: ranges for offset, ranges in drops}
     reposition_by_offset = {
         boundary + 1: (idx, boundary) for idx, boundary in enumerate(repositions)
     }
@@ -75,8 +76,7 @@ def _reference(
     for insertion in range(len(token_ids) + 1):
         drop = drop_by_offset.get(insertion)
         if drop is not None:
-            ranges, _ = drop
-            dropped = {token for start, end in ranges for token in range(start, end)}
+            dropped = {token for start, end in drop for token in range(start, end)}
             active = [token for token in active if token not in dropped]
             for token in dropped:
                 keep[token] = False
@@ -121,13 +121,16 @@ def _reference(
     key_to_token: list[int] = []
     token_to_key: list[int] = [-1] * len(token_ids)
     virtual: list[bool] = []
+    drop_event_to_key: list[int] = [-1] * len(drops)
     drop_index = 0
     reposition_index = 0
     for insertion in range(len(token_ids) + 1):
         if drop_index < len(drops) and drops[drop_index][0] == insertion:
-            records.append([DELTA_KIND, drops[drop_index][2], -1, -1])
-            key_to_token.append(-1)
-            virtual.append(True)
+            drop_event_to_key[drop_index] = len(records)
+            for start, end in drops[drop_index][1]:
+                records.append([DELTA_KIND, -start - 1, -end - 1, -1])
+                key_to_token.append(-1)
+                virtual.append(True)
             drop_index += 1
         if reposition_index < len(repositions) and repositions[reposition_index] + 1 == insertion:
             if effective[reposition_index]:
@@ -160,6 +163,7 @@ def _reference(
         "transition_old_positions": transition_old_positions,
         "transition_new_positions": transition_new_positions,
         "effective_reposition_stages": effective_stages,
+        "drop_event_to_key": drop_event_to_key,
         "effective_repositions": effective,
         "ignored_repositions": ignored,
         "next_position": next_position,
@@ -184,6 +188,7 @@ def _assert_layout_matches_reference(layout, expected) -> None:
         "transition_old_positions",
         "transition_new_positions",
         "effective_reposition_stages",
+        "drop_event_to_key",
         "effective_repositions",
         "ignored_repositions",
     )
@@ -193,20 +198,20 @@ def _assert_layout_matches_reference(layout, expected) -> None:
     assert layout.current_reposition == expected["current_reposition"]
 
 
-def test_plan_counterexample_preserves_early_reposition_marker() -> None:
+def test_plan_counterexample_preserves_early_reposition_record() -> None:
     layout = _compile(
         [0, 1, 2, 3],
-        [(3, [(1, 2)], -101), (4, [(0, 1)], -102)],
+        [(3, [(1, 2)]), (4, [(0, 1)])],
         [2, 3],
     )
     assert layout.records.tolist() == [
         [TOKEN_KIND, 0, -1, 0],
         [TOKEN_KIND, 1, -1, 1],
         [TOKEN_KIND, 2, 3, 0],
-        [DELTA_KIND, -101, -1, -1],
+        [DELTA_KIND, -2, -3, -1],
         [REPOSITION_KIND, 2, -1, -1],
         [TOKEN_KIND, 3, 3, 1],
-        [DELTA_KIND, -102, -1, -1],
+        [DELTA_KIND, -1, -2, -1],
         [REPOSITION_KIND, 3, -1, -1],
     ]
 
@@ -214,11 +219,11 @@ def test_plan_counterexample_preserves_early_reposition_marker() -> None:
 def test_same_boundary_applies_drop_before_reposition() -> None:
     layout = _compile(
         list(range(6)),
-        [(6, [(0, 2)], -201)],
+        [(6, [(0, 2)])],
         [5],
     )
     assert layout.records[-2:].tolist() == [
-        [DELTA_KIND, -201, -1, -1],
+        [DELTA_KIND, -1, -3, -1],
         [REPOSITION_KIND, 5, -1, -1],
     ]
     assert layout.positions.tolist() == [0, 1, 0, 1, 2, 3]
@@ -246,7 +251,7 @@ def test_noop_reposition_is_ignored_without_metadata_change() -> None:
 
 def test_reposition_rejects_empty_active_set() -> None:
     with pytest.raises(ValueError, match="has no active tokens"):
-        _compile([10, 11], [(2, [(0, 2)], -301)], [1])
+        _compile([10, 11], [(2, [(0, 2)])], [1])
 
 
 def test_cpu_compiler_matches_independent_random_state_machine() -> None:
@@ -255,7 +260,7 @@ def test_cpu_compiler_matches_independent_random_state_machine() -> None:
         token_count = rng.randint(8, 96)
         event_offsets = sorted(rng.sample(range(2, token_count + 1), rng.randint(1, 6)))
         active: list[int] = []
-        drops: list[tuple[int, list[tuple[int, int]], int]] = []
+        drops: list[tuple[int, list[tuple[int, int]]]] = []
         repositions: list[int] = []
         offset_set = set(event_offsets)
         for insertion in range(token_count + 1):
@@ -270,7 +275,7 @@ def test_cpu_compiler_matches_independent_random_state_machine() -> None:
                         ranges[-1] = (ranges[-1][0], token + 1)
                     else:
                         ranges.append((token, token + 1))
-                drops.append((insertion, ranges, -1000 - case * 10 - len(drops)))
+                drops.append((insertion, ranges))
             if insertion in offset_set and active and rng.random() < 0.8:
                 repositions.append(insertion - 1)
             if insertion < token_count:
@@ -289,7 +294,7 @@ def test_structured_comparators_use_exact_and_retry_semantics() -> None:
         [
             [TOKEN_KIND, 10, 2, 4],
             [TOKEN_KIND, 11, 2, 5],
-            [DELTA_KIND, -7, -1, -1],
+            [DELTA_KIND, -1, -3, -1],
             [REPOSITION_KIND, 8, -1, -1],
         ],
         dtype=torch.int32,
@@ -300,18 +305,38 @@ def test_structured_comparators_use_exact_and_retry_semantics() -> None:
     assert fast_compare_radix_records(cached, target) == 0
     assert fast_compare_retry_radix_records(cached, target) == len(cached)
 
-    target[2, 1] = -8
+    target[2, 2] = -4
     assert fast_compare_retry_radix_records(cached, target) == 2
-    target[2, 1] = -7
+    target[2, 2] = -3
     target[3, 1] = 9
     assert fast_compare_retry_radix_records(cached, target) == 3
+
+
+def test_delta_child_edge_hashes_and_compares_the_complete_range_block() -> None:
+    first = torch.tensor(
+        [
+            [DELTA_KIND, -1, -2, -1],
+            [DELTA_KIND, -4, -5, -1],
+            [TOKEN_KIND, 10, -1, 0],
+        ],
+        dtype=torch.int32,
+    )
+    same_edge = first.clone()
+    same_edge[2, 1] = 99
+    different_edge = first.clone()
+    different_edge[1, 1:3] = torch.tensor([-3, -4], dtype=torch.int32)
+
+    assert radix_record_edge_equal(first, same_edge)
+    assert radix_record_edge_hash(first) == radix_record_edge_hash(same_edge)
+    assert not radix_record_edge_equal(first, different_edge)
+    assert radix_record_edge_hash(first) != radix_record_edge_hash(different_edge)
 
 
 def test_retry_comparator_emits_only_changed_token_pages() -> None:
     cached = torch.tensor(
         [
             [TOKEN_KIND, 10, -1, 0],
-            [DELTA_KIND, -7, -1, -1],
+            [DELTA_KIND, -1, -2, -1],
             [TOKEN_KIND, 11, 2, 3],
             [TOKEN_KIND, 12, 2, 4],
         ],
@@ -339,7 +364,6 @@ def test_bounded_batch_compiler_preserves_request_order() -> None:
             drop_insert_offsets=torch.tensor([3], dtype=torch.int32),
             drop_range_offsets=torch.tensor([0, 1], dtype=torch.int32),
             drop_ranges=torch.tensor([0, 1], dtype=torch.int32),
-            delta_marker_ids=torch.tensor([-base], dtype=torch.int32),
             reposition_raw_boundaries=torch.tensor([2], dtype=torch.int32),
             reposition_insert_offsets=torch.tensor([3], dtype=torch.int32),
         )

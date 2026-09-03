@@ -76,7 +76,6 @@ def make_benchmark_input(token_count: int, event_count: int = 8) -> RadixReposit
         drop_insert_offsets=torch.tensor(event_offsets, dtype=torch.int32, device="cpu"),
         drop_range_offsets=torch.arange(event_count + 1, dtype=torch.int32, device="cpu"),
         drop_ranges=torch.tensor(flat_ranges, dtype=torch.int32, device="cpu"),
-        delta_marker_ids=-torch.arange(1, event_count + 1, dtype=torch.int32, device="cpu"),
         reposition_raw_boundaries=torch.tensor(
             [offset - 1 for offset in event_offsets], dtype=torch.int32, device="cpu"
         ),
@@ -89,13 +88,9 @@ def _python_reference_records(request: RadixRepositionInput) -> list[list[int]]:
     insertions = request.drop_insert_offsets.tolist()
     range_offsets = request.drop_range_offsets.tolist()
     ranges = request.drop_ranges.view(-1, 2).tolist()
-    marker_ids = request.delta_marker_ids.tolist()
     reposition_boundaries = request.reposition_raw_boundaries.tolist()
     drop_by_offset = {
-        insertion: (
-            ranges[range_offsets[event] : range_offsets[event + 1]],
-            marker_ids[event],
-        )
+        insertion: ranges[range_offsets[event] : range_offsets[event + 1]]
         for event, insertion in enumerate(insertions)
     }
     reposition_by_offset = {
@@ -111,7 +106,7 @@ def _python_reference_records(request: RadixRepositionInput) -> list[list[int]]:
     for insertion in range(len(token_ids) + 1):
         drop = drop_by_offset.get(insertion)
         if drop is not None:
-            dropped = {token for start, end in drop[0] for token in range(start, end)}
+            dropped = {token for start, end in drop for token in range(start, end)}
             active = [token for token in active if token not in dropped]
 
         reposition = reposition_by_offset.get(insertion)
@@ -137,7 +132,10 @@ def _python_reference_records(request: RadixRepositionInput) -> list[list[int]]:
     reposition_event = 0
     for insertion, token_id in enumerate(token_ids + [None]):
         if drop_event < len(insertions) and insertions[drop_event] == insertion:
-            records.append([DELTA_KIND, marker_ids[drop_event], -1, -1])
+            for start, end in ranges[
+                range_offsets[drop_event] : range_offsets[drop_event + 1]
+            ]:
+                records.append([DELTA_KIND, -start - 1, -end - 1, -1])
             drop_event += 1
         if (
             reposition_event < len(reposition_boundaries)
@@ -170,7 +168,6 @@ def _compile_one(request: RadixRepositionInput) -> RadixRepositionLayout:
         request.drop_insert_offsets,
         request.drop_range_offsets,
         request.drop_ranges,
-        request.delta_marker_ids,
         request.reposition_raw_boundaries,
         request.reposition_insert_offsets,
     )

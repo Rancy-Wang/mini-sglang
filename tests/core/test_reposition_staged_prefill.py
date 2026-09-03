@@ -9,8 +9,8 @@ import torch
 pytest.importorskip("tvm_ffi")
 
 import minisgl.core as core
-import minisgl.tokenizer.reposition_sequence as sequence_module
 from minisgl.core import Req, SamplingParams
+from minisgl.kernel.radix_reposition import compile_radix_reposition_layout
 from minisgl.message import BaseBackendMsg, TokenizeMsg, WarmupAckMsg
 from minisgl.scheduler.cache import CacheManager
 from minisgl.scheduler.prefill import PrefillManager
@@ -53,38 +53,65 @@ def _visible_until(
     return result
 
 
-def _sequence(*, max_tokens: int = 2) -> RepositionSequenceState:
+def _sequence(
+    *,
+    max_tokens: int = 2,
+    reposition_boundary: int | None = 4,
+    drop_positions: list[int] | None = None,
+    drop_ranges: list[int] | None = None,
+) -> RepositionSequenceState:
     token_ids = torch.arange(9, dtype=torch.int32)
-    drops = torch.tensor([2, 7], dtype=torch.int32)
-    drop_offsets = torch.tensor([0, 1, 2], dtype=torch.int32)
-    ranges = torch.tensor([0, 1, 3, 4], dtype=torch.int32)
-    reposition_boundaries = torch.tensor([4], dtype=torch.int32)
-    reposition_offsets = torch.tensor([5], dtype=torch.int32)
+    drop_positions = [2, 7] if drop_positions is None else drop_positions
+    drop_ranges = [0, 1, 3, 4] if drop_ranges is None else drop_ranges
+    drops = torch.tensor(drop_positions, dtype=torch.int32)
+    drop_offsets = torch.arange(len(drop_positions) + 1, dtype=torch.int32)
+    ranges = torch.tensor(drop_ranges, dtype=torch.int32)
+    reposition_boundaries = torch.tensor(
+        [] if reposition_boundary is None else [reposition_boundary],
+        dtype=torch.int32,
+    )
+    reposition_offsets = reposition_boundaries + 1
+    layout = compile_radix_reposition_layout(
+        token_ids,
+        drops,
+        drop_offsets,
+        ranges,
+        reposition_boundaries,
+        reposition_offsets,
+    )
     request = TokenizeMsg(
         uid=7,
         text="already tokenized",
         sampling_params=SamplingParams(max_tokens=max_tokens),
-        reposition=[4],
+        reposition=[] if reposition_boundary is None else [4],
         request_received_ns=123,
     )
     tokenized = TokenizedResult(
         input_ids=token_ids,
         true_positions=torch.arange(9, dtype=torch.int32),
         raw_positions=torch.arange(9, dtype=torch.int32),
-        radix_input_ids=token_ids.to(torch.int64),
-        radix_match_ids=token_ids.to(torch.int64),
+        radix_input_ids=layout.records[layout.token_to_key],
+        radix_match_ids=layout.records,
         prefix_keep_mask=torch.ones(9, dtype=torch.int32),
         prompt_tokens=9,
         full_input_ids=token_ids,
         full_token_visible_until=_visible_until(9, drops, drop_offsets, ranges),
-        full_keep_mask=torch.tensor([0, 1, 1, 0, 1, 1, 1, 1, 1], dtype=torch.int32),
+        full_keep_mask=layout.keep_mask.to(torch.int32),
         drop_event_positions=drops,
         drop_range_offsets=drop_offsets,
         drop_position_ranges=ranges,
-        drop_effective_event_count=2,
+        drop_effective_event_count=len(drop_positions),
         reposition_raw_boundaries=reposition_boundaries,
         reposition_insert_offsets=reposition_offsets,
         reposition_input_ids=token_ids,
+        radix_key_virtual_mask=layout.virtual_mask,
+        radix_key_to_token=layout.key_to_token,
+        radix_token_to_key=layout.token_to_key,
+        radix_positions=layout.positions,
+        radix_repos_info=layout.repos_info,
+        radix_next_position=layout.next_position,
+        radix_current_reposition=layout.current_reposition,
+        reposition_layout=layout,
         tokenize_invocations=1,
     )
     return RepositionSequenceState.pending(request, tokenized)
@@ -124,8 +151,19 @@ def test_empty_reposition_builds_one_structured_retry_source_without_staging() -
         reposition_input_ids=token_ids,
         tokenize_invocations=1,
     )
+    layout = compile_radix_reposition_layout(
+        token_ids,
+        torch.empty(0, dtype=torch.int32),
+        torch.zeros(1, dtype=torch.int32),
+        torch.empty(0, dtype=torch.int32),
+        tokenized.reposition_raw_boundaries,
+        tokenized.reposition_insert_offsets,
+    )
+    tokenized.reposition_layout = layout
+    tokenized.radix_input_ids = layout.records[layout.token_to_key]
+    tokenized.radix_match_ids = layout.records
     state = RepositionSequenceState.pending(request, tokenized)
-    state.compile([], step_token_budget=2)
+    state.activate(step_token_budget=2)
 
     message = state.build_next_msg()
 
@@ -136,25 +174,14 @@ def test_empty_reposition_builds_one_structured_retry_source_without_staging() -
     assert message.tokenize_invocations == 1
 
 
-def test_tokenizer_sequence_compiles_once_and_waits_between_scheduler_turns(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_tokenizer_sequence_reuses_one_precompiled_layout_between_scheduler_turns() -> None:
     state = _sequence()
-    calls = 0
-    real_compile = sequence_module.compile_radix_reposition_layout
-
-    def count_compile(*args, **kwargs):
-        nonlocal calls
-        calls += 1
-        return real_compile(*args, **kwargs)
-
-    monkeypatch.setattr(sequence_module, "compile_radix_reposition_layout", count_compile)
+    original_layout = state.layout
     open_msg = state.open_msg()
-    assert open_msg.full_token_count == 9
-    state.compile([-101, -102], step_token_budget=64)
-    assert calls == 1
-    with pytest.raises(RuntimeError, match="compiled more than once"):
-        state.compile([-101, -102], step_token_budget=64)
+    assert open_msg.uid == 7
+    assert tuple(vars(open_msg)) == ("uid",)
+    state.activate(step_token_budget=64)
+    assert state.layout is original_layout
 
     # Scheduler acknowledgements carry cumulative snapshots seeded by the
     # previous Tokenizer turn; accepting one must not count that seed twice.
@@ -178,10 +205,33 @@ def test_tokenizer_sequence_compiles_once_and_waits_between_scheduler_turns(
     assert final.radix_match_ns == 11
     assert final.retry_plan_ns == 0
     assert final.reposition_transition_count == 0
-    assert calls == 1
 
     assert not any(field.name.startswith("staged_") for field in fields(Req))
     assert not any(field.name.startswith("staged_") for field in fields(PendingReq))
+
+
+def test_scheduler_closes_final_warmup_sequence_but_keeps_intermediate_stage() -> None:
+    scheduler = object.__new__(Scheduler)
+    scheduler.context_sequence_uids = {7}
+    scheduler.cache_manager = SimpleNamespace(cache_req=lambda *args, **kwargs: None)
+    scheduler.table_manager = SimpleNamespace(free=lambda *args, **kwargs: None)
+    intermediate = SimpleNamespace(
+        uid=7,
+        table_idx=0,
+        is_warmup=True,
+        radix_next_position=None,
+    )
+    final = SimpleNamespace(
+        uid=7,
+        table_idx=0,
+        is_warmup=True,
+        radix_next_position=9,
+    )
+
+    scheduler._free_req_resources(intermediate)
+    assert scheduler.context_sequence_uids == {7}
+    scheduler._free_req_resources(final)
+    assert scheduler.context_sequence_uids == set()
 
 
 def test_each_scheduler_turn_reuses_the_previous_partial_radix_prefix(
@@ -196,7 +246,7 @@ def test_each_scheduler_turn_reuses_the_previous_partial_radix_prefix(
 
     monkeypatch.setattr(torch, "empty", cpu_empty)
     state = _sequence(max_tokens=1)
-    state.compile([-201, -202], step_token_budget=64)
+    state.activate(step_token_budget=64)
     page_table = torch.full((2, 64), -1, dtype=torch.int32)
     cache = CacheManager(64, 1, page_table, "radix")
     table = TableManager(2, page_table)
@@ -242,12 +292,8 @@ def test_each_scheduler_turn_reuses_the_previous_partial_radix_prefix(
 
 
 def test_terminal_reposition_dispatches_final_generation_without_new_raw_tokens() -> None:
-    state = _sequence(max_tokens=1)
-    assert state.tokenized.reposition_raw_boundaries is not None
-    assert state.tokenized.reposition_insert_offsets is not None
-    state.tokenized.reposition_raw_boundaries = torch.tensor([8], dtype=torch.int32)
-    state.tokenized.reposition_insert_offsets = torch.tensor([9], dtype=torch.int32)
-    state.compile([-301, -302], step_token_budget=64)
+    state = _sequence(max_tokens=1, reposition_boundary=8)
+    state.activate(step_token_budget=64)
 
     materialize = state.build_next_msg()
     assert materialize.raw_positions.tolist() == list(range(9))
@@ -262,6 +308,26 @@ def test_terminal_reposition_dispatches_final_generation_without_new_raw_tokens(
     assert not final.use_context_mask
     assert torch.any(final.radix_match_ids[:, 0] == 2)
     assert final.radix_commit_key_len == len(final.radix_match_ids)
+
+
+def test_terminal_drop_without_effective_reposition_uses_mask_and_commits_delta() -> None:
+    state = _sequence(
+        max_tokens=1,
+        reposition_boundary=None,
+        drop_positions=[9],
+        drop_ranges=[0, 1],
+    )
+    state.activate(step_token_budget=64)
+
+    final = state.build_next_msg()
+
+    assert final.use_context_mask
+    assert final.context_post_prefill_keep_mask is not None
+    assert final.context_post_prefill_keep_mask.tolist() == [0] + [1] * 8
+    assert final.drop_effective_event_count == 1
+    assert final.drop_event_positions.tolist() == [9]
+    assert final.radix_commit_key_len == len(final.radix_match_ids)
+    assert final.radix_match_ids[-1].tolist() == [1, -1, -2, -1]
 
 
 def test_final_mask_prefill_compacts_decode_view_and_retains_owned_drop_pages() -> None:

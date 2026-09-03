@@ -56,7 +56,7 @@ def test_serialize_deserialize():
     assert result.data[0].drop_effective_event_count == 2
 
     records = torch.tensor(
-        [[0, 10, -1, 0], [1, -100, -1, -1], [0, 11, 0, 1]],
+        [[0, 10, -1, 0], [1, -1, -2, -1], [0, 11, 0, 1]],
         dtype=torch.int32,
     )
     structured = UserMsg(
@@ -73,16 +73,9 @@ def test_serialize_deserialize():
     assert torch.equal(restored_structured.radix_match_ids, records)
     assert restored_structured.radix_key_virtual_mask.tolist() == [False, True, False]
 
-    open_msg = RepositionOpenMsg(
-        uid=2,
-        full_token_count=3,
-        drop_event_positions=torch.tensor([2], dtype=torch.int32),
-        drop_range_offsets=torch.tensor([0, 1], dtype=torch.int32),
-        drop_position_ranges=torch.tensor([0, 1], dtype=torch.int32),
-    )
+    open_msg = RepositionOpenMsg(uid=2)
     restored_open = BaseBackendMsg.decoder(open_msg.encoder())
-    assert restored_open.full_token_count == 3
-    assert restored_open.drop_position_ranges.tolist() == [0, 1]
+    assert vars(restored_open) == {"uid": 2}
 
     warmup = WarmupAckMsg(
         uid=3,

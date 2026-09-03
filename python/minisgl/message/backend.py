@@ -31,13 +31,9 @@ class ExitMsg(BaseBackendMsg):
 
 @dataclass
 class RepositionOpenMsg(BaseBackendMsg):
-    """Acquire stable scheduler-owned Delta marker IDs before one CPU compile."""
+    """Open a staged Reposition sequence and obtain its Prefill quantum."""
 
     uid: int
-    full_token_count: int
-    drop_event_positions: torch.Tensor
-    drop_range_offsets: torch.Tensor
-    drop_position_ranges: torch.Tensor
 
 
 @dataclass
@@ -50,11 +46,10 @@ class UserMsg(BaseBackendMsg):
     sampling_params: SamplingParams
     prompt_tokens: int | None = None
     radix_match_ids: torch.Tensor | None = None  # CPU 1D int64 tensor for radix query
-    radix_key_virtual_mask: torch.Tensor | None = None  # CPU 1D bool, key-axis virtual markers
-    radix_key_to_token: torch.Tensor | None = None  # CPU 1D int64, -1 for virtual markers
+    radix_key_virtual_mask: torch.Tensor | None = None  # CPU 1D bool, key-axis virtual records
+    radix_key_to_token: torch.Tensor | None = None  # CPU 1D int64, -1 for virtual records
     radix_token_to_key: torch.Tensor | None = None  # CPU 1D int64, full-token to key axis
     radix_commit_key_len: int | None = None  # internal upper bound for Radix match/commit
-    radix_marker_ids: List[int] | None = None  # scheduler-owned request leases
     drop_event_positions: torch.Tensor | None = None  # CPU 1D int32 absolute boundaries
     drop_range_offsets: torch.Tensor | None = None  # CPU 1D int32 CSR offsets
     drop_position_ranges: torch.Tensor | None = None  # CPU 1D int32 flattened [start, end, ...]

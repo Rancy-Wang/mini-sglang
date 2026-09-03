@@ -73,11 +73,19 @@ def _build_user_msg(msg: TokenizeMsg, t: Any) -> UserMsg:
         radix_match_ids=t.radix_match_ids,
         sampling_params=msg.sampling_params,
         prompt_tokens=t.prompt_tokens,
+        radix_key_virtual_mask=t.radix_key_virtual_mask,
+        radix_key_to_token=t.radix_key_to_token,
+        radix_token_to_key=t.radix_token_to_key,
+        radix_positions=t.radix_positions,
+        radix_repos_info=t.radix_repos_info,
+        radix_next_position=t.radix_next_position,
+        radix_current_reposition=t.radix_current_reposition,
         drop_event_positions=t.drop_event_positions,
         drop_range_offsets=t.drop_range_offsets,
         drop_position_ranges=t.drop_position_ranges,
         drop_effective_event_count=t.drop_effective_event_count,
         radix_commit_token_len=t.radix_commit_token_len,
+        radix_commit_key_len=t.radix_commit_key_len,
         enable_thinking=msg.enable_thinking,
         stop=msg.stop,
         stop_token_seqs=t.stop_token_seqs,
@@ -222,10 +230,7 @@ def tokenize_worker(
                         backend_msgs.append(AbortBackendMsg(uid=ack.uid))
                         continue
                     try:
-                        state.compile(
-                            ack.marker_ids,
-                            step_token_budget=ack.step_token_budget,
-                        )
+                        state.activate(step_token_budget=ack.step_token_budget)
                         next_msg = state.build_next_msg()
                         backend_msgs.append(next_msg)
                         if state.in_flight_final:
