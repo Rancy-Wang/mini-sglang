@@ -1,0 +1,807 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>一次 Forward 的 Stage-aware Attention：方案 2 与方案 3</title>
+  <style>
+    :root {
+      --paper: #f5f1e9;
+      --paper-strong: #fffdf8;
+      --ink: #18211d;
+      --muted: #66706a;
+      --line: #d8d2c6;
+      --line-strong: #bdb5a5;
+      --navy: #162a32;
+      --navy-soft: #213b46;
+      --blue: #176b87;
+      --blue-soft: #e0f0f4;
+      --orange: #b95e25;
+      --orange-soft: #f7e7d7;
+      --green: #34735c;
+      --green-soft: #e3efe8;
+      --red: #9d3d3d;
+      --red-soft: #f7e3df;
+      --purple: #65539b;
+      --purple-soft: #ebe7f5;
+      --gold: #9a7319;
+      --gold-soft: #f5edcf;
+      --shadow: 0 18px 50px rgba(25, 35, 31, 0.09);
+      --radius-lg: 22px;
+      --radius-md: 14px;
+      --radius-sm: 9px;
+      --mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      --sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 10% 0%, rgba(23, 107, 135, 0.10), transparent 30rem),
+        radial-gradient(circle at 95% 15%, rgba(185, 94, 37, 0.10), transparent 32rem),
+        var(--paper);
+      font-family: var(--sans);
+      line-height: 1.62;
+    }
+
+    a { color: inherit; }
+    code, .mono { font-family: var(--mono); }
+    code {
+      padding: 0.12em 0.32em;
+      color: var(--navy);
+      background: rgba(22, 42, 50, 0.07);
+      border-radius: 5px;
+    }
+    .shell { width: min(1480px, calc(100% - 40px)); margin: 0 auto; }
+
+    .hero {
+      position: relative;
+      overflow: hidden;
+      color: #f8f4eb;
+      background: var(--navy);
+      border-bottom: 1px solid rgba(255,255,255,0.10);
+    }
+    .hero::after {
+      content: "";
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      background-image:
+        linear-gradient(rgba(255,255,255,0.035) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255,255,255,0.035) 1px, transparent 1px);
+      background-size: 30px 30px;
+      mask-image: linear-gradient(to bottom, black, transparent 92%);
+    }
+    .hero-inner { position: relative; z-index: 1; padding: 74px 0 64px; }
+    .eyebrow {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin: 0 0 18px;
+      color: #a8dce9;
+      font-family: var(--mono);
+      font-size: 13px;
+      letter-spacing: 0.13em;
+      text-transform: uppercase;
+    }
+    .eyebrow::before { content: ""; width: 30px; height: 1px; background: currentColor; }
+    h1, h2, h3, p { margin-top: 0; }
+    h1 {
+      max-width: 1050px;
+      margin-bottom: 18px;
+      font-size: clamp(38px, 5.4vw, 78px);
+      line-height: 1.03;
+      letter-spacing: -0.045em;
+      font-weight: 650;
+    }
+    .hero-lead {
+      max-width: 900px;
+      margin-bottom: 30px;
+      color: #d6e0df;
+      font-size: clamp(17px, 2vw, 22px);
+    }
+    .hero-rule {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 1px;
+      max-width: 940px;
+      overflow: hidden;
+      border: 1px solid rgba(255,255,255,0.13);
+      border-radius: 13px;
+      background: rgba(255,255,255,0.12);
+    }
+    .hero-rule > div { padding: 15px 17px; background: rgba(13, 29, 35, 0.78); }
+    .hero-rule small { display: block; margin-bottom: 4px; color: #8fb1b8; }
+    .hero-rule strong { font-weight: 600; }
+
+    .toc-wrap { position: sticky; z-index: 20; top: 0; background: rgba(245,241,233,0.92); backdrop-filter: blur(12px); border-bottom: 1px solid var(--line); }
+    .toc { display: flex; gap: 24px; overflow-x: auto; padding: 12px 0; scrollbar-width: thin; }
+    .toc a { flex: 0 0 auto; color: var(--muted); font-size: 14px; font-weight: 650; text-decoration: none; }
+    .toc a:hover, .toc a:focus-visible { color: var(--blue); }
+
+    main { padding: 50px 0 80px; }
+    section { margin-top: 72px; scroll-margin-top: 78px; }
+    section:first-child { margin-top: 0; }
+    .section-head { display: grid; grid-template-columns: 120px minmax(0, 1fr); gap: 24px; align-items: start; margin-bottom: 25px; }
+    .section-no { color: var(--muted); font-family: var(--mono); font-size: 13px; letter-spacing: 0.10em; }
+    .section-head h2 { margin-bottom: 8px; font-size: clamp(27px, 3vw, 43px); line-height: 1.1; letter-spacing: -0.025em; }
+    .section-head p { max-width: 840px; margin-bottom: 0; color: var(--muted); }
+
+    .comparison-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; }
+    .scheme {
+      position: relative;
+      overflow: hidden;
+      min-width: 0;
+      background: var(--paper-strong);
+      border: 1px solid var(--line);
+      border-radius: var(--radius-lg);
+      box-shadow: var(--shadow);
+    }
+    .scheme::before { content: ""; position: absolute; inset: 0 0 auto; height: 5px; background: var(--scheme); }
+    .scheme-2 { --scheme: var(--blue); --scheme-soft: var(--blue-soft); }
+    .scheme-3 { --scheme: var(--orange); --scheme-soft: var(--orange-soft); }
+    .scheme-head { display: flex; justify-content: space-between; gap: 18px; align-items: flex-start; padding: 27px 28px 20px; border-bottom: 1px solid var(--line); }
+    .scheme-kicker { margin-bottom: 4px; color: var(--scheme); font-family: var(--mono); font-size: 12px; font-weight: 750; letter-spacing: 0.09em; text-transform: uppercase; }
+    .scheme h3 { margin-bottom: 5px; font-size: 24px; line-height: 1.2; }
+    .scheme-head p { margin-bottom: 0; color: var(--muted); }
+    .badge { flex: 0 0 auto; padding: 5px 10px; color: var(--scheme); background: var(--scheme-soft); border-radius: 999px; font-size: 12px; font-weight: 750; }
+    .scheme-body { padding: 26px 28px 29px; }
+
+    .flow { display: grid; gap: 10px; }
+    .flow-row { display: grid; grid-template-columns: minmax(0, 1fr) 30px minmax(0, 1fr); align-items: center; gap: 6px; }
+    .flow-node { min-height: 68px; padding: 12px 14px; background: #fbfaf6; border: 1px solid var(--line); border-radius: var(--radius-sm); }
+    .flow-node.hot { border-color: color-mix(in srgb, var(--scheme) 44%, var(--line)); background: var(--scheme-soft); }
+    .flow-node strong { display: block; margin-bottom: 2px; font-size: 14px; }
+    .flow-node span { display: block; color: var(--muted); font-family: var(--mono); font-size: 11px; line-height: 1.45; }
+    .arrow { color: var(--scheme); text-align: center; font-size: 23px; }
+    .wide-node { margin-top: 10px; padding: 15px; background: var(--navy); color: #f8f4eb; border-radius: var(--radius-sm); }
+    .wide-node strong { display: block; margin-bottom: 3px; }
+    .wide-node span { color: #bfd0d1; font-family: var(--mono); font-size: 12px; }
+
+    .plain-list { display: grid; gap: 11px; margin: 21px 0 0; padding: 0; list-style: none; }
+    .plain-list li { display: grid; grid-template-columns: 24px minmax(0, 1fr); gap: 10px; align-items: start; }
+    .plain-list b { color: var(--scheme); font-family: var(--mono); }
+
+    .clarifier { display: grid; grid-template-columns: 180px minmax(0, 1fr); gap: 24px; margin-top: 20px; padding: 22px 24px; color: #e9f0ee; background: var(--navy); border-radius: var(--radius-md); }
+    .clarifier strong { color: #9fd8e7; }
+    .clarifier p { margin: 0; }
+
+    .timeline { padding: 26px 28px; background: var(--paper-strong); border: 1px solid var(--line); border-radius: var(--radius-lg); box-shadow: var(--shadow); }
+    .timeline-grid { display: grid; grid-template-columns: 90px 1fr 84px 1.24fr 84px 1fr; gap: 8px; align-items: stretch; }
+    .stage-block, .event-block { min-height: 118px; border-radius: var(--radius-md); }
+    .stage-block { padding: 17px; background: #fbfaf6; border: 1px solid var(--line); }
+    .stage-block.active { outline: 3px solid rgba(23,107,135,0.16); border-color: var(--blue); }
+    .stage-label { display: block; margin-bottom: 10px; color: var(--muted); font-family: var(--mono); font-size: 12px; }
+    .event-block { display: grid; place-content: center; padding: 13px; color: var(--red); background: var(--red-soft); text-align: center; font-size: 12px; font-weight: 750; }
+    .event-block span { display: block; margin-top: 4px; color: var(--muted); font-weight: 500; }
+    .tokens { display: flex; flex-wrap: wrap; gap: 6px; }
+    .token { display: inline-grid; grid-template-columns: auto auto; gap: 5px; align-items: center; padding: 4px 8px; color: var(--navy); background: var(--green-soft); border: 1px solid rgba(52,115,92,0.20); border-radius: 999px; font-family: var(--mono); font-size: 12px; }
+    .token em { color: var(--muted); font-style: normal; }
+    .token.dropped { color: var(--red); background: var(--red-soft); text-decoration: line-through; }
+    .token.query { color: var(--blue); background: var(--blue-soft); }
+
+    .stage-toolbar { display: flex; justify-content: space-between; gap: 18px; align-items: center; margin: 25px 0 17px; }
+    .stage-toolbar p { margin: 0; color: var(--muted); }
+    .stage-buttons { display: inline-flex; padding: 4px; background: rgba(22,42,50,0.07); border-radius: 11px; }
+    .stage-buttons button { appearance: none; padding: 8px 13px; color: var(--muted); background: transparent; border: 0; border-radius: 8px; font: 650 13px var(--sans); cursor: pointer; }
+    .stage-buttons button[aria-pressed="true"] { color: white; background: var(--navy); }
+    .stage-buttons button:focus-visible { outline: 3px solid rgba(23,107,135,0.25); outline-offset: 2px; }
+
+    .stage-panel .scheme-head { padding-bottom: 16px; }
+    .tensor-stack { display: grid; gap: 15px; }
+    .tensor-row { display: grid; grid-template-columns: 112px minmax(0, 1fr); gap: 14px; align-items: start; }
+    .tensor-label strong { display: block; font-family: var(--mono); font-size: 13px; }
+    .tensor-label small { color: var(--muted); }
+    .tensor-buffer { display: flex; flex-wrap: wrap; gap: 6px; min-height: 30px; }
+    .cell { display: inline-flex; align-items: center; gap: 5px; padding: 5px 8px; color: var(--navy); background: #f1eee6; border-radius: 6px; font-family: var(--mono); font-size: 11px; }
+    .cell.q { color: var(--blue); background: var(--blue-soft); }
+    .cell.k { color: var(--purple); background: var(--purple-soft); }
+    .cell.v { color: var(--green); background: var(--green-soft); }
+    .cell.meta { color: var(--orange); background: var(--orange-soft); }
+    .buffer-note { margin: 18px 0 0; padding-top: 15px; color: var(--muted); border-top: 1px solid var(--line); font-size: 13px; }
+
+    .attention-map { margin-top: 20px; padding: 24px; background: var(--navy); border-radius: var(--radius-lg); box-shadow: var(--shadow); }
+    .attention-map h3 { margin-bottom: 4px; color: white; }
+    .attention-map > p { margin-bottom: 18px; color: #b9c9c8; }
+    .attention-map svg { display: block; width: 100%; height: auto; min-height: 360px; }
+    .attention-map text { font-family: var(--sans); }
+
+    .formula-band { display: grid; grid-template-columns: 1fr 44px 1fr; gap: 16px; align-items: center; margin-top: 20px; padding: 23px 25px; background: var(--gold-soft); border: 1px solid rgba(154,115,25,0.24); border-radius: var(--radius-md); }
+    .formula { overflow-wrap: anywhere; font: 14px/1.75 var(--mono); }
+    .equals { color: var(--gold); text-align: center; font-size: 30px; font-weight: 750; }
+    .formula-band small { display: block; margin-top: 6px; color: var(--muted); font-family: var(--sans); }
+
+    .table-wrap { overflow-x: auto; background: var(--paper-strong); border: 1px solid var(--line); border-radius: var(--radius-md); box-shadow: 0 10px 30px rgba(25,35,31,0.055); }
+    table { width: 100%; min-width: 840px; border-collapse: collapse; font-size: 14px; }
+    th, td { padding: 13px 15px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { color: var(--muted); background: #f0ede5; font-size: 12px; letter-spacing: 0.03em; }
+    tr:last-child td { border-bottom: 0; }
+    tbody tr:hover { background: rgba(23,107,135,0.035); }
+    td.mono { white-space: nowrap; font-size: 12px; }
+    .shape-table td:nth-child(1) { font-family: var(--mono); font-weight: 750; }
+    .scheme2-text { color: var(--blue); }
+    .scheme3-text { color: var(--orange); }
+    .same { color: var(--green); font-weight: 750; }
+
+    .definition-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; margin-bottom: 20px; }
+    .definition { padding: 18px; background: var(--paper-strong); border-top: 3px solid var(--green); border-radius: 0 0 var(--radius-sm) var(--radius-sm); }
+    .definition b { display: block; margin-bottom: 4px; font-family: var(--mono); }
+    .definition span { color: var(--muted); font-size: 13px; }
+
+    .math-proof { display: grid; gap: 1px; overflow: hidden; background: var(--line); border: 1px solid var(--line); border-radius: var(--radius-md); }
+    .proof-step { display: grid; grid-template-columns: 74px minmax(0, 1fr) 270px; gap: 18px; align-items: center; padding: 18px 20px; background: var(--paper-strong); }
+    .proof-step .step { color: var(--blue); font: 750 12px var(--mono); }
+    .proof-step .formula { color: var(--navy); }
+    .proof-step p { margin: 0; color: var(--muted); font-size: 13px; }
+
+    .diff-grid { display: grid; grid-template-columns: 190px repeat(2, minmax(0, 1fr)); overflow: hidden; border: 1px solid var(--line); border-radius: var(--radius-md); }
+    .diff-cell { min-width: 0; padding: 16px 18px; background: var(--paper-strong); border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+    .diff-cell:nth-child(3n) { border-right: 0; }
+    .diff-cell:nth-last-child(-n+3) { border-bottom: 0; }
+    .diff-head { color: white; background: var(--navy); font-weight: 750; }
+    .diff-head.s2 { background: var(--blue); }
+    .diff-head.s3 { background: var(--orange); }
+    .diff-label { color: var(--muted); font-weight: 750; }
+
+    .scope-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; }
+    .scope-card { padding: 25px; background: var(--paper-strong); border: 1px solid var(--line); border-radius: var(--radius-lg); }
+    .scope-card.s2 { border-top: 5px solid var(--blue); }
+    .scope-card.s3 { border-top: 5px solid var(--orange); }
+    .scope-card h3 { margin-bottom: 6px; }
+    .scope-card > p { color: var(--muted); }
+    .file-flow { display: grid; gap: 8px; margin-top: 19px; }
+    .file-node { display: grid; grid-template-columns: 44px minmax(0, 1fr); gap: 12px; align-items: start; padding: 13px 14px; background: #f4f1e9; border-radius: var(--radius-sm); }
+    .file-node .kind { color: var(--muted); font: 750 10px var(--mono); letter-spacing: 0.05em; }
+    .file-node code { padding: 0; background: transparent; font-size: 11px; overflow-wrap: anywhere; }
+    .file-node span { display: block; margin-top: 3px; color: var(--muted); font-size: 12px; }
+    .file-node.new { background: var(--orange-soft); }
+    .scope-arrow { color: var(--line-strong); text-align: center; line-height: 1; }
+
+    .truth-box { display: grid; grid-template-columns: 175px minmax(0, 1fr); gap: 22px; margin-top: 22px; padding: 22px 24px; background: var(--green-soft); border-left: 5px solid var(--green); border-radius: var(--radius-sm); }
+    .truth-box strong { color: var(--green); }
+    .truth-box p { margin: 0; }
+
+    .sources { margin: 0; padding-left: 20px; color: var(--muted); }
+    .sources li { margin: 9px 0; }
+    .sources code { overflow-wrap: anywhere; }
+    footer { padding: 35px 0 55px; color: var(--muted); border-top: 1px solid var(--line); font-size: 13px; }
+    footer .shell { display: flex; justify-content: space-between; gap: 20px; }
+
+    @media (max-width: 1050px) {
+      .shell { width: min(100% - 30px, 940px); }
+      .timeline-grid { grid-template-columns: 1fr 72px 1fr; }
+      .timeline-grid .axis-label { display: none; }
+      .event-block { min-height: 80px; }
+      .proof-step { grid-template-columns: 64px minmax(0, 1fr); }
+      .proof-step p { grid-column: 2; }
+    }
+    @media (max-width: 820px) {
+      .comparison-grid, .scope-grid { grid-template-columns: 1fr; }
+      .section-head { grid-template-columns: 1fr; gap: 6px; }
+      .clarifier, .truth-box { grid-template-columns: 1fr; gap: 7px; }
+      .definition-grid { grid-template-columns: 1fr; }
+      .diff-grid { grid-template-columns: 135px repeat(2, minmax(220px, 1fr)); overflow-x: auto; }
+      .formula-band { grid-template-columns: 1fr; }
+      .equals { transform: rotate(90deg); }
+      .stage-toolbar { align-items: flex-start; flex-direction: column; }
+      .hero-rule { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 560px) {
+      .shell { width: min(100% - 22px, 520px); }
+      .hero-inner { padding: 52px 0 45px; }
+      h1 { font-size: 39px; }
+      main { padding-top: 36px; }
+      section { margin-top: 54px; }
+      .scheme-head, .scheme-body, .timeline, .scope-card { padding-left: 18px; padding-right: 18px; }
+      .scheme-head { flex-direction: column; }
+      .flow-row { grid-template-columns: 1fr; }
+      .arrow { transform: rotate(90deg); }
+      .timeline-grid { grid-template-columns: 1fr; }
+      .event-block { min-height: auto; }
+      .tensor-row { grid-template-columns: 1fr; gap: 5px; }
+      .stage-buttons { width: 100%; }
+      .stage-buttons button { flex: 1; }
+      .attention-map { padding: 16px 9px; overflow-x: auto; }
+      .attention-map svg { width: 840px; max-width: none; }
+      footer .shell { flex-direction: column; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      html { scroll-behavior: auto; }
+      *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+    }
+    @media print {
+      .toc-wrap, .stage-buttons { display: none; }
+      body { background: white; }
+      .hero { print-color-adjust: exact; }
+      section { break-inside: avoid; }
+      .scheme, .timeline, .table-wrap, .attention-map { box-shadow: none; }
+    }
+  </style>
+</head>
+<body>
+  <header class="hero">
+    <div class="shell hero-inner">
+      <p class="eyebrow">Reposition / Drop Message · Design study</p>
+      <h1>一次 Forward，如何跨越多个 Attention Stage？</h1>
+      <p class="hero-lead">方案 2 把每个 stage 的 K/V 视图显式展开；方案 3 让算子按元数据即时生成逻辑视图。两条路径改变的是 Transformer 每层的 Attention，而不是绕过层间依赖。</p>
+      <div class="hero-rule" aria-label="设计约束摘要">
+        <div><small>外层调用</small><strong>1 × model.forward()</strong></div>
+        <div><small>每层工作</small><strong>1 × QKV + stage-aware Attention</strong></div>
+        <div><small>最终产物</small><strong>正确 O、最终 KV、next-token logits</strong></div>
+      </div>
+    </div>
+  </header>
+
+  <nav class="toc-wrap" aria-label="文档目录">
+    <div class="shell toc">
+      <a href="#idea">01 基本思想</a>
+      <a href="#example">02 三阶段例子</a>
+      <a href="#tensors">03 Q/K/V 与 O</a>
+      <a href="#equivalence">04 数学等价</a>
+      <a href="#difference">05 方案区别</a>
+      <a href="#scope">06 修改范围</a>
+      <a href="#sources">07 当前实现依据</a>
+    </div>
+  </nav>
+
+  <main class="shell">
+    <section id="idea">
+      <div class="section-head">
+        <div class="section-no">SECTION 01</div>
+        <div>
+          <h2>同一个目标，两种物理实现</h2>
+          <p>二者共享同一份 stage plan：每个 query 属于哪个 stage、它能看见哪些 token、这些 token 在该 stage 使用什么 RoPE position。差别仅在于逻辑 K/V 视图何时、在哪里被展开。</p>
+        </div>
+      </div>
+
+      <div class="comparison-grid">
+        <article class="scheme scheme-2">
+          <div class="scheme-head">
+            <div>
+              <div class="scheme-kicker">Scheme 2 · explicit materialization</div>
+              <h3>算子外显式展开</h3>
+              <p>先物化每个 stage 需要的旋转后 K 和 V occurrence，再交给 ragged/varlen Attention。</p>
+            </div>
+            <span class="badge">改动较小</span>
+          </div>
+          <div class="scheme-body">
+            <div class="flow" aria-label="方案 2 每层数据流">
+              <div class="flow-row">
+                <div class="flow-node"><strong>H<sup>ℓ−1</sup>[N,D]</strong><span>上一层全部 token hidden states</span></div>
+                <div class="arrow">→</div>
+                <div class="flow-node"><strong>Q/K/V base</strong><span>Q[N,Hq,d], K,V[N,Hkv,d]</span></div>
+              </div>
+              <div class="flow-row">
+                <div class="flow-node hot"><strong>Stage expand</strong><span>gather + per-occurrence RoPE</span></div>
+                <div class="arrow">→</div>
+                <div class="flow-node hot"><strong>Q̂ / K<sub>occ</sub> / V<sub>occ</sub></strong><span>[N,Hq,d] / [T,Hkv,d]</span></div>
+              </div>
+              <div class="wide-node"><strong>一次 varlen Attention</strong><span>cu_seqlens_q + cu_seqlens_k → O[N,Hq,d]</span></div>
+            </div>
+            <ol class="plain-list">
+              <li><b>01</b><span>每层 Q/K/V 投影只做一次。</span></li>
+              <li><b>02</b><span>同一个 token 的 base K 可按不同 stage position 被复制、旋转多次。</span></li>
+              <li><b>03</b><span>Attention 后丢弃 occurrence buffer，只把最终位置的 active KV 写入 cache。</span></li>
+            </ol>
+          </div>
+        </article>
+
+        <article class="scheme scheme-3">
+          <div class="scheme-head">
+            <div>
+              <div class="scheme-kicker">Scheme 3 · fused logical views</div>
+              <h3>算子内逻辑展开</h3>
+              <p>不创建 K/V occurrence 张量；Kernel 根据 stage 元数据 gather base K/V，并在寄存器中完成 RoPE。</p>
+            </div>
+            <span class="badge">改动较大</span>
+          </div>
+          <div class="scheme-body">
+            <div class="flow" aria-label="方案 3 每层数据流">
+              <div class="flow-row">
+                <div class="flow-node"><strong>H<sup>ℓ−1</sup>[N,D]</strong><span>上一层全部 token hidden states</span></div>
+                <div class="arrow">→</div>
+                <div class="flow-node"><strong>Q/K/V base</strong><span>每个 raw token 仅一份物理向量</span></div>
+              </div>
+              <div class="flow-row">
+                <div class="flow-node hot"><strong>Stage metadata</strong><span>token_ids + positions + cu_q/cu_k</span></div>
+                <div class="arrow">→</div>
+                <div class="flow-node hot"><strong>Fused kernel</strong><span>gather → RoPE → score → online softmax</span></div>
+              </div>
+              <div class="wide-node"><strong>直接产生 O + final-cache epilogue</strong><span>无 Kocc/Vocc 全局内存写入</span></div>
+            </div>
+            <ol class="plain-list">
+              <li><b>01</b><span>物理 K/V 仍为二维 token × head 结构，并非真的永久保存一个 stage 维。</span></li>
+              <li><b>02</b><span>逻辑 K<sub>s,r</sub> 在 tile 内由 token id 与 position 二元索引定义。</span></li>
+              <li><b>03</b><span>通过 online softmax 跨 K tile 合并，不需要物化完整 score matrix。</span></li>
+            </ol>
+          </div>
+        </article>
+      </div>
+
+      <div class="clarifier">
+        <strong>“一次 Forward”的准确含义</strong>
+        <p>不是在进入模型前提前算完 Attention 数值。第 ℓ 层的 Q/K/V 依赖第 ℓ−1 层的输出，因此仍必须逐层执行；可合并的是原来跨 scheduler turn 的多个 stage，使每一层在同一次外层 <code>model.forward()</code> 内完成 stage-aware Attention。</p>
+      </div>
+    </section>
+
+    <section id="example">
+      <div class="section-head">
+        <div class="section-no">SECTION 02</div>
+        <div>
+          <h2>复杂例子：两次 Drop + 两次 Reposition</h2>
+          <p>六个 raw token 依次出生。每次 Drop 改变后续 query 的可见集合，每次 Reposition 则给幸存 token 重新编号。token 的 hidden state 只计算一次，但它的 K 在后续 stage 可能以新的 RoPE position 被读取。</p>
+        </div>
+      </div>
+
+      <div class="timeline">
+        <div class="timeline-grid" aria-label="三个 Attention stage 的事件时间线">
+          <div class="axis-label"><span class="stage-label">STAGE</span></div>
+          <div class="stage-block active" data-timeline-stage="0">
+            <span class="stage-label">S0 · 初始位置</span>
+            <div class="tokens"><span class="token">t0<em>@0</em></span><span class="token">t1<em>@1</em></span><span class="token">t2<em>@2</em></span></div>
+          </div>
+          <div class="event-block">DROP t0<span>REPOSITION</span></div>
+          <div class="stage-block" data-timeline-stage="1">
+            <span class="stage-label">S1 · t3,t4 出生</span>
+            <div class="tokens"><span class="token">t1<em>@0</em></span><span class="token">t2<em>@1</em></span><span class="token query">t3<em>@2</em></span><span class="token query">t4<em>@3</em></span></div>
+          </div>
+          <div class="event-block">DROP t1<span>REPOSITION</span></div>
+          <div class="stage-block" data-timeline-stage="2">
+            <span class="stage-label">S2 · t5 出生</span>
+            <div class="tokens"><span class="token">t2<em>@0</em></span><span class="token">t3<em>@1</em></span><span class="token">t4<em>@2</em></span><span class="token query">t5<em>@3</em></span></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="stage-toolbar">
+        <p id="stage-description">S0：计算 t0、t1、t2；每个 query 只看当前 stage 内的因果前缀。</p>
+        <div class="stage-buttons" role="group" aria-label="选择 Attention stage">
+          <button type="button" data-stage="0" aria-pressed="true">Stage 0</button>
+          <button type="button" data-stage="1" aria-pressed="false">Stage 1</button>
+          <button type="button" data-stage="2" aria-pressed="false">Stage 2</button>
+        </div>
+      </div>
+
+      <div class="comparison-grid stage-panel" aria-live="polite">
+        <article class="scheme scheme-2">
+          <div class="scheme-head">
+            <div><div class="scheme-kicker">Scheme 2 · selected stage</div><h3 id="s2-title">S0 显式 occurrence</h3></div>
+            <span class="badge" id="s2-count">3 K/V rows</span>
+          </div>
+          <div class="scheme-body tensor-stack">
+            <div class="tensor-row"><div class="tensor-label"><strong>Q̂ segment</strong><small>旋转后 query</small></div><div class="tensor-buffer" id="s2-q"></div></div>
+            <div class="tensor-row"><div class="tensor-label"><strong>K<sub>occ</sub></strong><small>已物化</small></div><div class="tensor-buffer" id="s2-k"></div></div>
+            <div class="tensor-row"><div class="tensor-label"><strong>V<sub>occ</sub></strong><small>已物化</small></div><div class="tensor-buffer" id="s2-v"></div></div>
+            <p class="buffer-note" id="s2-note"></p>
+          </div>
+        </article>
+
+        <article class="scheme scheme-3">
+          <div class="scheme-head">
+            <div><div class="scheme-kicker">Scheme 3 · selected stage</div><h3 id="s3-title">S0 Kernel 逻辑视图</h3></div>
+            <span class="badge">0 occurrence rows</span>
+          </div>
+          <div class="scheme-body tensor-stack">
+            <div class="tensor-row"><div class="tensor-label"><strong>Q base</strong><small>按 q_pos 旋转</small></div><div class="tensor-buffer" id="s3-q"></div></div>
+            <div class="tensor-row"><div class="tensor-label"><strong>K map</strong><small>token → position</small></div><div class="tensor-buffer" id="s3-k"></div></div>
+            <div class="tensor-row"><div class="tensor-label"><strong>Registers</strong><small>即时逻辑 K</small></div><div class="tensor-buffer" id="s3-v"></div></div>
+            <p class="buffer-note" id="s3-note"></p>
+          </div>
+        </article>
+      </div>
+
+      <div class="attention-map">
+        <h3>分段 Q、K、V 如何映射回 O</h3>
+        <p>每一行是独立的 varlen segment；所有 O 按 raw query 顺序拼回 <code>O[0:6]</code>，再进入同一层的输出投影、残差和 MLP。</p>
+        <svg viewBox="0 0 1200 430" role="img" aria-labelledby="map-title map-desc">
+          <title id="map-title">三个 stage 的 Q K V 到 O 映射</title>
+          <desc id="map-desc">Stage 0 的三个 query 生成 O0 到 O2，Stage 1 的两个 query 生成 O3 到 O4，Stage 2 的一个 query 生成 O5，最终按原 query 次序拼接。</desc>
+          <defs>
+            <marker id="arrow-blue" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#6fc3da"/></marker>
+            <marker id="arrow-gold" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#e7c05d"/></marker>
+          </defs>
+          <g fill="none" stroke="#47606a" stroke-width="1">
+            <line x1="0" y1="145" x2="1200" y2="145"/><line x1="0" y1="270" x2="1200" y2="270"/>
+          </g>
+          <g font-size="13" fill="#9fb4b7" font-family="monospace">
+            <text x="18" y="32">S0</text><text x="18" y="173">S1</text><text x="18" y="298">S2</text>
+          </g>
+          <g font-size="12" text-anchor="middle">
+            <g fill="#dff2f6">
+              <rect x="70" y="43" width="64" height="34" rx="8" fill="#195873"/><text x="102" y="65">Q t0@0</text>
+              <rect x="142" y="43" width="64" height="34" rx="8" fill="#195873"/><text x="174" y="65">Q t1@1</text>
+              <rect x="214" y="43" width="64" height="34" rx="8" fill="#195873"/><text x="246" y="65">Q t2@2</text>
+              <rect x="70" y="184" width="74" height="34" rx="8" fill="#195873"/><text x="107" y="206">Q t3@2</text>
+              <rect x="152" y="184" width="74" height="34" rx="8" fill="#195873"/><text x="189" y="206">Q t4@3</text>
+              <rect x="70" y="309" width="74" height="34" rx="8" fill="#195873"/><text x="107" y="331">Q t5@3</text>
+            </g>
+            <g fill="#e9e5f8">
+              <rect x="70" y="91" width="208" height="33" rx="8" fill="#4f437c"/><text x="174" y="112">K/V {t0@0, t1@1, t2@2}</text>
+              <rect x="70" y="232" width="292" height="33" rx="8" fill="#4f437c"/><text x="216" y="253">K/V {t1@0, t2@1, t3@2, t4@3}</text>
+              <rect x="70" y="357" width="292" height="33" rx="8" fill="#4f437c"/><text x="216" y="378">K/V {t2@0, t3@1, t4@2, t5@3}</text>
+            </g>
+            <g fill="#f9f1dc">
+              <rect x="425" y="53" width="180" height="62" rx="13" fill="#765d1d"/><text x="515" y="78">Attention S0</text><text x="515" y="98" fill="#e8d799">mask: causal</text>
+              <rect x="425" y="194" width="180" height="62" rx="13" fill="#765d1d"/><text x="515" y="219">Attention S1</text><text x="515" y="239" fill="#e8d799">mask: drop t0 + causal</text>
+              <rect x="425" y="319" width="180" height="62" rx="13" fill="#765d1d"/><text x="515" y="344">Attention S2</text><text x="515" y="364" fill="#e8d799">mask: drop t0,t1 + causal</text>
+            </g>
+            <g fill="#e5f4eb">
+              <rect x="680" y="60" width="58" height="38" rx="8" fill="#2d6a52"/><text x="709" y="84">O0</text>
+              <rect x="746" y="60" width="58" height="38" rx="8" fill="#2d6a52"/><text x="775" y="84">O1</text>
+              <rect x="812" y="60" width="58" height="38" rx="8" fill="#2d6a52"/><text x="841" y="84">O2</text>
+              <rect x="680" y="205" width="58" height="38" rx="8" fill="#2d6a52"/><text x="709" y="229">O3</text>
+              <rect x="746" y="205" width="58" height="38" rx="8" fill="#2d6a52"/><text x="775" y="229">O4</text>
+              <rect x="680" y="330" width="58" height="38" rx="8" fill="#2d6a52"/><text x="709" y="354">O5</text>
+            </g>
+          </g>
+          <g fill="none" stroke="#6fc3da" stroke-width="2" marker-end="url(#arrow-blue)">
+            <path d="M 292 83 C 345 83, 365 83, 414 83"/><path d="M 375 224 C 395 224, 402 224, 414 224"/><path d="M 375 349 C 395 349, 402 349, 414 349"/>
+            <path d="M 616 83 L 665 83"/><path d="M 616 224 L 665 224"/><path d="M 616 349 L 665 349"/>
+          </g>
+          <g>
+            <rect x="925" y="115" width="242" height="190" rx="18" fill="#203b45" stroke="#55717a"/>
+            <text x="1046" y="144" text-anchor="middle" fill="#9fb4b7" font-size="12">QUERY-ORDER SCATTER</text>
+            <g font-size="12" text-anchor="middle" fill="#e5f4eb">
+              <rect x="955" y="166" width="54" height="38" rx="7" fill="#2d6a52"/><text x="982" y="190">O0</text>
+              <rect x="1016" y="166" width="54" height="38" rx="7" fill="#2d6a52"/><text x="1043" y="190">O1</text>
+              <rect x="1077" y="166" width="54" height="38" rx="7" fill="#2d6a52"/><text x="1104" y="190">O2</text>
+              <rect x="955" y="213" width="54" height="38" rx="7" fill="#2d6a52"/><text x="982" y="237">O3</text>
+              <rect x="1016" y="213" width="54" height="38" rx="7" fill="#2d6a52"/><text x="1043" y="237">O4</text>
+              <rect x="1077" y="213" width="54" height="38" rx="7" fill="#2d6a52"/><text x="1104" y="237">O5</text>
+            </g>
+            <text x="1046" y="279" text-anchor="middle" fill="#d4e0df" font-size="13">→ output projection / residual / MLP</text>
+          </g>
+          <g fill="none" stroke="#e7c05d" stroke-width="2" marker-end="url(#arrow-gold)">
+            <path d="M 882 79 C 910 79, 904 167, 940 180"/><path d="M 816 224 C 875 224, 884 224, 940 224"/><path d="M 750 349 C 880 349, 888 267, 940 241"/>
+          </g>
+        </svg>
+      </div>
+    </section>
+
+    <section id="tensors">
+      <div class="section-head">
+        <div class="section-no">SECTION 03</div>
+        <div>
+          <h2>形式化 Q、K、V：物理张量与逻辑视图</h2>
+          <p>示例取 <code>N=6</code> 个 raw token、<code>S=3</code> 个 stage、<code>Hq=Hkv=1</code>、<code>d=2</code>。可见 K/V occurrence 总数 <code>T=3+4+4=11</code>，最终 active token 数 <code>Nf=4</code>。</p>
+        </div>
+      </div>
+
+      <div class="definition-grid">
+        <div class="definition"><b>I<sub>s</sub> · query set</b><span>I₀={t0,t1,t2}，I₁={t3,t4}，I₂={t5}</span></div>
+        <div class="definition"><b>J<sub>s</sub> · visible key set</b><span>J₀={t0,t1,t2}，J₁={t1,t2,t3,t4}，J₂={t2,t3,t4,t5}</span></div>
+        <div class="definition"><b>p<sub>s</sub>(t) · position</b><span>同一 token 可在不同 stage 使用不同 RoPE position</span></div>
+      </div>
+
+      <div class="table-wrap">
+        <table class="shape-table">
+          <thead><tr><th>张量 / 元数据</th><th>方案 2 形状</th><th>方案 3 形状</th><th>代表内容</th></tr></thead>
+          <tbody>
+            <tr><td>Q_base</td><td>[6,1,2]</td><td>[6,1,2]</td><td>t0…t5 各一份未旋转 query</td></tr>
+            <tr><td>K_base / V_base</td><td>[6,1,2]</td><td>[6,1,2]</td><td>t0…t5 各一份基础 key/value</td></tr>
+            <tr><td>Q_rot</td><td class="scheme2-text">[6,1,2]，物化</td><td class="scheme3-text">不物化；tile 内生成</td><td>每个 query 使用出生 stage 的 position</td></tr>
+            <tr><td>K_occ / V_occ</td><td class="scheme2-text">[11,1,2]，物化</td><td class="scheme3-text">不存在</td><td>J₀ ‖ J₁ ‖ J₂ 的逻辑 K/V 视图</td></tr>
+            <tr><td>key_token_ids</td><td>[11]</td><td>[11]</td><td>0,1,2 | 1,2,3,4 | 2,3,4,5</td></tr>
+            <tr><td>key_positions</td><td>[11]</td><td>[11]</td><td>0,1,2 | 0,1,2,3 | 0,1,2,3</td></tr>
+            <tr><td>cu_q / cu_k</td><td>[4] / [4]</td><td>[4] / [4]</td><td>[0,3,5,6] / [0,3,7,11]</td></tr>
+            <tr><td>O</td><td>[6,1,2]</td><td>[6,1,2]</td><td class="same">完全相同的 O0…O5</td></tr>
+            <tr><td>final K/V cache</td><td>[4,1,2]</td><td>[4,1,2]</td><td>t2@0, t3@1, t4@2, t5@3</td></tr>
+            <tr><td>next logits</td><td>[1,Vocab]</td><td>[1,Vocab]</td><td>取最后 query t5 的最终层 hidden state</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="formula-band">
+        <div class="formula"><strong>方案 2</strong><br>K_occ[s,r] := R(key_positions[s,r]) · K_base[key_token_ids[s,r]]<small>先写入全局内存，再由 Attention 读取。</small></div>
+        <div class="equals">≡</div>
+        <div class="formula"><strong>方案 3</strong><br>K_logical(s,r) := R(p<sub>s,r</sub>) · K_base[j<sub>s,r</sub>]<small>同一表达式在 Kernel tile 的寄存器中即时求值。</small></div>
+      </div>
+
+      <h3 style="margin: 34px 0 14px;">玩具数值：二维 RoPE 每个 position 旋转 90°</h3>
+      <p style="color:var(--muted);">令所有 <code>q_base=k_base=(1,0)</code>；R(0)(1,0)=(1,0)，R(1)(1,0)=(0,1)，R(2)(1,0)=(-1,0)，R(3)(1,0)=(0,-1)。V0=(1,0)，V1=(0,1)，V2=(1,1)，V3=(2,0)，V4=(0,2)，V5=(2,2)。</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Query</th><th>所在 stage / 可见 keys</th><th>scaled scores（1/√2）</th><th>softmax weights</th><th>O 结果</th></tr></thead>
+          <tbody>
+            <tr><td class="mono">t0@0</td><td>S0 · {t0}</td><td class="mono">[0.707107]</td><td class="mono">[1]</td><td class="mono same">(1.000000, 0.000000)</td></tr>
+            <tr><td class="mono">t1@1</td><td>S0 · {t0,t1}</td><td class="mono">[0, 0.707107]</td><td class="mono">[0.330238, 0.669762]</td><td class="mono same">(0.330238, 0.669762)</td></tr>
+            <tr><td class="mono">t2@2</td><td>S0 · {t0,t1,t2}</td><td class="mono">[-0.707107, 0, 0.707107]</td><td class="mono">[0.140029, 0.283995, 0.575975]</td><td class="mono same">(0.716005, 0.859971)</td></tr>
+            <tr><td class="mono">t3@2</td><td>S1 · {t1,t2,t3}</td><td class="mono">[-0.707107, 0, 0.707107]</td><td class="mono">[0.140029, 0.283995, 0.575975]</td><td class="mono same">(1.435946, 0.424025)</td></tr>
+            <tr><td class="mono">t4@3</td><td>S1 · {t1,t2,t3,t4}</td><td class="mono">[0, -0.707107, 0, 0.707107]</td><td class="mono">[0.221181, 0.109057, 0.221181, 0.448581]</td><td class="mono same">(0.551419, 1.227400)</td></tr>
+            <tr><td class="mono">t5@3</td><td>S2 · {t2,t3,t4,t5}</td><td class="mono">[0, -0.707107, 0, 0.707107]</td><td class="mono">[0.221181, 0.109057, 0.221181, 0.448581]</td><td class="mono same">(1.336457, 1.560704)</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="equivalence">
+      <div class="section-head">
+        <div class="section-no">SECTION 04</div>
+        <div>
+          <h2>为什么数学上等价？</h2>
+          <p>两种方案只改变张量的物化位置，不改变 Attention 定义。只要 stage membership、token gather、RoPE position 和 mask 完全相同，就能逐层归纳得到相同输出。</p>
+        </div>
+      </div>
+      <div class="math-proof">
+        <div class="proof-step"><div class="step">STEP 1</div><div class="formula">qᵢ=WQ·Norm(hᵢ<sup>ℓ−1</sup>), kⱼ=WK·Norm(hⱼ<sup>ℓ−1</sup>), vⱼ=WV·Norm(hⱼ<sup>ℓ−1</sup>)</div><p>同一层、同一输入 hidden state，所以 base Q/K/V 相同。</p></div>
+        <div class="proof-step"><div class="step">STEP 2</div><div class="formula">q̂ᵢ=R(pₛ(i))qᵢ，k̂ₛⱼ=R(pₛ(j))kⱼ</div><p>方案 2 写进 occurrence buffer；方案 3 在寄存器求值。</p></div>
+        <div class="proof-step"><div class="step">STEP 3</div><div class="formula">aᵢⱼ=q̂ᵢᵀk̂ₛⱼ/√d + Mₛ(i,j)</div><p>M 同时编码 stage 可见性、Drop、causal 与可选 sliding window。</p></div>
+        <div class="proof-step"><div class="step">STEP 4</div><div class="formula">oᵢ=Σⱼ∈Jₛ softmaxⱼ(aᵢⱼ)·vⱼ</div><p>相同 scores、归一化域和 V，得到相同 O。</p></div>
+        <div class="proof-step"><div class="step">STEP 5</div><div class="formula">H<sup>ℓ</sup><sub>(2)</sub>=H<sup>ℓ</sup><sub>(3)</sub> ⇒ H<sup>ℓ+1</sup><sub>(2)</sub>=H<sup>ℓ+1</sup><sub>(3)</sub></div><p>逐层归纳至 LM Head，因此 next-token logits 相同。</p></div>
+      </div>
+
+      <div class="truth-box">
+        <strong>数值实现注意</strong>
+        <p>Kernel 的 tile 顺序、归约树和 online softmax 合并次序可能造成正常的浮点舍入差异，因此工程验证应使用 dtype 对应的 <code>atol/rtol</code>，而不是要求 bitwise equality。对于 scaled RoPE/YaRN，应调用与现有模型完全相同的 R(p)，不能只凭标准 RoPE 的相对位置恒等式替代。</p>
+      </div>
+    </section>
+
+    <section id="difference">
+      <div class="section-head">
+        <div class="section-no">SECTION 05</div>
+        <div><h2>两种方案的核心区别</h2><p>方案 2 是“用显存和带宽换工程复用”；方案 3 是“用 Kernel 复杂度换较少的中间流量”。</p></div>
+      </div>
+      <div class="diff-grid" role="table" aria-label="方案 2 与方案 3 对比">
+        <div class="diff-cell diff-head" role="columnheader">维度</div><div class="diff-cell diff-head s2" role="columnheader">方案 2 · 显式展开</div><div class="diff-cell diff-head s3" role="columnheader">方案 3 · 算子融合</div>
+        <div class="diff-cell diff-label">K/V 组织</div><div class="diff-cell">物化 <code>K_occ,V_occ[T,…]</code></div><div class="diff-cell">仅保留 <code>K_base,V_base[N,…]</code></div>
+        <div class="diff-cell diff-label">RoPE 位置</div><div class="diff-cell">gather 后批量旋转并写回临时张量</div><div class="diff-cell">加载 tile 后在寄存器旋转</div>
+        <div class="diff-cell diff-label">Attention 调用</div><div class="diff-cell">可复用 varlen/ragged Attention API</div><div class="diff-cell">需要原生理解 stage indirection 的新 Kernel</div>
+        <div class="diff-cell diff-label">额外空间</div><div class="diff-cell"><code>O(T·Hkv·d)</code> occurrence storage</div><div class="diff-cell"><code>O(T)</code> metadata；无展开 K/V</div>
+        <div class="diff-cell diff-label">全局内存流量</div><div class="diff-cell">写 K_occ/V_occ，再由 Attention 读回</div><div class="diff-cell">base K/V 直接加载；避免 occurrence 往返</div>
+        <div class="diff-cell diff-label">实现风险</div><div class="diff-cell">中等：metadata、scatter、cache commit</div><div class="diff-cell">高：Kernel 正确性、GQA、RoPE、mask、数值稳定性</div>
+        <div class="diff-cell diff-label">适合阶段</div><div class="diff-cell">先建立正确性基线与性能上界</div><div class="diff-cell">基线稳定后做最终性能实现</div>
+      </div>
+    </section>
+
+    <section id="scope">
+      <div class="section-head">
+        <div class="section-no">SECTION 06</div>
+        <div>
+          <h2>后端修改范围不同在哪里？</h2>
+          <p>下面是实现提案的预期触达面，不表示当前仓库已经具备方案 2 或方案 3。正式编码仍需独立设计、Plan ID、测试和性能验证。</p>
+        </div>
+      </div>
+      <div class="scope-grid">
+        <article class="scope-card s2">
+          <h3 class="scheme2-text">方案 2：复用现有 Attention 主体</h3>
+          <p>新增 stage plan 和 occurrence materializer；保持模型层循环、输出投影、MLP 和大部分 varlen Attention 语义不变。</p>
+          <div class="file-flow">
+            <div class="file-node"><div class="kind">PLAN</div><div><code>tokenizer/reposition_sequence.py</code><span>由逐 turn 派发扩展为可传输的完整 stage execution plan。</span></div></div>
+            <div class="scope-arrow">↓</div>
+            <div class="file-node"><div class="kind">WIRE</div><div><code>message.py · core.py</code><span>携带 query stage、key token id、stage position、cu_q/cu_k。</span></div></div>
+            <div class="scope-arrow">↓</div>
+            <div class="file-node"><div class="kind">BATCH</div><div><code>scheduler/scheduler.py · attention/base.py</code><span>编译批级 stage metadata，并保持 query 顺序。</span></div></div>
+            <div class="scope-arrow">↓</div>
+            <div class="file-node"><div class="kind">ATTN</div><div><code>layers/attention.py · attention/fa.py</code><span>产生 Q_rot/K_occ/V_occ，调用 ragged/varlen Attention。</span></div></div>
+            <div class="scope-arrow">↓</div>
+            <div class="file-node"><div class="kind">CACHE</div><div><code>kvcache/mha_pool.py</code><span>只提交最终 active token 的最终-position KV。</span></div></div>
+          </div>
+        </article>
+
+        <article class="scope-card s3">
+          <h3 class="scheme3-text">方案 3：Attention 与 RoPE 深度融合</h3>
+          <p>共享方案 2 的 stage plan 和 wire metadata，但不需要 occurrence materializer；改为新增 fused stage-aware kernel 与专用 cache epilogue。</p>
+          <div class="file-flow">
+            <div class="file-node"><div class="kind">PLAN</div><div><code>tokenizer/reposition_sequence.py · message.py · core.py</code><span>与方案 2 相同：建立完整 stage DAG 与批级元数据。</span></div></div>
+            <div class="scope-arrow">↓</div>
+            <div class="file-node"><div class="kind">API</div><div><code>layers/attention.py · attention/base.py</code><span>允许 backend 接收未旋转 Q/K base 与 stage position map。</span></div></div>
+            <div class="scope-arrow">↓</div>
+            <div class="file-node new"><div class="kind">NEW</div><div><code>kernel/triton/stage_aware_attention.py</code><span>tile 内 gather、RoPE、Drop/causal mask、online softmax。</span></div></div>
+            <div class="scope-arrow">↓</div>
+            <div class="file-node"><div class="kind">BACK</div><div><code>attention/fa.py 或新 backend</code><span>调度 fused kernel，并为 GQA/sliding/sinks 提供显式分支。</span></div></div>
+            <div class="scope-arrow">↓</div>
+            <div class="file-node new"><div class="kind">EPIL</div><div><code>kvcache/mha_pool.py · cache write kernel</code><span>按 final_token_ids/final_positions 旋转并提交最终 KV。</span></div></div>
+          </div>
+        </article>
+      </div>
+      <div class="truth-box">
+        <strong>共同保持不变</strong>
+        <p>Embedding、Transformer layer 的顺序、output projection、残差、MLP、最终 norm 与 LM Head 的数学定义不变。改变集中在 stage metadata 的生成/传输，以及每层从 QKV 投影之后到 Attention O 之前的路径。</p>
+      </div>
+    </section>
+
+    <section id="sources">
+      <div class="section-head">
+        <div class="section-no">SECTION 07</div>
+        <div>
+          <h2>当前实现与提案边界</h2>
+          <p>当前 mini-sglang Reposition 是 stage-outer 的多 scheduler turn 实现；本页的方案 2、方案 3 是将这些 stage 合入一次外层 Forward 的设计推导，不是已实现能力。</p>
+        </div>
+      </div>
+      <ul class="sources">
+        <li><code>python/minisgl/tokenizer/reposition_sequence.py:181-288</code> · <strong>RepositionSequenceState.build_next_msg</strong>：在下一有效 Reposition 前截断，并为本 turn 组装 active token、position 与 Drop metadata。</li>
+        <li><code>python/minisgl/tokenizer/reposition_sequence.py:317-374</code> · <strong>RepositionSequenceState.accept_ack</strong>：收到前一 turn acknowledgement 后应用 Drop/Reposition transition。</li>
+        <li><code>python/minisgl/tokenizer/server.py:178-224</code> · <strong>tokenizer_server</strong>：acknowledgement 驱动下一阶段消息派发。</li>
+        <li><code>python/minisgl/scheduler/scheduler.py:576-618</code> · <strong>Scheduler._prepare_batch / _make_positions</strong>：当前 batch 只生成一条扁平 position 向量。</li>
+        <li><code>python/minisgl/layers/attention.py:51-72</code> · <strong>AttentionLayer.forward</strong>：当前使用同一 <code>batch.positions</code> 对 Q/K 做一次 RoPE。</li>
+        <li><code>python/minisgl/attention/base.py:20-47,362-433</code> · <strong>ContextAttentionBatch / build_context_attention_batch</strong>：已有的 ragged Context segment 和 <code>cu_seqlens_q/cu_seqlens_k</code> 基础设施。</li>
+        <li><code>python/minisgl/attention/fa.py:107-156</code> · <strong>FlashAttentionBackend.forward</strong>：当前先把 K/V 存入 cache，再选择普通或 segmented Attention。</li>
+        <li><code>python/minisgl/engine/engine.py:221-236</code> · <strong>Engine.forward_batch</strong>：每个已调度 batch 调用一次模型 forward 并采样 next token。</li>
+        <li><code>python/minisgl/kvcache/mha_pool.py:16-56</code> · <strong>MHAKVCache</strong>：物理 KV buffer 与按 layer 写入接口。</li>
+        <li><code>python/minisgl/layers/embedding.py:87-100</code> · <strong>ParallelLMHead.forward</strong>：Prefill 时选择每个请求的最后 query，再产生 logits。</li>
+      </ul>
+    </section>
+  </main>
+
+  <footer>
+    <div class="shell"><span>Stage-aware Attention design note · PLAN-CS-20260903-R1</span><span>蓝：显式展开 · 橙：算子融合 · 绿：两者共同输出</span></div>
+  </footer>
+
+  <script>
+    (() => {
+      const stages = [
+        {
+          label: "S0",
+          description: "S0：计算 t0、t1、t2；每个 query 只看当前 stage 内的因果前缀。",
+          queries: [["t0",0,"(1,0)"],["t1",1,"(0,1)"],["t2",2,"(-1,0)"]],
+          keys: [["t0",0,"(1,0)"],["t1",1,"(0,1)"],["t2",2,"(-1,0)"]],
+          values: [["t0","v0"],["t1","v1"],["t2","v2"]],
+          note2: "物理切片 Kocc[0:3] / Vocc[0:3]；cu_q[0:2]=[0,3]，cu_k[0:2]=[0,3]。",
+          note3: "Kernel 读取 key_token_ids[0:3]=[0,1,2] 与 key_positions[0:3]=[0,1,2]。"
+        },
+        {
+          label: "S1",
+          description: "S1：t0 已 Drop；t1、t2 被 Reposition 到 0、1，新 query t3、t4 位于 2、3。",
+          queries: [["t3",2,"(-1,0)"],["t4",3,"(0,-1)"]],
+          keys: [["t1",0,"(1,0)"],["t2",1,"(0,1)"],["t3",2,"(-1,0)"],["t4",3,"(0,-1)"]],
+          values: [["t1","v1"],["t2","v2"],["t3","v3"],["t4","v4"]],
+          note2: "物理切片 Kocc[3:7] / Vocc[3:7]；t1、t2 的 base K 被按新 position 再次旋转。",
+          note3: "Kernel 不复制 t1、t2；通过 (token_id, stage_position)=(1,0),(2,1) 形成逻辑 K。"
+        },
+        {
+          label: "S2",
+          description: "S2：t0、t1 均已 Drop；t2、t3、t4 再次 Reposition，t5 在 position 3 出生。",
+          queries: [["t5",3,"(0,-1)"]],
+          keys: [["t2",0,"(1,0)"],["t3",1,"(0,1)"],["t4",2,"(-1,0)"],["t5",3,"(0,-1)"]],
+          values: [["t2","v2"],["t3","v3"],["t4","v4"],["t5","v5"]],
+          note2: "物理切片 Kocc[7:11] / Vocc[7:11]；完成 O5 后仅提交最终 active KV。",
+          note3: "同一 tile 计算 O5，epilogue 写回 t2@0,t3@1,t4@2,t5@3 的最终 KV。"
+        }
+      ];
+
+      const byId = (id) => document.getElementById(id);
+      const cell = (text, kind) => {
+        const el = document.createElement("span");
+        el.className = `cell ${kind}`;
+        el.textContent = text;
+        return el;
+      };
+      const replaceCells = (id, values, formatter, kind) => {
+        const root = byId(id);
+        root.replaceChildren(...values.map((value) => cell(formatter(value), kind)));
+      };
+
+      const renderStage = (index) => {
+        const stage = stages[index];
+        document.querySelectorAll("[data-stage]").forEach((button) => {
+          button.setAttribute("aria-pressed", String(Number(button.dataset.stage) === index));
+        });
+        document.querySelectorAll("[data-timeline-stage]").forEach((block) => {
+          block.classList.toggle("active", Number(block.dataset.timelineStage) === index);
+        });
+        byId("stage-description").textContent = stage.description;
+        byId("s2-title").textContent = `${stage.label} 显式 occurrence`;
+        byId("s3-title").textContent = `${stage.label} Kernel 逻辑视图`;
+        byId("s2-count").textContent = `${stage.keys.length} K/V rows`;
+        replaceCells("s2-q", stage.queries, (x) => `${x[0]}@${x[1]}=${x[2]}`, "q");
+        replaceCells("s2-k", stage.keys, (x) => `${x[0]}@${x[1]}=${x[2]}`, "k");
+        replaceCells("s2-v", stage.values, (x) => `${x[0]}:${x[1]}`, "v");
+        replaceCells("s3-q", stage.queries, (x) => `${x[0]} + q_pos=${x[1]}`, "q");
+        replaceCells("s3-k", stage.keys, (x) => `${x[0]} → p${x[1]}`, "meta");
+        replaceCells("s3-v", stage.keys, (x) => `R(${x[1]})Kbase[${x[0]}]`, "k");
+        byId("s2-note").textContent = stage.note2;
+        byId("s3-note").textContent = stage.note3;
+      };
+
+      document.querySelectorAll("[data-stage]").forEach((button) => {
+        button.addEventListener("click", () => renderStage(Number(button.dataset.stage)));
+      });
+      renderStage(0);
+    })();
+  </script>
+</body>
+</html>
