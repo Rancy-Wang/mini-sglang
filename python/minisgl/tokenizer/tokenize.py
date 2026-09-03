@@ -645,6 +645,7 @@ class TokenizeManager:
         ):
             raise RuntimeError("Harmony completion render has no generation prompt.")
         expected: list[_HarmonyComponentOwnership] = []
+        expected_component_ids: list[int] = []
         component_id = 0
         for start, end in complete_ranges:
             header = encoding.decode(input_ids[start:end]).split("<|message|>", 1)[0]
@@ -664,12 +665,54 @@ class TokenizeManager:
                     "cannot align message ownership."
                 )
             expected.append(prompt.ownership[component_id])
+            expected_component_ids.append(component_id)
             component_id += 1
         if any(not item.is_analysis for item in prompt.ownership[component_id:]):
             raise RuntimeError(
                 "Harmony analysis filtering changed the native message stream; "
                 "cannot align message ownership."
             )
+
+        if self._preserve_harmony_thinking:
+            decode_bytes = getattr(getattr(encoding, "_inner", None), "decode_bytes", None)
+            if decode_bytes is None:
+                raise RuntimeError(
+                    "Harmony byte decoding is required to map retained thinking content."
+                )
+            thinking_ranges: dict[int, List[tuple[int, int]]] = {}
+            for (start, end), prompt_component_id in zip(
+                complete_ranges, expected_component_ids, strict=True
+            ):
+                thinking_source = prompt.thinking_components.get(prompt_component_id)
+                if thinking_source is None:
+                    continue
+                raw_message_id, source = thinking_source
+                token_bytes = [
+                    bytes(decode_bytes([token_id])) for token_id in input_ids[start:end]
+                ]
+                byte_offsets = [0]
+                for value in token_bytes:
+                    byte_offsets.append(byte_offsets[-1] + len(value))
+                source_bytes = source.encode("utf-8")
+                source_start = b"".join(token_bytes).find(source_bytes)
+                source_end = source_start + len(source_bytes)
+                if (
+                    source_start < 0
+                    or source_start not in byte_offsets
+                    or source_end not in byte_offsets
+                ):
+                    raise RuntimeError(
+                        "Harmony thinking content does not align to exact token boundaries."
+                    )
+                thinking_ranges.setdefault(raw_message_id, []).append(
+                    (
+                        start + byte_offsets.index(source_start),
+                        start + byte_offsets.index(source_end),
+                    )
+                )
+            self._harmony_thinking_ranges = thinking_ranges
+        else:
+            self._harmony_thinking_ranges = {}
 
         owners = [-1] * len(input_ids)
         decode_bytes = getattr(getattr(encoding, "_inner", None), "decode_bytes", None)
