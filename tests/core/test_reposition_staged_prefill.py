@@ -11,7 +11,7 @@ pytest.importorskip("tvm_ffi")
 import minisgl.core as core
 import minisgl.tokenizer.reposition_sequence as sequence_module
 from minisgl.core import Req, SamplingParams
-from minisgl.message import TokenizeMsg, WarmupAckMsg
+from minisgl.message import BaseBackendMsg, TokenizeMsg, WarmupAckMsg
 from minisgl.scheduler.cache import CacheManager
 from minisgl.scheduler.prefill import PrefillManager
 from minisgl.scheduler.scheduler import Scheduler
@@ -206,8 +206,11 @@ def test_each_scheduler_turn_reuses_the_previous_partial_radix_prefix(
     )
 
     cached_counts = []
+    active_cached_counts = []
     for turn in range(2):
-        message = state.build_next_msg()
+        # Exercise the real Tokenizer -> Scheduler ownership boundary.  Without
+        # the wire copy, later state transitions could mutate this test's key.
+        message = BaseBackendMsg.decoder(state.build_next_msg().encoder())
         manager.add_one_req(message)
         batch = manager.schedule_next_batch(prefill_budget=64)
         assert batch is not None and len(batch.reqs) == 1
@@ -215,6 +218,7 @@ def test_each_scheduler_turn_reuses_the_previous_partial_radix_prefix(
         cache.allocate_paged(batch.reqs)
         req.complete_one()
         cached_counts.append(req.radix_cached_tokens)
+        active_cached_counts.append(req.initial_active_cached_len)
         ack = _ack(
             req.uid,
             radix_match_ns=req.radix_match_ns,
@@ -228,7 +232,7 @@ def test_each_scheduler_turn_reuses_the_previous_partial_radix_prefix(
 
     assert cached_counts[0] == 0
     assert cached_counts[1] > 0
-    assert kv_cache.calls
+    assert active_cached_counts[1] > 0
     cache.check_integrity()
 
 

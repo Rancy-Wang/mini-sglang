@@ -66,10 +66,12 @@ def test_serialize_deserialize():
         raw_positions=torch.arange(len(t), dtype=torch.int32),
         radix_input_ids=records,
         radix_match_ids=records,
+        radix_key_virtual_mask=torch.tensor([False, True, False]),
         sampling_params=SamplingParams(),
     )
     restored_structured = BaseBackendMsg.decoder(structured.encoder())
     assert torch.equal(restored_structured.radix_match_ids, records)
+    assert restored_structured.radix_key_virtual_mask.tolist() == [False, True, False]
 
     open_msg = RepositionOpenMsg(
         uid=2,

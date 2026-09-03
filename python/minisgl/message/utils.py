@@ -57,7 +57,9 @@ def deserialize_type(cls_map: Dict[str, Type], data: Dict) -> Any:
     if type_name == "Tensor":
         buffer = data["buffer"]
         dtype_str = data["dtype"].replace("torch.", "")
-        np_dtype = getattr(np, dtype_str)
+        # NumPy 1.24 removed the deprecated ``np.bool`` alias while PyTorch
+        # continues to spell this wire dtype ``torch.bool``.
+        np_dtype = np.bool_ if dtype_str == "bool" else getattr(np, dtype_str)
         assert isinstance(buffer, bytes)
         np_tensor = np.frombuffer(buffer, dtype=np_dtype)
         shape = data.get("shape")
