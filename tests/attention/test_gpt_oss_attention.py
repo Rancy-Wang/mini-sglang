@@ -454,9 +454,11 @@ def test_flashinfer_uses_preclipped_context_segments_for_sliding():
     wrapper.run.side_effect = lambda **kwargs: kwargs["q"]
     backend._new_prefill_wrapper = MagicMock(return_value=wrapper)
     metadata = _fi_metadata()
-    metadata.context_segments = SimpleNamespace(query_start=0, query_end=1, wrappers={})
+    metadata.context_segments = SimpleNamespace(
+        query_start=0, query_end=1, wrappers={}, is_decode=False
+    )
     metadata.sliding_context_segments = SimpleNamespace(
-        query_start=0, query_end=1, wrappers={}
+        query_start=0, query_end=1, wrappers={}, is_decode=False
     )
     batch = SimpleNamespace(attn_metadata=metadata, out_loc=object())
     q = torch.empty(1, 1, 4)
