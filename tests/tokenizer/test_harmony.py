@@ -1,11 +1,9 @@
 from datetime import date
 
 import pytest
-
 from minisgl.core import SamplingParams
 from minisgl.message import TokenizeMsg
 from minisgl.tokenizer.tokenize import TokenizeManager
-
 
 TOOLS = [
     {

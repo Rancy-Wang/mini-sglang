@@ -31,7 +31,6 @@ from minisgl.tokenizer.template_provenance import (
 from minisgl.tokenizer.thinking_template import prepare_thinking_template
 from transformers import PreTrainedTokenizerBase
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -1729,7 +1728,6 @@ class TokenizeManager:
                 safe_mode=False,
             )
         safe_mode = False
-        effective_tools = template_tools
         provenance: TemplateTokenProvenance | None = None
         cross_owner_tokens = 0
         if has_reposition or drop_rule is not None:
@@ -1784,7 +1782,6 @@ class TokenizeManager:
                     safe_mode=True,
                 )
                 safe_mode = True
-                effective_tools = None
                 full_no_gen, no_gen_owner, no_gen_query_epoch, unstable_rounds = (
                     self._round_by_round_no_gen(messages, msg.enable_thinking, None)
                 )
