@@ -128,7 +128,7 @@ def _ack(uid: int, **metrics: int) -> WarmupAckMsg:
     )
 
 
-def test_empty_reposition_builds_one_structured_retry_source_without_staging() -> None:
+def test_sequence_rejects_layout_without_an_effective_reposition() -> None:
     token_ids = torch.arange(5, dtype=torch.int32)
     request = TokenizeMsg(
         uid=6,
@@ -162,16 +162,8 @@ def test_empty_reposition_builds_one_structured_retry_source_without_staging() -
     tokenized.reposition_layout = layout
     tokenized.radix_input_ids = layout.records[layout.token_to_key]
     tokenized.radix_match_ids = layout.records
-    state = RepositionSequenceState.pending(request, tokenized)
-    state.activate(step_token_budget=2)
-
-    message = state.build_next_msg()
-
-    assert message.raw_positions.tolist() == [0, 1, 2, 3, 4]
-    assert message.radix_match_ids.ndim == 2
-    assert not message.is_warmup
-    assert not message.use_context_mask
-    assert message.tokenize_invocations == 1
+    with pytest.raises(ValueError, match="effective transition"):
+        RepositionSequenceState.pending(request, tokenized)
 
 
 def test_tokenizer_sequence_reuses_one_precompiled_layout_between_scheduler_turns() -> None:
@@ -201,6 +193,8 @@ def test_tokenizer_sequence_reuses_one_precompiled_layout_between_scheduler_turn
     assert not final.is_warmup
     assert final.context_post_prefill_keep_mask.tolist() == [0, 1, 1, 0, 1, 1, 1, 1, 1]
     assert final.tokenize_invocations == 1
+    assert final.context_stage_count == 2
+    assert final.reposition_ipc_tensor_bytes > first.reposition_ipc_tensor_bytes > 0
     assert final.radix_compile_ns > 0
     assert final.radix_match_ns == 11
     assert final.retry_plan_ns == 0
@@ -208,6 +202,26 @@ def test_tokenizer_sequence_reuses_one_precompiled_layout_between_scheduler_turn
 
     assert not any(field.name.startswith("staged_") for field in fields(Req))
     assert not any(field.name.startswith("staged_") for field in fields(PendingReq))
+
+
+def test_context_stage_count_tracks_actual_scheduler_dispatches() -> None:
+    state = _sequence()
+    state.activate(step_token_budget=2)
+
+    messages = []
+    while True:
+        message = state.build_next_msg()
+        messages.append(message)
+        if not message.is_warmup:
+            break
+        state.accept_ack(_ack(7))
+
+    assert len(messages) > len(state.layout.transition_offsets)
+    assert [message.context_stage_count for message in messages] == list(
+        range(1, len(messages) + 1)
+    )
+    assert messages[-1].context_stage_count == len(messages)
+    assert messages[-1].reposition_ipc_tensor_bytes > messages[0].reposition_ipc_tensor_bytes
 
 
 def test_scheduler_closes_final_warmup_sequence_but_keeps_intermediate_stage() -> None:
@@ -307,27 +321,7 @@ def test_terminal_reposition_dispatches_final_generation_without_new_raw_tokens(
     assert not final.is_warmup
     assert not final.use_context_mask
     assert torch.any(final.radix_match_ids[:, 0] == 2)
-    assert final.radix_commit_key_len == len(final.radix_match_ids)
-
-
-def test_terminal_drop_without_effective_reposition_uses_mask_and_commits_delta() -> None:
-    state = _sequence(
-        max_tokens=1,
-        reposition_boundary=None,
-        drop_positions=[9],
-        drop_ranges=[0, 1],
-    )
-    state.activate(step_token_budget=64)
-
-    final = state.build_next_msg()
-
-    assert final.use_context_mask
-    assert final.context_post_prefill_keep_mask is not None
-    assert final.context_post_prefill_keep_mask.tolist() == [0] + [1] * 8
-    assert final.drop_effective_event_count == 1
-    assert final.drop_event_positions.tolist() == [9]
-    assert final.radix_commit_key_len == len(final.radix_match_ids)
-    assert final.radix_match_ids[-1].tolist() == [1, -1, -2, -1]
+    assert final.radix_commit_key_len is None
 
 
 def test_final_mask_prefill_compacts_decode_view_and_retains_owned_drop_pages() -> None:

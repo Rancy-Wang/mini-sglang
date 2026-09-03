@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 from minisgl.message import UserReply
+from minisgl.message.metrics import RequestMetricsState
 from minisgl.server.api_server import (
     CacheUsageReport,
     FrontendManager,
@@ -119,3 +120,32 @@ def test_request_accepts_sglang_stream_options() -> None:
         stream_options={"include_usage": True},
     )
     assert req.stream_options is not None and req.stream_options.include_usage
+
+
+def test_server_metrics_report_template_dispatch_ipc_and_retry_transfer_separately() -> None:
+    state = RequestMetricsState(
+        request_received_ns=10,
+        prompt_tokens=20,
+        active_prompt_tokens=12,
+        tokenize_invocations=1,
+        chat_template_invocations=1,
+        context_stage_count=3,
+        reposition_ipc_tensor_bytes=4096,
+    )
+    state.observe_reposition(
+        radix_match_ns=30,
+        retry_plan_ns=40,
+        transition_count=5,
+        h2d_bytes=100,
+        d2h_bytes=0,
+    )
+    state.observe_token(20, visible=True)
+
+    metrics = state.finish(25).as_api_dict()
+
+    assert metrics["tokenize_invocations"] == 1
+    assert metrics["chat_template_invocations"] == 1
+    assert metrics["context_stage_count"] == 3
+    assert metrics["reposition_ipc_tensor_bytes"] == 4096
+    assert metrics["reposition_h2d_bytes"] == 100
+    assert metrics["reposition_d2h_bytes"] == 0

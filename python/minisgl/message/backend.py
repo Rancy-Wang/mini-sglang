@@ -74,6 +74,7 @@ class UserMsg(BaseBackendMsg):
     context_post_prefill_keep_mask: torch.Tensor | None = None  # final raw keep-set
     request_received_ns: int | None = None  # frontend monotonic clock, public requests only
     tokenize_invocations: int = 1
+    chat_template_invocations: int = 0
     context_stage_count: int = 0
     radix_compile_ns: int = 0
     radix_match_ns: int = 0
@@ -81,6 +82,7 @@ class UserMsg(BaseBackendMsg):
     reposition_transition_count: int = 0
     reposition_h2d_bytes: int = 0
     reposition_d2h_bytes: int = 0
+    reposition_ipc_tensor_bytes: int = 0
 
 
 @dataclass

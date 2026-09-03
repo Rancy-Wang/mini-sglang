@@ -138,6 +138,46 @@ def test_tokenizer_filters_nonprefix_effective_drop_events_before_radix_compile(
     assert layout.records[-1].tolist() == [1, -3, -4, -1]
 
 
+def test_target_filter_splits_mixed_current_and_future_ranges_at_one_insertion() -> None:
+    events = TokenDropEvents(
+        event_insert_offsets=torch.tensor([4], dtype=torch.int32),
+        range_offsets=torch.tensor([0, 1], dtype=torch.int32),
+        raw_ranges=torch.tensor([0, 4], dtype=torch.int32),
+        full_token_visible_until=torch.full((4,), 4, dtype=torch.int32),
+        effective_event_count=-1,
+        effective_ranges=((0, 2),),
+    )
+
+    positions, offsets, ranges = TokenizeManager._select_effective_delta_wire(
+        events,
+        torch.tensor([0, 0, 1, 1], dtype=torch.bool),
+    )
+
+    assert positions.tolist() == [4]
+    assert offsets.tolist() == [0, 1]
+    assert ranges.tolist() == [0, 2]
+
+
+def test_target_filter_preserves_multiple_effective_fragments_at_one_insertion() -> None:
+    events = TokenDropEvents(
+        event_insert_offsets=torch.tensor([6], dtype=torch.int32),
+        range_offsets=torch.tensor([0, 1], dtype=torch.int32),
+        raw_ranges=torch.tensor([0, 6], dtype=torch.int32),
+        full_token_visible_until=torch.full((6,), 6, dtype=torch.int32),
+        effective_event_count=-1,
+        effective_ranges=((0, 2), (4, 6)),
+    )
+
+    positions, offsets, ranges = TokenizeManager._select_effective_delta_wire(
+        events,
+        torch.tensor([0, 0, 1, 1, 0, 0], dtype=torch.bool),
+    )
+
+    assert positions.tolist() == [6]
+    assert offsets.tolist() == [0, 2]
+    assert ranges.tolist() == [0, 2, 4, 6]
+
+
 @pytest.mark.parametrize("reposition", [[1, 1], [2, 1], [True], [-1]])
 def test_reposition_resolver_rejects_noncanonical_ids(reposition: list[int]) -> None:
     with pytest.raises(ValueError):

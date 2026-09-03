@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
 from datetime import date
@@ -29,6 +30,9 @@ from minisgl.tokenizer.template_provenance import (
 )
 from minisgl.tokenizer.thinking_template import prepare_thinking_template
 from transformers import PreTrainedTokenizerBase
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -63,6 +67,7 @@ class TokenizedResult:
     stop_token_seqs: List[List[int]] | None = None
     message_meta: dict | None = None
     tokenize_invocations: int = 1
+    chat_template_invocations: int = 0
 
 
 @dataclass(frozen=True)
@@ -147,6 +152,8 @@ class TokenizeManager:
         # Be optimistic: many tokenizers accept extra kwargs via **kwargs even
         # when the explicit signature does not list `enable_thinking`.
         self._supports_enable_thinking = True
+        self._tokenize_invocations = 0
+        self._chat_template_invocations = 0
 
     @staticmethod
     def _empty_context_events() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -200,6 +207,7 @@ class TokenizeManager:
             )
 
         keep_mask = final_keep_mask.to(device="cpu", dtype=torch.bool).view(-1)
+        target_ranges = list(events.effective_ranges)
         selected_positions: list[int] = []
         selected_ranges: list[tuple[int, int]] = []
         selected_offsets = [0]
@@ -211,25 +219,23 @@ class TokenizeManager:
                 (int(start), int(finish))
                 for start, finish in ranges[begin:end].tolist()
             ]
-            effective: list[bool] = []
+            effective_ranges: list[tuple[int, int]] = []
             for start, finish in event_ranges:
-                segment = keep_mask[start:finish]
-                all_kept = bool(torch.all(segment).item())
-                all_dropped = bool(torch.all(~segment).item())
-                if not (all_kept or all_dropped):
+                for target_start, target_finish in target_ranges:
+                    overlap_start = max(start, target_start)
+                    overlap_finish = min(finish, target_finish)
+                    if overlap_start < overlap_finish:
+                        effective_ranges.append((overlap_start, overlap_finish))
+            effective_ranges = TokenizeManager._canonicalize_position_ranges(effective_ranges)
+            for start, finish in effective_ranges:
+                if bool(torch.any(keep_mask[start:finish]).item()):
                     raise ValueError(
-                        "A target-specific keep mask partially cuts a Drop delta range: "
+                        "Target-effective Drop ranges disagree with the final keep mask: "
                         f"event={insertion}, range=[{start}, {finish})"
                     )
-                effective.append(all_dropped)
-            if effective and any(state != effective[0] for state in effective[1:]):
-                raise ValueError(
-                    "One Drop event has inconsistent target-specific range visibility: "
-                    f"event={insertion}, effective={effective}"
-                )
-            if effective and effective[0]:
+            if effective_ranges:
                 selected_positions.append(int(insertion))
-                selected_ranges.extend(event_ranges)
+                selected_ranges.extend(effective_ranges)
                 selected_offsets.append(len(selected_ranges))
 
         return (
@@ -248,6 +254,8 @@ class TokenizeManager:
         tools: List[Dict[str, Any]] | None,
     ) -> Any:
         if self.is_gpt_oss:
+            self._chat_template_invocations += 1
+            self._tokenize_invocations += 1
             tokens = self._render_harmony_tokens(
                 messages,
                 add_generation_prompt=add_generation_prompt,
@@ -271,6 +279,9 @@ class TokenizeManager:
         tried_bare_tools = self._template_requires_bare_tools
         while True:
             try:
+                self._chat_template_invocations += 1
+                if tokenize:
+                    self._tokenize_invocations += 1
                 return self.tokenizer.apply_chat_template(messages, **kwargs)
             except TypeError as exc:
                 # Only downgrade when the failure is specifically due to an
@@ -602,6 +613,8 @@ class TokenizeManager:
             tools=tools,
         )
         encoding = self._get_harmony_encoding()
+        self._chat_template_invocations += 1
+        self._tokenize_invocations += 1
         input_ids = [
             int(token_id)
             for token_id in encoding.render_conversation_for_completion(
@@ -797,36 +810,16 @@ class TokenizeManager:
         *,
         enable_thinking: bool | None,
         tools: List[Dict[str, Any]] | None,
-        expected_input_ids: List[int] | None,
     ) -> TemplateTokenProvenance:
-        def render(add_generation_prompt: bool) -> str:
-            return self._render_chat_template(
-                messages,
-                add_generation_prompt=add_generation_prompt,
-                enable_thinking=effective_enable_thinking,
-                tools=effective_tools,
-            )
-
         effective_tools = self._effective_template_tools(tools)
-        effective_enable_thinking = enable_thinking
-        canonical_no_gen = render(False)
-        canonical_with_gen = render(True)
-        supported_thinking = enable_thinking if self._supports_enable_thinking else None
-        if supported_thinking != effective_enable_thinking:
-            effective_enable_thinking = supported_thinking
-            canonical_no_gen = render(False)
-            canonical_with_gen = render(True)
-        effective_tools = self._effective_template_tools(tools)
-
+        self._chat_template_invocations += 1
+        self._tokenize_invocations += 1
         return build_template_token_provenance(
             self.tokenizer,
             messages,
-            canonical_text=canonical_with_gen,
-            canonical_no_generation_text=canonical_no_gen,
-            expected_input_ids=expected_input_ids,
             tools=effective_tools,
             add_generation_prompt=True,
-            enable_thinking=effective_enable_thinking,
+            enable_thinking=(enable_thinking if self._supports_enable_thinking else None),
             chat_template=self._chat_template_override,
             template_kwargs=self._chat_template_kwargs,
         )
@@ -1647,6 +1640,8 @@ class TokenizeManager:
 
     def _chat_tokenize(self, msg: TokenizeMsg) -> TokenizedResult:
         assert isinstance(msg.text, list)
+        self._tokenize_invocations = 0
+        self._chat_template_invocations = 0
         self._reasoning_effort = msg.reasoning_effort
         self._preserve_harmony_thinking = False
         self._harmony_thinking_ranges = {}
@@ -1694,11 +1689,7 @@ class TokenizeManager:
         effective_tools = template_tools
         provenance: TemplateTokenProvenance | None = None
         cross_owner_tokens = 0
-        if (
-            has_reposition
-            or isinstance(drop_rule, (MessageDropRule, KeepTextDropRule))
-            or (self.is_gpt_oss and isinstance(drop_rule, TextDropRule))
-        ):
+        if has_reposition or drop_rule is not None:
             if self.is_gpt_oss:
                 full_with_gen, owner_with_gen, gen_prompt_start = self._render_harmony_message_drop(
                     messages,
@@ -1709,26 +1700,11 @@ class TokenizeManager:
                     provenance = self._build_harmony_provenance(full_with_gen, owner_with_gen)
                     cross_owner_tokens = provenance.cross_owner_tokens
             else:
-                try:
-                    provenance = self._build_template_provenance(
-                        messages,
-                        enable_thinking=msg.enable_thinking,
-                        tools=template_tools,
-                        expected_input_ids=None,
-                    )
-                except Exception:
-                    messages, target_offset = self._build_template_messages(
-                        msg.text,
-                        safe_mode=True,
-                    )
-                    safe_mode = True
-                    effective_tools = None
-                    provenance = self._build_template_provenance(
-                        messages,
-                        enable_thinking=msg.enable_thinking,
-                        tools=None,
-                        expected_input_ids=None,
-                    )
+                provenance = self._build_template_provenance(
+                    messages,
+                    enable_thinking=msg.enable_thinking,
+                    tools=template_tools,
+                )
                 full_with_gen = provenance.input_ids
                 owner_with_gen = provenance.owners
                 cross_owner_tokens = provenance.cross_owner_tokens
@@ -1800,16 +1776,6 @@ class TokenizeManager:
                 if len(full_no_gen) > 0
                 else [next_assistant_id] * len(full_with_gen)
             )
-
-            if drop_rule is not None and not self.is_gpt_oss:
-                provenance = self._build_template_provenance(
-                    messages,
-                    enable_thinking=msg.enable_thinking,
-                    tools=effective_tools,
-                    expected_input_ids=full_with_gen,
-                )
-                owner_with_gen = provenance.owners
-                cross_owner_tokens = provenance.cross_owner_tokens
 
         full_no_gen_tensor = torch.tensor(full_no_gen, dtype=torch.int32, device="cpu")
         full_with_gen_tensor = torch.tensor(full_with_gen, dtype=torch.int32, device="cpu")
@@ -1946,6 +1912,26 @@ class TokenizeManager:
             reposition_raw_boundaries,
             reposition_insert_offsets,
         )
+        effective_reposition = False
+        ignored_reposition_boundaries: list[int] = []
+        if layout is not None and reposition_raw_boundaries is not None:
+            effective_reposition = bool(
+                torch.any(layout.effective_reposition_stages > 0).item()
+            )
+            ignored_reposition_boundaries = reposition_raw_boundaries[
+                layout.ignored_repositions
+            ].tolist()
+            if ignored_reposition_boundaries:
+                logger.warning(
+                    "Ignoring no-op Reposition boundaries for request %s: %s",
+                    msg.uid,
+                    ignored_reposition_boundaries,
+                )
+        if msg.reposition == []:
+            logger.warning(
+                "Ignoring empty Reposition list for request %s; using the ordinary path.",
+                msg.uid,
+            )
         if layout is None:
             radix_input_ids = radix_match_ids[keep_mask].contiguous()
             radix_commit_key_len = None
@@ -1998,7 +1984,7 @@ class TokenizeManager:
             ),
             reposition_raw_boundaries=reposition_raw_boundaries,
             reposition_insert_offsets=reposition_insert_offsets,
-            reposition_input_ids=(full_with_gen_tensor if msg.reposition is not None else None),
+            reposition_input_ids=(full_with_gen_tensor if effective_reposition else None),
             radix_commit_token_len=warmup_commit_token_len,
             radix_commit_key_len=radix_commit_key_len,
             radix_key_virtual_mask=(layout.virtual_mask if layout is not None else None),
@@ -2031,7 +2017,10 @@ class TokenizeManager:
                 "radix_drop_key_mode": self.radix_drop_key_mode,
                 "drop_rule_type": drop_rule.type if drop_rule is not None else None,
                 "thinking_template_capability": thinking_template_capability,
+                "ignored_reposition_boundaries": ignored_reposition_boundaries,
             },
+            tokenize_invocations=self._tokenize_invocations,
+            chat_template_invocations=self._chat_template_invocations,
         )
 
     def tokenize(self, msgs: List[TokenizeMsg]) -> List[TokenizedResult]:

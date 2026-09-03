@@ -99,6 +99,7 @@ def _build_user_msg(msg: TokenizeMsg, t: Any) -> UserMsg:
         use_context_mask=msg.use_context_mask,
         request_received_ns=msg.request_received_ns,
         tokenize_invocations=t.tokenize_invocations,
+        chat_template_invocations=t.chat_template_invocations,
     )
 
 

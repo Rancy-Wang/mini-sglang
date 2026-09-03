@@ -16,6 +16,7 @@ class ServerMetrics:
     generated_tokens: int
     completion_tokens: int
     tokenize_invocations: int = 1
+    chat_template_invocations: int = 0
     context_stage_count: int = 0
     radix_compile_ns: int = 0
     radix_match_ns: int = 0
@@ -23,6 +24,7 @@ class ServerMetrics:
     reposition_transition_count: int = 0
     reposition_h2d_bytes: int = 0
     reposition_d2h_bytes: int = 0
+    reposition_ipc_tensor_bytes: int = 0
 
     def __post_init__(self) -> None:
         timestamps = (
@@ -40,6 +42,7 @@ class ServerMetrics:
             raise ValueError("A terminal generation must contain at least one sampled token.")
         counters = (
             self.tokenize_invocations,
+            self.chat_template_invocations,
             self.context_stage_count,
             self.radix_compile_ns,
             self.radix_match_ns,
@@ -47,6 +50,7 @@ class ServerMetrics:
             self.reposition_transition_count,
             self.reposition_h2d_bytes,
             self.reposition_d2h_bytes,
+            self.reposition_ipc_tensor_bytes,
         )
         if self.tokenize_invocations < 1 or any(value < 0 for value in counters[1:]):
             raise ValueError("Serving performance counters must be non-negative.")
@@ -61,6 +65,7 @@ class ServerMetrics:
             "generated_tokens": self.generated_tokens,
             "completion_tokens": self.completion_tokens,
             "tokenize_invocations": self.tokenize_invocations,
+            "chat_template_invocations": self.chat_template_invocations,
             "context_stage_count": self.context_stage_count,
             "radix_compile_ns": self.radix_compile_ns,
             "radix_match_ns": self.radix_match_ns,
@@ -68,6 +73,7 @@ class ServerMetrics:
             "reposition_transition_count": self.reposition_transition_count,
             "reposition_h2d_bytes": self.reposition_h2d_bytes,
             "reposition_d2h_bytes": self.reposition_d2h_bytes,
+            "reposition_ipc_tensor_bytes": self.reposition_ipc_tensor_bytes,
         }
 
 
@@ -83,6 +89,7 @@ class RequestMetricsState:
     generated_tokens: int = 0
     completion_tokens: int = 0
     tokenize_invocations: int = 1
+    chat_template_invocations: int = 0
     context_stage_count: int = 0
     radix_compile_ns: int = 0
     radix_match_ns: int = 0
@@ -90,6 +97,7 @@ class RequestMetricsState:
     reposition_transition_count: int = 0
     reposition_h2d_bytes: int = 0
     reposition_d2h_bytes: int = 0
+    reposition_ipc_tensor_bytes: int = 0
 
     def observe_reposition(
         self,
@@ -130,6 +138,7 @@ class RequestMetricsState:
             generated_tokens=self.generated_tokens,
             completion_tokens=self.completion_tokens,
             tokenize_invocations=self.tokenize_invocations,
+            chat_template_invocations=self.chat_template_invocations,
             context_stage_count=self.context_stage_count,
             radix_compile_ns=self.radix_compile_ns,
             radix_match_ns=self.radix_match_ns,
@@ -137,4 +146,5 @@ class RequestMetricsState:
             reposition_transition_count=self.reposition_transition_count,
             reposition_h2d_bytes=self.reposition_h2d_bytes,
             reposition_d2h_bytes=self.reposition_d2h_bytes,
+            reposition_ipc_tensor_bytes=self.reposition_ipc_tensor_bytes,
         )

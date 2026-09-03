@@ -47,20 +47,55 @@ class _TraceTemplateOutputs(NodeTransformer):
             if names:
                 del self._loop_vars[-len(names) :]
 
-    def visit_Output(self, node: nodes.Output, *args, **kwargs):
-        node = self.generic_visit(node, *args, **kwargs)
+    @staticmethod
+    def _references_generation_prompt(node: nodes.Node) -> bool:
+        if isinstance(node, nodes.Name) and node.name == "add_generation_prompt":
+            return True
+        return any(
+            isinstance(candidate, nodes.Name)
+            and candidate.name == "add_generation_prompt"
+            for candidate in node.find_all(nodes.Name)
+        )
+
+    def _marker_call(self, phase: str, lineno: int) -> nodes.Call:
         loop_values = [nodes.Name(name, "load") for name in reversed(self._loop_vars)]
+        return nodes.Call(
+            nodes.Name("_minisgl_owner_marker", "load"),
+            [nodes.Const(phase), *loop_values],
+            [],
+            None,
+            None,
+        ).set_lineno(lineno)
 
-        def marker_call(phase: str) -> nodes.Call:
-            return nodes.Call(
-                nodes.Name("_minisgl_owner_marker", "load"),
-                [nodes.Const(phase), *loop_values],
-                [],
-                None,
-                None,
-            ).set_lineno(node.lineno)
+    def _marker_output(self, phase: str, lineno: int) -> nodes.Output:
+        return nodes.Output([self._marker_call(phase, lineno)]).set_lineno(lineno)
 
-        node.nodes = [marker_call("B"), *node.nodes, marker_call("E")]
+    def visit_If(self, node: nodes.If, *args, **kwargs):
+        traces_generation = self._references_generation_prompt(node.test)
+        node = self.generic_visit(node, *args, **kwargs)
+        if traces_generation:
+            node.body = [
+                self._marker_output("G", node.lineno),
+                *node.body,
+                self._marker_output("H", node.lineno),
+            ]
+        return node
+
+    def visit_Output(self, node: nodes.Output, *args, **kwargs):
+        traces_generation = self._references_generation_prompt(node)
+        node = self.generic_visit(node, *args, **kwargs)
+        traced_nodes = [
+            self._marker_call("B", node.lineno),
+            *node.nodes,
+            self._marker_call("E", node.lineno),
+        ]
+        if traces_generation:
+            traced_nodes = [
+                self._marker_call("G", node.lineno),
+                *traced_nodes,
+                self._marker_call("H", node.lineno),
+            ]
+        node.nodes = traced_nodes
         return node
 
 
@@ -113,25 +148,26 @@ def _render_traced_template(
         _minisgl_owner_marker=owner_marker,
         **template_kwargs,
     )
-    pattern = re.compile(re.escape(marker_prefix) + r"([BE]):(-?\d+)\x00")
+    pattern = re.compile(re.escape(marker_prefix) + r"([BEGH]):(-?\d+)\x00")
     return traced, marker_prefix, pattern
 
 
 def _parse_character_owners(
     traced_text: str,
-    canonical_text: str,
-    canonical_no_generation_text: str,
     marker_pattern: re.Pattern[str],
     *,
     message_count: int,
     add_generation_prompt: bool,
-) -> list[int]:
+) -> tuple[str, list[int]]:
     clean_parts: list[str] = []
     owners: list[int] = []
     active: list[int] = []
+    generation_depth = 0
     cursor = 0
 
     def active_owner() -> int:
+        if generation_depth > 0:
+            return message_count
         return next((owner for owner in reversed(active) if owner >= 0), -1)
 
     for match in marker_pattern.finditer(traced_text):
@@ -143,32 +179,29 @@ def _parse_character_owners(
         marker_owner = int(match.group(2))
         if phase == "B":
             active.append(marker_owner)
-        else:
+        elif phase == "E":
             if not active:
                 raise RuntimeError("Unbalanced chat-template provenance marker.")
             active.pop()
+        elif phase == "G":
+            generation_depth += 1
+        else:
+            if generation_depth == 0:
+                raise RuntimeError("Unbalanced generation-prompt provenance marker.")
+            generation_depth -= 1
         cursor = match.end()
 
     tail = traced_text[cursor:]
     clean_parts.append(tail)
     owners.extend([active_owner()] * len(tail))
-    if active:
+    if active or generation_depth:
         raise RuntimeError("Unbalanced chat-template provenance marker.")
 
     clean_text = "".join(clean_parts)
-    if clean_text != canonical_text:
-        raise RuntimeError(
-            "Instrumented chat template changed canonical text; "
-            "cannot construct reliable message ownership."
-        )
-    if len(owners) != len(canonical_text):
+    if len(owners) != len(clean_text):
         raise RuntimeError("Character ownership length does not match canonical chat text.")
     if len(owners) == 0:
-        return owners
-
-    generation_start = None
-    if add_generation_prompt and canonical_text.startswith(canonical_no_generation_text):
-        generation_start = len(canonical_no_generation_text)
+        return clean_text, owners
 
     known = [idx for idx, owner in enumerate(owners) if owner >= 0]
     if not known:
@@ -178,9 +211,7 @@ def _parse_character_owners(
             )
         fallback = message_count if add_generation_prompt and message_count == 0 else 0
         owners = [fallback] * len(owners)
-        if generation_start is not None:
-            owners[generation_start:] = [message_count] * (len(owners) - generation_start)
-        return owners
+        return clean_text, owners
 
     first_known = known[0]
     first_owner = owners[first_known]
@@ -194,22 +225,17 @@ def _parse_character_owners(
         else:
             previous_owner = owners[idx]
 
-    if generation_start is not None:
-        owners[generation_start:] = [message_count] * (len(owners) - generation_start)
-    elif add_generation_prompt:
+    if add_generation_prompt and message_count not in owners:
         last_known = known[-1]
         if last_known + 1 < len(owners):
             owners[last_known + 1 :] = [message_count] * (len(owners) - last_known - 1)
-    return owners
+    return clean_text, owners
 
 
 def build_template_token_provenance(
     tokenizer,
     messages: list[dict[str, Any]],
     *,
-    canonical_text: str,
-    canonical_no_generation_text: str,
-    expected_input_ids: list[int] | None,
     tools: list[dict[str, Any]] | None,
     add_generation_prompt: bool,
     enable_thinking: bool | None,
@@ -231,10 +257,8 @@ def build_template_token_provenance(
         enable_thinking=enable_thinking,
         extra_template_kwargs=template_kwargs,
     )
-    char_owners = _parse_character_owners(
+    canonical_text, char_owners = _parse_character_owners(
         traced_text,
-        canonical_text,
-        canonical_no_generation_text,
         marker_pattern,
         message_count=len(messages),
         add_generation_prompt=add_generation_prompt,
@@ -246,12 +270,6 @@ def build_template_token_provenance(
         return_offsets_mapping=True,
     )
     input_ids = [int(token_id) for token_id in encoded["input_ids"]]
-    if expected_input_ids is not None and input_ids != [
-        int(token_id) for token_id in expected_input_ids
-    ]:
-        raise RuntimeError(
-            "Canonical chat text tokenization differs from apply_chat_template(tokenize=True)."
-        )
 
     offsets = [(int(start), int(end)) for start, end in encoded["offset_mapping"]]
     owners: list[int] = []

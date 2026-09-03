@@ -511,8 +511,10 @@ class Scheduler(SchedulerIOMixin):
                     prompt_tokens=prompt_tokens,
                     active_prompt_tokens=len(msg.input_ids),
                     tokenize_invocations=msg.tokenize_invocations,
+                    chat_template_invocations=msg.chat_template_invocations,
                     context_stage_count=msg.context_stage_count,
                     radix_compile_ns=msg.radix_compile_ns,
+                    reposition_ipc_tensor_bytes=msg.reposition_ipc_tensor_bytes,
                 )
                 self.request_metrics[msg.uid].observe_reposition(
                     radix_match_ns=msg.radix_match_ns,

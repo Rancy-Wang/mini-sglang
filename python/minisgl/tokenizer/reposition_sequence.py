@@ -46,6 +46,8 @@ class RepositionSequenceState:
     transition_count: int = 0
     h2d_bytes: int = 0
     d2h_bytes: int = 0
+    dispatch_count: int = 0
+    ipc_tensor_bytes: int = 0
 
     @classmethod
     def pending(cls, request: TokenizeMsg, tokenized: TokenizedResult) -> RepositionSequenceState:
@@ -58,6 +60,8 @@ class RepositionSequenceState:
         if tokenized.reposition_layout is None:
             raise ValueError("Reposition sequence requires a precompiled Radix layout.")
         layout = tokenized.reposition_layout
+        if len(layout.transition_offsets) <= 1:
+            raise ValueError("Reposition sequence requires at least one effective transition.")
         return cls(
             request=request,
             tokenized=tokenized,
@@ -185,12 +189,7 @@ class RepositionSequenceState:
 
         raw_count = len(self.tokenized.reposition_input_ids)
         next_reposition = self._next_effective_reposition()
-        if len(self.layout.transition_offsets) == 1:
-            # ``reposition=[]`` is a structured Retry source, not a staged
-            # request. It retains the ordinary single-Prefill mask/Extend path.
-            end = raw_count
-        else:
-            end = min(raw_count, self.raw_cursor + self.step_token_budget)
+        end = min(raw_count, self.raw_cursor + self.step_token_budget)
         if next_reposition is not None:
             end = min(end, next_reposition[0])
         transition_only = end == self.raw_cursor and self.transition_dispatch_pending
@@ -223,7 +222,8 @@ class RepositionSequenceState:
         self.in_flight_end = end
         self.in_flight_final = is_final
         self.transition_dispatch_pending = False
-        return UserMsg(
+        self.dispatch_count += 1
+        message = UserMsg(
             uid=self.request.uid,
             input_ids=self.tokenized.reposition_input_ids[raw_index].contiguous(),
             true_positions=self.current_positions[raw_index].contiguous(),
@@ -235,7 +235,7 @@ class RepositionSequenceState:
             radix_key_virtual_mask=virtual_mask,
             radix_key_to_token=key_to_token,
             radix_token_to_key=token_to_key,
-            radix_commit_key_len=commit_key_len,
+            radix_commit_key_len=None if is_final else commit_key_len,
             drop_event_positions=drop_positions,
             drop_range_offsets=drop_offsets,
             drop_position_ranges=drop_ranges,
@@ -267,14 +267,23 @@ class RepositionSequenceState:
             context_post_prefill_keep_mask=post_prefill_keep,
             request_received_ns=self.request.request_received_ns,
             tokenize_invocations=self.tokenized.tokenize_invocations,
-            context_stage_count=len(self.layout.transition_offsets),
+            chat_template_invocations=self.tokenized.chat_template_invocations,
+            context_stage_count=self.dispatch_count,
             radix_compile_ns=self.layout.compile_ns,
             radix_match_ns=self.radix_match_ns,
             retry_plan_ns=self.retry_plan_ns,
             reposition_transition_count=self.transition_count,
             reposition_h2d_bytes=self.h2d_bytes,
             reposition_d2h_bytes=self.d2h_bytes,
+            reposition_ipc_tensor_bytes=self.ipc_tensor_bytes,
         )
+        self.ipc_tensor_bytes += sum(
+            value.numel() * value.element_size()
+            for value in vars(message).values()
+            if isinstance(value, torch.Tensor)
+        )
+        message.reposition_ipc_tensor_bytes = self.ipc_tensor_bytes
+        return message
 
     def _active_after_events(self, boundary: int) -> torch.Tensor:
         assert self.active_raw is not None

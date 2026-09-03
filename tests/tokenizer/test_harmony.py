@@ -229,7 +229,7 @@ def test_position_drop_wire_separates_effective_and_future_events():
         target_msg_id=4,
     )
 
-    assert plan.event_positions.tolist() == [1, 4]
+    assert plan.event_insert_offsets.tolist() == [1, 4]
     assert plan.effective_event_count == 1
 
 
@@ -240,5 +240,5 @@ def test_position_drop_wire_marks_merged_target_boundary_ambiguous():
         target_msg_id=4,
     )
 
-    assert plan.event_positions.tolist() == [4]
+    assert plan.event_insert_offsets.tolist() == [4]
     assert plan.effective_event_count == -1
