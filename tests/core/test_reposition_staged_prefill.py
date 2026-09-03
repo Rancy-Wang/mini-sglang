@@ -241,6 +241,29 @@ def test_each_scheduler_turn_reuses_the_previous_partial_radix_prefix(
     cache.check_integrity()
 
 
+def test_terminal_reposition_dispatches_final_generation_without_new_raw_tokens() -> None:
+    state = _sequence(max_tokens=1)
+    assert state.tokenized.reposition_raw_boundaries is not None
+    assert state.tokenized.reposition_insert_offsets is not None
+    state.tokenized.reposition_raw_boundaries = torch.tensor([8], dtype=torch.int32)
+    state.tokenized.reposition_insert_offsets = torch.tensor([9], dtype=torch.int32)
+    state.compile([-301, -302], step_token_budget=64)
+
+    materialize = state.build_next_msg()
+    assert materialize.raw_positions.tolist() == list(range(9))
+    assert materialize.is_warmup
+    assert not torch.any(materialize.radix_match_ids[:, 0] == 2)
+
+    state.accept_ack(_ack(7))
+    final = state.build_next_msg()
+
+    assert final.raw_positions.tolist() == [1, 2, 4, 5, 6, 7, 8]
+    assert not final.is_warmup
+    assert not final.use_context_mask
+    assert torch.any(final.radix_match_ids[:, 0] == 2)
+    assert final.radix_commit_key_len == len(final.radix_match_ids)
+
+
 def test_final_mask_prefill_compacts_decode_view_and_retains_owned_drop_pages() -> None:
     page_table = torch.full((1, 16), -1, dtype=torch.int32)
     token_pool = torch.zeros_like(page_table)

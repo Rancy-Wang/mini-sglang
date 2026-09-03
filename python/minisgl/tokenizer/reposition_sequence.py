@@ -62,6 +62,7 @@ class RepositionSequenceState:
     current_records: torch.Tensor | None = None
     in_flight_end: int = 0
     in_flight_final: bool = False
+    transition_dispatch_pending: bool = False
     radix_match_ns: int = 0
     retry_plan_ns: int = 0
     transition_count: int = 0
@@ -157,6 +158,7 @@ class RepositionSequenceState:
                 for event, offset in enumerate(self.tokenized.reposition_insert_offsets.tolist())
                 if int(offset) == insertion
                 and int(self.layout.effective_reposition_stages[event]) > 0
+                and int(self.layout.effective_reposition_stages[event]) > self.current_stage
             ]
             if not candidates:
                 return None
@@ -169,7 +171,7 @@ class RepositionSequenceState:
             candidates = [
                 self.marker_ids[event]
                 for event, offset in enumerate(self.drop_event_positions.tolist())
-                if int(offset) == insertion
+                if event >= self.drop_cursor and int(offset) == insertion
             ]
             if not candidates:
                 return None
@@ -217,7 +219,7 @@ class RepositionSequenceState:
     def build_next_msg(self) -> UserMsg:
         if self.layout is None or self.current_records is None:
             raise RuntimeError("Reposition sequence must be compiled before dispatch.")
-        if self.in_flight_end > self.raw_cursor:
+        if self.in_flight_end != 0 or self.in_flight_final:
             raise RuntimeError("A Reposition step is already awaiting Scheduler acknowledgement.")
         assert self.active_raw is not None
         assert self.current_positions is not None
@@ -234,7 +236,8 @@ class RepositionSequenceState:
             end = min(raw_count, self.raw_cursor + self.step_token_budget)
         if next_reposition is not None:
             end = min(end, next_reposition[0])
-        if end <= self.raw_cursor:
+        transition_only = end == self.raw_cursor and self.transition_dispatch_pending
+        if end < self.raw_cursor or (end == self.raw_cursor and not transition_only):
             raise RuntimeError("Reposition sequence did not make raw-token progress.")
 
         new_raw = torch.arange(self.raw_cursor, end, dtype=torch.int32, device="cpu")
@@ -269,6 +272,7 @@ class RepositionSequenceState:
         )
         self.in_flight_end = end
         self.in_flight_final = is_final
+        self.transition_dispatch_pending = False
         return UserMsg(
             uid=self.request.uid,
             input_ids=self.tokenized.reposition_input_ids[raw_index].contiguous(),
@@ -401,8 +405,10 @@ class RepositionSequenceState:
             self.current_records[token_rows, 3] = new_positions
             self.current_stage = stage
             self.current_reposition = boundary
+            self.transition_dispatch_pending = True
         self.raw_cursor = self.in_flight_end
         self.in_flight_end = 0
+        self.in_flight_final = False
 
 
 __all__ = ["RepositionSequenceState"]
