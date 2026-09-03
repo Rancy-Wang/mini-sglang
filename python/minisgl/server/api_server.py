@@ -741,6 +741,9 @@ class FrontendManager:
                     completion_tokens = ack.completion_tokens
                 if ack.server_metrics is not None:
                     server_metrics = ack.server_metrics
+                    drop_skipped_tokens = max(
+                        drop_skipped_tokens, server_metrics.drop_skipped_tokens
+                    )
                 if ack.incremental_output or ack.incremental_token_ids:
                     encoded = encode_piece(
                         parser.feed(
@@ -1015,6 +1018,9 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
                 completion_tokens = ack.completion_tokens
             if ack.server_metrics is not None:
                 server_metrics = ack.server_metrics
+                drop_skipped_tokens = max(
+                    drop_skipped_tokens, server_metrics.drop_skipped_tokens
+                )
             if ack.finished:
                 break
     except RequestRejected as exc:

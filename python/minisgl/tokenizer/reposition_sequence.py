@@ -48,6 +48,7 @@ class RepositionSequenceState:
     d2h_bytes: int = 0
     dispatch_count: int = 0
     ipc_tensor_bytes: int = 0
+    drop_skipped_tokens: int = 0
 
     @classmethod
     def pending(cls, request: TokenizeMsg, tokenized: TokenizedResult) -> RepositionSequenceState:
@@ -276,6 +277,7 @@ class RepositionSequenceState:
             reposition_h2d_bytes=self.h2d_bytes,
             reposition_d2h_bytes=self.d2h_bytes,
             reposition_ipc_tensor_bytes=self.ipc_tensor_bytes,
+            prior_drop_skipped_tokens=self.drop_skipped_tokens,
         )
         self.ipc_tensor_bytes += sum(
             value.numel() * value.element_size()
@@ -328,6 +330,9 @@ class RepositionSequenceState:
         )
         self.h2d_bytes = max(self.h2d_bytes, ack.reposition_h2d_bytes)
         self.d2h_bytes = max(self.d2h_bytes, ack.reposition_d2h_bytes)
+        self.drop_skipped_tokens = max(
+            self.drop_skipped_tokens, ack.drop_skipped_tokens
+        )
 
         assert self.layout is not None
         assert self.current_positions is not None

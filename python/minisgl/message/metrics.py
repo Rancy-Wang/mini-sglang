@@ -25,6 +25,7 @@ class ServerMetrics:
     reposition_h2d_bytes: int = 0
     reposition_d2h_bytes: int = 0
     reposition_ipc_tensor_bytes: int = 0
+    drop_skipped_tokens: int = 0
 
     def __post_init__(self) -> None:
         timestamps = (
@@ -51,6 +52,7 @@ class ServerMetrics:
             self.reposition_h2d_bytes,
             self.reposition_d2h_bytes,
             self.reposition_ipc_tensor_bytes,
+            self.drop_skipped_tokens,
         )
         if self.tokenize_invocations < 1 or any(value < 0 for value in counters[1:]):
             raise ValueError("Serving performance counters must be non-negative.")
@@ -74,6 +76,7 @@ class ServerMetrics:
             "reposition_h2d_bytes": self.reposition_h2d_bytes,
             "reposition_d2h_bytes": self.reposition_d2h_bytes,
             "reposition_ipc_tensor_bytes": self.reposition_ipc_tensor_bytes,
+            "drop_skipped_tokens": self.drop_skipped_tokens,
         }
 
 
@@ -98,6 +101,7 @@ class RequestMetricsState:
     reposition_h2d_bytes: int = 0
     reposition_d2h_bytes: int = 0
     reposition_ipc_tensor_bytes: int = 0
+    drop_skipped_tokens: int = 0
 
     def observe_reposition(
         self,
@@ -147,4 +151,5 @@ class RequestMetricsState:
             reposition_h2d_bytes=self.reposition_h2d_bytes,
             reposition_d2h_bytes=self.reposition_d2h_bytes,
             reposition_ipc_tensor_bytes=self.reposition_ipc_tensor_bytes,
+            drop_skipped_tokens=self.drop_skipped_tokens,
         )

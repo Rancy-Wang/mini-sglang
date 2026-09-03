@@ -83,6 +83,7 @@ class UserMsg(BaseBackendMsg):
     reposition_h2d_bytes: int = 0
     reposition_d2h_bytes: int = 0
     reposition_ipc_tensor_bytes: int = 0
+    prior_drop_skipped_tokens: int = 0
 
 
 @dataclass

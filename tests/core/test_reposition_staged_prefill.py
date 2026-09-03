@@ -117,12 +117,12 @@ def _sequence(
     return RepositionSequenceState.pending(request, tokenized)
 
 
-def _ack(uid: int, **metrics: int) -> WarmupAckMsg:
+def _ack(uid: int, *, drop_skipped_tokens: int = 0, **metrics: int) -> WarmupAckMsg:
     return WarmupAckMsg(
         uid=uid,
         hit_ratio=1.0,
         cached_tokens=1,
-        drop_skipped_tokens=0,
+        drop_skipped_tokens=drop_skipped_tokens,
         finished=True,
         **metrics,
     )
@@ -185,7 +185,7 @@ def test_tokenizer_sequence_reuses_one_precompiled_layout_between_scheduler_turn
     assert first.radix_match_ns == 5
     with pytest.raises(RuntimeError, match="awaiting Scheduler"):
         state.build_next_msg()
-    state.accept_ack(_ack(7, radix_match_ns=11))
+    state.accept_ack(_ack(7, radix_match_ns=11, drop_skipped_tokens=3))
 
     final = state.build_next_msg()
     assert final.raw_positions.tolist() == [1, 2, 3, 4, 5, 6, 7, 8]
@@ -199,6 +199,7 @@ def test_tokenizer_sequence_reuses_one_precompiled_layout_between_scheduler_turn
     assert final.radix_match_ns == 11
     assert final.retry_plan_ns == 0
     assert final.reposition_transition_count == 0
+    assert final.prior_drop_skipped_tokens == 3
 
     assert not any(field.name.startswith("staged_") for field in fields(Req))
     assert not any(field.name.startswith("staged_") for field in fields(PendingReq))

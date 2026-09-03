@@ -289,6 +289,10 @@ class Scheduler(SchedulerIOMixin):
                         visible = not (finished and next_token in self.eos_token_ids)
                         metrics_state.observe_token(generated_ns, visible=visible)
                         if finished:
+                            metrics_state.drop_skipped_tokens = max(
+                                metrics_state.drop_skipped_tokens,
+                                req.drop_skipped_tokens,
+                            )
                             server_metrics = metrics_state.finish(generated_ns)
                             self.request_metrics.pop(req.uid, None)
                     reply.append(
@@ -515,6 +519,7 @@ class Scheduler(SchedulerIOMixin):
                     context_stage_count=msg.context_stage_count,
                     radix_compile_ns=msg.radix_compile_ns,
                     reposition_ipc_tensor_bytes=msg.reposition_ipc_tensor_bytes,
+                    drop_skipped_tokens=msg.prior_drop_skipped_tokens,
                 )
                 self.request_metrics[msg.uid].observe_reposition(
                     radix_match_ns=msg.radix_match_ns,

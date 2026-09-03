@@ -131,6 +131,7 @@ def test_server_metrics_report_template_dispatch_ipc_and_retry_transfer_separate
         chat_template_invocations=1,
         context_stage_count=3,
         reposition_ipc_tensor_bytes=4096,
+        drop_skipped_tokens=7,
     )
     state.observe_reposition(
         radix_match_ns=30,
@@ -149,3 +150,4 @@ def test_server_metrics_report_template_dispatch_ipc_and_retry_transfer_separate
     assert metrics["reposition_ipc_tensor_bytes"] == 4096
     assert metrics["reposition_h2d_bytes"] == 100
     assert metrics["reposition_d2h_bytes"] == 0
+    assert metrics["drop_skipped_tokens"] == 7
