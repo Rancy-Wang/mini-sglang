@@ -11,9 +11,9 @@ pytest.importorskip("tvm_ffi")
 import minisgl.core as core
 from minisgl.core import Req, SamplingParams
 from minisgl.kernel.radix_reposition import compile_radix_reposition_layout
-from minisgl.message import BaseBackendMsg, TokenizeMsg, WarmupAckMsg
+from minisgl.message import BaseBackendMsg, RequestRejectMsg, TokenizeMsg, WarmupAckMsg
 from minisgl.scheduler.cache import CacheManager
-from minisgl.scheduler.prefill import PrefillManager
+from minisgl.scheduler.prefill import PrefillManager, RepositionCapacityError
 from minisgl.scheduler.scheduler import Scheduler
 from minisgl.scheduler.table import TableManager
 from minisgl.scheduler.utils import PendingReq
@@ -304,6 +304,89 @@ def test_each_scheduler_turn_reuses_the_previous_partial_radix_prefix(
     assert active_cached_counts[1] > 0
     assert kv_cache.calls
     cache.check_integrity()
+
+
+def test_reposition_capacity_failure_yields_once_then_becomes_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(torch.Tensor, "pin_memory", lambda self: self)
+    target = torch.column_stack(
+        (
+            torch.zeros(8, dtype=torch.int32),
+            torch.arange(8, dtype=torch.int32),
+            torch.full((8,), -1, dtype=torch.int32),
+            torch.arange(8, dtype=torch.int32),
+        )
+    )
+    page_table = torch.full((1, 16), -1, dtype=torch.int32)
+    cache = CacheManager(8, 1, page_table, "radix")
+    cached_pages = cache._allocate(6)
+    cache.prefix_cache.insert_prefix(target[:6], cached_pages)
+    table = TableManager(1, page_table)
+    manager = PrefillManager(
+        cache_manager=cache,
+        table_manager=table,
+        decode_manager=SimpleNamespace(inflight_tokens=0),
+    )
+    manager.pending_list.append(
+        PendingReq(
+            uid=81,
+            input_ids=torch.tensor([0, 5, 6, 7], dtype=torch.int32),
+            true_positions=torch.arange(4, dtype=torch.int32),
+            raw_positions=torch.tensor([0, 5, 6, 7], dtype=torch.int32),
+            radix_input_ids=target[[0, 5, 6, 7]],
+            radix_match_ids=target,
+            sampling_params=SamplingParams(max_tokens=1),
+            prefix_keep_mask=torch.tensor([1, 0, 0, 0, 0, 1, 1, 1], dtype=torch.int32),
+            radix_key_virtual_mask=torch.zeros(8, dtype=torch.bool),
+            radix_key_to_token=torch.arange(8, dtype=torch.int64),
+            radix_token_to_key=torch.arange(8, dtype=torch.int64),
+            radix_positions=torch.arange(8, dtype=torch.int32),
+            radix_repos_info=torch.full((8,), -1, dtype=torch.int32),
+        )
+    )
+
+    assert manager.schedule_next_batch(prefill_budget=8) is None
+    assert manager.pending_list[0].uid == 81
+    cache.check_integrity()
+    with pytest.raises(RepositionCapacityError) as raised:
+        manager.schedule_next_batch(prefill_budget=8)
+
+    assert raised.value.required_pages == 3
+    assert raised.value.available_pages == 2
+    assert raised.value.matched_pages == 6
+    assert raised.value.retry_pages == 0
+    cache.check_integrity()
+
+
+def test_scheduler_rejects_terminal_reposition_capacity_failure() -> None:
+    error = RepositionCapacityError(
+        uid=82,
+        required_pages=9,
+        available_pages=3,
+        matched_pages=12,
+        retry_pages=2,
+    )
+    scheduler = object.__new__(Scheduler)
+    scheduler.prefill_budget = 16
+    scheduler.prefill_manager = SimpleNamespace(
+        schedule_next_batch=lambda _budget: (_ for _ in ()).throw(error),
+        abort_req=lambda uid: uid,
+    )
+    scheduler.decode_manager = SimpleNamespace(schedule_next_batch=lambda: None)
+    scheduler.request_metrics = {82: object()}
+    scheduler.context_sequence_uids = {82}
+    replies: list[list[RequestRejectMsg]] = []
+    scheduler.send_result = replies.append
+
+    assert scheduler._schedule_next_batch() is None
+    assert scheduler.request_metrics == {}
+    assert scheduler.context_sequence_uids == set()
+    assert len(replies) == 1 and len(replies[0]) == 1
+    reply = replies[0][0]
+    assert reply.uid == 82
+    assert reply.status_code == 503
+    assert reply.error_code == "reposition_kv_capacity_exhausted"
 
 
 def test_terminal_reposition_dispatches_final_generation_without_new_raw_tokens() -> None:

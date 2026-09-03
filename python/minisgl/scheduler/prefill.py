@@ -23,6 +23,32 @@ logger = init_logger(__name__)
 _sparse_kernel_failure_logged = False
 
 
+@dataclass(frozen=True)
+class RepositionCapacityError(RuntimeError):
+    uid: int
+    required_pages: int
+    available_pages: int
+    matched_pages: int
+    retry_pages: int
+
+    @property
+    def signature(self) -> tuple[int, int, int, int]:
+        return (
+            self.required_pages,
+            self.available_pages,
+            self.matched_pages,
+            self.retry_pages,
+        )
+
+    def __str__(self) -> str:
+        return (
+            "Reposition cannot make progress with the current KV capacity: "
+            f"needs {self.required_pages} allocatable pages after pinning its source, "
+            f"but only {self.available_pages} remain "
+            f"(matched={self.matched_pages}, retry={self.retry_pages})."
+        )
+
+
 def _calculate_cache_reuse_ratio(
     cached_len: int,
     matchable_prefix_len: int,
@@ -394,6 +420,7 @@ class PrefillAdder:
         estimated_len = extend_len + req.output_len + retry_page_count
 
         if estimated_len + self.reserved_size > self.cache_manager.available_size:
+            available_pages = self.cache_manager.available_size
             if original_stream is not None:
                 (
                     req.input_ids,
@@ -402,9 +429,18 @@ class PrefillAdder:
                     req.radix_input_ids,
                     req.use_context_mask,
                 ) = original_stream
+            if req.radix_positions is not None and req.radix_repos_info is not None:
+                raise RepositionCapacityError(
+                    uid=req.uid,
+                    required_pages=estimated_len + self.reserved_size,
+                    available_pages=available_pages,
+                    matched_pages=cache_handle.physical_cached_len,
+                    retry_pages=retry_page_count,
+                )
             return None
         self.cache_manager.lock(cache_handle)
         if estimated_len + self.reserved_size > self.cache_manager.available_size:
+            available_pages = self.cache_manager.available_size
             self.cache_manager.unlock(cache_handle)
             if original_stream is not None:
                 (
@@ -414,6 +450,14 @@ class PrefillAdder:
                     req.radix_input_ids,
                     req.use_context_mask,
                 ) = original_stream
+            if req.radix_positions is not None and req.radix_repos_info is not None:
+                raise RepositionCapacityError(
+                    uid=req.uid,
+                    required_pages=estimated_len + self.reserved_size,
+                    available_pages=available_pages,
+                    matched_pages=cache_handle.physical_cached_len,
+                    retry_pages=retry_page_count,
+                )
             return None
 
         table_idx = self.table_manager.allocate()
@@ -659,6 +703,9 @@ class PrefillManager:
     kv_cache: BaseKVCachePool | None = None
     retry_rope_cache: torch.Tensor | None = None
     pending_list: List[PendingReq] = field(default_factory=list)
+    _reposition_capacity_failures: dict[int, tuple[int, int, int, int]] = field(
+        default_factory=dict
+    )
 
     def add_one_req(self, req: UserMsg) -> None:
         if req.use_context_mask:
@@ -756,7 +803,16 @@ class PrefillManager:
                     break
                 if planned_context_mask and not supports_multi_context_mask:
                     break
-            if req := adder.try_add_one(pending_req, context_plan):
+            try:
+                req = adder.try_add_one(pending_req, context_plan)
+            except RepositionCapacityError as exc:
+                previous = self._reposition_capacity_failures.get(exc.uid)
+                self._reposition_capacity_failures[exc.uid] = exc.signature
+                if previous == exc.signature and adder.reserved_size == 0 and not reqs:
+                    raise
+                break
+            if req:
+                self._reposition_capacity_failures.pop(pending_req.uid, None)
                 pending_req.chunked_req = None
                 if isinstance(req, ChunkedReq):
                     pending_req.chunked_req = req
@@ -772,6 +828,7 @@ class PrefillManager:
         return Batch(reqs=reqs, phase="prefill")
 
     def abort_req(self, uid: int) -> Req | PendingReq | None:
+        self._reposition_capacity_failures.pop(uid, None)
         for i, req in enumerate(self.pending_list):
             if req.uid == uid:
                 self.pending_list.pop(i)

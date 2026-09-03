@@ -28,7 +28,7 @@ from .cache import CacheManager
 from .config import SchedulerConfig
 from .decode import DecodeManager
 from .io import SchedulerIOMixin
-from .prefill import ChunkedReq, PrefillManager
+from .prefill import ChunkedReq, PrefillManager, RepositionCapacityError
 from .radix_symbol import RadixSymbolRegistry, inject_radix_symbols
 from .table import TableManager
 from .utils import PendingReq
@@ -590,10 +590,24 @@ class Scheduler(SchedulerIOMixin):
 
     def _schedule_next_batch(self) -> ForwardInput | None:
         # TODO: support other policies: e.g. DECODE first
-        batch = (
-            self.prefill_manager.schedule_next_batch(self.prefill_budget)
-            or self.decode_manager.schedule_next_batch()
-        )
+        try:
+            batch = self.prefill_manager.schedule_next_batch(self.prefill_budget)
+        except RepositionCapacityError as exc:
+            self.prefill_manager.abort_req(exc.uid)
+            self.request_metrics.pop(exc.uid, None)
+            self._close_context_sequence(exc.uid)
+            self.send_result(
+                [
+                    RequestRejectMsg(
+                        uid=exc.uid,
+                        status_code=503,
+                        error_code="reposition_kv_capacity_exhausted",
+                        detail=str(exc),
+                    )
+                ]
+            )
+            batch = None
+        batch = batch or self.decode_manager.schedule_next_batch()
         return self._prepare_batch(batch) if batch else None
 
     def _forward(self, forward_input: ForwardInput) -> ForwardOutput:
