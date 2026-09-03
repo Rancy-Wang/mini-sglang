@@ -66,6 +66,8 @@ class ContextPrefillPlan:
     reason: str
     radix_cached_tokens: int
     usage_cached_tokens: int | None
+    retry_plan: torch.Tensor | None = None
+    retry_active_full_positions: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -211,10 +213,31 @@ class PrefillAdder:
     def plan_context_prefill(self, req: PendingReq) -> ContextPrefillPlan | None:
         if not req.use_context_mask or req.chunked_req is not None:
             return None
-        full_match = self.cache_manager.match_full_req(req)
-        if full_match is None:
-            return None
-        active_match = self.cache_manager.derive_active_match(req, full_match)
+        structured_retry = (
+            req.context_compact_stream
+            and req.radix_match_ids is not None
+            and req.radix_match_ids.ndim == 2
+        )
+        retry_plan = None
+        retry_active_full_positions = None
+        if structured_retry:
+            match_started_ns = time.perf_counter_ns()
+            active_match = self.cache_manager.match_req(req)
+            match_elapsed_ns = time.perf_counter_ns() - match_started_ns
+            match_retry_plan_ns = 0 if active_match is None else active_match.retry_plan_ns
+            req.radix_match_ns += max(0, match_elapsed_ns - match_retry_plan_ns)
+            if active_match is None:
+                return None
+            req.retry_plan_ns += active_match.retry_plan_ns
+            radix_cached_tokens = active_match.handle.physical_cached_len
+            retry_plan = active_match.retry_plan
+            retry_active_full_positions = active_match.active_full_positions
+        else:
+            full_match = self.cache_manager.match_full_req(req)
+            if full_match is None:
+                return None
+            active_match = self.cache_manager.derive_active_match(req, full_match)
+            radix_cached_tokens = full_match.handle.physical_cached_len
         fallback_reason = (
             _mask_free_context_reason(
                 req,
@@ -225,7 +248,6 @@ class PrefillAdder:
             else "mask_free_disabled"
         )
         if fallback_reason is None:
-            radix_cached_tokens = full_match.handle.physical_cached_len
             if active_match.active_cached_len > radix_cached_tokens:
                 raise RuntimeError("Active cache usage exceeds resident Radix matches.")
             logger.debug(
@@ -246,6 +268,8 @@ class PrefillAdder:
                 reason="mask_free_visibility_equivalent",
                 radix_cached_tokens=radix_cached_tokens,
                 usage_cached_tokens=active_match.active_cached_len,
+                retry_plan=retry_plan,
+                retry_active_full_positions=retry_active_full_positions,
             )
 
         if req.context_compact_stream:
@@ -265,8 +289,10 @@ class PrefillAdder:
                 cached_len=active_match.active_cached_len,
                 initial_full_match_indices=active_match.full_match_indices,
                 reason=fallback_reason,
-                radix_cached_tokens=full_match.handle.physical_cached_len,
+                radix_cached_tokens=radix_cached_tokens,
                 usage_cached_tokens=None,
+                retry_plan=retry_plan,
+                retry_active_full_positions=retry_active_full_positions,
             )
 
         assert req.full_input_ids is not None
@@ -327,6 +353,8 @@ class PrefillAdder:
             initial_full_match_indices = context_plan.initial_full_match_indices
             radix_cached_tokens = context_plan.radix_cached_tokens
             usage_cached_tokens = context_plan.usage_cached_tokens
+            retry_plan = context_plan.retry_plan
+            retry_active_full_positions = context_plan.retry_active_full_positions
         elif req.use_context_mask:
             match = self.cache_manager.match_full_req(req)
             if match is None:

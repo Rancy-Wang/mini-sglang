@@ -233,6 +233,7 @@ def test_each_scheduler_turn_reuses_the_previous_partial_radix_prefix(
     assert cached_counts[0] == 0
     assert cached_counts[1] > 0
     assert active_cached_counts[1] > 0
+    assert kv_cache.calls
     cache.check_integrity()
 
 
