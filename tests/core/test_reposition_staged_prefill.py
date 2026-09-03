@@ -184,6 +184,13 @@ def test_each_scheduler_turn_reuses_the_previous_partial_radix_prefix(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(torch.Tensor, "pin_memory", lambda self: self)
+    real_empty = torch.empty
+
+    def cpu_empty(*args, **kwargs):
+        kwargs.pop("pin_memory", None)
+        return real_empty(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", cpu_empty)
     state = _sequence(max_tokens=1)
     state.compile([-201, -202], step_token_budget=64)
     page_table = torch.full((2, 64), -1, dtype=torch.int32)
