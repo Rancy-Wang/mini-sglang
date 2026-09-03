@@ -134,6 +134,69 @@ def test_context_segments_match_dense_mask_with_cached_prefix_and_drops():
     assert torch.equal(reconstructed, expected)
 
 
+def test_context_segments_use_compact_slots_after_drop_and_reposition():
+    visible_until = torch.tensor([4, 6, 6, 6, 6, 6], dtype=torch.int32)
+    raw_positions = torch.tensor([0, 2, 3, 5], dtype=torch.int32)
+    true_positions = torch.tensor([0, 1, 4, 5], dtype=torch.int32)
+    query_start = 2
+    segments = build_context_attention_segments(
+        visible_until,
+        query_start=query_start,
+        query_length=2,
+        key_length=4,
+        raw_positions=raw_positions,
+        true_positions=true_positions,
+    )
+    reconstructed = torch.zeros((2, 4), dtype=torch.bool)
+    for segment in segments:
+        query_count = segment.query_end - segment.query_start
+        prefix_count = len(segment.key_positions) - query_count
+        for local_query in range(query_count):
+            reconstructed[
+                segment.query_start + local_query,
+                segment.key_positions[: prefix_count + local_query + 1],
+            ] = True
+
+    expected = build_context_visibility_mask_reference(
+        visible_until,
+        query_positions=raw_positions[query_start:].to(torch.int64),
+        key_positions=raw_positions.to(torch.int64),
+    )
+    assert torch.equal(reconstructed, expected)
+    assert max(position.item() for segment in segments for position in segment.key_positions) < 4
+
+
+def test_context_sliding_segments_separate_raw_drop_and_reposition_axes():
+    visible_until = torch.tensor([6, 6, 5, 6, 6, 6], dtype=torch.int32)
+    raw_positions = torch.tensor([0, 2, 3, 5], dtype=torch.int32)
+    true_positions = torch.tensor([0, 1, 4, 5], dtype=torch.int32)
+    query_start = 2
+    window_left = 2
+    segments = build_context_attention_segments(
+        visible_until,
+        query_start=query_start,
+        query_length=2,
+        key_length=4,
+        raw_positions=raw_positions,
+        true_positions=true_positions,
+        sliding_window=window_left,
+    )
+    reconstructed = torch.zeros((2, 4), dtype=torch.bool)
+    for segment in segments:
+        assert segment.query_end - segment.query_start == 1
+        reconstructed[segment.query_start, segment.key_positions] = True
+
+    query_raw = raw_positions[query_start:].to(torch.int64)
+    query_true = true_positions[query_start:].to(torch.int64)
+    expected = build_context_visibility_mask_reference(
+        visible_until,
+        query_positions=query_raw,
+        key_positions=raw_positions.to(torch.int64),
+    )
+    expected &= true_positions.unsqueeze(0) >= (query_true - window_left).unsqueeze(1)
+    assert torch.equal(reconstructed, expected)
+
+
 def test_context_sliding_segments_use_absolute_positions_across_drops():
     visible_until = torch.tensor([4, 6, 3, 6, 6, 6], dtype=torch.int32)
     query_start = 3

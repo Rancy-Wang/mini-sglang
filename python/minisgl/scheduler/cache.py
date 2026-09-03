@@ -638,7 +638,10 @@ class CacheManager:
                     non_blocking=True,
                 )
             ]
-            if req.initial_active_cached_len > len(active_indices):
+            if (
+                getattr(req, "staged_full_page_indices", None) is None
+                and req.initial_active_cached_len > len(active_indices)
+            ):
                 raise RuntimeError(
                     "Matched active prefix exceeds the delta-marker commit boundary."
                 )
@@ -655,7 +658,10 @@ class CacheManager:
             )
 
             staged_full_page_indices = getattr(req, "staged_full_page_indices", None)
+            staged_owned_page_mask = getattr(req, "staged_owned_page_mask", None)
             if staged_full_page_indices is not None:
+                if staged_owned_page_mask is None:
+                    raise RuntimeError("Staged Reposition commit lost page ownership metadata.")
                 staged_len = min(len(staged_full_page_indices), full_token_prefix_len)
                 staged_active = active_positions < staged_len
                 if bool(torch.any(staged_active).item()):
@@ -669,9 +675,12 @@ class CacheManager:
                         dtype=torch.int64,
                         non_blocking=True,
                     )
-                    staged_full_page_indices[staged_positions_device] = active_indices[
-                        staged_active_device
-                    ]
+                    current_active_indices = active_indices[staged_active_device]
+                    previous_indices = staged_full_page_indices[staged_positions_device]
+                    staged_owned_page_mask[staged_positions_device] |= (
+                        (previous_indices < 0) | (previous_indices != current_active_indices)
+                    )
+                    staged_full_page_indices[staged_positions_device] = current_active_indices
                 staged_pages = staged_full_page_indices[:staged_len]
                 if bool(torch.any(staged_pages < 0).item()):
                     missing = torch.nonzero(staged_pages < 0, as_tuple=False).view(-1)
@@ -683,7 +692,7 @@ class CacheManager:
                 filled[:staged_len] = True
 
             old_full_cached_len = old_handle.physical_cached_len
-            if old_full_cached_len > 0:
+            if old_full_cached_len > 0 and staged_full_page_indices is None:
                 if len(req.initial_full_match_indices) < old_full_cached_len:
                     raise RuntimeError(
                         "Initial full-token match indices are shorter than the cache handle."
@@ -699,7 +708,7 @@ class CacheManager:
                 device=active_indices.device, non_blocking=True
             )
             overlap = active_positions < old_full_cached_len
-            if bool(torch.any(overlap).item()):
+            if staged_full_page_indices is None and bool(torch.any(overlap).item()):
                 overlap_device = overlap.to(device=active_indices.device, non_blocking=True)
                 if not torch.equal(
                     full_indices[active_positions_device[overlap_device]],
@@ -821,8 +830,20 @@ class CacheManager:
             )
             return adopted
 
-        active_slots = torch.arange(len(candidates), dtype=torch.int64, device=candidates.device)
-        newly_allocated = active_slots >= req.initial_active_cached_len
+        staged_owned_page_mask = getattr(req, "staged_owned_page_mask", None)
+        if staged_owned_page_mask is not None:
+            # The staged map covers the prompt raw stream. Any later generated
+            # tokens are necessarily request-owned pages.
+            staged_len = min(len(staged_owned_page_mask), len(candidates))
+            newly_allocated = torch.ones(
+                len(candidates), dtype=torch.bool, device=candidates.device
+            )
+            newly_allocated[:staged_len] = staged_owned_page_mask[:staged_len]
+        else:
+            active_slots = torch.arange(
+                len(candidates), dtype=torch.int64, device=candidates.device
+            )
+            newly_allocated = active_slots >= req.initial_active_cached_len
         if req.retry_transformed_mask is not None:
             transformed = req.retry_transformed_mask.to(
                 device=candidates.device, dtype=torch.bool, non_blocking=True

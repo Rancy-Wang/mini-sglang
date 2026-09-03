@@ -59,6 +59,29 @@ def _reposition_user_msg(uid: int) -> UserMsg:
     )
 
 
+def _noop_reposition_user_msg(uid: int) -> UserMsg:
+    return UserMsg(
+        uid=uid,
+        input_ids=torch.tensor([10, 11, 13], dtype=torch.int32),
+        true_positions=torch.tensor([0, 1, 3], dtype=torch.int32),
+        raw_positions=torch.tensor([0, 1, 3], dtype=torch.int32),
+        radix_input_ids=torch.tensor([10, 11, 13], dtype=torch.int64),
+        sampling_params=core.SamplingParams(max_tokens=1),
+        radix_match_ids=torch.tensor([10, 11, 12, 13], dtype=torch.int64),
+        drop_event_positions=torch.tensor([3], dtype=torch.int32),
+        drop_range_offsets=torch.tensor([0, 1], dtype=torch.int32),
+        drop_position_ranges=torch.tensor([2, 3], dtype=torch.int32),
+        drop_effective_event_count=1,
+        reposition_raw_boundaries=torch.tensor([2], dtype=torch.int32),
+        reposition_insert_offsets=torch.tensor([3], dtype=torch.int32),
+        reposition_input_ids=torch.tensor([10, 11, 12, 13], dtype=torch.int32),
+        full_input_ids=torch.tensor([10, 11, 12, 13], dtype=torch.int32),
+        full_token_visible_until=torch.tensor([5, 5, 3, 5], dtype=torch.int32),
+        full_keep_mask=torch.tensor([1, 1, 0, 1], dtype=torch.int32),
+        prefix_keep_mask=torch.tensor([1, 1, 0], dtype=torch.int32),
+    )
+
+
 def test_scheduler_compiles_reposition_batch_once(monkeypatch: pytest.MonkeyPatch) -> None:
     import minisgl.scheduler.scheduler as scheduler_module
 
@@ -92,8 +115,27 @@ def test_scheduler_compiles_reposition_batch_once(monkeypatch: pytest.MonkeyPatc
         assert message.reposition_transition_raw_tokens.tolist() == [1]
         assert message.radix_match_ids[:, 0].tolist() == [0, 0, 1, 2, 0]
         assert message.radix_marker_ids is not None
+        assert not message.use_context_mask
         scheduler.delta_marker_registry.release_request_refs(message.radix_marker_ids)
         message.radix_marker_ids = None
+    assert scheduler.delta_marker_registry.request_ref_count == 0
+
+
+def test_scheduler_routes_drop_with_noop_reposition_to_mask() -> None:
+    scheduler = object.__new__(Scheduler)
+    scheduler.delta_marker_registry = DeltaMarkerRegistry()
+    scheduler.cache_manager = SimpleNamespace(drop_aware_eviction=False)
+    scheduler.send_result = lambda _: None
+    message = _noop_reposition_user_msg(103)
+
+    rejected = scheduler._compile_reposition_batch([message])
+
+    assert rejected == set()
+    assert message.reposition_transition_offsets.tolist() == [0]
+    assert message.use_context_mask
+    assert message.radix_marker_ids is not None
+    scheduler.delta_marker_registry.release_request_refs(message.radix_marker_ids)
+    message.radix_marker_ids = None
     assert scheduler.delta_marker_registry.request_ref_count == 0
 
 

@@ -104,6 +104,7 @@ class Req:
     radix_materialized_stage: torch.Tensor | None = None
     reposition_transition_offsets: torch.Tensor | None = None
     staged_full_page_indices: torch.Tensor | None = None
+    staged_owned_page_mask: torch.Tensor | None = None
     staged_reposition: bool = False
     radix_actual_materialized_stage: int = 0
     radix_next_position: int | None = None
@@ -119,6 +120,7 @@ class Req:
     reposition_transition_count: int = 0
     reposition_h2d_bytes: int = 0
     reposition_d2h_bytes: int = 0
+    prefill_start_len: int = field(init=False)
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu
@@ -137,8 +139,12 @@ class Req:
             raise ValueError("raw_positions must be strictly increasing.")
         assert self.radix_input_ids.is_cpu
         assert self.radix_match_ids.is_cpu
-        if self.use_context_mask and not self.is_warmup:
-            raise ValueError("Context-mask Prefill is restricted to internal warmup requests.")
+        if self.use_context_mask and not (
+            self.is_warmup or self.staged_reposition or self.radix_materialized_stage is not None
+        ):
+            raise ValueError(
+                "Context-mask Prefill is restricted to internal warmup or Reposition requests."
+            )
         if self.prefix_keep_mask is not None:
             assert self.prefix_keep_mask.is_cpu
         assert len(self.input_ids) == len(self.true_positions)
@@ -203,7 +209,19 @@ class Req:
                 raise ValueError(
                     "A Reposition token would execute before its required stage is materialized."
                 )
+        if self.staged_owned_page_mask is not None:
+            if self.staged_full_page_indices is None:
+                raise ValueError("Staged page ownership requires a staged raw-to-page map.")
+            if (
+                self.staged_owned_page_mask.dtype != torch.bool
+                or self.staged_owned_page_mask.ndim != 1
+                or self.staged_owned_page_mask.device
+                != self.staged_full_page_indices.device
+                or len(self.staged_owned_page_mask) != len(self.staged_full_page_indices)
+            ):
+                raise ValueError("staged_owned_page_mask must cover the staged raw-to-page map.")
         self.device_len = len(self.input_ids)
+        self.prefill_start_len = self.cached_len
         self.max_device_len = len(self.input_ids) + self.output_len
         assert 0 <= self.cached_len < self.device_len <= self.max_device_len
         assert 0 <= self.initial_active_cached_len <= self.cached_len

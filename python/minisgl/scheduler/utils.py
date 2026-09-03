@@ -77,6 +77,12 @@ class PendingReq:
     staged_active_raw: torch.Tensor | None = None
     staged_current_positions: torch.Tensor | None = None
     staged_full_page_indices: torch.Tensor | None = None
+    staged_owned_page_mask: torch.Tensor | None = None
+    staged_initial_full_match_indices: torch.Tensor | None = None
+    staged_matchable_prefix_len: int = 0
+    staged_radix_cached_tokens: int = 0
+    staged_usage_cached_tokens: int = 0
+    staged_cache_reuse_ratio: float = 0.0
     staged_cache_handle: BaseCacheHandle | None = None
     staged_table_idx: int | None = None
 

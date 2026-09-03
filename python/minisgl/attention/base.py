@@ -251,13 +251,17 @@ def build_context_attention_segments(
     query_start: int,
     query_length: int,
     key_length: int,
+    raw_positions: torch.Tensor | None = None,
+    true_positions: torch.Tensor | None = None,
     sliding_window: int | None = None,
 ) -> tuple[ContextAttentionSegment, ...]:
-    """Compile the exact token-position Drop mask into causal KV segments.
+    """Compile an exact raw-position Drop mask into causal KV segments.
 
     Query offsets in the result are relative to the input Q tensor. Key
-    positions stay on the full, absolute token axis so callers can gather the
-    corresponding page-table entries without changing RoPE positions.
+    positions are compact page-table slots. ``raw_positions`` supplies the
+    immutable full-token coordinate used by Drop visibility, while
+    ``true_positions`` supplies the current RoPE coordinate used by an optional
+    sliding window. Keeping those axes separate is required after Reposition.
     """
 
     if full_token_visible_until.ndim != 1 or not full_token_visible_until.is_cpu:
@@ -267,12 +271,24 @@ def build_context_attention_segments(
     if sliding_window is not None and sliding_window < 0:
         raise ValueError("sliding_window must be non-negative when provided.")
     query_end = query_start + query_length
-    if query_end > key_length or key_length > len(full_token_visible_until):
-        raise ValueError("Context attention query/key bounds exceed the full token stream.")
+    if query_end > key_length:
+        raise ValueError("Context attention query bounds exceed the compact KV stream.")
 
-    visible_until = full_token_visible_until[:key_length].to(dtype=torch.int64)
-    key_positions = torch.arange(key_length, dtype=torch.int64, device="cpu")
-    if bool(torch.any(visible_until <= key_positions).item()):
+    if raw_positions is None:
+        raw_positions = torch.arange(key_length, dtype=torch.int32, device="cpu")
+    if raw_positions.ndim != 1 or not raw_positions.is_cpu or len(raw_positions) != key_length:
+        raise ValueError("raw_positions must be a CPU vector covering the compact KV stream.")
+    raw_positions = raw_positions.to(dtype=torch.int64)
+    if len(raw_positions) > 1 and bool(
+        torch.any(raw_positions[1:] <= raw_positions[:-1]).item()
+    ):
+        raise ValueError("raw_positions must be strictly increasing.")
+    if len(raw_positions) == 0 or int(raw_positions[-1]) >= len(full_token_visible_until):
+        raise ValueError("Context raw positions exceed full_token_visible_until.")
+
+    table_slots = torch.arange(key_length, dtype=torch.int64, device="cpu")
+    visible_until = full_token_visible_until[raw_positions].to(dtype=torch.int64)
+    if bool(torch.any(visible_until <= raw_positions).item()):
         raise ValueError("A token cannot become invisible before it has been computed.")
 
     if sliding_window is not None:
@@ -281,36 +297,62 @@ def build_context_attention_segments(
         # window. Preselect each query's exact absolute-position window and run
         # causal attention without an additional kernel-side window.
         segments = []
-        for absolute_query in range(query_start, query_end):
-            prefix_positions = key_positions[
-                max(0, absolute_query - sliding_window) : absolute_query
+        if true_positions is None:
+            true_positions = raw_positions
+        if (
+            true_positions.ndim != 1
+            or not true_positions.is_cpu
+            or len(true_positions) != key_length
+        ):
+            raise ValueError("true_positions must be a CPU vector covering the compact KV stream.")
+        true_positions = true_positions.to(dtype=torch.int64)
+        if len(true_positions) > 1 and bool(
+            torch.any(true_positions[1:] <= true_positions[:-1]).item()
+        ):
+            raise ValueError("true_positions must be strictly increasing.")
+        for query_slot in range(query_start, query_end):
+            query_raw = raw_positions[query_slot]
+            query_true = true_positions[query_slot]
+            prefix_slots = table_slots[:query_slot]
+            active_prefix = prefix_slots[
+                (visible_until[:query_slot] > query_raw)
+                & (true_positions[:query_slot] >= query_true - sliding_window)
             ]
-            active_prefix = prefix_positions[visible_until[prefix_positions] > absolute_query]
             segments.append(
                 ContextAttentionSegment(
-                    query_start=absolute_query - query_start,
-                    query_end=absolute_query - query_start + 1,
+                    query_start=query_slot - query_start,
+                    query_end=query_slot - query_start + 1,
                     key_positions=torch.cat(
-                        (active_prefix, key_positions[absolute_query : absolute_query + 1])
+                        (active_prefix, table_slots[query_slot : query_slot + 1])
                     ),
                 )
             )
         return tuple(segments)
 
+    # A segment may share one causal attention call while its visible prefix is
+    # stable. An expiry at raw position p starts a new segment at the first
+    # compact query whose raw position is >= p. This remains correct when Drop
+    # has left holes in the compact table.
     boundaries = {query_start, query_end}
-    expiring = visible_until[(visible_until > query_start) & (visible_until < query_end)]
-    boundaries.update(int(position) for position in torch.unique(expiring).tolist())
+    query_raw_positions = raw_positions[query_start:query_end]
+    for expiry in torch.unique(visible_until[:query_end]).tolist():
+        local_boundary = int(
+            torch.searchsorted(query_raw_positions, int(expiry), side="left").item()
+        )
+        if 0 < local_boundary < query_length:
+            boundaries.add(query_start + local_boundary)
     ordered = sorted(boundaries)
 
     segments = []
-    for absolute_start, absolute_end in zip(ordered, ordered[1:]):
-        prefix_positions = key_positions[:absolute_start]
-        active_prefix = prefix_positions[visible_until[:absolute_start] > absolute_start]
-        local_queries = key_positions[absolute_start:absolute_end]
+    for compact_start, compact_end in zip(ordered, ordered[1:]):
+        query_raw = raw_positions[compact_start]
+        prefix_slots = table_slots[:compact_start]
+        active_prefix = prefix_slots[visible_until[:compact_start] > query_raw]
+        local_queries = table_slots[compact_start:compact_end]
         segments.append(
             ContextAttentionSegment(
-                query_start=absolute_start - query_start,
-                query_end=absolute_end - query_start,
+                query_start=compact_start - query_start,
+                query_end=compact_end - query_start,
                 key_positions=torch.cat((active_prefix, local_queries)),
             )
         )
@@ -326,7 +368,7 @@ def build_context_attention_batch(
 
     Segments are emitted request-by-request and query-order-preserving, so their
     concatenated Q layout is identical to the scheduler's flattened Prefill Q.
-    Absolute key positions and table ownership remain explicit until the GPU
+    Compact key slots and table ownership remain explicit until the GPU
     page-table compiler resolves them.
     """
 
@@ -347,6 +389,16 @@ def build_context_attention_batch(
             query_start=req.cached_len,
             query_length=req.extend_len,
             key_length=req.device_len,
+            raw_positions=(
+                req.raw_positions[: req.device_len]
+                if getattr(req, "raw_positions", None) is not None
+                else None
+            ),
+            true_positions=(
+                req.true_positions[: req.device_len]
+                if getattr(req, "true_positions", None) is not None
+                else None
+            ),
             sliding_window=sliding_window,
         )
         first_segment = segments[0]
@@ -385,7 +437,7 @@ def compile_context_page_tables(
     page_table: torch.Tensor,
     context_batch: ContextAttentionBatch,
 ) -> CompiledContextPageTables:
-    """Resolve absolute Context keys into FA/FI page layouts in one GPU kernel."""
+    """Resolve compact Context keys into FA/FI page layouts in one GPU kernel."""
 
     num_segments = context_batch.num_segments
     total_keys = len(context_batch.key_positions)

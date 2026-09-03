@@ -422,6 +422,11 @@ class Scheduler(SchedulerIOMixin):
         msg.radix_current_reposition = layout.current_reposition
         msg.context_stage_count = len(layout.transition_offsets)
         msg.radix_compile_ns = layout.compile_ns
+        if len(layout.transition_offsets) == 1 and bool(torch.any(~layout.keep_mask).item()):
+            # A Drop-only (or no-op Reposition) request stays on the existing
+            # one-pass mask path. Effective Reposition requests select the
+            # per-epoch mask only after staged state has been initialized.
+            msg.use_context_mask = True
         if msg.radix_commit_token_len is not None:
             msg.radix_commit_key_len = key_prefix_len_for_token_boundary(
                 layout, msg.radix_commit_token_len
