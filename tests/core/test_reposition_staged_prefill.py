@@ -156,10 +156,14 @@ def test_tokenizer_sequence_compiles_once_and_waits_between_scheduler_turns(
     with pytest.raises(RuntimeError, match="compiled more than once"):
         state.compile([-101, -102], step_token_budget=64)
 
+    # Scheduler acknowledgements carry cumulative snapshots seeded by the
+    # previous Tokenizer turn; accepting one must not count that seed twice.
+    state.radix_match_ns = 5
     first = state.build_next_msg()
     assert first.raw_positions.tolist() == [0, 1, 2, 3, 4]
     assert first.use_context_mask
     assert first.is_warmup
+    assert first.radix_match_ns == 5
     with pytest.raises(RuntimeError, match="awaiting Scheduler"):
         state.build_next_msg()
     state.accept_ack(_ack(7, radix_match_ns=11))

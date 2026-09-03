@@ -355,11 +355,17 @@ class RepositionSequenceState:
             raise RuntimeError("Warmup acknowledgement does not match the Reposition step.")
         if not ack.finished:
             raise RuntimeError("An internal Reposition step unexpectedly entered Decode.")
-        self.radix_match_ns += ack.radix_match_ns
-        self.retry_plan_ns += ack.retry_plan_ns
-        self.transition_count += ack.reposition_transition_count
-        self.h2d_bytes += ack.reposition_h2d_bytes
-        self.d2h_bytes += ack.reposition_d2h_bytes
+        # Every Scheduler turn starts from the cumulative counters carried by
+        # ``build_next_msg`` and returns a new cumulative snapshot.  Merging by
+        # maximum preserves monotonicity without counting the prior stages a
+        # second time.
+        self.radix_match_ns = max(self.radix_match_ns, ack.radix_match_ns)
+        self.retry_plan_ns = max(self.retry_plan_ns, ack.retry_plan_ns)
+        self.transition_count = max(
+            self.transition_count, ack.reposition_transition_count
+        )
+        self.h2d_bytes = max(self.h2d_bytes, ack.reposition_h2d_bytes)
+        self.d2h_bytes = max(self.d2h_bytes, ack.reposition_d2h_bytes)
 
         assert self.layout is not None
         assert self.current_positions is not None
