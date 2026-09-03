@@ -404,7 +404,7 @@ class PrefillAdder:
             cached_len = match.active_cached_len
             cached_indices = match.active_match_indices
             initial_full_match_indices = match.full_match_indices[: match.full_cached_len]
-            radix_cached_tokens = cached_len
+            radix_cached_tokens = match.handle.physical_cached_len
             usage_cached_tokens = cached_len
             retry_plan = match.retry_plan
             retry_active_full_positions = match.active_full_positions

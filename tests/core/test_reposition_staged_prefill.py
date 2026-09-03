@@ -260,7 +260,11 @@ def test_each_scheduler_turn_reuses_the_previous_partial_radix_prefix(
         return real_empty(*args, **kwargs)
 
     monkeypatch.setattr(torch, "empty", cpu_empty)
-    state = _sequence(max_tokens=1)
+    state = _sequence(
+        max_tokens=1,
+        drop_positions=[4],
+        drop_ranges=[0, 3],
+    )
     state.activate(step_token_budget=64)
     page_table = torch.full((2, 64), -1, dtype=torch.int32)
     cache = CacheManager(64, 1, page_table, "radix")
@@ -276,6 +280,8 @@ def test_each_scheduler_turn_reuses_the_previous_partial_radix_prefix(
 
     cached_counts = []
     active_cached_counts = []
+    drop_skipped_counts = []
+    context_mask_flags = []
     for turn in range(2):
         # Exercise the real Tokenizer -> Scheduler ownership boundary.  Without
         # the wire copy, later state transitions could mutate this test's key.
@@ -288,6 +294,8 @@ def test_each_scheduler_turn_reuses_the_previous_partial_radix_prefix(
         req.complete_one()
         cached_counts.append(req.radix_cached_tokens)
         active_cached_counts.append(req.initial_active_cached_len)
+        drop_skipped_counts.append(req.drop_skipped_tokens)
+        context_mask_flags.append(req.use_context_mask)
         ack = _ack(
             req.uid,
             radix_match_ns=req.radix_match_ns,
@@ -300,8 +308,11 @@ def test_each_scheduler_turn_reuses_the_previous_partial_radix_prefix(
             state.accept_ack(ack)
 
     assert cached_counts[0] == 0
-    assert cached_counts[1] > 0
+    assert cached_counts[1] == req.cache_handle.physical_cached_len
+    assert cached_counts[1] > active_cached_counts[1]
     assert active_cached_counts[1] > 0
+    assert drop_skipped_counts == [0, cached_counts[1] - active_cached_counts[1]]
+    assert context_mask_flags == [True, False]
     assert kv_cache.calls
     cache.check_integrity()
 
