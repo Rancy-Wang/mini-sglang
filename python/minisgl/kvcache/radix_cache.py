@@ -829,18 +829,17 @@ class RadixPrefixCache(BasePrefixCache):
 
         if len(records) == 0:
             return []
-        boundaries = [
-            index
-            for index in range(1, len(records))
-            if bool(virtual_mask[index - 1]) != bool(virtual_mask[index])
-            or (
-                bool(virtual_mask[index - 1])
-                and bool(virtual_mask[index])
-                and not (
-                    int(records[index - 1, 0]) == 1 and int(records[index, 0]) == 1
-                )
-            )
-        ]
+        from minisgl.kernel.radix_reposition import DELTA_KIND
+
+        previous_virtual = virtual_mask[:-1]
+        current_virtual = virtual_mask[1:]
+        virtual_transition = previous_virtual != current_virtual
+        adjacent_virtual = previous_virtual & current_virtual
+        adjacent_delta = (records[:-1, 0] == DELTA_KIND) & (
+            records[1:, 0] == DELTA_KIND
+        )
+        split = virtual_transition | (adjacent_virtual & ~adjacent_delta)
+        boundaries = (torch.nonzero(split, as_tuple=False).view(-1) + 1).tolist()
         boundaries.append(len(records))
         return boundaries
 

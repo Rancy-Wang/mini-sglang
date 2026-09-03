@@ -144,6 +144,42 @@ def test_multi_range_delta_edge_uses_the_complete_block_for_child_lookup() -> No
     cache.check_integrity()
 
 
+def test_structured_segment_scan_is_batched_without_tensor_scalar_iteration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    records = _records(
+        [
+            [TOKEN_KIND, 10, -1, 0],
+            [TOKEN_KIND, 11, -1, 1],
+            [DELTA_KIND, -1, -2, -1],
+            [DELTA_KIND, -3, -4, -1],
+            [REPOSITION_KIND, 1, -1, -1],
+            [TOKEN_KIND, 12, 1, 0],
+            [DELTA_KIND, -2, -3, -1],
+            [REPOSITION_KIND, 5, -1, -1],
+            [REPOSITION_KIND, 6, -1, -1],
+            [TOKEN_KIND, 13, 6, 0],
+        ]
+    )
+    virtual = records[:, 0] != TOKEN_KIND
+
+    def reject_scalar_bool(_self) -> bool:
+        raise AssertionError("structured segment scan performed a tensor scalar conversion")
+
+    monkeypatch.setattr(torch.Tensor, "__bool__", reject_scalar_bool)
+
+    assert RadixPrefixCache._structured_segment_ends(records, virtual) == [
+        2,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+    ]
+
+
 def test_ordinary_radix_index_survives_edge_split() -> None:
     cache = _cache()
     first = torch.tensor([10, 11, 12], dtype=torch.int32)
