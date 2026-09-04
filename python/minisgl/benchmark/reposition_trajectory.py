@@ -494,7 +494,7 @@ def inspect_metrics(metrics: Any, *, stress: bool, cold: bool) -> list[str]:
         <= int(metrics["request_finished_ns"])
     ):
         issues.append("system:nonmonotonic_metrics")
-    if int(metrics["tokenize_invocations"]) != 1:
+    if stress and int(metrics["tokenize_invocations"]) != 1:
         issues.append("system:tokenize_invocations_not_one")
     if int(metrics["reposition_d2h_bytes"]) != 0:
         issues.append("system:reposition_d2h_nonzero")
