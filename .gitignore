@@ -31,3 +31,7 @@ env/
 # .vscode
 .vscode/
 .coverage
+
+# local experiments
+/local/
+!scripts/request_matrix_config.example.json

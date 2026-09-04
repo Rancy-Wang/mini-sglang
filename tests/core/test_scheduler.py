@@ -58,6 +58,9 @@ def main():
         UserMsg(
             uid=0,
             input_ids=ids,
+            true_positions=torch.arange(len(ids), dtype=torch.int32),
+            raw_positions=torch.arange(len(ids), dtype=torch.int32),
+            radix_input_ids=ids.to(torch.int64),
             sampling_params=SamplingParams(max_tokens=100),
         )
     )
