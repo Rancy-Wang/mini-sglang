@@ -206,6 +206,11 @@ def test_inspection_accepts_valid_oracle_tool_call_and_metrics() -> None:
         "reposition_d2h_bytes": 0,
     }
     assert inspect_metrics(metrics, stress=True, cold=True) == []
+    metrics["tokenize_invocations"] = 20
+    assert inspect_metrics(metrics, stress=False, cold=False) == []
+    assert inspect_metrics(metrics, stress=True, cold=False) == [
+        "system:tokenize_invocations_not_one"
+    ]
 
 
 def test_attribution_uses_baseline_stream_warm_and_concurrency_cells() -> None:
