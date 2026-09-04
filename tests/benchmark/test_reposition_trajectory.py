@@ -15,6 +15,7 @@ from minisgl.benchmark.reposition_trajectory import (
     inspect_metrics,
     inspect_text,
     load_trajectory_case,
+    parse_response_bytes,
     parse_sse,
 )
 
@@ -170,6 +171,31 @@ def test_parse_sse_preserves_reasoning_content_and_tool_arguments() -> None:
     ]
     assert parsed["finish_reason"] == "tool_calls"
     assert parsed["usage"] == {"prompt_tokens": 10}
+    assert parsed["sse_done"] is True
+
+
+def test_response_parser_rejects_invalid_utf8_and_incomplete_sse() -> None:
+    try:
+        parse_response_bytes(b"\xff", stream=False)
+    except UnicodeDecodeError:
+        pass
+    else:
+        raise AssertionError("invalid UTF-8 must not be replaced silently")
+
+    try:
+        parse_sse('data: {"choices": []}\n')
+    except ValueError as exc:
+        assert "[DONE]" in str(exc)
+    else:
+        raise AssertionError("an incomplete SSE trajectory must fail")
+
+
+def test_message_inspection_without_oracle_only_checks_structure() -> None:
+    issues, report = inspect_message(_assistant(), tools=TOOLS)
+
+    assert issues == []
+    assert report["oracle_tool_calls"] is None
+    assert report["oracle_exact_match"] is None
 
 
 def test_inspection_detects_repetition_weird_characters_and_bad_tool_json() -> None:

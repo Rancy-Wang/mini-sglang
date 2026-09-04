@@ -185,7 +185,7 @@ def _merge_tool_call_delta(tool_calls: list[dict[str, Any]], delta: dict[str, An
                 target[key] = str(target.get(key, "")) + str(function[key])
 
 
-def parse_sse(raw_text: str) -> dict[str, Any]:
+def parse_sse(raw_text: str, *, require_done: bool = True) -> dict[str, Any]:
     message: dict[str, Any] = {"role": "assistant", "content": ""}
     content: list[str] = []
     reasoning: list[str] = []
@@ -194,11 +194,19 @@ def parse_sse(raw_text: str) -> dict[str, Any]:
     finish_reason: str | None = None
     server_metrics: dict[str, Any] | None = None
     usage: dict[str, Any] | None = None
-    for line in raw_text.splitlines():
-        if not line.startswith("data:"):
+    saw_done = False
+    for line_number, line in enumerate(raw_text.splitlines(), 1):
+        if not line or line.startswith(":"):
             continue
+        if line.startswith(("event:", "id:", "retry:")):
+            continue
+        if not line.startswith("data:"):
+            raise ValueError(f"Malformed SSE line {line_number}: missing data prefix")
         payload = line.removeprefix("data:").strip()
-        if not payload or payload == "[DONE]":
+        if not payload:
+            continue
+        if payload == "[DONE]":
+            saw_done = True
             continue
         event = json.loads(payload)
         if not isinstance(event, dict):
@@ -233,12 +241,15 @@ def parse_sse(raw_text: str) -> dict[str, Any]:
         message["reasoning_content"] = "".join(reasoning)
     if tool_calls:
         message["tool_calls"] = tool_calls
+    if require_done and not saw_done:
+        raise ValueError("SSE response is missing the [DONE] event")
     return {
         "message": message,
         "finish_reason": finish_reason,
         "server_metrics": server_metrics,
         "usage": usage,
         "events": events,
+        "sse_done": saw_done,
     }
 
 
@@ -256,6 +267,20 @@ def parse_nonstream(payload: dict[str, Any]) -> dict[str, Any]:
         "server_metrics": payload.get("server_metrics"),
         "usage": payload.get("usage"),
     }
+
+
+def parse_response_bytes(raw_bytes: bytes, *, stream: bool) -> dict[str, Any]:
+    """Decode and parse a response without silently replacing malformed UTF-8."""
+
+    raw_text = raw_bytes.decode("utf-8", errors="strict")
+    if stream:
+        parsed = parse_sse(raw_text)
+    else:
+        payload = json.loads(raw_text)
+        if not isinstance(payload, dict):
+            raise ValueError("Non-stream response is not a JSON object")
+        parsed = parse_nonstream(payload)
+    return {"raw_response_text": raw_text, **parsed}
 
 
 def _suspicious_characters(text: str) -> dict[str, int]:
@@ -420,7 +445,7 @@ def inspect_message(
     message: dict[str, Any],
     *,
     tools: Any,
-    expected: dict[str, Any],
+    expected: dict[str, Any] | None = None,
 ) -> tuple[list[str], dict[str, Any]]:
     issues: list[str] = []
     text_report: dict[str, Any] = {}
@@ -430,9 +455,12 @@ def inspect_message(
         text_report[field] = report
 
     schemas = _tool_schemas(tools)
+    raw_calls = message.get("tool_calls")
+    if raw_calls is not None and not isinstance(raw_calls, list):
+        issues.append("tool_calls:not_array")
     actual_calls = canonical_tool_calls(message)
-    expected_calls = canonical_tool_calls(expected)
-    if len(actual_calls) != len(expected_calls):
+    expected_calls = canonical_tool_calls(expected) if isinstance(expected, dict) else None
+    if expected_calls is not None and len(actual_calls) != len(expected_calls):
         issues.append("tool_calls:count_mismatch")
     signatures: list[str] = []
     tool_report: list[dict[str, Any]] = []
@@ -461,7 +489,9 @@ def inspect_message(
         "tool_calls": tool_report,
         "canonical_tool_calls": actual_calls,
         "oracle_tool_calls": expected_calls,
-        "oracle_exact_match": actual_calls == expected_calls,
+        "oracle_exact_match": actual_calls == expected_calls
+        if expected_calls is not None
+        else None,
     }
 
 
@@ -599,19 +629,12 @@ async def post_request(
         raw_text = raw_bytes.decode("utf-8", errors="strict")
         if status_code != 200:
             raise RuntimeError(f"HTTP {status_code}: {raw_text[:1000]}")
-        if request.get("stream") is True:
-            parsed = parse_sse(raw_text)
-        else:
-            payload = json.loads(raw_text)
-            if not isinstance(payload, dict):
-                raise ValueError("Non-stream response is not a JSON object")
-            parsed = parse_nonstream(payload)
+        parsed = parse_response_bytes(raw_bytes, stream=request.get("stream") is True)
         return {
             "ok": True,
             "status_code": status_code,
             "client_started_ns": started_ns,
             "client_finished_ns": finished_ns,
-            "raw_response_text": raw_text,
             **parsed,
         }
     except Exception as exc:
