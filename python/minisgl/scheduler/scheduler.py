@@ -7,12 +7,15 @@ import torch
 from minisgl.core import Batch, Req
 from minisgl.env import ENV
 from minisgl.kernel.context_plan import preload_context_plan_kernel
+from minisgl.layers import get_rope
 from minisgl.message import (
     AbortBackendMsg,
     BaseBackendMsg,
     BatchBackendMsg,
     DetokenizeMsg,
     ExitMsg,
+    RepositionOpenAckMsg,
+    RepositionOpenMsg,
     RequestMetricsState,
     RequestRejectMsg,
     UserMsg,
@@ -25,13 +28,7 @@ from .cache import CacheManager
 from .config import SchedulerConfig
 from .decode import DecodeManager
 from .io import SchedulerIOMixin
-from .prefill import ChunkedReq, PrefillManager
-from .radix_delta import (
-    DeltaMarkerRegistry,
-    inject_delta_markers,
-    key_prefix_len_for_token_boundary,
-    select_effective_delta_events,
-)
+from .prefill import ChunkedReq, PrefillManager, RepositionCapacityError
 from .radix_symbol import RadixSymbolRegistry, inject_radix_symbols
 from .table import TableManager
 from .utils import PendingReq
@@ -101,9 +98,6 @@ class Scheduler(SchedulerIOMixin):
         self.radix_symbol_registry = (
             RadixSymbolRegistry() if self.radix_drop_key_mode == "symbol" else None
         )
-        self.delta_marker_registry = (
-            DeltaMarkerRegistry() if self.radix_drop_key_mode == "delta-marker" else None
-        )
         self.cache_manager = CacheManager(
             self.engine.num_pages,
             config.page_size,
@@ -111,15 +105,23 @@ class Scheduler(SchedulerIOMixin):
             config.cache_type,
             drop_aware_eviction=config.drop_aware_eviction,
         )
-        if self.delta_marker_registry is not None:
-            self.cache_manager.bind_delta_marker_registry(self.delta_marker_registry)
         self.decode_manager = DecodeManager(config.page_size)
+        rotary_config = config.model_config.rotary_config
+        retry_rope = get_rope(
+            head_dim=rotary_config.head_dim,
+            rotary_dim=rotary_config.rotary_dim,
+            max_position=rotary_config.max_position,
+            base=rotary_config.base,
+            rope_scaling=(tuple(rotary_config.scaling.items()) if rotary_config.scaling else None),
+        )
         self.prefill_manager = PrefillManager(
             self.cache_manager,
             self.table_manager,
             self.decode_manager,
             has_sliding_window=config.model_config.sliding_window is not None,
             enable_mask_free_context_prefill=config.mask_free_context_prefill,
+            kv_cache=self.engine.kv_cache,
+            retry_rope_cache=retry_rope.cos_sin_cache,
         )
         if config.contextual_prefill_mode not in {"staged", "mask"}:
             raise ValueError(
@@ -143,6 +145,7 @@ class Scheduler(SchedulerIOMixin):
         # some alias for easy access
         self.finished_reqs: Set[Req] = set()
         self.request_metrics: Dict[int, RequestMetricsState] = {}
+        self.context_sequence_uids: Set[int] = set()
         self.tokenizer = load_tokenizer(config.model_path)
         self.eos_token_id = self.tokenizer.eos_token_id
         eos_values = (
@@ -232,6 +235,7 @@ class Scheduler(SchedulerIOMixin):
         with self.cache_manager.lazy_free_region():
             for i, req in enumerate(batch.reqs):
                 if isinstance(req, ChunkedReq):
+                    self.prefill_manager.complete_chunk(req)
                     continue
                 if req in self.finished_reqs:
                     # An abort or an earlier overlapping batch already released
@@ -249,9 +253,16 @@ class Scheduler(SchedulerIOMixin):
                             cached_tokens=req.reported_cached_tokens,
                             drop_skipped_tokens=req.drop_skipped_tokens,
                             finished=finished,
+                            radix_match_ns=req.radix_match_ns,
+                            retry_plan_ns=req.retry_plan_ns,
+                            reposition_transition_count=req.reposition_transition_count,
+                            reposition_h2d_bytes=req.reposition_h2d_bytes,
+                            reposition_d2h_bytes=req.reposition_d2h_bytes,
                         )
                     )
                 else:
+                    if req.context_post_prefill_keep_mask is not None:
+                        self._compact_context_after_prefill(req)
                     next_token_tensor = next_tokens_cpu[i]
                     req.append_host(next_token_tensor.unsqueeze(0))
                     next_token = int(next_token_tensor.item())
@@ -268,9 +279,20 @@ class Scheduler(SchedulerIOMixin):
                     server_metrics = None
                     metrics_state = self.request_metrics.get(req.uid)
                     if metrics_state is not None:
+                        metrics_state.observe_reposition(
+                            radix_match_ns=req.radix_match_ns,
+                            retry_plan_ns=req.retry_plan_ns,
+                            transition_count=req.reposition_transition_count,
+                            h2d_bytes=req.reposition_h2d_bytes,
+                            d2h_bytes=req.reposition_d2h_bytes,
+                        )
                         visible = not (finished and next_token in self.eos_token_ids)
                         metrics_state.observe_token(generated_ns, visible=visible)
                         if finished:
+                            metrics_state.drop_skipped_tokens = max(
+                                metrics_state.drop_skipped_tokens,
+                                req.drop_skipped_tokens,
+                            )
                             server_metrics = metrics_state.finish(generated_ns)
                             self.request_metrics.pop(req.uid, None)
                     reply.append(
@@ -280,9 +302,7 @@ class Scheduler(SchedulerIOMixin):
                             finished=finished,
                             finish_reason=finish_reason if finished else None,
                             matched_stop=matched_stop,
-                            cached_tokens=(
-                                req.reported_cached_tokens if finished else None
-                            ),
+                            cached_tokens=(req.reported_cached_tokens if finished else None),
                             prompt_tokens=req.prompt_tokens if finished else None,
                             completion_tokens=req.completion_tokens if finished else None,
                             server_metrics=server_metrics,
@@ -299,20 +319,165 @@ class Scheduler(SchedulerIOMixin):
         self.finished_reqs = new_finished_reqs
         self.send_result(reply)
 
+    def _compact_context_after_prefill(self, req: Req) -> None:
+        """Switch the final masked Reposition Prefill to its active Decode view."""
+
+        keep_mask = req.context_post_prefill_keep_mask
+        if keep_mask is None:
+            return
+        prompt_len = req.cached_len
+        if prompt_len != len(req.input_ids) or req.device_len != prompt_len + 1:
+            raise RuntimeError("Post-Prefill compaction must run immediately after prompt Prefill.")
+        prompt_raw = req.raw_positions[:prompt_len].to(dtype=torch.int64, device="cpu")
+        if len(prompt_raw) == 0 or int(prompt_raw[-1]) >= len(keep_mask):
+            raise RuntimeError("Post-Prefill keep mask does not cover the prompt raw positions.")
+        keep = (keep_mask[prompt_raw] != 0).to(dtype=torch.bool, device="cpu")
+        if not bool(torch.any(keep).item()):
+            raise RuntimeError("Reposition cannot Drop every prompt token before generation.")
+
+        pages = self.table_manager.page_table[req.table_idx, :prompt_len].clone()
+        keep_device = keep.to(device=pages.device, non_blocking=True)
+        active_slots = torch.arange(prompt_len, dtype=torch.int64, device="cpu")
+        owned = active_slots >= req.initial_active_cached_len
+        if req.retry_transformed_mask is not None:
+            owned[: len(req.retry_transformed_mask)] |= req.retry_transformed_mask
+        dropped_owned = (~keep) & owned
+        if bool(torch.any(dropped_owned).item()):
+            dropped_device = dropped_owned.to(device=pages.device, non_blocking=True)
+            dropped_positions = prompt_raw[dropped_owned]
+            dropped_pages = pages[dropped_device]
+            if req.inactive_cached_positions is None:
+                req.inactive_cached_positions = dropped_positions
+                req.inactive_cached_pages = dropped_pages
+            else:
+                assert req.inactive_cached_pages is not None
+                req.inactive_cached_positions = torch.cat(
+                    (req.inactive_cached_positions, dropped_positions)
+                )
+                req.inactive_cached_pages = torch.cat((req.inactive_cached_pages, dropped_pages))
+
+        kept_count = int(torch.count_nonzero(keep).item())
+        self.table_manager.page_table[req.table_idx, :kept_count].copy_(pages[keep_device])
+        self.table_manager.token_pool[req.table_idx, :kept_count].copy_(
+            self.table_manager.token_pool[req.table_idx, :prompt_len][keep_device]
+        )
+        self.table_manager.token_pool[req.table_idx, kept_count].copy_(
+            self.table_manager.token_pool[req.table_idx, prompt_len]
+        )
+
+        queued_true_position = req.true_positions[prompt_len:].clone()
+        queued_raw_position = req.raw_positions[prompt_len:].clone()
+        req.input_ids = req.input_ids[keep].contiguous()
+        req.true_positions = torch.cat(
+            (req.true_positions[:prompt_len][keep].contiguous(), queued_true_position)
+        )
+        req.raw_positions = torch.cat(
+            (req.raw_positions[:prompt_len][keep].contiguous(), queued_raw_position)
+        )
+        req.radix_input_ids = req.radix_input_ids[keep].contiguous()
+
+        initial_keep = keep[: req.initial_active_cached_len]
+        req.initial_active_cached_len = int(torch.count_nonzero(initial_keep).item())
+        if req.retry_transformed_mask is not None:
+            req.retry_transformed_mask = req.retry_transformed_mask[initial_keep].contiguous()
+        removed = prompt_len - kept_count
+        req.cached_len = kept_count
+        req.device_len = kept_count + 1
+        req.max_device_len -= removed
+        req.use_context_mask = False
+        req.context_compact_stream = False
+        req.context_post_prefill_keep_mask = None
+        req.full_input_ids = None
+        req.full_token_visible_until = None
+        req.full_keep_mask = None
+
     def _process_one_msg(self, msg: BaseBackendMsg) -> None:
         if isinstance(msg, BatchBackendMsg):
-            for msg in msg.data:
-                self._process_one_msg(msg)
+            for item in msg.data:
+                self._process_one_msg(item)
         elif isinstance(msg, ExitMsg):
             raise KeyboardInterrupt
+        elif isinstance(msg, RepositionOpenMsg):
+            try:
+                if self.radix_drop_key_mode != "delta-marker":
+                    raise ValueError("Reposition requires --radix-drop-key-mode delta-marker.")
+                if self.cache_manager.drop_aware_eviction:
+                    raise ValueError(
+                        "Reposition currently supports ordinary Radix eviction only; "
+                        "disable Drop-aware eviction."
+                    )
+                if msg.uid in self.context_sequence_uids:
+                    raise ValueError(f"Duplicate Reposition sequence UID: {msg.uid}")
+                self.context_sequence_uids.add(msg.uid)
+                self.send_result(
+                    [
+                        RepositionOpenAckMsg(
+                            uid=msg.uid,
+                            step_token_budget=self.prefill_budget,
+                        )
+                    ]
+                )
+            except ValueError as exc:
+                self._close_context_sequence(msg.uid)
+                self.send_result(
+                    [
+                        RequestRejectMsg(
+                            uid=msg.uid,
+                            status_code=400,
+                            error_code="invalid_context_events",
+                            detail=str(exc),
+                        )
+                    ]
+                )
         elif isinstance(msg, UserMsg):
             logger.debug_rank0("Received user msg: %s", msg)
-            true_input_len = (
-                len(msg.full_input_ids)
-                if msg.use_context_mask and msg.full_input_ids is not None
-                else int(msg.true_positions[-1].item()) + 1 if len(msg.true_positions) > 0 else 0
-            )
+            if self.radix_symbol_registry is not None and msg.message_meta is not None:
+                state_starts = msg.message_meta.get(
+                    "radix_state_starts", msg.message_meta.get("message_starts", [])
+                )
+                if not isinstance(state_starts, list):
+                    raise ValueError("message_meta.radix_state_starts must be a list.")
+                if msg.radix_match_ids is None:
+                    raise ValueError("Symbol Radix mode requires full radix_match_ids.")
+                msg.radix_match_ids, msg.radix_input_ids = inject_radix_symbols(
+                    msg.radix_match_ids,
+                    msg.true_positions,
+                    state_starts,
+                    self.radix_symbol_registry,
+                )
+            elif self.radix_drop_key_mode == "delta-marker":
+                if msg.radix_match_ids is None:
+                    raise ValueError("Delta-marker Radix mode requires full radix_match_ids.")
+                if msg.radix_match_ids.ndim != 2 or msg.radix_match_ids.shape[1] != 4:
+                    raise ValueError(
+                        "Delta-marker Radix keys must be precompiled CPU int32 [N, 4] records."
+                    )
+
+            if msg.radix_next_position is not None:
+                true_input_len = msg.radix_next_position
+            elif len(msg.true_positions) > 0:
+                true_input_len = int(msg.true_positions[-1].item()) + 1
+            else:
+                true_input_len = 0
             max_seq_len = self.engine.max_seq_len
+            if true_input_len > max_seq_len:
+                detail = (
+                    f"A Reposition materialization step needs sequence length {true_input_len}, "
+                    f"which exceeds the model context length {max_seq_len}."
+                )
+                logger.warning_rank0("Rejecting request %s: %s", msg.uid, detail)
+                self.send_result(
+                    [
+                        RequestRejectMsg(
+                            uid=msg.uid,
+                            status_code=413,
+                            error_code="context_length_exceeded",
+                            detail=detail,
+                        )
+                    ]
+                )
+                self._close_context_sequence(msg.uid)
+                return
             max_output_len = max_seq_len - true_input_len
             if max_output_len <= 0:
                 detail = (
@@ -330,83 +495,8 @@ class Scheduler(SchedulerIOMixin):
                         )
                     ]
                 )
+                self._close_context_sequence(msg.uid)
                 return
-
-            if self.radix_symbol_registry is not None and msg.message_meta is not None:
-                state_starts = msg.message_meta.get(
-                    "radix_state_starts", msg.message_meta.get("message_starts", [])
-                )
-                if not isinstance(state_starts, list):
-                    raise ValueError("message_meta.radix_state_starts must be a list.")
-                if msg.radix_match_ids is None:
-                    raise ValueError("Symbol Radix mode requires full radix_match_ids.")
-                msg.radix_match_ids, msg.radix_input_ids = inject_radix_symbols(
-                    msg.radix_match_ids,
-                    msg.true_positions,
-                    state_starts,
-                    self.radix_symbol_registry,
-                )
-            elif self.delta_marker_registry is not None:
-                if msg.radix_match_ids is None:
-                    raise ValueError("Delta-marker Radix mode requires full radix_match_ids.")
-                drop_wire = (
-                    msg.drop_event_positions,
-                    msg.drop_range_offsets,
-                    msg.drop_position_ranges,
-                )
-                if any(tensor is not None for tensor in drop_wire):
-                    if not all(tensor is not None for tensor in drop_wire):
-                        raise ValueError(
-                            "Token-position Drop metadata must be provided as one complete set."
-                        )
-                    event_positions, range_offsets, position_ranges = drop_wire
-                    assert event_positions is not None
-                    assert range_offsets is not None
-                    assert position_ranges is not None
-                    drop_aware_eviction = getattr(
-                        getattr(self, "cache_manager", None),
-                        "drop_aware_eviction",
-                        False,
-                    )
-                    if drop_aware_eviction:
-                        if msg.full_keep_mask is None:
-                            raise ValueError(
-                                "Drop-aware delta markers require a target-specific "
-                                "full_keep_mask."
-                            )
-                        event_positions, range_offsets, position_ranges = (
-                            select_effective_delta_events(
-                                event_positions,
-                                range_offsets,
-                                position_ranges,
-                                msg.full_keep_mask,
-                            )
-                        )
-                    marker_ids: tuple[int, ...] = ()
-                    try:
-                        layout = inject_delta_markers(
-                            msg.radix_match_ids,
-                            event_positions,
-                            range_offsets,
-                            position_ranges,
-                            self.delta_marker_registry,
-                        )
-                        if layout is not None:
-                            marker_ids = layout.marker_ids
-                            msg.radix_match_ids = layout.keys
-                            msg.radix_key_virtual_mask = layout.virtual_mask
-                            msg.radix_key_to_token = layout.key_to_token
-                            msg.radix_token_to_key = layout.token_to_key
-                            msg.radix_marker_ids = list(marker_ids)
-                        if layout is not None and msg.radix_commit_token_len is not None:
-                            msg.radix_commit_key_len = key_prefix_len_for_token_boundary(
-                                layout, msg.radix_commit_token_len
-                            )
-                    except Exception:
-                        if marker_ids:
-                            self.delta_marker_registry.release_request_refs(marker_ids)
-                            msg.radix_marker_ids = None
-                        raise
 
             if msg.sampling_params.max_tokens > max_output_len:
                 msg.sampling_params.max_tokens = max_output_len
@@ -424,14 +514,25 @@ class Scheduler(SchedulerIOMixin):
                     request_received_ns=request_received_ns,
                     prompt_tokens=prompt_tokens,
                     active_prompt_tokens=len(msg.input_ids),
+                    tokenize_invocations=msg.tokenize_invocations,
+                    chat_template_invocations=msg.chat_template_invocations,
+                    context_stage_count=msg.context_stage_count,
+                    radix_compile_ns=msg.radix_compile_ns,
+                    reposition_ipc_tensor_bytes=msg.reposition_ipc_tensor_bytes,
+                    drop_skipped_tokens=msg.prior_drop_skipped_tokens,
+                )
+                self.request_metrics[msg.uid].observe_reposition(
+                    radix_match_ns=msg.radix_match_ns,
+                    retry_plan_ns=msg.retry_plan_ns,
+                    transition_count=msg.reposition_transition_count,
+                    h2d_bytes=msg.reposition_h2d_bytes,
+                    d2h_bytes=msg.reposition_d2h_bytes,
                 )
             try:
                 self.prefill_manager.add_one_req(msg)
             except Exception:
                 self.request_metrics.pop(msg.uid, None)
-                if self.delta_marker_registry is not None and msg.radix_marker_ids:
-                    self.delta_marker_registry.release_request_refs(msg.radix_marker_ids)
-                    msg.radix_marker_ids = None
+                self._close_context_sequence(msg.uid)
                 raise
         elif isinstance(msg, AbortBackendMsg):
             logger.debug_rank0("Aborting request %d", msg.uid)
@@ -439,17 +540,23 @@ class Scheduler(SchedulerIOMixin):
             req_to_free = self.prefill_manager.abort_req(msg.uid)
             req_to_free = req_to_free or self.decode_manager.abort_req(msg.uid)
             if isinstance(req_to_free, PendingReq):
-                if self.delta_marker_registry is not None and req_to_free.radix_marker_ids:
-                    self.delta_marker_registry.release_request_refs(req_to_free.radix_marker_ids)
-                    req_to_free.radix_marker_ids = ()
+                self._close_context_sequence(msg.uid)
             elif req_to_free is not None:
                 self._free_req_resources(req_to_free)
                 # The request may still be present in an overlapping GPU batch.
                 # _process_last_data uses this tombstone to discard that stale result.
                 self.finished_reqs.add(req_to_free)
+            else:
+                self._close_context_sequence(msg.uid)
         else:
             logger.error(f"Unknown message type: {type(msg)}")
             raise NotImplementedError
+
+    def _close_context_sequence(self, uid: int) -> bool:
+        if uid not in self.context_sequence_uids:
+            return False
+        self.context_sequence_uids.remove(uid)
+        return True
 
     def _free_req_resources(self, req: Req) -> None:
         try:
@@ -458,9 +565,13 @@ class Scheduler(SchedulerIOMixin):
             try:
                 self.table_manager.free(req.table_idx)
             finally:
-                if self.delta_marker_registry is not None and req.radix_marker_ids:
-                    self.delta_marker_registry.release_request_refs(req.radix_marker_ids)
-                    req.radix_marker_ids = ()
+                if (
+                    req.is_warmup
+                    and req.radix_next_position is None
+                    and req.uid in self.context_sequence_uids
+                ):
+                    return
+                self._close_context_sequence(req.uid)
 
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
         self.engine.graph_runner.pad_batch(batch)
@@ -479,10 +590,24 @@ class Scheduler(SchedulerIOMixin):
 
     def _schedule_next_batch(self) -> ForwardInput | None:
         # TODO: support other policies: e.g. DECODE first
-        batch = (
-            self.prefill_manager.schedule_next_batch(self.prefill_budget)
-            or self.decode_manager.schedule_next_batch()
-        )
+        try:
+            batch = self.prefill_manager.schedule_next_batch(self.prefill_budget)
+        except RepositionCapacityError as exc:
+            self.prefill_manager.abort_req(exc.uid)
+            self.request_metrics.pop(exc.uid, None)
+            self._close_context_sequence(exc.uid)
+            self.send_result(
+                [
+                    RequestRejectMsg(
+                        uid=exc.uid,
+                        status_code=503,
+                        error_code="reposition_kv_capacity_exhausted",
+                        detail=str(exc),
+                    )
+                ]
+            )
+            batch = None
+        batch = batch or self.decode_manager.schedule_next_batch()
         return self._prepare_batch(batch) if batch else None
 
     def _forward(self, forward_input: ForwardInput) -> ForwardOutput:

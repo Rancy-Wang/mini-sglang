@@ -66,7 +66,8 @@ class SamplingParams:
 @dataclass(eq=False)
 class Req:
     input_ids: torch.Tensor  # cpu tensor
-    true_positions: torch.Tensor  # cpu tensor, absolute position for each input token
+    true_positions: torch.Tensor  # cpu tensor, current KV position for each active token
+    raw_positions: torch.Tensor  # cpu tensor, immutable full-token position
     radix_input_ids: torch.Tensor  # cpu tensor, int64 encoded key ids for radix
     radix_match_ids: torch.Tensor  # cpu tensor, full int64 encoded key ids for radix matching
     initial_full_match_indices: (
@@ -93,11 +94,26 @@ class Req:
     full_token_visible_until: torch.Tensor | None = None
     full_keep_mask: torch.Tensor | None = None
     use_context_mask: bool = False
+    context_compact_stream: bool = False
+    context_post_prefill_keep_mask: torch.Tensor | None = None
     radix_key_virtual_mask: torch.Tensor | None = None
     radix_key_to_token: torch.Tensor | None = None
     radix_token_to_key: torch.Tensor | None = None
     radix_commit_key_len: int | None = None
-    radix_marker_ids: tuple[int, ...] = ()
+    radix_positions: torch.Tensor | None = None
+    radix_repos_info: torch.Tensor | None = None
+    radix_next_position: int | None = None
+    radix_current_reposition: int = -1
+    retry_transformed_mask: torch.Tensor | None = None
+    inactive_cached_positions: torch.Tensor | None = None
+    inactive_cached_pages: torch.Tensor | None = None
+    tokenize_invocations: int = 1
+    radix_compile_ns: int = 0
+    radix_match_ns: int = 0
+    retry_plan_ns: int = 0
+    reposition_transition_count: int = 0
+    reposition_h2d_bytes: int = 0
+    reposition_d2h_bytes: int = 0
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu
@@ -108,13 +124,38 @@ class Req:
             torch.any(self.true_positions[1:] <= self.true_positions[:-1]).item()
         ):
             raise ValueError("true_positions must be strictly increasing.")
+        if self.raw_positions.ndim != 1 or not self.raw_positions.is_cpu:
+            raise ValueError("raw_positions must be a one-dimensional CPU tensor.")
+        if len(self.raw_positions) > 1 and bool(
+            torch.any(self.raw_positions[1:] <= self.raw_positions[:-1]).item()
+        ):
+            raise ValueError("raw_positions must be strictly increasing.")
         assert self.radix_input_ids.is_cpu
         assert self.radix_match_ids.is_cpu
-        if self.use_context_mask and not self.is_warmup:
-            raise ValueError("Context-mask Prefill is restricted to internal warmup requests.")
+        if self.use_context_mask and not (
+            self.is_warmup or self.context_post_prefill_keep_mask is not None
+        ):
+            raise ValueError(
+                "Context-mask Prefill is restricted to internal warmup or Reposition requests."
+            )
+        if self.context_post_prefill_keep_mask is not None:
+            keep_mask = self.context_post_prefill_keep_mask
+            if (
+                not keep_mask.is_cpu
+                or keep_mask.ndim != 1
+                or keep_mask.dtype not in (torch.bool, torch.int32)
+            ):
+                raise ValueError(
+                    "context_post_prefill_keep_mask must be a CPU bool or int32 vector."
+                )
+            if len(self.raw_positions) == 0 or int(self.raw_positions[-1]) >= len(keep_mask):
+                raise ValueError(
+                    "context_post_prefill_keep_mask does not cover the compact raw stream."
+                )
         if self.prefix_keep_mask is not None:
             assert self.prefix_keep_mask.is_cpu
         assert len(self.input_ids) == len(self.true_positions)
+        assert len(self.input_ids) == len(self.raw_positions)
         assert len(self.input_ids) == len(self.radix_input_ids)
         radix_layout = (
             self.radix_key_virtual_mask,
@@ -150,11 +191,19 @@ class Req:
                 raise ValueError("Real Radix keys must preserve full-token order.")
             if not torch.equal(token_to_key, real_key_positions):
                 raise ValueError("radix_token_to_key is not the inverse key mapping.")
-            virtual_keys = self.radix_match_ids[virtual_mask].tolist()
-            if virtual_keys != list(self.radix_marker_ids):
-                raise ValueError("radix_marker_ids do not match the virtual Radix key stream.")
-        elif self.radix_marker_ids:
-            raise ValueError("radix_marker_ids require a delta-marker Radix layout.")
+            if self.radix_match_ids.ndim == 2:
+                from minisgl.kernel.radix_reposition import (
+                    validate_radix_reposition_records,
+                )
+
+                validate_radix_reposition_records(
+                    self.radix_match_ids,
+                    token_count=len(token_to_key),
+                    require_materialized=True,
+                )
+                expected_virtual = self.radix_match_ids[:, 0] != 0
+                if not torch.equal(virtual_mask, expected_virtual):
+                    raise ValueError("Structured Radix virtual kinds disagree with the mask.")
         if self.radix_commit_key_len is not None:
             if self.radix_key_virtual_mask is None:
                 raise ValueError("radix_commit_key_len requires a delta-marker Radix layout.")
@@ -164,6 +213,36 @@ class Req:
         self.max_device_len = len(self.input_ids) + self.output_len
         assert 0 <= self.cached_len < self.device_len <= self.max_device_len
         assert 0 <= self.initial_active_cached_len <= self.cached_len
+        if self.retry_transformed_mask is not None:
+            if (
+                not self.retry_transformed_mask.is_cpu
+                or self.retry_transformed_mask.dtype != torch.bool
+                or self.retry_transformed_mask.ndim != 1
+                or len(self.retry_transformed_mask) != self.initial_active_cached_len
+            ):
+                raise ValueError(
+                    "retry_transformed_mask must be a CPU bool vector covering the initial "
+                    "active cache prefix."
+                )
+        inactive_retry = (
+            self.inactive_cached_positions,
+            self.inactive_cached_pages,
+        )
+        if any(tensor is not None for tensor in inactive_retry):
+            if not all(tensor is not None for tensor in inactive_retry):
+                raise ValueError("Inactive cached positions and pages must be provided together.")
+            inactive_positions, inactive_pages = inactive_retry
+            assert inactive_positions is not None
+            assert inactive_pages is not None
+            if (
+                inactive_positions.device.type != "cpu"
+                or inactive_positions.dtype != torch.int64
+                or inactive_positions.ndim != 1
+                or inactive_pages.dtype != torch.int32
+                or inactive_pages.ndim != 1
+                or len(inactive_positions) != len(inactive_pages)
+            ):
+                raise ValueError("Inactive cached metadata has an invalid layout.")
         if self.radix_cached_tokens < 0:
             raise ValueError("radix_cached_tokens must be non-negative.")
         if self.usage_cached_tokens is not None:
@@ -201,9 +280,9 @@ class Req:
                 )
             if not torch.equal(
                 self.input_ids,
-                self.full_input_ids[self.true_positions.to(dtype=torch.int64)],
+                self.full_input_ids[self.raw_positions.to(dtype=torch.int64)],
             ):
-                raise ValueError("Active input_ids do not match full_input_ids at true_positions.")
+                raise ValueError("Active input_ids do not match full_input_ids at raw_positions.")
             key_positions = torch.arange(full_len, dtype=torch.int32, device="cpu")
             if bool(torch.any(self.full_token_visible_until <= key_positions).item()):
                 raise ValueError("A token cannot become invisible before it has been computed.")
@@ -251,16 +330,75 @@ class Req:
         # can schedule the next batch with consistent absolute positions.
         self.cached_len = self.device_len
         self.device_len += 1
-        self.true_seq_len += 1
-        next_pos = torch.tensor([self.true_seq_len - 1], dtype=torch.int32, device="cpu")
+        position = (
+            self.radix_next_position if self.radix_next_position is not None else self.true_seq_len
+        )
+        next_pos = torch.tensor([position], dtype=torch.int32, device="cpu")
         self.true_positions = torch.cat([self.true_positions, next_pos])
+        self.true_seq_len = max(self.true_seq_len, position + 1)
+        if self.radix_next_position is not None:
+            self.radix_next_position += 1
+        if self.radix_token_to_key is not None:
+            pending_host_tokens = len(self.raw_positions) - len(self.input_ids)
+            if pending_host_tokens < 0:
+                raise RuntimeError("Raw positions fell behind the host token stream.")
+            raw_position = len(self.radix_token_to_key) + pending_host_tokens
+        else:
+            raw_position = int(self.raw_positions[-1]) + 1
+        self.raw_positions = torch.cat(
+            [
+                self.raw_positions,
+                torch.tensor([raw_position], dtype=torch.int32, device="cpu"),
+            ]
+        )
 
     def append_host(self, next_token: torch.Tensor) -> None:
-        # Position is already appended in `complete_one`.
+        # Overlap scheduling can finish the following decode before this sampled
+        # token reaches the CPU. Pair it with its own queued position instead of
+        # the newest (possibly one-token-ahead) position.
+        host_token_index = len(self.input_ids)
+        if host_token_index >= len(self.true_positions) or host_token_index >= len(
+            self.raw_positions
+        ):
+            raise RuntimeError("A sampled token arrived before its position metadata.")
+        host_true_position = int(self.true_positions[host_token_index])
+        host_raw_position = int(self.raw_positions[host_token_index])
+        if self.radix_token_to_key is not None and host_raw_position != len(
+            self.radix_token_to_key
+        ):
+            raise RuntimeError("Generated-token raw positions are not contiguous.")
         self.input_ids = torch.cat([self.input_ids, next_token])
-        next_token_key = next_token.to(dtype=torch.int64, device="cpu")
+        if self.radix_match_ids.ndim == 2:
+            next_token_key = torch.tensor(
+                [
+                    [
+                        0,
+                        int(next_token[0]),
+                        self.radix_current_reposition,
+                        host_true_position,
+                    ]
+                ],
+                dtype=torch.int32,
+                device="cpu",
+            )
+        else:
+            next_token_key = next_token.to(dtype=torch.int64, device="cpu")
         self.radix_input_ids = torch.cat([self.radix_input_ids, next_token_key])
         self.radix_match_ids = torch.cat([self.radix_match_ids, next_token_key])
+        if self.radix_positions is not None:
+            self.radix_positions = torch.cat(
+                [
+                    self.radix_positions,
+                    torch.tensor([host_true_position], dtype=torch.int32, device="cpu"),
+                ]
+            )
+        if self.radix_repos_info is not None:
+            self.radix_repos_info = torch.cat(
+                [
+                    self.radix_repos_info,
+                    torch.tensor([self.radix_current_reposition], dtype=torch.int32, device="cpu"),
+                ]
+            )
         if self.radix_key_virtual_mask is not None:
             assert self.radix_key_to_token is not None
             assert self.radix_token_to_key is not None

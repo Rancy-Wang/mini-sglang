@@ -24,6 +24,15 @@ class BaseKVCachePool(ABC):
         self, k: torch.Tensor, v: torch.Tensor, out_loc: torch.Tensor, layer_id: int
     ) -> None: ...
 
+    @abstractmethod
+    def retry_reposition(
+        self,
+        source_slots: torch.Tensor,
+        destination_slots: torch.Tensor,
+        position_pairs: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+    ) -> None: ...
+
     @property
     @abstractmethod
     def device(self) -> torch.device: ...

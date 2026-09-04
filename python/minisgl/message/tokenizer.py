@@ -63,6 +63,19 @@ class WarmupAckMsg(BaseTokenizerMsg):
     cached_tokens: int
     drop_skipped_tokens: int
     finished: bool
+    radix_match_ns: int = 0
+    retry_plan_ns: int = 0
+    reposition_transition_count: int = 0
+    reposition_h2d_bytes: int = 0
+    reposition_d2h_bytes: int = 0
+
+
+@dataclass
+class RepositionOpenAckMsg(BaseTokenizerMsg):
+    """Scheduler acknowledgement carrying the per-turn Prefill quantum."""
+
+    uid: int
+    step_token_budget: int
 
 
 @dataclass
@@ -83,6 +96,7 @@ class TokenizeMsg(BaseTokenizerMsg):
     target_msg_id: int | None = None
     drop_message: Dict[int, List[int]] | None = None
     drop_rule: Dict[str, Any] | None = None
+    reposition: List[int] | None = None
     enable_thinking: bool | None = None
     reasoning_effort: str | None = None
     tools: List[Dict[str, Any]] | None = None

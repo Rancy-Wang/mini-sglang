@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, List, Tuple
+from typing import TYPE_CHECKING, List
 
 import torch
 from minisgl.core import Batch, Req, get_global_ctx
@@ -11,7 +12,7 @@ from minisgl.utils import init_logger
 from .utils import PendingReq
 
 if TYPE_CHECKING:
-    from minisgl.kvcache import BaseCacheHandle
+    from minisgl.kvcache import BaseCacheHandle, BaseKVCachePool
     from minisgl.message import UserMsg
 
     from .cache import CacheManager
@@ -20,6 +21,32 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 _sparse_kernel_failure_logged = False
+
+
+@dataclass(frozen=True)
+class RepositionCapacityError(RuntimeError):
+    uid: int
+    required_pages: int
+    available_pages: int
+    matched_pages: int
+    retry_pages: int
+
+    @property
+    def signature(self) -> tuple[int, int, int, int]:
+        return (
+            self.required_pages,
+            self.available_pages,
+            self.matched_pages,
+            self.retry_pages,
+        )
+
+    def __str__(self) -> str:
+        return (
+            "Reposition cannot make progress with the current KV capacity: "
+            f"needs {self.required_pages} allocatable pages after pinning its source, "
+            f"but only {self.available_pages} remain "
+            f"(matched={self.matched_pages}, retry={self.retry_pages})."
+        )
 
 
 def _calculate_cache_reuse_ratio(
@@ -37,9 +64,9 @@ def _calculate_cache_reuse_ratio(
 def _supports_multi_context_mask_prefill() -> bool:
     try:
         backend = get_global_ctx().attn_backend
-    except AssertionError:
+    except (AssertionError, AttributeError):
         return False
-    return backend.supports_multi_context_mask_prefill
+    return bool(getattr(backend, "supports_multi_context_mask_prefill", False))
 
 
 class ChunkedReq(Req):
@@ -56,6 +83,7 @@ class ContextPrefillPlan:
     use_context_mask: bool
     input_ids: torch.Tensor
     true_positions: torch.Tensor
+    raw_positions: torch.Tensor
     radix_input_ids: torch.Tensor
     cache_handle: BaseCacheHandle
     cached_indices: torch.Tensor
@@ -64,6 +92,22 @@ class ContextPrefillPlan:
     reason: str
     radix_cached_tokens: int
     usage_cached_tokens: int | None
+    retry_plan: torch.Tensor | None = None
+    retry_active_full_positions: torch.Tensor | None = None
+
+
+@dataclass(frozen=True)
+class PrefillAllocation:
+    cache_handle: BaseCacheHandle
+    table_idx: int
+    cache_reuse_ratio: float
+    initial_full_match_indices: torch.Tensor
+    cached_len: int
+    radix_cached_tokens: int
+    usage_cached_tokens: int | None
+    retry_transformed_mask: torch.Tensor | None
+    inactive_cached_positions: torch.Tensor | None
+    inactive_cached_pages: torch.Tensor | None
 
 
 def _mask_free_context_reason_reference(
@@ -88,7 +132,7 @@ def _mask_free_context_reason_reference(
         return "invalid_context_metadata_length"
 
     keep_mask = req.full_keep_mask != 0
-    active_positions = req.true_positions.to(dtype=torch.int64, device="cpu")
+    active_positions = req.raw_positions.to(dtype=torch.int64, device="cpu")
     expected_positions = torch.nonzero(keep_mask, as_tuple=False).view(-1).to(torch.int64)
     if not torch.equal(active_positions, expected_positions):
         return "active_stream_does_not_match_keep_mask"
@@ -120,8 +164,7 @@ def _mask_free_context_reason_reference(
     min_kept_expiry = torch.cummin(kept_expiry, dim=0).values[query_positions]
     if bool(
         torch.any(
-            (max_dropped_expiry > query_positions)
-            | (min_kept_expiry <= query_positions)
+            (max_dropped_expiry > query_positions) | (min_kept_expiry <= query_positions)
         ).item()
     ):
         return "visibility_changes_within_extend"
@@ -159,7 +202,7 @@ def _mask_free_context_reason(
     assert position_ranges is not None
     try:
         conflict = first_mask_free_conflict_event(
-            req.true_positions,
+            req.raw_positions,
             event_positions,
             range_offsets,
             position_ranges,
@@ -190,14 +233,37 @@ class PrefillAdder:
     table_manager: TableManager
     has_sliding_window: bool = False
     enable_mask_free_context_prefill: bool = True
+    kv_cache: BaseKVCachePool | None = None
+    retry_rope_cache: torch.Tensor | None = None
 
     def plan_context_prefill(self, req: PendingReq) -> ContextPrefillPlan | None:
         if not req.use_context_mask or req.chunked_req is not None:
             return None
-        full_match = self.cache_manager.match_full_req(req)
-        if full_match is None:
-            return None
-        active_match = self.cache_manager.derive_active_match(req, full_match)
+        structured_retry = (
+            req.context_compact_stream
+            and req.radix_match_ids is not None
+            and req.radix_match_ids.ndim == 2
+        )
+        retry_plan = None
+        retry_active_full_positions = None
+        if structured_retry:
+            match_started_ns = time.perf_counter_ns()
+            active_match = self.cache_manager.match_req(req)
+            match_elapsed_ns = time.perf_counter_ns() - match_started_ns
+            match_retry_plan_ns = 0 if active_match is None else active_match.retry_plan_ns
+            req.radix_match_ns += max(0, match_elapsed_ns - match_retry_plan_ns)
+            if active_match is None:
+                return None
+            req.retry_plan_ns += active_match.retry_plan_ns
+            radix_cached_tokens = active_match.handle.physical_cached_len
+            retry_plan = active_match.retry_plan
+            retry_active_full_positions = active_match.active_full_positions
+        else:
+            full_match = self.cache_manager.match_full_req(req)
+            if full_match is None:
+                return None
+            active_match = self.cache_manager.derive_active_match(req, full_match)
+            radix_cached_tokens = full_match.handle.physical_cached_len
         fallback_reason = (
             _mask_free_context_reason(
                 req,
@@ -208,7 +274,6 @@ class PrefillAdder:
             else "mask_free_disabled"
         )
         if fallback_reason is None:
-            radix_cached_tokens = full_match.handle.physical_cached_len
             if active_match.active_cached_len > radix_cached_tokens:
                 raise RuntimeError("Active cache usage exceeds resident Radix matches.")
             logger.debug(
@@ -220,6 +285,7 @@ class PrefillAdder:
                 use_context_mask=False,
                 input_ids=req.input_ids,
                 true_positions=req.true_positions,
+                raw_positions=req.raw_positions,
                 radix_input_ids=req.radix_input_ids,
                 cache_handle=active_match.handle,
                 cached_indices=active_match.active_match_indices,
@@ -228,12 +294,35 @@ class PrefillAdder:
                 reason="mask_free_visibility_equivalent",
                 radix_cached_tokens=radix_cached_tokens,
                 usage_cached_tokens=active_match.active_cached_len,
+                retry_plan=retry_plan,
+                retry_active_full_positions=retry_active_full_positions,
+            )
+
+        if req.context_compact_stream:
+            logger.debug(
+                "Context request %s retained compact mask Prefill: %s.",
+                req.uid,
+                fallback_reason,
+            )
+            return ContextPrefillPlan(
+                use_context_mask=True,
+                input_ids=req.input_ids,
+                true_positions=req.true_positions,
+                raw_positions=req.raw_positions,
+                radix_input_ids=req.radix_input_ids,
+                cache_handle=active_match.handle,
+                cached_indices=active_match.active_match_indices,
+                cached_len=active_match.active_cached_len,
+                initial_full_match_indices=active_match.full_match_indices,
+                reason=fallback_reason,
+                radix_cached_tokens=radix_cached_tokens,
+                usage_cached_tokens=None,
+                retry_plan=retry_plan,
+                retry_active_full_positions=retry_active_full_positions,
             )
 
         assert req.full_input_ids is not None
-        full_positions = torch.arange(
-            len(req.full_input_ids), dtype=torch.int32, device="cpu"
-        )
+        full_positions = torch.arange(len(req.full_input_ids), dtype=torch.int32, device="cpu")
         full_radix_input_ids = (
             req.radix_match_ids[req.radix_token_to_key]
             if req.radix_token_to_key is not None
@@ -249,6 +338,7 @@ class PrefillAdder:
             use_context_mask=True,
             input_ids=req.full_input_ids,
             true_positions=full_positions,
+            raw_positions=full_positions,
             radix_input_ids=full_radix_input_ids,
             cache_handle=full_match.handle,
             cached_indices=full_match.safe_match_indices,
@@ -263,20 +353,24 @@ class PrefillAdder:
         self,
         req: PendingReq,
         context_plan: ContextPrefillPlan | None = None,
-    ) -> Tuple[BaseCacheHandle, int, float, torch.Tensor, int, int, int | None] | None:
+    ) -> PrefillAllocation | None:
         if self.table_manager.available_size == 0:
             return None
 
         original_stream = None
+        retry_plan = None
+        retry_active_full_positions = None
         if context_plan is not None:
             original_stream = (
                 req.input_ids,
                 req.true_positions,
+                req.raw_positions,
                 req.radix_input_ids,
                 req.use_context_mask,
             )
             req.input_ids = context_plan.input_ids
             req.true_positions = context_plan.true_positions
+            req.raw_positions = context_plan.raw_positions
             req.radix_input_ids = context_plan.radix_input_ids
             req.use_context_mask = context_plan.use_context_mask
             cache_handle = context_plan.cache_handle
@@ -285,6 +379,8 @@ class PrefillAdder:
             initial_full_match_indices = context_plan.initial_full_match_indices
             radix_cached_tokens = context_plan.radix_cached_tokens
             usage_cached_tokens = context_plan.usage_cached_tokens
+            retry_plan = context_plan.retry_plan
+            retry_active_full_positions = context_plan.retry_active_full_positions
         elif req.use_context_mask:
             match = self.cache_manager.match_full_req(req)
             if match is None:
@@ -296,15 +392,22 @@ class PrefillAdder:
             radix_cached_tokens = match.handle.physical_cached_len
             usage_cached_tokens = None
         else:
+            match_started_ns = time.perf_counter_ns()
             match = self.cache_manager.match_req(req)
+            match_elapsed_ns = time.perf_counter_ns() - match_started_ns
+            match_retry_plan_ns = 0 if match is None else match.retry_plan_ns
+            req.radix_match_ns += max(0, match_elapsed_ns - match_retry_plan_ns)
             if match is None:
                 return None
+            req.retry_plan_ns += match.retry_plan_ns
             cache_handle = match.handle
             cached_len = match.active_cached_len
             cached_indices = match.active_match_indices
             initial_full_match_indices = match.full_match_indices[: match.full_cached_len]
-            radix_cached_tokens = cached_len
+            radix_cached_tokens = match.handle.physical_cached_len
             usage_cached_tokens = cached_len
+            retry_plan = match.retry_plan
+            retry_active_full_positions = match.active_full_positions
         full_prefix_len, active_prefix_len = self.cache_manager.matchable_prefix_lens(req)
         cache_reuse_ratio = _calculate_cache_reuse_ratio(
             cached_len,
@@ -312,56 +415,150 @@ class PrefillAdder:
         )
         # TODO: better estimate policy
         extend_len = req.input_len - cached_len
-        estimated_len = extend_len + req.output_len
+        retry_transformed_mask = None
+        retry_page_count = 0 if retry_plan is None else len(retry_plan)
+        estimated_len = extend_len + req.output_len + retry_page_count
 
         if estimated_len + self.reserved_size > self.cache_manager.available_size:
+            available_pages = self.cache_manager.available_size
             if original_stream is not None:
                 (
                     req.input_ids,
                     req.true_positions,
+                    req.raw_positions,
                     req.radix_input_ids,
                     req.use_context_mask,
                 ) = original_stream
+            if req.radix_positions is not None and req.radix_repos_info is not None:
+                raise RepositionCapacityError(
+                    uid=req.uid,
+                    required_pages=estimated_len + self.reserved_size,
+                    available_pages=available_pages,
+                    matched_pages=cache_handle.physical_cached_len,
+                    retry_pages=retry_page_count,
+                )
             return None
         self.cache_manager.lock(cache_handle)
         if estimated_len + self.reserved_size > self.cache_manager.available_size:
+            available_pages = self.cache_manager.available_size
             self.cache_manager.unlock(cache_handle)
             if original_stream is not None:
                 (
                     req.input_ids,
                     req.true_positions,
+                    req.raw_positions,
                     req.radix_input_ids,
                     req.use_context_mask,
                 ) = original_stream
+            if req.radix_positions is not None and req.radix_repos_info is not None:
+                raise RepositionCapacityError(
+                    uid=req.uid,
+                    required_pages=estimated_len + self.reserved_size,
+                    available_pages=available_pages,
+                    matched_pages=cache_handle.physical_cached_len,
+                    retry_pages=retry_page_count,
+                )
             return None
 
         table_idx = self.table_manager.allocate()
+        retry_pages = torch.empty(0, dtype=torch.int32, device=cached_indices.device)
+        retry_inactive_positions = None
+        retry_inactive_pages = None
         try:
+            if retry_page_count > 0:
+                if self.kv_cache is None or self.retry_rope_cache is None:
+                    raise RuntimeError("Retry Reposition KV transform is not configured.")
+                if retry_plan is None or retry_active_full_positions is None:
+                    raise RuntimeError("Retry Reposition plan metadata is incomplete.")
+                changed_old_positions = retry_plan[:, 2]
+                changed_new_positions = retry_plan[:, 3]
+                rope_cache_len = len(self.retry_rope_cache)
+                if (
+                    int(torch.min(changed_old_positions).item()) < 0
+                    or int(torch.min(changed_new_positions).item()) < 0
+                    or int(torch.max(changed_old_positions).item()) >= rope_cache_len
+                    or int(torch.max(changed_new_positions).item()) >= rope_cache_len
+                ):
+                    raise RuntimeError("Retry Reposition position exceeds the RoPE cache.")
+                if req.radix_token_to_key is None:
+                    raise RuntimeError("Retry Reposition requires a structured token mapping.")
+                full_to_active = torch.full(
+                    (len(req.radix_token_to_key),), -1, dtype=torch.int32, device="cpu"
+                )
+                full_to_active[retry_active_full_positions] = torch.arange(
+                    len(retry_active_full_positions), dtype=torch.int32, device="cpu"
+                )
+                changed_active_indices = full_to_active[retry_plan[:, 1].to(torch.int64)]
+                retry_metadata = (
+                    torch.column_stack(
+                        (
+                            retry_plan[:, 0],
+                            retry_plan[:, 1],
+                            changed_active_indices,
+                            changed_old_positions,
+                            changed_new_positions,
+                        ),
+                    )
+                    .pin_memory()
+                    .to(device=self.cache_manager.device, non_blocking=True)
+                )
+                req.reposition_h2d_bytes += retry_metadata.numel() * retry_metadata.element_size()
+                req.reposition_transition_count += retry_page_count
+                source_full_device = retry_metadata[:, 0].to(torch.int64)
+                target_full_device = retry_metadata[:, 1].to(torch.int64)
+                source_pages = initial_full_match_indices[source_full_device]
+                retry_pages = self.cache_manager.allocate_retry_pages(retry_page_count)
+                self.kv_cache.retry_reposition(
+                    source_pages,
+                    retry_pages,
+                    retry_metadata[:, 3:],
+                    self.retry_rope_cache,
+                )
+                initial_full_match_indices = initial_full_match_indices.clone()
+                initial_full_match_indices[target_full_device] = retry_pages
+                active_rows_cpu = changed_active_indices >= 0
+                retry_transformed_mask = torch.zeros(cached_len, dtype=torch.bool, device="cpu")
+                changed_active = changed_active_indices[active_rows_cpu].to(torch.int64)
+                retry_transformed_mask[changed_active] = True
+                if bool(torch.any(active_rows_cpu).item()):
+                    active_rows = retry_metadata[:, 2] >= 0
+                    cached_indices = cached_indices.clone()
+                    active_indices = retry_metadata[active_rows, 2].to(torch.int64)
+                    cached_indices[active_indices] = retry_pages[active_rows]
+                inactive_rows_cpu = changed_active_indices < 0
+                if bool(torch.any(inactive_rows_cpu).item()):
+                    retry_inactive_positions = retry_plan[inactive_rows_cpu, 1].to(torch.int64)
+                    retry_inactive_pages = retry_pages[retry_metadata[:, 2] < 0]
             if cached_len > 0:  # NOTE: set the cached part
                 device_ids = self.table_manager.token_pool[table_idx][:cached_len]
                 page_entry = self.table_manager.page_table[table_idx][:cached_len]
                 device_ids.copy_(req.input_ids[:cached_len].pin_memory(), non_blocking=True)
                 page_entry.copy_(cached_indices)
         except Exception:
+            self.cache_manager.free_retry_pages(retry_pages)
             self.table_manager.free(table_idx)
             self.cache_manager.unlock(cache_handle)
             if original_stream is not None:
                 (
                     req.input_ids,
                     req.true_positions,
+                    req.raw_positions,
                     req.radix_input_ids,
                     req.use_context_mask,
                 ) = original_stream
             raise
 
-        return (
-            cache_handle,
-            table_idx,
-            cache_reuse_ratio,
-            initial_full_match_indices.clone(),
-            cached_len,
-            radix_cached_tokens,
-            usage_cached_tokens,
+        return PrefillAllocation(
+            cache_handle=cache_handle,
+            table_idx=table_idx,
+            cache_reuse_ratio=cache_reuse_ratio,
+            initial_full_match_indices=initial_full_match_indices.clone(),
+            cached_len=cached_len,
+            radix_cached_tokens=radix_cached_tokens,
+            usage_cached_tokens=usage_cached_tokens,
+            retry_transformed_mask=retry_transformed_mask,
+            inactive_cached_positions=retry_inactive_positions,
+            inactive_cached_pages=retry_inactive_pages,
         )
 
     def _add_one_req(
@@ -375,6 +572,9 @@ class PrefillAdder:
         initial_active_cached_len: int,
         radix_cached_tokens: int,
         usage_cached_tokens: int | None,
+        retry_transformed_mask: torch.Tensor | None,
+        inactive_cached_positions: torch.Tensor | None,
+        inactive_cached_pages: torch.Tensor | None,
     ) -> Req:
         remain_len = pending_req.input_len - cached_len
         chunk_size = min(self.token_budget, remain_len)
@@ -389,6 +589,7 @@ class PrefillAdder:
         return CLS(
             input_ids=pending_req.input_ids[: cached_len + chunk_size],
             true_positions=pending_req.true_positions[: cached_len + chunk_size],
+            raw_positions=pending_req.raw_positions[: cached_len + chunk_size],
             radix_input_ids=pending_req.radix_input_ids[: cached_len + chunk_size],
             radix_match_ids=(
                 pending_req.radix_match_ids
@@ -397,7 +598,11 @@ class PrefillAdder:
             ),
             initial_full_match_indices=initial_full_match_indices,
             initial_active_cached_len=initial_active_cached_len,
-            true_seq_len=int(pending_req.true_positions[cached_len + chunk_size - 1].item()) + 1,
+            true_seq_len=(
+                pending_req.radix_next_position
+                if pending_req.radix_next_position is not None
+                else int(pending_req.true_positions[cached_len + chunk_size - 1].item()) + 1
+            ),
             table_idx=table_idx,
             cached_len=cached_len,
             output_len=pending_req.output_len,
@@ -413,9 +618,7 @@ class PrefillAdder:
             radix_cached_tokens=radix_cached_tokens,
             usage_cached_tokens=usage_cached_tokens,
             drop_skipped_tokens=(
-                radix_cached_tokens - usage_cached_tokens
-                if usage_cached_tokens is not None
-                else 0
+                radix_cached_tokens - usage_cached_tokens if usage_cached_tokens is not None else 0
             ),
             full_input_ids=(pending_req.full_input_ids if pending_req.use_context_mask else None),
             full_token_visible_until=(
@@ -423,11 +626,26 @@ class PrefillAdder:
             ),
             full_keep_mask=(pending_req.full_keep_mask if pending_req.use_context_mask else None),
             use_context_mask=pending_req.use_context_mask,
+            context_compact_stream=pending_req.context_compact_stream,
+            context_post_prefill_keep_mask=pending_req.context_post_prefill_keep_mask,
             radix_key_virtual_mask=pending_req.radix_key_virtual_mask,
             radix_key_to_token=pending_req.radix_key_to_token,
             radix_token_to_key=pending_req.radix_token_to_key,
             radix_commit_key_len=pending_req.radix_commit_key_len,
-            radix_marker_ids=pending_req.radix_marker_ids,
+            radix_positions=pending_req.radix_positions,
+            radix_repos_info=pending_req.radix_repos_info,
+            radix_next_position=pending_req.radix_next_position,
+            radix_current_reposition=pending_req.radix_current_reposition,
+            retry_transformed_mask=retry_transformed_mask,
+            inactive_cached_positions=inactive_cached_positions,
+            inactive_cached_pages=inactive_cached_pages,
+            tokenize_invocations=pending_req.tokenize_invocations,
+            radix_compile_ns=pending_req.radix_compile_ns,
+            radix_match_ns=pending_req.radix_match_ns,
+            retry_plan_ns=pending_req.retry_plan_ns,
+            reposition_transition_count=pending_req.reposition_transition_count,
+            reposition_h2d_bytes=pending_req.reposition_h2d_bytes,
+            reposition_d2h_bytes=pending_req.reposition_d2h_bytes,
         )
 
     def try_add_one(
@@ -439,7 +657,7 @@ class PrefillAdder:
             return None
 
         if chunked_req := pending_req.chunked_req:
-            return self._add_one_req(
+            result = self._add_one_req(
                 pending_req=pending_req,
                 cache_handle=chunked_req.cache_handle,
                 table_idx=chunked_req.table_idx,
@@ -449,29 +667,28 @@ class PrefillAdder:
                 initial_active_cached_len=chunked_req.initial_active_cached_len,
                 radix_cached_tokens=chunked_req.radix_cached_tokens,
                 usage_cached_tokens=chunked_req.usage_cached_tokens,
+                retry_transformed_mask=chunked_req.retry_transformed_mask,
+                inactive_cached_positions=chunked_req.inactive_cached_positions,
+                inactive_cached_pages=chunked_req.inactive_cached_pages,
             )
+            return result
 
         if resource := self._try_allocate_one(pending_req, context_plan):
-            (
-                cache_handle,
-                table_idx,
-                cache_reuse_ratio,
-                initial_full_match_indices,
-                initial_active_cached_len,
-                radix_cached_tokens,
-                usage_cached_tokens,
-            ) = resource
-            return self._add_one_req(
+            result = self._add_one_req(
                 pending_req=pending_req,
-                cache_handle=cache_handle,
-                table_idx=table_idx,
-                cached_len=initial_active_cached_len,
-                cache_reuse_ratio=cache_reuse_ratio,
-                initial_full_match_indices=initial_full_match_indices,
-                initial_active_cached_len=initial_active_cached_len,
-                radix_cached_tokens=radix_cached_tokens,
-                usage_cached_tokens=usage_cached_tokens,
+                cache_handle=resource.cache_handle,
+                table_idx=resource.table_idx,
+                cached_len=resource.cached_len,
+                cache_reuse_ratio=resource.cache_reuse_ratio,
+                initial_full_match_indices=resource.initial_full_match_indices,
+                initial_active_cached_len=resource.cached_len,
+                radix_cached_tokens=resource.radix_cached_tokens,
+                usage_cached_tokens=resource.usage_cached_tokens,
+                retry_transformed_mask=resource.retry_transformed_mask,
+                inactive_cached_positions=resource.inactive_cached_positions,
+                inactive_cached_pages=resource.inactive_cached_pages,
             )
+            return result
 
         return None
 
@@ -483,12 +700,20 @@ class PrefillManager:
     decode_manager: DecodeManager
     has_sliding_window: bool = False
     enable_mask_free_context_prefill: bool = True
+    kv_cache: BaseKVCachePool | None = None
+    retry_rope_cache: torch.Tensor | None = None
     pending_list: List[PendingReq] = field(default_factory=list)
+    _reposition_capacity_failures: dict[int, tuple[int, int, int, int]] = field(
+        default_factory=dict
+    )
 
     def add_one_req(self, req: UserMsg) -> None:
         if req.use_context_mask:
-            if not req.is_warmup:
-                raise ValueError("Context-mask Prefill is restricted to warmup requests.")
+            if not req.is_warmup and req.context_post_prefill_keep_mask is None:
+                raise ValueError(
+                    "Context-mask Prefill is restricted to internal warmup or "
+                    "Reposition requests."
+                )
             if req.full_input_ids is None or req.radix_match_ids is None:
                 raise ValueError(
                     "Context-mask Prefill requires a full token stream and Radix keys."
@@ -498,6 +723,7 @@ class PrefillManager:
                 uid=req.uid,
                 input_ids=req.input_ids,
                 true_positions=req.true_positions,
+                raw_positions=req.raw_positions,
                 radix_input_ids=req.radix_input_ids,
                 radix_match_ids=req.radix_match_ids,
                 sampling_params=req.sampling_params,
@@ -515,13 +741,31 @@ class PrefillManager:
                 drop_position_ranges=req.drop_position_ranges,
                 drop_effective_event_count=req.drop_effective_event_count,
                 use_context_mask=req.use_context_mask,
+                context_compact_stream=req.context_compact_stream,
+                context_post_prefill_keep_mask=req.context_post_prefill_keep_mask,
                 radix_key_virtual_mask=req.radix_key_virtual_mask,
                 radix_key_to_token=req.radix_key_to_token,
                 radix_token_to_key=req.radix_token_to_key,
                 radix_commit_key_len=req.radix_commit_key_len,
-                radix_marker_ids=tuple(req.radix_marker_ids or ()),
+                radix_positions=req.radix_positions,
+                radix_repos_info=req.radix_repos_info,
+                radix_next_position=req.radix_next_position,
+                radix_current_reposition=req.radix_current_reposition,
+                tokenize_invocations=req.tokenize_invocations,
+                radix_compile_ns=req.radix_compile_ns,
+                radix_match_ns=req.radix_match_ns,
+                retry_plan_ns=req.retry_plan_ns,
+                reposition_transition_count=req.reposition_transition_count,
+                reposition_h2d_bytes=req.reposition_h2d_bytes,
+                reposition_d2h_bytes=req.reposition_d2h_bytes,
             )
         )
+
+    def complete_chunk(self, chunk: ChunkedReq) -> None:
+        # Ordinary chunk state is carried by ``PendingReq.chunked_req``.  A
+        # Reposition step finishes and returns to the tokenizer instead of
+        # remaining resident in this manager.
+        _ = chunk
 
     def schedule_next_batch(self, prefill_budget: int) -> Batch | None:
         if len(self.pending_list) == 0:
@@ -535,6 +779,8 @@ class PrefillManager:
             table_manager=self.table_manager,
             has_sliding_window=self.has_sliding_window,
             enable_mask_free_context_prefill=self.enable_mask_free_context_prefill,
+            kv_cache=self.kv_cache,
+            retry_rope_cache=self.retry_rope_cache,
         )
         reqs: List[Req] = []
         chunked_list: List[PendingReq] = []
@@ -557,7 +803,16 @@ class PrefillManager:
                     break
                 if planned_context_mask and not supports_multi_context_mask:
                     break
-            if req := adder.try_add_one(pending_req, context_plan):
+            try:
+                req = adder.try_add_one(pending_req, context_plan)
+            except RepositionCapacityError as exc:
+                previous = self._reposition_capacity_failures.get(exc.uid)
+                self._reposition_capacity_failures[exc.uid] = exc.signature
+                if previous == exc.signature and adder.reserved_size == 0 and not reqs:
+                    raise
+                break
+            if req:
+                self._reposition_capacity_failures.pop(pending_req.uid, None)
                 pending_req.chunked_req = None
                 if isinstance(req, ChunkedReq):
                     pending_req.chunked_req = req
@@ -573,6 +828,7 @@ class PrefillManager:
         return Batch(reqs=reqs, phase="prefill")
 
     def abort_req(self, uid: int) -> Req | PendingReq | None:
+        self._reposition_capacity_failures.pop(uid, None)
         for i, req in enumerate(self.pending_list):
             if req.uid == uid:
                 self.pending_list.pop(i)

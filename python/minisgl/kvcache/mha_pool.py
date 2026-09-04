@@ -55,6 +55,26 @@ class MHAKVCache(BaseKVCachePool):
             v=v,
         )
 
+    def retry_reposition(
+        self,
+        source_slots: torch.Tensor,
+        destination_slots: torch.Tensor,
+        position_pairs: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+    ) -> None:
+        if self._kv_buffer.shape[3] != 1:
+            raise RuntimeError("Retry Reposition requires page_size=1.")
+        from minisgl.kernel import retry_reposition_kv
+
+        retry_reposition_kv(
+            self._k_buffer[:, :, 0],
+            self._v_buffer[:, :, 0],
+            source_slots,
+            destination_slots,
+            position_pairs,
+            cos_sin_cache,
+        )
+
     @property
     def device(self) -> torch.device:
         return self._device

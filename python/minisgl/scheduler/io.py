@@ -9,6 +9,7 @@ from minisgl.message import (
     BatchTokenizerMsg,
     DetokenizeMsg,
     RequestRejectMsg,
+    RepositionOpenAckMsg,
     WarmupAckMsg,
 )
 from minisgl.utils import ZmqPubQueue, ZmqPullQueue, ZmqPushQueue, ZmqSubQueue, init_logger
@@ -78,7 +79,8 @@ class SchedulerIOMixin:
         raise NotImplementedError("should be implemented")
 
     def offline_send_result(
-        self, reply: List[DetokenizeMsg | WarmupAckMsg | RequestRejectMsg]
+        self,
+        reply: List[DetokenizeMsg | WarmupAckMsg | RepositionOpenAckMsg | RequestRejectMsg],
     ) -> None:
         raise NotImplementedError("should be implemented")
 
@@ -131,7 +133,8 @@ class SchedulerIOMixin:
         return pending_msgs
 
     def _reply_tokenizer_rank0(
-        self, reply: List[DetokenizeMsg | WarmupAckMsg | RequestRejectMsg]
+        self,
+        reply: List[DetokenizeMsg | WarmupAckMsg | RepositionOpenAckMsg | RequestRejectMsg],
     ) -> None:
         num_reply = len(reply)
         logger.debug_rank0(f"Replying to tokenizer: {num_reply} messages")
@@ -141,6 +144,7 @@ class SchedulerIOMixin:
             self._send_into_tokenizer.put(BatchTokenizerMsg(data=reply))  # type: ignore
 
     def _reply_tokenizer_rank1(
-        self, reply: List[DetokenizeMsg | WarmupAckMsg | RequestRejectMsg]
+        self,
+        reply: List[DetokenizeMsg | WarmupAckMsg | RepositionOpenAckMsg | RequestRejectMsg],
     ) -> None:
         _ = reply  # do nothing for non-primary ranks
