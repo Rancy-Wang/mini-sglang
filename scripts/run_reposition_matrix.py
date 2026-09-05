@@ -33,7 +33,11 @@ from minisgl.benchmark.reposition_bcp import (
     select_replay_tasks,
     select_task_set,
 )
-from minisgl.benchmark.reposition_trajectory import inspect_metrics, parse_response_bytes
+from minisgl.benchmark.reposition_trajectory import (
+    METRIC_FIELDS,
+    inspect_metrics,
+    parse_response_bytes,
+)
 
 from scripts.profile_reposition_matrix import (
     create_profile_bootstrap,
@@ -817,22 +821,32 @@ def audit_request_matrix(
                         }
                         audit = audit_parsed_response(parsed, request=requests[index])
                         if require_server_metrics:
-                            # Fixed R10 chains are cold, prefix-extending partial, then exact
-                            # warm rehit. Both non-final requests must execute Retry transitions;
-                            # only the exact final rehit may legitimately report zero Retry work.
+                            # A fixed matrix can reuse an exact key across non-stream/stream
+                            # cases, and an effective Reposition can legitimately have no
+                            # reusable old-position KV. Validate every stress request, then
+                            # require positive Retry activity once per server configuration
+                            # after the complete matrix has been collected.
                             audit["issues"] = sorted(
                                 set(audit["issues"])
                                 | set(
                                     inspect_metrics(
                                         parsed.get("server_metrics"),
                                         stress=bool(requests[index].get("reposition")),
-                                        cold=(
-                                            bool(requests[index].get("reposition"))
-                                            and index < max(len(requests) - 1, 1)
-                                        ),
+                                        cold=False,
                                     )
                                 )
                             )
+                            metrics = parsed.get("server_metrics")
+                            if isinstance(metrics, dict) and bool(
+                                requests[index].get("reposition")
+                            ):
+                                transition = int(metrics.get("reposition_transition_count", 0))
+                                h2d_bytes = int(metrics.get("reposition_h2d_bytes", 0))
+                                if (transition > 0) != (h2d_bytes > 0):
+                                    audit["issues"] = sorted(
+                                        set(audit["issues"])
+                                        | {"system:retry_transition_h2d_inconsistent"}
+                                    )
                     except Exception as exc:
                         audit = {
                             "issues": ["transport:request_or_parse_failure"],
@@ -846,7 +860,33 @@ def audit_request_matrix(
                         "request_index": index + 1,
                         "response": parsed_response,
                         "audit": audit,
+                        "reposition_stress": (
+                            bool(requests[index].get("reposition"))
+                            if 0 <= index < len(requests)
+                            else False
+                        ),
                     }
+                )
+    if require_server_metrics:
+        by_config: dict[str, list[dict[str, Any]]] = {}
+        for record in records:
+            if record["reposition_stress"] and record["response"].get("ok"):
+                by_config.setdefault(str(record.get("config_name")), []).append(record)
+        for config_records in by_config.values():
+            complete_metrics = [
+                record["response"].get("server_metrics")
+                for record in config_records
+                if isinstance(record["response"].get("server_metrics"), dict)
+                and METRIC_FIELDS <= set(record["response"]["server_metrics"])
+            ]
+            if complete_metrics and not any(
+                int(metrics["reposition_transition_count"]) > 0
+                and int(metrics["reposition_h2d_bytes"]) > 0
+                for metrics in complete_metrics
+            ):
+                first = config_records[0]
+                first["audit"]["issues"] = sorted(
+                    set(first["audit"]["issues"]) | {"system:retry_activity_missing"}
                 )
     return {"records": records, "summary": summarize_records(records)}
 

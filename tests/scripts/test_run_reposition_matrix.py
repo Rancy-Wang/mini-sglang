@@ -329,6 +329,143 @@ def test_request_matrix_audit_counts_success_and_generated_tokens(tmp_path: Path
     assert metrics_report["summary"]["issues"] == {"system:missing_server_metrics": 1}
 
 
+def _write_fixed_matrix_case(
+    root: Path,
+    *,
+    case_number: int,
+    config_name: str,
+    transition_count: int,
+    h2d_bytes: int,
+    stream: bool = False,
+) -> None:
+    case_dir = root / f"request-{case_number:06d}"
+    case_dir.mkdir()
+    request = {
+        "messages": [{"role": "user", "content": "task"}],
+        "reposition": [10],
+        "stream": stream,
+    }
+    metrics = {
+        "request_received_ns": 1,
+        "first_token_generated_ns": 2,
+        "request_finished_ns": 3,
+        "prompt_tokens": 100,
+        "active_prompt_tokens": 20,
+        "generated_tokens": 2,
+        "completion_tokens": 2,
+        "tokenize_invocations": 1,
+        "context_stage_count": 3,
+        "reposition_transition_count": transition_count,
+        "reposition_h2d_bytes": h2d_bytes,
+        "reposition_d2h_bytes": 0,
+    }
+    payload = {
+        "choices": [
+            {
+                "message": {"role": "assistant", "content": "complete answer"},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {"completion_tokens": 2},
+        "server_metrics": metrics,
+    }
+    body_text = json.dumps(payload)
+    if stream:
+        event = {
+            "choices": [
+                {
+                    "delta": {"role": "assistant", "content": "complete answer"},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"completion_tokens": 2},
+            "server_metrics": metrics,
+        }
+        body_text = f"data: {json.dumps(event)}\n\ndata: [DONE]\n\n"
+    (case_dir / "requests.jsonl").write_text(json.dumps(request) + "\n")
+    (case_dir / "results.jsonl").write_text(
+        json.dumps(
+            {
+                "config_name": config_name,
+                "case_id": case_dir.name,
+                "response_chain": [
+                    {
+                        "request_index": 1,
+                        "outcome": "success",
+                        "response": {
+                            "status_code": 200,
+                            "body_text": body_text,
+                        },
+                    }
+                ],
+            }
+        )
+        + "\n"
+    )
+
+
+def test_fixed_matrix_accepts_zero_retry_for_exact_rehit_or_noop_reposition(
+    tmp_path: Path,
+) -> None:
+    _write_fixed_matrix_case(
+        tmp_path,
+        case_number=1,
+        config_name="minisgl",
+        transition_count=2,
+        h2d_bytes=128,
+    )
+    _write_fixed_matrix_case(
+        tmp_path,
+        case_number=2,
+        config_name="minisgl",
+        transition_count=0,
+        h2d_bytes=0,
+        stream=True,
+    )
+
+    report = matrix.audit_request_matrix(tmp_path, require_server_metrics=True)
+
+    assert report["summary"]["issues"] == {}
+
+
+def test_fixed_matrix_requires_retry_activity_per_server_config(tmp_path: Path) -> None:
+    _write_fixed_matrix_case(
+        tmp_path,
+        case_number=1,
+        config_name="minisgl-a",
+        transition_count=0,
+        h2d_bytes=0,
+    )
+    _write_fixed_matrix_case(
+        tmp_path,
+        case_number=2,
+        config_name="minisgl-b",
+        transition_count=1,
+        h2d_bytes=64,
+    )
+
+    report = matrix.audit_request_matrix(tmp_path, require_server_metrics=True)
+
+    assert report["summary"]["issues"] == {"system:retry_activity_missing": 1}
+
+
+def test_fixed_matrix_rejects_retry_transition_h2d_mismatch(tmp_path: Path) -> None:
+    _write_fixed_matrix_case(
+        tmp_path,
+        case_number=1,
+        config_name="minisgl",
+        transition_count=1,
+        h2d_bytes=0,
+    )
+
+    report = matrix.audit_request_matrix(tmp_path, require_server_metrics=True)
+
+    assert report["summary"]["issues"] == {
+        "system:retry_activity_missing": 1,
+        "system:retry_transition_h2d_inconsistent": 1,
+    }
+
+
 def test_cell_replay_forwards_selection_warmup_and_server_lifecycle(tmp_path, monkeypatch) -> None:
     seen: dict = {}
 
