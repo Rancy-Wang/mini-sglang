@@ -38,6 +38,7 @@ MINISGL_TARGETS = (
     ProfileTarget("decode", "minisgl/scheduler/decode.py", "DecodeManager.schedule_next_batch"),
     ProfileTarget("radix_match", "minisgl/scheduler/cache.py", "CacheManager.match_req"),
     ProfileTarget("free_and_cache", "minisgl/scheduler/cache.py", "CacheManager.cache_req"),
+    ProfileTarget("evict", "minisgl/kvcache/radix_cache.py", "RadixPrefixCache.evict"),
 )
 
 SGLANG_TARGETS = (

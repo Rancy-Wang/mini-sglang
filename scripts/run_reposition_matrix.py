@@ -33,7 +33,7 @@ from minisgl.benchmark.reposition_bcp import (
     select_replay_tasks,
     select_task_set,
 )
-from minisgl.benchmark.reposition_trajectory import parse_response_bytes
+from minisgl.benchmark.reposition_trajectory import inspect_metrics, parse_response_bytes
 
 from scripts.profile_reposition_matrix import (
     create_profile_bootstrap,
@@ -167,10 +167,12 @@ async def replay_tasks(
     request_timeout: float,
     request_selection: str = "all",
     warmup: bool = False,
+    repetition_start: int = 1,
+    require_server_metrics: bool = False,
 ) -> list[dict[str, Any]]:
     if not tasks or not endpoints:
         raise ValueError("tasks and endpoints must be non-empty")
-    if concurrency < 1 or repetitions < 1:
+    if concurrency < 1 or repetitions < 1 or repetition_start < 1:
         raise ValueError("concurrency and repetitions must be positive")
     if request_selection not in {"all", "last"}:
         raise ValueError("request_selection must be all or last")
@@ -231,6 +233,17 @@ async def replay_tasks(
                             request=request,
                             expected=expected,
                         )
+                        if require_server_metrics:
+                            audit["issues"] = sorted(
+                                set(audit["issues"])
+                                | set(
+                                    inspect_metrics(
+                                        response.get("server_metrics"),
+                                        stress=bool(request.get("reposition")),
+                                        cold=False,
+                                    )
+                                )
+                            )
                     record = {
                         "case_id": task.case_id,
                         "mode": mode,
@@ -253,7 +266,7 @@ async def replay_tasks(
             *(
                 run_task(endpoint_index, repetition, task)
                 for endpoint_index in range(len(endpoints))
-                for repetition in range(1, repetitions + 1)
+                for repetition in range(repetition_start, repetition_start + repetitions)
                 for task in tasks
             )
         )
@@ -598,38 +611,77 @@ def _run_cell_replay(
     request_timeout: float,
     shutdown_timeout: float,
 ) -> list[dict[str, Any]]:
-    endpoints = cell.endpoints
+    output_dir.mkdir(parents=True, exist_ok=True)
     with ExitStack() as stack:
         if cell.telemetry:
             stack.enter_context(_capture_telemetry(output_dir / "telemetry"))
-        if cell.server_config is not None:
-            configs = load_server_configs(cell.server_config)
-            log_dir = output_dir / "server-logs"
+        if cell.server_config is None:
+            return asyncio.run(
+                replay_tasks(
+                    tasks,
+                    endpoints=cell.endpoints,
+                    mode=cell.mode,
+                    concurrency=cell.concurrency,
+                    repetitions=cell.repetitions,
+                    output_dir=output_dir,
+                    request_overrides=cell.request_overrides,
+                    request_timeout=request_timeout,
+                    request_selection=cell.request_selection,
+                    warmup=cell.warmup,
+                    require_server_metrics=cell.framework == "minisgl",
+                )
+            )
+
+        # A managed server is restarted for every measured repetition.  This makes each
+        # repetition begin with an empty process-local KV cache instead of silently warming
+        # later samples with the first repetition's requests.
+        configs = load_server_configs(cell.server_config)
+        records: list[dict[str, Any]] = []
+        for repetition in range(1, cell.repetitions + 1):
+            repetition_dir = output_dir / f"rep-{repetition:02d}"
+            log_dir = output_dir / "server-logs" / f"rep-{repetition:02d}"
             log_dir.mkdir(parents=True)
-            for config in configs:
-                stack.enter_context(
-                    running_server(
-                        config,
-                        log_dir / f"{config.config_id}.log",
-                        startup_timeout,
-                        shutdown_timeout,
+            with ExitStack() as servers:
+                for config in configs:
+                    servers.enter_context(
+                        running_server(
+                            config,
+                            log_dir / f"{config.config_id}.log",
+                            startup_timeout,
+                            shutdown_timeout,
+                        )
+                    )
+                records.extend(
+                    asyncio.run(
+                        replay_tasks(
+                            tasks,
+                            endpoints=tuple(config.endpoint_url for config in configs),
+                            mode=cell.mode,
+                            concurrency=cell.concurrency,
+                            repetitions=1,
+                            repetition_start=repetition,
+                            output_dir=repetition_dir,
+                            request_overrides=cell.request_overrides,
+                            request_timeout=request_timeout,
+                            request_selection=cell.request_selection,
+                            warmup=cell.warmup,
+                            require_server_metrics=cell.framework == "minisgl",
+                        )
                     )
                 )
-            endpoints = tuple(config.endpoint_url for config in configs)
-        return asyncio.run(
-            replay_tasks(
-                tasks,
-                endpoints=endpoints,
-                mode=cell.mode,
-                concurrency=cell.concurrency,
-                repetitions=cell.repetitions,
-                output_dir=output_dir,
-                request_overrides=cell.request_overrides,
-                request_timeout=request_timeout,
-                request_selection=cell.request_selection,
-                warmup=cell.warmup,
+        records.sort(
+            key=lambda item: (
+                item["endpoint_index"],
+                item["repetition"],
+                item["case_id"],
+                item["turn"],
             )
         )
+        append_gzip_jsonl(output_dir / "result.jsonl.gz", records)
+        (output_dir / "trajectory.txt").write_text(
+            render_text_trajectory(records), encoding="utf-8"
+        )
+        return records
 
 
 def run_experiment_manifest(
@@ -736,7 +788,9 @@ def run_experiment_manifest(
     return summary
 
 
-def audit_request_matrix(matrix_dir: Path) -> dict[str, Any]:
+def audit_request_matrix(
+    matrix_dir: Path, *, require_server_metrics: bool = False
+) -> dict[str, Any]:
     records: list[dict[str, Any]] = []
     for case_dir in sorted(matrix_dir.glob("request-*")):
         requests_path = case_dir / "requests.jsonl"
@@ -762,6 +816,17 @@ def audit_request_matrix(matrix_dir: Path) -> dict[str, Any]:
                             **parsed,
                         }
                         audit = audit_parsed_response(parsed, request=requests[index])
+                        if require_server_metrics:
+                            audit["issues"] = sorted(
+                                set(audit["issues"])
+                                | set(
+                                    inspect_metrics(
+                                        parsed.get("server_metrics"),
+                                        stress=bool(requests[index].get("reposition")),
+                                        cold=index == 0,
+                                    )
+                                )
+                            )
                     except Exception as exc:
                         audit = {
                             "issues": ["transport:request_or_parse_failure"],
@@ -904,6 +969,7 @@ def build_parser() -> argparse.ArgumentParser:
     audit = subparsers.add_parser("audit-request-matrix")
     audit.add_argument("--matrix-dir", type=Path, required=True)
     audit.add_argument("--output", type=Path, required=True)
+    audit.add_argument("--require-server-metrics", action="store_true")
 
     proxy = subparsers.add_parser("proxy")
     proxy.add_argument("--host", default="127.0.0.1")
@@ -934,7 +1000,9 @@ def main(argv: Iterable[str] | None = None) -> int:
         )
         return 0
     if args.command == "audit-request-matrix":
-        report = audit_request_matrix(args.matrix_dir)
+        report = audit_request_matrix(
+            args.matrix_dir, require_server_metrics=args.require_server_metrics
+        )
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(
             json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n",

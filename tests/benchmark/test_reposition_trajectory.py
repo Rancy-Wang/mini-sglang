@@ -6,6 +6,7 @@ from minisgl.benchmark.reposition_trajectory import (
     DEFAULT_DROP_RULE,
     DEFAULT_REPOSITION,
     TrajectoryCase,
+    _reference_radix_records,
     apply_consistency_checks,
     build_control_request,
     build_stress_request,
@@ -121,6 +122,52 @@ def test_stress_request_has_exact_drop_and_reposition_interfaces() -> None:
     control = build_control_request(_case())
     assert "drop_rule" not in control
     assert "reposition" not in control
+
+
+def test_independent_radix_reference_uses_direct_negative_ranges_and_reposition() -> None:
+    records = _reference_radix_records(
+        [10, 11, 12, 13],
+        [3],
+        [0, 1],
+        [[0, 1]],
+        [2],
+        [3],
+    )
+
+    assert records == [
+        [0, 10, -1, 0],
+        [0, 11, 2, 0],
+        [0, 12, 2, 1],
+        [1, -1, -2, -1],
+        [2, 2, -1, -1],
+        [0, 13, 2, 2],
+    ]
+
+
+def test_independent_radix_reference_tracks_multiple_drop_reposition_cycles() -> None:
+    records = _reference_radix_records(
+        [10, 11, 12, 13, 14, 15, 16],
+        [3, 6],
+        [0, 1, 3],
+        [[0, 1], [1, 2], [4, 5]],
+        [2, 5],
+        [3, 6],
+    )
+
+    assert records == [
+        [0, 10, -1, 0],
+        [0, 11, 2, 0],
+        [0, 12, 5, 0],
+        [1, -1, -2, -1],
+        [2, 2, -1, -1],
+        [0, 13, 5, 1],
+        [0, 14, 2, 3],
+        [0, 15, 5, 2],
+        [1, -2, -3, -1],
+        [1, -5, -6, -1],
+        [2, 5, -1, -1],
+        [0, 16, 5, 3],
+    ]
 
 
 def test_parse_sse_preserves_reasoning_content_and_tool_arguments() -> None:

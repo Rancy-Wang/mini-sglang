@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import gzip
 import json
+from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from minisgl.benchmark.reposition_bcp import CapturedRequest, ReplayTask
@@ -208,6 +210,9 @@ def test_request_matrix_audit_counts_success_and_generated_tokens(tmp_path: Path
     assert report["summary"]["issues"] == {}
     assert report["records"][0]["response"]["ok"] is True
 
+    metrics_report = matrix.audit_request_matrix(tmp_path, require_server_metrics=True)
+    assert metrics_report["summary"]["issues"] == {"system:missing_server_metrics": 1}
+
 
 def test_cell_replay_forwards_selection_warmup_and_server_lifecycle(tmp_path, monkeypatch) -> None:
     seen: dict = {}
@@ -249,3 +254,77 @@ def test_cell_replay_forwards_selection_warmup_and_server_lifecycle(tmp_path, mo
     assert seen["warmup"] is True
     assert seen["concurrency"] == 4
     assert seen["repetitions"] == 3
+
+
+def test_managed_server_restarts_and_warms_up_for_every_repetition(tmp_path, monkeypatch) -> None:
+    calls: list[dict] = []
+    lifecycle: list[tuple[str, str]] = []
+    config = SimpleNamespace(config_id="server-1", endpoint_url="http://server/v1")
+
+    @contextmanager
+    def fake_running_server(config, log_path, startup_timeout, shutdown_timeout):
+        del log_path, startup_timeout, shutdown_timeout
+        lifecycle.append(("start", config.config_id))
+        yield
+        lifecycle.append(("stop", config.config_id))
+
+    async def fake_replay(tasks, **kwargs):
+        del tasks
+        calls.append(kwargs)
+        repetition = kwargs["repetition_start"]
+        return [
+            {
+                "case_id": "231",
+                "mode": "rolling",
+                "endpoint_index": 0,
+                "repetition": repetition,
+                "turn": 6,
+                "response": {"message": {"role": "assistant", "content": "ok"}},
+                "audit": {"issues": []},
+            }
+        ]
+
+    monkeypatch.setattr(matrix, "load_server_configs", lambda _: [config])
+    monkeypatch.setattr(matrix, "running_server", fake_running_server)
+    monkeypatch.setattr(matrix, "replay_tasks", fake_replay)
+    cell = matrix.ExperimentCell(
+        name="rolling",
+        mode="rolling",
+        concurrency=4,
+        repetitions=3,
+        endpoints=(),
+        server_config=tmp_path / "servers.json",
+        request_overrides={"max_tokens": 32},
+        baseline_cell=None,
+        framework="minisgl",
+        profile_on_slowdown=False,
+        nsys=False,
+        telemetry=False,
+        request_selection="last",
+        warmup=True,
+    )
+
+    records = matrix._run_cell_replay(
+        cell,
+        tasks=[_task()],
+        output_dir=tmp_path / "managed",
+        startup_timeout=1,
+        request_timeout=2,
+        shutdown_timeout=3,
+    )
+
+    assert lifecycle == [
+        ("start", "server-1"),
+        ("stop", "server-1"),
+        ("start", "server-1"),
+        ("stop", "server-1"),
+        ("start", "server-1"),
+        ("stop", "server-1"),
+    ]
+    assert [call["repetition_start"] for call in calls] == [1, 2, 3]
+    assert all(call["repetitions"] == 1 for call in calls)
+    assert all(call["warmup"] is True for call in calls)
+    assert all(call["require_server_metrics"] is True for call in calls)
+    assert [record["repetition"] for record in records] == [1, 2, 3]
+    with gzip.open(tmp_path / "managed" / "result.jsonl.gz", "rt") as stream:
+        assert [json.loads(line)["repetition"] for line in stream] == [1, 2, 3]

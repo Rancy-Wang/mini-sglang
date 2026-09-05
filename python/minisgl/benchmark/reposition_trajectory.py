@@ -169,6 +169,84 @@ def build_stress_request(
     return request
 
 
+def _reference_radix_records(
+    token_ids: Sequence[int],
+    drop_insert_offsets: Sequence[int],
+    drop_range_offsets: Sequence[int],
+    drop_ranges: Sequence[Sequence[int]],
+    reposition_raw_boundaries: Sequence[int],
+    reposition_insert_offsets: Sequence[int],
+) -> list[list[int]]:
+    """Slow, independent structured-key oracle used only by the R10 preflight."""
+
+    if len(drop_range_offsets) != len(drop_insert_offsets) + 1:
+        raise ValueError("Drop range offsets do not delimit every Drop event.")
+    if len(reposition_raw_boundaries) != len(reposition_insert_offsets):
+        raise ValueError("Reposition boundaries and insertion offsets have different lengths.")
+    drops_by_insertion: dict[int, list[tuple[int, list[Sequence[int]]]]] = {}
+    for event, insertion in enumerate(drop_insert_offsets):
+        start = int(drop_range_offsets[event])
+        end = int(drop_range_offsets[event + 1])
+        drops_by_insertion.setdefault(int(insertion), []).append(
+            (event, list(drop_ranges[start:end]))
+        )
+    reposition_by_insertion: dict[int, list[tuple[int, int]]] = {}
+    for event, (boundary, insertion) in enumerate(
+        zip(reposition_raw_boundaries, reposition_insert_offsets, strict=True)
+    ):
+        reposition_by_insertion.setdefault(int(insertion), []).append((event, int(boundary)))
+
+    active: list[int] = []
+    positions = [-1] * len(token_ids)
+    reposition_info = [-1] * len(token_ids)
+    effective = [False] * len(reposition_raw_boundaries)
+    current_reposition = -1
+    next_position = 0
+    for insertion in range(len(token_ids) + 1):
+        for _, ranges in drops_by_insertion.get(insertion, []):
+            dropped = {
+                raw_token
+                for raw_start, raw_end in ranges
+                for raw_token in range(int(raw_start), int(raw_end))
+            }
+            active = [raw_token for raw_token in active if raw_token not in dropped]
+        for event, boundary in reposition_by_insertion.get(insertion, []):
+            if not active:
+                raise ValueError(f"Reposition at raw boundary {boundary} has no active tokens.")
+            if any(positions[raw_token] != rank for rank, raw_token in enumerate(active)):
+                effective[event] = True
+                for rank, raw_token in enumerate(active):
+                    if positions[raw_token] != rank:
+                        positions[raw_token] = rank
+                        reposition_info[raw_token] = boundary
+                current_reposition = boundary
+                next_position = len(active)
+        if insertion < len(token_ids):
+            positions[insertion] = next_position
+            reposition_info[insertion] = current_reposition
+            active.append(insertion)
+            next_position += 1
+
+    records: list[list[int]] = []
+    for insertion in range(len(token_ids) + 1):
+        for _, ranges in drops_by_insertion.get(insertion, []):
+            for raw_start, raw_end in ranges:
+                records.append([1, -int(raw_start) - 1, -int(raw_end) - 1, -1])
+        for event, boundary in reposition_by_insertion.get(insertion, []):
+            if effective[event]:
+                records.append([2, boundary, -1, -1])
+        if insertion < len(token_ids):
+            records.append(
+                [
+                    0,
+                    int(token_ids[insertion]),
+                    reposition_info[insertion],
+                    positions[insertion],
+                ]
+            )
+    return records
+
+
 def _merge_tool_call_delta(tool_calls: list[dict[str, Any]], delta: dict[str, Any]) -> None:
     index = int(delta.get("index", len(tool_calls)))
     while len(tool_calls) <= index:
@@ -812,6 +890,7 @@ def calibrate_request(
     tolerance: int,
     max_tokens: int,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    from minisgl.kernel.radix_reposition import validate_radix_reposition_records
     from minisgl.tokenizer.tokenize import TokenizeManager
     from transformers import AutoTokenizer
 
@@ -864,6 +943,40 @@ def calibrate_request(
             "Final active prompt and generation budget exceed the configured context window: "
             f"{len(result.input_ids)} + {max_tokens} > {max_context}"
         )
+    radix_records = result.radix_match_ids
+    if radix_records is None or radix_records.ndim != 2:
+        raise ValueError("Multi-Reposition preflight did not produce a structured Radix key.")
+    validate_radix_reposition_records(
+        radix_records,
+        token_count=full_len,
+        require_materialized=True,
+    )
+    required_tensors = {
+        "drop_event_positions": result.drop_event_positions,
+        "drop_range_offsets": result.drop_range_offsets,
+        "drop_position_ranges": result.drop_position_ranges,
+        "reposition_raw_boundaries": result.reposition_raw_boundaries,
+        "reposition_insert_offsets": result.reposition_insert_offsets,
+        "full_input_ids": result.full_input_ids,
+    }
+    missing = sorted(name for name, value in required_tensors.items() if value is None)
+    if missing:
+        raise ValueError(f"Structured Radix preflight is missing tensors: {missing}")
+    actual_records = radix_records.tolist()
+    expected_records = _reference_radix_records(
+        required_tensors["full_input_ids"].tolist(),
+        required_tensors["drop_event_positions"].tolist(),
+        required_tensors["drop_range_offsets"].tolist(),
+        required_tensors["drop_position_ranges"].view(-1, 2).tolist(),
+        required_tensors["reposition_raw_boundaries"].tolist(),
+        required_tensors["reposition_insert_offsets"].tolist(),
+    )
+    if actual_records != expected_records:
+        raise ValueError("Structured Radix key differs from the independent R10 reference.")
+    encoded_radix_records = json.dumps(
+        actual_records, ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    virtual_records = [record for record in actual_records if record[0] != 0]
     summary = {
         "model_path": model_path,
         "target_tokens": target,
@@ -878,6 +991,16 @@ def calibrate_request(
         "effective_reposition_boundaries": result.reposition_raw_boundaries.tolist(),
         "ignored_reposition_boundaries": ignored,
         "drop_effective_event_count": result.drop_effective_event_count,
+        "radix_key": {
+            "shape": list(radix_records.shape),
+            "sha256": hashlib.sha256(encoded_radix_records).hexdigest(),
+            "reference_exact_match": True,
+            "token_records": sum(record[0] == 0 for record in actual_records),
+            "delta_records": sum(record[0] == 1 for record in actual_records),
+            "reposition_records": sum(record[0] == 2 for record in actual_records),
+            "virtual_records": virtual_records,
+        },
+        "_radix_key_records": actual_records,
     }
     return request, summary
 
@@ -906,6 +1029,17 @@ def _write_artifacts(
     server_log: str | None,
 ) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
+    preflight = copy.deepcopy(preflight)
+    radix_key_records = preflight.pop("_radix_key_records", None)
+    if radix_key_records is not None:
+        radix_key_bytes = json.dumps(
+            radix_key_records, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+        radix_key_path = output_dir / "radix_key.json.gz"
+        with gzip.open(radix_key_path, "wb") as stream:
+            stream.write(radix_key_bytes)
+        preflight["radix_key"]["artifact"] = str(radix_key_path)
+        preflight["radix_key"]["artifact_bytes_uncompressed"] = len(radix_key_bytes)
     with gzip.open(output_dir / "trajectory.jsonl.gz", "wt", encoding="utf-8") as stream:
         for record in records:
             json.dump(record, stream, ensure_ascii=False, sort_keys=True)

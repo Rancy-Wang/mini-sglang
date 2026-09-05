@@ -64,6 +64,7 @@ def test_bootstrap_is_task_local_and_covers_both_framework_maps(tmp_path: Path) 
         "decode",
         "radix_match",
         "free_and_cache",
+        "evict",
     }
     assert {target.stage for target in targets_for_framework("sglang")} >= {
         "tokenize",
