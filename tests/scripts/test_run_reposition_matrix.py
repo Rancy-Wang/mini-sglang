@@ -466,6 +466,38 @@ def test_fixed_matrix_rejects_retry_transition_h2d_mismatch(tmp_path: Path) -> N
     }
 
 
+def test_request_matrix_audit_cli_writes_readable_trajectory(tmp_path: Path) -> None:
+    matrix_dir = tmp_path / "matrix"
+    matrix_dir.mkdir()
+    _write_fixed_matrix_case(
+        matrix_dir,
+        case_number=1,
+        config_name="minisgl",
+        transition_count=1,
+        h2d_bytes=64,
+    )
+    output = tmp_path / "audit.json"
+
+    assert (
+        matrix.main(
+            [
+                "audit-request-matrix",
+                "--matrix-dir",
+                str(matrix_dir),
+                "--output",
+                str(output),
+                "--require-server-metrics",
+            ]
+        )
+        == 0
+    )
+
+    trajectory = output.with_suffix(".trajectory.txt").read_text(encoding="utf-8")
+    assert "request-000001 / nonstream / 1" in trajectory
+    assert "[content]\ncomplete answer" in trajectory
+    assert "[issues] none" in trajectory
+
+
 def test_cell_replay_forwards_selection_warmup_and_server_lifecycle(tmp_path, monkeypatch) -> None:
     seen: dict = {}
 

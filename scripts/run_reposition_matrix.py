@@ -857,6 +857,12 @@ def audit_request_matrix(
                     {
                         "config_name": result.get("config_name"),
                         "case_id": result.get("case_id"),
+                        "mode": (
+                            "stream"
+                            if 0 <= index < len(requests) and requests[index].get("stream") is True
+                            else "nonstream"
+                        ),
+                        "turn": index + 1,
                         "request_index": index + 1,
                         "response": parsed_response,
                         "audit": audit,
@@ -1062,6 +1068,7 @@ def build_parser() -> argparse.ArgumentParser:
     audit = subparsers.add_parser("audit-request-matrix")
     audit.add_argument("--matrix-dir", type=Path, required=True)
     audit.add_argument("--output", type=Path, required=True)
+    audit.add_argument("--trajectory-output", type=Path)
     audit.add_argument("--require-server-metrics", action="store_true")
 
     proxy = subparsers.add_parser("proxy")
@@ -1101,6 +1108,12 @@ def main(argv: Iterable[str] | None = None) -> int:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(
             json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        trajectory_output = args.trajectory_output or args.output.with_suffix(".trajectory.txt")
+        trajectory_output.parent.mkdir(parents=True, exist_ok=True)
+        trajectory_output.write_text(
+            render_text_trajectory(report["records"]),
             encoding="utf-8",
         )
         return 0
