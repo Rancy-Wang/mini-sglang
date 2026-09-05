@@ -329,6 +329,39 @@ def test_request_matrix_audit_counts_success_and_generated_tokens(tmp_path: Path
     assert metrics_report["summary"]["issues"] == {"system:missing_server_metrics": 1}
 
 
+def test_request_matrix_audit_prefers_exact_raw_response_bytes(tmp_path: Path) -> None:
+    case_dir = tmp_path / "request-000001"
+    case_dir.mkdir()
+    request = {"messages": [{"role": "user", "content": "task"}], "stream": False}
+    (case_dir / "requests.jsonl").write_text(json.dumps(request) + "\n")
+    raw_path = tmp_path / "raw/config-001/request-000001/request-001.response.bin.gz"
+    raw_path.parent.mkdir(parents=True)
+    with gzip.open(raw_path, "wb") as stream:
+        stream.write(b"\xffnot-utf8")
+    (case_dir / "results.jsonl").write_text(
+        json.dumps(
+            {
+                "config_name": "minisgl",
+                "case_id": case_dir.name,
+                "response_chain": [
+                    {
+                        "request_index": 1,
+                        "outcome": "success",
+                        "raw_response_path": raw_path.relative_to(tmp_path).as_posix(),
+                        "response": {"status_code": 200, "body_text": "{}"},
+                    }
+                ],
+            }
+        )
+        + "\n"
+    )
+
+    report = matrix.audit_request_matrix(tmp_path)
+
+    assert report["summary"]["issues"] == {"transport:request_or_parse_failure": 1}
+    assert report["records"][0]["response"]["ok"] is False
+
+
 def _write_fixed_matrix_case(
     root: Path,
     *,
@@ -496,6 +529,166 @@ def test_request_matrix_audit_cli_writes_readable_trajectory(tmp_path: Path) -> 
     assert "request-000001 / nonstream / 1" in trajectory
     assert "[content]\ncomplete answer" in trajectory
     assert "[issues] none" in trajectory
+
+
+def test_isolated_request_matrix_restarts_server_for_each_case(tmp_path, monkeypatch) -> None:
+    config_source = tmp_path / "config.json"
+    config_source.write_text('{"configurations": []}\n')
+    config = SimpleNamespace(
+        config_id="config-001",
+        name="minisgl",
+        source_path=config_source,
+        endpoint_url="http://server/v1/chat/completions",
+    )
+    cases = [
+        SimpleNamespace(
+            case_id=f"request-{index:06d}",
+            source_path=tmp_path / f"case-{index}.jsonl",
+            requests=({"messages": [{"role": "user", "content": str(index)}]},),
+        )
+        for index in (1, 2)
+    ]
+    lifecycle: list[tuple[str, str]] = []
+
+    @contextmanager
+    def fake_running_server(config, log_path, startup_timeout, shutdown_timeout):
+        del config, startup_timeout, shutdown_timeout
+        lifecycle.append(("start", log_path.name))
+        yield object()
+        lifecycle.append(("stop", log_path.name))
+
+    async def fake_post_chain(case, *, endpoint, request_timeout, output_dir, config_id):
+        del endpoint, request_timeout, output_dir, config_id
+        return [
+            {
+                "request_index": 1,
+                "outcome": "success",
+                "response": {"status_code": 200, "headers": [], "body_text": "{}"},
+                "error": None,
+                "case": case.case_id,
+            }
+        ]
+
+    monkeypatch.setattr(matrix, "running_server", fake_running_server)
+    monkeypatch.setattr(matrix, "_post_isolated_request_chain", fake_post_chain)
+
+    state = matrix.run_isolated_request_matrix(
+        [config],
+        cases,
+        output_dir=tmp_path / "output",
+        startup_timeout=1,
+        request_timeout=2,
+        shutdown_timeout=3,
+    )
+
+    assert lifecycle == [
+        ("start", "request-000001.log"),
+        ("stop", "request-000001.log"),
+        ("start", "request-000002.log"),
+        ("stop", "request-000002.log"),
+    ]
+    assert state["status"] == "success"
+    assert state["matrix"]["completed_cells"] == 2
+    assert json.loads((tmp_path / "output" / "run.json").read_text())["status"] == "success"
+    for case in cases:
+        result = json.loads((tmp_path / "output" / case.case_id / "results.jsonl").read_text())
+        assert result["case_id"] == case.case_id
+        assert result["response_chain"][0]["case"] == case.case_id
+
+
+def test_isolated_request_matrix_parser_exposes_timeouts() -> None:
+    args = matrix.build_parser().parse_args(
+        [
+            "run-isolated-request-matrix",
+            "--configs",
+            "configs.json",
+            "--requests",
+            "cases",
+            "--output-dir",
+            "results",
+            "--startup-timeout",
+            "10",
+            "--request-timeout",
+            "20",
+            "--shutdown-timeout",
+            "30",
+        ]
+    )
+
+    assert args.startup_timeout == 10
+    assert args.request_timeout == 20
+    assert args.shutdown_timeout == 30
+
+
+def test_isolated_request_chain_preserves_exact_raw_artifacts(tmp_path, monkeypatch) -> None:
+    async def fake_post(client, *, endpoint, request):
+        del client, endpoint, request
+        return b"\xffraw-response", {
+            "ok": False,
+            "status_code": 200,
+            "headers": [("content-type", "application/json")],
+            "error": {"type": "UnicodeDecodeError", "message": "invalid UTF-8"},
+        }
+
+    monkeypatch.setattr(matrix, "_post_capture", fake_post)
+    case = SimpleNamespace(
+        case_id="request-000001",
+        requests=({"messages": [{"role": "user", "content": "你好"}]},),
+    )
+
+    chain = asyncio.run(
+        matrix._post_isolated_request_chain(
+            case,
+            endpoint="http://server/v1/chat/completions",
+            request_timeout=1,
+            output_dir=tmp_path,
+            config_id="config-001",
+        )
+    )
+
+    with gzip.open(tmp_path / chain[0]["request_path"], "rt", encoding="utf-8") as stream:
+        assert json.load(stream) == case.requests[0]
+    with gzip.open(tmp_path / chain[0]["raw_response_path"], "rb") as stream:
+        assert stream.read() == b"\xffraw-response"
+    assert chain[0]["outcome"] == "failure"
+
+
+def test_isolated_request_matrix_records_interruption(tmp_path, monkeypatch) -> None:
+    config_source = tmp_path / "config.json"
+    config_source.write_text('{"configurations": []}\n')
+    config = SimpleNamespace(
+        config_id="config-001",
+        name="minisgl",
+        source_path=config_source,
+        endpoint_url="http://server/v1/chat/completions",
+    )
+    case = SimpleNamespace(
+        case_id="request-000001",
+        source_path=tmp_path / "case.jsonl",
+        requests=({"messages": [{"role": "user", "content": "task"}]},),
+    )
+
+    @contextmanager
+    def interrupted_server(*args, **kwargs):
+        del args, kwargs
+        raise KeyboardInterrupt
+        yield
+
+    monkeypatch.setattr(matrix, "running_server", interrupted_server)
+
+    with pytest.raises(KeyboardInterrupt):
+        matrix.run_isolated_request_matrix(
+            [config],
+            [case],
+            output_dir=tmp_path / "output",
+            startup_timeout=1,
+            request_timeout=1,
+            shutdown_timeout=1,
+        )
+
+    state = json.loads((tmp_path / "output" / "run.json").read_text())
+    assert state["status"] == "interrupted"
+    assert state["matrix"]["completed_cells"] == 0
 
 
 def test_cell_replay_forwards_selection_warmup_and_server_lifecycle(tmp_path, monkeypatch) -> None:

@@ -44,7 +44,15 @@ from scripts.profile_reposition_matrix import (
     detect_slowdown,
     summarize_profile,
 )
-from scripts.run_request_matrix import load_server_configs, running_server
+from scripts.run_request_matrix import (
+    ConversationCase,
+    ServerConfig,
+    ServerStartupError,
+    discover_request_files,
+    load_conversation_cases,
+    load_server_configs,
+    running_server,
+)
 
 _HOP_HEADERS = {
     "connection",
@@ -157,6 +165,208 @@ async def _post_capture(
         "error": error,
         "issues": ["transport:request_or_parse_failure"],
     }
+
+
+async def _post_isolated_request_chain(
+    case: ConversationCase,
+    *,
+    endpoint: str,
+    request_timeout: float,
+    output_dir: Path,
+    config_id: str,
+) -> list[dict[str, Any]]:
+    chain: list[dict[str, Any]] = []
+    async with httpx.AsyncClient(timeout=request_timeout, trust_env=False) as client:
+        for request_index, request in enumerate(case.requests, 1):
+            stem = f"raw/{config_id}/{case.case_id}/request-{request_index:03d}"
+            request_path = output_dir / f"{stem}.request.json.gz"
+            response_path = output_dir / f"{stem}.response.bin.gz"
+            _write_gzip_json(request_path, request)
+            raw, parsed = await _post_capture(client, endpoint=endpoint, request=request)
+            _write_gzip_bytes(response_path, raw)
+            chain.append(
+                {
+                    "request_index": request_index,
+                    "outcome": "success" if parsed.get("ok") else "failure",
+                    "request_path": request_path.relative_to(output_dir).as_posix(),
+                    "raw_response_path": response_path.relative_to(output_dir).as_posix(),
+                    "response": {
+                        "status_code": parsed.get("status_code"),
+                        "headers": parsed.get("headers", []),
+                        "body_text": raw.decode("utf-8", errors="replace"),
+                    },
+                    "error": parsed.get("error"),
+                }
+            )
+    return chain
+
+
+def _isolated_matrix_result(
+    config: ServerConfig,
+    case: ConversationCase,
+    chain: Sequence[dict[str, Any]],
+    *,
+    started_at: str,
+    duration_seconds: float,
+    startup_error: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    first_error = startup_error or next(
+        (item.get("error") for item in chain if item.get("error")), None
+    )
+    failed = startup_error is not None or any(item.get("outcome") != "success" for item in chain)
+    return {
+        "config_id": config.config_id,
+        "config_name": config.name,
+        "case_id": case.case_id,
+        "outcome": "failure" if failed else "success",
+        "started_at": started_at,
+        "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "duration_seconds": duration_seconds,
+        "response_chain": list(chain),
+        "error": first_error,
+    }
+
+
+def run_isolated_request_matrix(
+    configs: Sequence[ServerConfig],
+    cases: Sequence[ConversationCase],
+    *,
+    output_dir: Path,
+    startup_timeout: float,
+    request_timeout: float,
+    shutdown_timeout: float,
+) -> dict[str, Any]:
+    """Run every fixed request file in a freshly started server process."""
+
+    if not configs or not cases:
+        raise ValueError("Isolated request matrix needs configs and cases.")
+    if min(startup_timeout, request_timeout, shutdown_timeout) <= 0:
+        raise ValueError("Isolated request matrix timeouts must be positive.")
+    output_dir = output_dir.expanduser().resolve()
+    if output_dir.exists() and (not output_dir.is_dir() or any(output_dir.iterdir())):
+        raise ValueError(f"Output directory must be empty: {output_dir}")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(configs[0].source_path, output_dir / "config.json")
+    for case in cases:
+        case_dir = output_dir / case.case_id
+        case_dir.mkdir()
+        case_dir.joinpath("requests.jsonl").write_text(
+            "".join(
+                json.dumps(request, ensure_ascii=False, sort_keys=True) + "\n"
+                for request in case.requests
+            ),
+            encoding="utf-8",
+        )
+        case_dir.joinpath("results.jsonl").touch()
+
+    expected_cells = len(configs) * len(cases)
+    started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    state = {
+        "status": "running",
+        "started_at": started_at,
+        "finished_at": None,
+        "matrix": {
+            "config_count": len(configs),
+            "case_count": len(cases),
+            "request_count": sum(len(case.requests) for case in cases),
+            "expected_cells": expected_cells,
+            "completed_cells": 0,
+        },
+        "timeouts_seconds": {
+            "startup": startup_timeout,
+            "request": request_timeout,
+            "shutdown": shutdown_timeout,
+        },
+        "counts": {"success": 0, "failure": 0},
+        "configs": [{"config_id": config.config_id, "name": config.name} for config in configs],
+        "cases": [
+            {
+                "case_id": case.case_id,
+                "source_path": str(case.source_path),
+                "request_count": len(case.requests),
+            }
+            for case in cases
+        ],
+    }
+
+    def write_state() -> None:
+        (output_dir / "run.json").write_text(
+            json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+    write_state()
+    try:
+        for config_number, config in enumerate(configs, 1):
+            for case_number, case in enumerate(cases, 1):
+                print(
+                    f"[{config_number}/{len(configs)} {config.name}] isolated case "
+                    f"{case_number}/{len(cases)}: {case.case_id}"
+                )
+                case_started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                started = time.monotonic()
+                log_path = output_dir / "server-logs" / config.config_id / f"{case.case_id}.log"
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    with running_server(
+                        config,
+                        log_path,
+                        startup_timeout,
+                        shutdown_timeout,
+                    ):
+                        chain = asyncio.run(
+                            _post_isolated_request_chain(
+                                case,
+                                endpoint=config.endpoint_url,
+                                request_timeout=request_timeout,
+                                output_dir=output_dir,
+                                config_id=config.config_id,
+                            )
+                        )
+                    result = _isolated_matrix_result(
+                        config,
+                        case,
+                        chain,
+                        started_at=case_started_at,
+                        duration_seconds=time.monotonic() - started,
+                    )
+                except ServerStartupError as exc:
+                    result = _isolated_matrix_result(
+                        config,
+                        case,
+                        [],
+                        started_at=case_started_at,
+                        duration_seconds=time.monotonic() - started,
+                        startup_error={
+                            "type": exc.error_type,
+                            "message": str(exc),
+                            "server_returncode": exc.server_returncode,
+                        },
+                    )
+                state["counts"][result["outcome"]] += 1
+                state["matrix"]["completed_cells"] += 1
+                with (output_dir / case.case_id / "results.jsonl").open(
+                    "a", encoding="utf-8", newline="\n"
+                ) as output:
+                    output.write(json.dumps(result, ensure_ascii=False, sort_keys=True) + "\n")
+                write_state()
+    except KeyboardInterrupt:
+        state["status"] = "interrupted"
+        state["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        write_state()
+        raise
+    except BaseException:
+        state["status"] = "failed"
+        state["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        write_state()
+        raise
+
+    state["status"] = "success" if state["counts"]["failure"] == 0 else "failed"
+    state["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    state["failed_cells"] = state["counts"]["failure"]
+    state["incomplete_cells"] = expected_cells - state["matrix"]["completed_cells"]
+    write_state()
+    return state
 
 
 async def replay_tasks(
@@ -811,8 +1021,14 @@ def audit_request_matrix(
                 audit = {"issues": ["transport:missing_response"], "inspection": {}}
                 if isinstance(response, dict) and 0 <= index < len(requests):
                     try:
+                        raw_response_path = response_item.get("raw_response_path")
+                        if isinstance(raw_response_path, str):
+                            with gzip.open(matrix_dir / raw_response_path, "rb") as stream:
+                                raw_response = stream.read()
+                        else:
+                            raw_response = response.get("body_text", "").encode("utf-8")
                         parsed = parse_response_bytes(
-                            response.get("body_text", "").encode("utf-8"),
+                            raw_response,
                             stream=requests[index].get("stream") is True,
                         )
                         parsed_response = {
@@ -820,6 +1036,10 @@ def audit_request_matrix(
                             **parsed,
                         }
                         audit = audit_parsed_response(parsed, request=requests[index])
+                        if response_item.get("outcome") != "success":
+                            audit["issues"] = sorted(
+                                set(audit["issues"]) | {"transport:request_or_parse_failure"}
+                            )
                         if require_server_metrics:
                             # A fixed matrix can reuse an exact key across non-stream/stream
                             # cases, and an effective Reposition can legitimately have no
@@ -1071,6 +1291,14 @@ def build_parser() -> argparse.ArgumentParser:
     audit.add_argument("--trajectory-output", type=Path)
     audit.add_argument("--require-server-metrics", action="store_true")
 
+    isolated = subparsers.add_parser("run-isolated-request-matrix")
+    isolated.add_argument("--configs", type=Path, required=True)
+    isolated.add_argument("--requests", type=Path, required=True)
+    isolated.add_argument("--output-dir", type=Path, required=True)
+    isolated.add_argument("--startup-timeout", type=float, default=1800)
+    isolated.add_argument("--request-timeout", type=float, default=1800)
+    isolated.add_argument("--shutdown-timeout", type=float, default=60)
+
     proxy = subparsers.add_parser("proxy")
     proxy.add_argument("--host", default="127.0.0.1")
     proxy.add_argument("--port", type=int, required=True)
@@ -1117,6 +1345,20 @@ def main(argv: Iterable[str] | None = None) -> int:
             encoding="utf-8",
         )
         return 0
+    if args.command == "run-isolated-request-matrix":
+        state = run_isolated_request_matrix(
+            load_server_configs(args.configs),
+            load_conversation_cases(discover_request_files(args.requests)),
+            output_dir=args.output_dir,
+            startup_timeout=args.startup_timeout,
+            request_timeout=args.request_timeout,
+            shutdown_timeout=args.shutdown_timeout,
+        )
+        print(
+            f"Isolated matrix {state['status']}: {state['counts']['success']}/"
+            f"{state['matrix']['expected_cells']} cells succeeded."
+        )
+        return 0 if state["status"] == "success" else 1
     if args.command == "materialize-fixed":
         tasks = _prepare_tasks(args.capture_root, args.preferred_case_id, args.task_limit)
         paths = materialize_fixed_request_cases(
