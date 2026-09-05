@@ -852,10 +852,18 @@ def audit_request_matrix(
 
 
 class _ProxyState:
-    def __init__(self, upstream: str, mode: str, audit_output: Path) -> None:
+    def __init__(
+        self,
+        upstream: str,
+        mode: str,
+        audit_output: Path,
+        *,
+        require_server_metrics: bool = False,
+    ) -> None:
         self.upstream = upstream.rstrip("/")
         self.mode = mode
         self.audit_output = audit_output
+        self.require_server_metrics = require_server_metrics
         self.lock = threading.Lock()
         self.sequence = 0
 
@@ -867,6 +875,28 @@ class _ProxyState:
     def record(self, value: dict[str, Any]) -> None:
         with self.lock:
             append_gzip_jsonl(self.audit_output, [value])
+
+
+def _audit_proxy_response(
+    parsed: dict[str, Any],
+    *,
+    request: dict[str, Any],
+    require_server_metrics: bool,
+) -> dict[str, Any]:
+    audit = audit_parsed_response(parsed, request=request)
+    if require_server_metrics:
+        has_reposition = bool(request.get("reposition"))
+        audit["issues"] = sorted(
+            set(audit["issues"])
+            | set(
+                inspect_metrics(
+                    parsed.get("server_metrics"),
+                    stress=has_reposition,
+                    cold=has_reposition,
+                )
+            )
+        )
+    return audit
 
 
 def make_proxy_handler(state: _ProxyState) -> type[BaseHTTPRequestHandler]:
@@ -943,7 +973,11 @@ def make_proxy_handler(state: _ProxyState) -> type[BaseHTTPRequestHandler]:
             try:
                 parsed = parse_response_bytes(bytes(raw), stream=forwarded.get("stream") is True)
                 record["response"] = parsed
-                record["audit"] = audit_parsed_response(parsed, request=forwarded)
+                record["audit"] = _audit_proxy_response(
+                    parsed,
+                    request=forwarded,
+                    require_server_metrics=state.require_server_metrics,
+                )
             except Exception as exc:
                 record["audit"] = {
                     "issues": ["transport:request_or_parse_failure"],
@@ -954,9 +988,22 @@ def make_proxy_handler(state: _ProxyState) -> type[BaseHTTPRequestHandler]:
     return Handler
 
 
-def serve_proxy(*, host: str, port: int, upstream: str, mode: str, audit_output: Path) -> None:
+def serve_proxy(
+    *,
+    host: str,
+    port: int,
+    upstream: str,
+    mode: str,
+    audit_output: Path,
+    require_server_metrics: bool = False,
+) -> None:
     audit_output.parent.mkdir(parents=True, exist_ok=True)
-    state = _ProxyState(upstream, mode, audit_output)
+    state = _ProxyState(
+        upstream,
+        mode,
+        audit_output,
+        require_server_metrics=require_server_metrics,
+    )
     server = ThreadingHTTPServer((host, port), make_proxy_handler(state))
     server.serve_forever()
 
@@ -983,6 +1030,7 @@ def build_parser() -> argparse.ArgumentParser:
     proxy.add_argument("--upstream", required=True)
     proxy.add_argument("--mode", choices=("full", "rolling", "rolling-drop-only"), required=True)
     proxy.add_argument("--audit-output", type=Path, required=True)
+    proxy.add_argument("--require-server-metrics", action="store_true")
 
     fixed = subparsers.add_parser("materialize-fixed")
     fixed.add_argument("--capture-root", type=Path, action="append", required=True)
@@ -1003,6 +1051,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             upstream=args.upstream,
             mode=args.mode,
             audit_output=args.audit_output,
+            require_server_metrics=args.require_server_metrics,
         )
         return 0
     if args.command == "audit-request-matrix":

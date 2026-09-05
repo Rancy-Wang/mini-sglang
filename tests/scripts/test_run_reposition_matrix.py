@@ -162,6 +162,68 @@ def test_rolling_replay_requires_retry_transition_and_h2d_metrics(tmp_path, monk
     ]
 
 
+def test_proxy_metrics_audit_requires_retry_activity_only_when_enabled() -> None:
+    request = {
+        "messages": [{"role": "user", "content": "task"}],
+        "reposition": [10],
+    }
+    parsed = {
+        "message": {"role": "assistant", "content": "complete answer"},
+        "finish_reason": "stop",
+        "server_metrics": {
+            "request_received_ns": 1,
+            "first_token_generated_ns": 2,
+            "request_finished_ns": 3,
+            "prompt_tokens": 100,
+            "active_prompt_tokens": 20,
+            "generated_tokens": 2,
+            "completion_tokens": 2,
+            "tokenize_invocations": 1,
+            "context_stage_count": 3,
+            "reposition_transition_count": 0,
+            "reposition_h2d_bytes": 0,
+            "reposition_d2h_bytes": 0,
+        },
+    }
+
+    optional = matrix._audit_proxy_response(
+        parsed,
+        request=request,
+        require_server_metrics=False,
+    )
+    required = matrix._audit_proxy_response(
+        parsed,
+        request=request,
+        require_server_metrics=True,
+    )
+
+    assert optional["issues"] == []
+    assert required["issues"] == [
+        "system:cold_retry_h2d_missing",
+        "system:cold_retry_transition_missing",
+    ]
+
+
+def test_proxy_parser_exposes_server_metrics_requirement() -> None:
+    parser = matrix.build_parser()
+    args = parser.parse_args(
+        [
+            "proxy",
+            "--port",
+            "32100",
+            "--upstream",
+            "http://127.0.0.1:32000",
+            "--mode",
+            "rolling",
+            "--audit-output",
+            "audit.jsonl.gz",
+            "--require-server-metrics",
+        ]
+    )
+
+    assert args.require_server_metrics is True
+
+
 def test_manifest_requires_exactly_one_endpoint_source(tmp_path: Path) -> None:
     manifest = tmp_path / "manifest.json"
     manifest.write_text(
