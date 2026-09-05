@@ -240,7 +240,7 @@ async def replay_tasks(
                                     inspect_metrics(
                                         response.get("server_metrics"),
                                         stress=bool(request.get("reposition")),
-                                        cold=False,
+                                        cold=bool(request.get("reposition")),
                                     )
                                 )
                             )
@@ -817,13 +817,19 @@ def audit_request_matrix(
                         }
                         audit = audit_parsed_response(parsed, request=requests[index])
                         if require_server_metrics:
+                            # Fixed R10 chains are cold, prefix-extending partial, then exact
+                            # warm rehit. Both non-final requests must execute Retry transitions;
+                            # only the exact final rehit may legitimately report zero Retry work.
                             audit["issues"] = sorted(
                                 set(audit["issues"])
                                 | set(
                                     inspect_metrics(
                                         parsed.get("server_metrics"),
                                         stress=bool(requests[index].get("reposition")),
-                                        cold=index == 0,
+                                        cold=(
+                                            bool(requests[index].get("reposition"))
+                                            and index < max(len(requests) - 1, 1)
+                                        ),
                                     )
                                 )
                             )

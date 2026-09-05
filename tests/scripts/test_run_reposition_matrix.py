@@ -109,6 +109,59 @@ def test_replay_writes_raw_full_trajectory_and_rolling_plan(tmp_path, monkeypatc
     assert len(list((tmp_path / "result" / "raw").rglob("*.response.bin.gz"))) == 6
 
 
+def test_rolling_replay_requires_retry_transition_and_h2d_metrics(tmp_path, monkeypatch) -> None:
+    async def fake_post(client, *, endpoint, request):
+        del client, endpoint, request
+        response = {
+            "ok": True,
+            "status_code": 200,
+            "headers": [],
+            "client_started_ns": 1,
+            "client_first_byte_ns": 2,
+            "client_finished_ns": 3,
+            "raw_response_text": "{}",
+            "message": {"role": "assistant", "content": "complete answer"},
+            "finish_reason": "stop",
+            "server_metrics": {
+                "request_received_ns": 1,
+                "first_token_generated_ns": 2,
+                "request_finished_ns": 3,
+                "prompt_tokens": 100,
+                "active_prompt_tokens": 20,
+                "generated_tokens": 2,
+                "completion_tokens": 2,
+                "tokenize_invocations": 1,
+                "context_stage_count": 3,
+                "reposition_transition_count": 0,
+                "reposition_h2d_bytes": 0,
+                "reposition_d2h_bytes": 0,
+            },
+            "usage": {"completion_tokens": 2},
+        }
+        return b"{}", response
+
+    monkeypatch.setattr(matrix, "_post_capture", fake_post)
+    records = asyncio.run(
+        matrix.replay_tasks(
+            [_task()],
+            endpoints=["http://server/v1"],
+            mode="rolling",
+            concurrency=1,
+            repetitions=1,
+            output_dir=tmp_path / "result",
+            request_overrides={},
+            request_timeout=10,
+            request_selection="last",
+            require_server_metrics=True,
+        )
+    )
+
+    assert records[0]["audit"]["issues"] == [
+        "system:cold_retry_h2d_missing",
+        "system:cold_retry_transition_missing",
+    ]
+
+
 def test_manifest_requires_exactly_one_endpoint_source(tmp_path: Path) -> None:
     manifest = tmp_path / "manifest.json"
     manifest.write_text(
