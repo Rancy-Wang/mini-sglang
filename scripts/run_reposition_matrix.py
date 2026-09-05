@@ -749,6 +749,7 @@ def audit_request_matrix(matrix_dir: Path) -> dict[str, Any]:
             for response_item in result.get("response_chain", []):
                 index = int(response_item["request_index"]) - 1
                 response = response_item.get("response")
+                parsed_response: dict[str, Any] = {"ok": False}
                 audit = {"issues": ["transport:missing_response"], "inspection": {}}
                 if isinstance(response, dict) and 0 <= index < len(requests):
                     try:
@@ -756,6 +757,10 @@ def audit_request_matrix(matrix_dir: Path) -> dict[str, Any]:
                             response.get("body_text", "").encode("utf-8"),
                             stream=requests[index].get("stream") is True,
                         )
+                        parsed_response = {
+                            "ok": response_item.get("outcome") == "success",
+                            **parsed,
+                        }
                         audit = audit_parsed_response(parsed, request=requests[index])
                     except Exception as exc:
                         audit = {
@@ -768,6 +773,7 @@ def audit_request_matrix(matrix_dir: Path) -> dict[str, Any]:
                         "config_name": result.get("config_name"),
                         "case_id": result.get("case_id"),
                         "request_index": index + 1,
+                        "response": parsed_response,
                         "audit": audit,
                     }
                 )

@@ -163,6 +163,52 @@ def test_summary_keeps_latency_ttft_and_issue_counts() -> None:
     }
 
 
+def test_request_matrix_audit_counts_success_and_generated_tokens(tmp_path: Path) -> None:
+    case_dir = tmp_path / "request-000001"
+    case_dir.mkdir()
+    request = {
+        "messages": [{"role": "user", "content": "task"}],
+        "stream": False,
+    }
+    response_body = {
+        "choices": [
+            {
+                "message": {"role": "assistant", "content": "complete answer"},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {"completion_tokens": 2},
+    }
+    (case_dir / "requests.jsonl").write_text(json.dumps(request) + "\n")
+    (case_dir / "results.jsonl").write_text(
+        json.dumps(
+            {
+                "config_name": "minisgl",
+                "case_id": "request-000001",
+                "response_chain": [
+                    {
+                        "request_index": 1,
+                        "outcome": "success",
+                        "response": {
+                            "status_code": 200,
+                            "body_text": json.dumps(response_body),
+                        },
+                    }
+                ],
+            }
+        )
+        + "\n"
+    )
+
+    report = matrix.audit_request_matrix(tmp_path)
+
+    assert report["summary"]["requests"] == 1
+    assert report["summary"]["successful"] == 1
+    assert report["summary"]["generated_tokens"] == 2
+    assert report["summary"]["issues"] == {}
+    assert report["records"][0]["response"]["ok"] is True
+
+
 def test_cell_replay_forwards_selection_warmup_and_server_lifecycle(tmp_path, monkeypatch) -> None:
     seen: dict = {}
 
