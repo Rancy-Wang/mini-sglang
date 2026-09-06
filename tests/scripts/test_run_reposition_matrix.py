@@ -109,6 +109,55 @@ def test_replay_writes_raw_full_trajectory_and_rolling_plan(tmp_path, monkeypatc
     assert len(list((tmp_path / "result" / "raw").rglob("*.response.bin.gz"))) == 6
 
 
+def test_multi_endpoint_replay_uses_one_shared_task_pool_and_global_concurrency(
+    tmp_path, monkeypatch
+) -> None:
+    active = 0
+    maximum_active = 0
+
+    async def fake_post(client, *, endpoint, request):
+        nonlocal active, maximum_active
+        del client, endpoint, request
+        active += 1
+        maximum_active = max(maximum_active, active)
+        await asyncio.sleep(0.01)
+        active -= 1
+        return b"{}", {
+            "ok": True,
+            "status_code": 200,
+            "headers": [],
+            "client_started_ns": 1,
+            "client_first_byte_ns": 2,
+            "client_finished_ns": 3,
+            "raw_response_text": "{}",
+            "message": {"role": "assistant", "content": "complete answer"},
+            "finish_reason": "stop",
+            "server_metrics": None,
+            "usage": None,
+        }
+
+    monkeypatch.setattr(matrix, "_post_capture", fake_post)
+    tasks = [ReplayTask(case_id=str(index), requests=(_task().requests[-1],)) for index in range(4)]
+
+    records = asyncio.run(
+        matrix.replay_tasks(
+            tasks,
+            endpoints=["http://server-0/v1", "http://server-1/v1"],
+            mode="full",
+            concurrency=2,
+            repetitions=1,
+            output_dir=tmp_path / "result",
+            request_overrides={},
+            request_timeout=10,
+        )
+    )
+
+    assert len(records) == 4
+    assert maximum_active == 2
+    assignment = {record["case_id"]: record["endpoint_index"] for record in records}
+    assert assignment == {"0": 0, "1": 1, "2": 0, "3": 1}
+
+
 def test_rolling_replay_requires_retry_transition_and_h2d_metrics(tmp_path, monkeypatch) -> None:
     async def fake_post(client, *, endpoint, request):
         del client, endpoint, request

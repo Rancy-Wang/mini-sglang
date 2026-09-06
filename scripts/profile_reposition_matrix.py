@@ -10,7 +10,7 @@ import sys
 import threading
 import time
 from collections import defaultdict
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from types import FrameType
 from typing import Any, Iterable, Sequence
@@ -30,15 +30,82 @@ MINISGL_TARGETS = (
     ProfileTarget("tokenize", "minisgl/tokenizer/tokenize.py", "TokenizeManager.tokenize"),
     ProfileTarget("scheduler", "minisgl/scheduler/scheduler.py", "Scheduler._process_one_msg"),
     ProfileTarget("scheduler", "minisgl/scheduler/scheduler.py", "Scheduler._schedule_next_batch"),
+    ProfileTarget("scheduler_idle", "minisgl/scheduler/scheduler.py", "Scheduler.run_when_idle"),
     ProfileTarget("prefill_extend", "minisgl/scheduler/prefill.py", "PrefillAdder.try_add_one"),
+    ProfileTarget(
+        "prefill_extend",
+        "minisgl/scheduler/prefill.py",
+        "PrefillAdder.plan_context_prefill",
+    ),
     ProfileTarget(
         "prefill_extend", "minisgl/engine/engine.py", "Engine.forward_batch", phase="prefill"
     ),
     ProfileTarget("decode", "minisgl/engine/engine.py", "Engine.forward_batch", phase="decode"),
     ProfileTarget("decode", "minisgl/scheduler/decode.py", "DecodeManager.schedule_next_batch"),
     ProfileTarget("radix_match", "minisgl/scheduler/cache.py", "CacheManager.match_req"),
+    ProfileTarget(
+        "radix_match",
+        "minisgl/scheduler/cache.py",
+        "CacheManager._match_and_prune_legacy_holes",
+    ),
+    ProfileTarget("radix_match", "minisgl/scheduler/cache.py", "CacheManager._derive_active_match"),
+    ProfileTarget("radix_match", "minisgl/kvcache/radix_cache.py", "RadixPrefixCache.match_prefix"),
+    ProfileTarget("radix_match", "minisgl/kvcache/radix_cache.py", "RadixPrefixCache._tree_walk"),
+    ProfileTarget(
+        "radix_match", "minisgl/kvcache/radix_cache.py", "RadixTreeNode.find_exact_child"
+    ),
+    ProfileTarget("radix_match", "minisgl/kvcache/radix_cache.py", "RadixTreeNode.get_match_len"),
+    ProfileTarget("radix_compare", "minisgl/kernel/radix.py", "fast_compare_radix_records"),
+    ProfileTarget("radix_compare", "minisgl/kernel/radix.py", "radix_record_edge_hash"),
+    ProfileTarget("radix_compare", "minisgl/kernel/radix.py", "radix_record_edge_equal"),
+    ProfileTarget(
+        "radix_compile",
+        "minisgl/kernel/radix_reposition.py",
+        "compile_radix_reposition_layout",
+    ),
+    ProfileTarget(
+        "radix_compile",
+        "minisgl/kernel/radix_reposition.py",
+        "compile_radix_reposition_layout_batch",
+    ),
     ProfileTarget("free_and_cache", "minisgl/scheduler/cache.py", "CacheManager.cache_req"),
+    ProfileTarget(
+        "free_and_cache",
+        "minisgl/scheduler/cache.py",
+        "CacheManager._cache_finished_delta_req",
+    ),
+    ProfileTarget(
+        "free_and_cache",
+        "minisgl/scheduler/cache.py",
+        "CacheManager._free_finished_candidates",
+    ),
+    ProfileTarget(
+        "radix_insert", "minisgl/kvcache/radix_cache.py", "RadixPrefixCache.insert_prefix"
+    ),
+    ProfileTarget("radix_insert", "minisgl/kvcache/radix_cache.py", "RadixPrefixCache._split_node"),
+    ProfileTarget(
+        "radix_insert",
+        "minisgl/kvcache/radix_cache.py",
+        "RadixPrefixCache._register_ordinary_node",
+    ),
+    ProfileTarget("radix_insert", "minisgl/kvcache/radix_cache.py", "RadixTreeNode.set_key_value"),
+    ProfileTarget("integrity", "minisgl/scheduler/cache.py", "CacheManager.check_integrity"),
+    ProfileTarget(
+        "integrity", "minisgl/kvcache/radix_cache.py", "RadixPrefixCache.check_integrity"
+    ),
+    ProfileTarget(
+        "integrity",
+        "minisgl/kvcache/radix_cache.py",
+        "RadixPrefixCache._check_drop_aware_integrity",
+    ),
+    ProfileTarget("allocation", "minisgl/scheduler/cache.py", "CacheManager._allocate"),
+    ProfileTarget("allocation", "minisgl/scheduler/cache.py", "CacheManager._free"),
     ProfileTarget("evict", "minisgl/kvcache/radix_cache.py", "RadixPrefixCache.evict"),
+    ProfileTarget(
+        "evict",
+        "minisgl/kvcache/radix_cache.py",
+        "RadixPrefixCache._collect_leave_nodes_for_evict",
+    ),
 )
 
 SGLANG_TARGETS = (
@@ -80,19 +147,35 @@ def targets_for_framework(framework: str) -> tuple[ProfileTarget, ...]:
 class EventProfiler:
     """Low-intrusion matched-function timing with optional unsynchronized NVTX ranges."""
 
-    def __init__(self, targets: Sequence[ProfileTarget], output: Path, *, nvtx: bool) -> None:
+    def __init__(
+        self,
+        targets: Sequence[ProfileTarget],
+        output: Path,
+        *,
+        nvtx: bool,
+        sample_limit: int = 4096,
+    ) -> None:
+        if sample_limit < 1:
+            raise ValueError("sample_limit must be positive")
         self.targets = tuple(targets)
         self.output = output
         self.nvtx = nvtx
+        self.sample_limit = sample_limit
         self._local = threading.local()
         self._lock = threading.Lock()
-        self._aggregates: dict[tuple[str, str, str], list[int]] = defaultdict(lambda: [0, 0])
+        self._targets_by_name: dict[str, list[ProfileTarget]] = defaultdict(list)
+        for target in self.targets:
+            self._targets_by_name[target.qualname.rsplit(".", 1)[-1]].append(target)
+        self._aggregates: dict[tuple[str, str, str], _ProfileAggregate] = defaultdict(
+            _ProfileAggregate
+        )
+        self._random = random.Random(17)
         self._nvtx_module: Any | None = None
 
     def _match(self, frame: FrameType) -> ProfileTarget | None:
         filename = frame.f_code.co_filename.replace("\\", "/")
         qualname = getattr(frame.f_code, "co_qualname", frame.f_code.co_name)
-        for target in self.targets:
+        for target in self._targets_by_name.get(frame.f_code.co_name, ()):
             if not filename.endswith(target.filename_suffix) or not qualname.endswith(
                 target.qualname
             ):
@@ -120,9 +203,12 @@ class EventProfiler:
         return self._nvtx_module
 
     def callback(self, frame: FrameType, event: str, _: Any) -> None:
-        stacks = getattr(self._local, "stacks", None)
-        if stacks is None:
-            stacks = self._local.stacks = {}
+        active = getattr(self._local, "active", None)
+        if active is None:
+            active = self._local.active = []
+        frames = getattr(self._local, "frames", None)
+        if frames is None:
+            frames = self._local.frames = {}
         frame_id = id(frame)
         if event == "call":
             target = self._match(frame)
@@ -131,25 +217,37 @@ class EventProfiler:
             nvtx = self._nvtx()
             if nvtx is not None:
                 nvtx.range_push(f"r10:{target.stage}:{target.qualname}")
-            stacks[frame_id] = (target, time.perf_counter_ns(), nvtx is not None)
+            entry = _ActiveCall(frame_id, target, time.perf_counter_ns(), 0, nvtx is not None)
+            active.append(entry)
+            frames[frame_id] = entry
             return
         if event not in {"return", "exception"}:
             return
-        active = stacks.pop(frame_id, None)
-        if active is None:
+        entry = frames.pop(frame_id, None)
+        if entry is None:
             return
-        target, started_ns, pushed = active
-        elapsed_ns = time.perf_counter_ns() - started_ns
-        if pushed:
+        if not active or active[-1] is not entry:
+            return
+        active.pop()
+        elapsed_ns = time.perf_counter_ns() - entry.started_ns
+        self_ns = max(0, elapsed_ns - entry.profiled_child_ns)
+        if active:
+            active[-1].profiled_child_ns += elapsed_ns
+        if entry.nvtx_pushed:
             nvtx = self._nvtx()
             if nvtx is not None:
                 nvtx.range_pop()
+        target = entry.target
         qualname = target.qualname + (f"[{target.phase}]" if target.phase is not None else "")
         key = (target.stage, target.filename_suffix, qualname)
         with self._lock:
             aggregate = self._aggregates[key]
-            aggregate[0] += 1
-            aggregate[1] += elapsed_ns
+            aggregate.add(
+                elapsed_ns,
+                self_ns,
+                sample_limit=self.sample_limit,
+                generator=self._random,
+            )
 
     def install(self) -> None:
         sys.setprofile(self.callback)
@@ -165,8 +263,7 @@ class EventProfiler:
                 "stage": stage,
                 "filename_suffix": filename,
                 "qualname": qualname,
-                "calls": value[0],
-                "total_ns": value[1],
+                **value.to_dict(),
             }
             for (stage, filename, qualname), value in sorted(self._aggregates.items())
         ]
@@ -177,6 +274,59 @@ class EventProfiler:
         with output.open("a", encoding="utf-8", newline="\n") as stream:
             for row in rows:
                 stream.write(json.dumps(row, sort_keys=True) + "\n")
+
+
+@dataclass
+class _ActiveCall:
+    frame_id: int
+    target: ProfileTarget
+    started_ns: int
+    profiled_child_ns: int
+    nvtx_pushed: bool
+
+
+@dataclass
+class _ProfileAggregate:
+    calls: int = 0
+    total_ns: int = 0
+    self_ns: int = 0
+    min_ns: int | None = None
+    max_ns: int = 0
+    samples_ns: list[int] = field(default_factory=list)
+    self_samples_ns: list[int] = field(default_factory=list)
+
+    def add(
+        self,
+        elapsed_ns: int,
+        self_ns: int,
+        *,
+        sample_limit: int,
+        generator: random.Random,
+    ) -> None:
+        self.calls += 1
+        self.total_ns += elapsed_ns
+        self.self_ns += self_ns
+        self.min_ns = elapsed_ns if self.min_ns is None else min(self.min_ns, elapsed_ns)
+        self.max_ns = max(self.max_ns, elapsed_ns)
+        if len(self.samples_ns) < sample_limit:
+            self.samples_ns.append(elapsed_ns)
+            self.self_samples_ns.append(self_ns)
+            return
+        replacement = generator.randrange(self.calls)
+        if replacement < sample_limit:
+            self.samples_ns[replacement] = elapsed_ns
+            self.self_samples_ns[replacement] = self_ns
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "calls": self.calls,
+            "total_ns": self.total_ns,
+            "self_ns": self.self_ns,
+            "min_ns": self.min_ns or 0,
+            "max_ns": self.max_ns,
+            "samples_ns": self.samples_ns,
+            "self_samples_ns": self.self_samples_ns,
+        }
 
 
 _ACTIVE_PROFILER: EventProfiler | None = None
@@ -226,8 +376,47 @@ def create_profile_bootstrap(
     return {PROFILE_CONFIG_ENV: str(config_path.resolve()), "PYTHONPATH": pythonpath}
 
 
+def _percentile(values: Sequence[int], fraction: float) -> int:
+    if not values:
+        return 0
+    ordered = sorted(values)
+    return ordered[round((len(ordered) - 1) * fraction)]
+
+
+def _timing_summary(aggregate: dict[str, Any]) -> dict[str, Any]:
+    calls = int(aggregate["calls"])
+    total_ns = int(aggregate["total_ns"])
+    self_ns = int(aggregate["self_ns"])
+    samples_ns = aggregate["samples_ns"]
+    self_samples_ns = aggregate["self_samples_ns"]
+    return {
+        **aggregate,
+        "total_ms": total_ns / 1_000_000,
+        "self_ms": self_ns / 1_000_000,
+        "mean_ms": total_ns / calls / 1_000_000,
+        "self_mean_ms": self_ns / calls / 1_000_000,
+        "p50_ms": _percentile(samples_ns, 0.5) / 1_000_000,
+        "p95_ms": _percentile(samples_ns, 0.95) / 1_000_000,
+        "self_p50_ms": _percentile(self_samples_ns, 0.5) / 1_000_000,
+        "self_p95_ms": _percentile(self_samples_ns, 0.95) / 1_000_000,
+        "min_ms": int(aggregate["min_ns"]) / 1_000_000,
+        "max_ms": int(aggregate["max_ns"]) / 1_000_000,
+        "sample_count": len(samples_ns),
+    }
+
+
 def summarize_profile(paths: Iterable[Path]) -> dict[str, Any]:
-    stages: dict[str, dict[str, int]] = defaultdict(lambda: {"calls": 0, "total_ns": 0})
+    stages: dict[str, dict[str, Any]] = defaultdict(
+        lambda: {
+            "calls": 0,
+            "total_ns": 0,
+            "self_ns": 0,
+            "min_ns": 0,
+            "max_ns": 0,
+            "samples_ns": [],
+            "self_samples_ns": [],
+        }
+    )
     functions: dict[tuple[str, str, str], dict[str, Any]] = {}
     for path in paths:
         for line in path.read_text(encoding="utf-8").splitlines():
@@ -237,6 +426,13 @@ def summarize_profile(paths: Iterable[Path]) -> dict[str, Any]:
             stage = stages[str(row["stage"])]
             stage["calls"] += int(row["calls"])
             stage["total_ns"] += int(row["total_ns"])
+            stage["self_ns"] += int(row.get("self_ns", row["total_ns"]))
+            row_min = int(row.get("min_ns", 0))
+            if row_min and (not stage["min_ns"] or row_min < stage["min_ns"]):
+                stage["min_ns"] = row_min
+            stage["max_ns"] = max(stage["max_ns"], int(row.get("max_ns", 0)))
+            stage["samples_ns"].extend(int(value) for value in row.get("samples_ns", []))
+            stage["self_samples_ns"].extend(int(value) for value in row.get("self_samples_ns", []))
             key = (str(row["stage"]), str(row["filename_suffix"]), str(row["qualname"]))
             aggregate = functions.setdefault(
                 key,
@@ -246,27 +442,26 @@ def summarize_profile(paths: Iterable[Path]) -> dict[str, Any]:
                     "qualname": key[2],
                     "calls": 0,
                     "total_ns": 0,
+                    "self_ns": 0,
+                    "min_ns": 0,
+                    "max_ns": 0,
+                    "samples_ns": [],
+                    "self_samples_ns": [],
                 },
             )
             aggregate["calls"] += int(row["calls"])
             aggregate["total_ns"] += int(row["total_ns"])
+            aggregate["self_ns"] += int(row.get("self_ns", row["total_ns"]))
+            if row_min and (not aggregate["min_ns"] or row_min < aggregate["min_ns"]):
+                aggregate["min_ns"] = row_min
+            aggregate["max_ns"] = max(aggregate["max_ns"], int(row.get("max_ns", 0)))
+            aggregate["samples_ns"].extend(int(value) for value in row.get("samples_ns", []))
+            aggregate["self_samples_ns"].extend(
+                int(value) for value in row.get("self_samples_ns", [])
+            )
     return {
-        "stages": {
-            key: {
-                **value,
-                "total_ms": value["total_ns"] / 1_000_000,
-                "mean_ms": value["total_ns"] / value["calls"] / 1_000_000,
-            }
-            for key, value in sorted(stages.items())
-        },
-        "functions": [
-            {
-                **value,
-                "total_ms": value["total_ns"] / 1_000_000,
-                "mean_ms": value["total_ns"] / value["calls"] / 1_000_000,
-            }
-            for _, value in sorted(functions.items())
-        ],
+        "stages": {key: _timing_summary(value) for key, value in sorted(stages.items())},
+        "functions": [_timing_summary(value) for _, value in sorted(functions.items())],
     }
 
 

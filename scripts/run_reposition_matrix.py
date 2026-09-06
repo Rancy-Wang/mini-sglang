@@ -391,7 +391,7 @@ async def replay_tasks(
     if request_selection not in {"all", "last"}:
         raise ValueError("request_selection must be all or last")
     output_dir.mkdir(parents=True, exist_ok=True)
-    semaphores = [asyncio.Semaphore(concurrency) for _ in endpoints]
+    semaphore = asyncio.Semaphore(concurrency)
     records: list[dict[str, Any]] = []
     records_lock = asyncio.Lock()
 
@@ -411,9 +411,9 @@ async def replay_tasks(
                     None,
                 )
                 if first_text is not None:
-                    first_text["content"] += (
-                        "\n[R10 isolated warmup; do not reuse as benchmark input]"
-                    )
+                    first_text[
+                        "content"
+                    ] += "\n[R10 isolated warmup; do not reuse as benchmark input]"
                 raw, response = await _post_capture(client, endpoint=endpoint, request=request)
                 stem = f"endpoint-{endpoint_index:02d}"
                 _write_gzip_json(output_dir / "warmup" / f"{stem}.request.json.gz", request)
@@ -422,7 +422,7 @@ async def replay_tasks(
             append_gzip_jsonl(output_dir / "warmup" / "result.jsonl.gz", warmups)
 
         async def run_task(endpoint_index: int, repetition: int, task: ReplayTask) -> None:
-            async with semaphores[endpoint_index]:
+            async with semaphore:
                 indexed_requests = list(enumerate(task.requests))
                 if request_selection == "last":
                     indexed_requests = indexed_requests[-1:]
@@ -478,10 +478,9 @@ async def replay_tasks(
 
         await asyncio.gather(
             *(
-                run_task(endpoint_index, repetition, task)
-                for endpoint_index in range(len(endpoints))
+                run_task(task_index % len(endpoints), repetition, task)
                 for repetition in range(repetition_start, repetition_start + repetitions)
-                for task in tasks
+                for task_index, task in enumerate(tasks)
             )
         )
 
@@ -746,12 +745,13 @@ def _run_profile_cell(
                 )
             )
             endpoints.append(config.endpoint_url)
+        profiled_tasks = tasks[: max(len(endpoints), cell.concurrency)]
         records = asyncio.run(
             replay_tasks(
-                tasks[:1],
+                profiled_tasks,
                 endpoints=endpoints,
                 mode=cell.mode,
-                concurrency=1,
+                concurrency=cell.concurrency,
                 repetitions=1,
                 output_dir=output_dir / "replay",
                 request_overrides=cell.request_overrides,
