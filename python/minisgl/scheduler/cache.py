@@ -45,21 +45,12 @@ class CacheManager:
         page_size: int,
         page_table: torch.Tensor,
         type: str,
-        *,
-        drop_aware_eviction: bool = False,
     ):
         # The `_free_slots` follows a page-aligned manner. For example, if page_size = 2,
         # the `_free_slots` may look like [0, 2, 4, 6, ...], and each slot represents a page.
         device = page_table.device
         self.free_slots = torch.arange(num_pages, dtype=torch.int32, device=device) * page_size
         self.prefix_cache = create_prefix_cache(device=device, type=type)
-        self.drop_aware_eviction = drop_aware_eviction
-        if drop_aware_eviction:
-            from minisgl.kvcache.radix_cache import RadixPrefixCache
-
-            if not isinstance(self.prefix_cache, RadixPrefixCache):
-                raise ValueError("Drop-aware eviction requires the Radix prefix cache.")
-            self.prefix_cache.enable_drop_aware_eviction()
         self.device = device
         self.num_pages = num_pages
         self.page_table = page_table
@@ -70,11 +61,11 @@ class CacheManager:
             return torch.empty(0, dtype=torch.int32, device=self.device)
         return handle.get_matched_indices()
 
-    def _match_and_prune_legacy_holes(
+    def _match_prefix(
         self,
         radix_query: torch.Tensor,
         virtual_mask: torch.Tensor | None = None,
-    ) -> tuple[BaseCacheHandle, torch.Tensor, torch.Tensor] | None:
+    ) -> tuple[BaseCacheHandle, torch.Tensor, torch.Tensor]:
         result = self.prefix_cache.match_prefix(radix_query, virtual_mask)
         handle = result.cuda_handle
         indices = self._matched_indices(handle)
@@ -83,40 +74,6 @@ class CacheManager:
             if handle.cached_len > 0
             else torch.empty(0, dtype=torch.bool, device="cpu")
         )
-        value_virtual_mask = matched_virtual_mask.to(device=indices.device, non_blocking=True)
-        holes = torch.nonzero((indices < 0) & (~value_virtual_mask), as_tuple=False).view(-1)
-        if len(holes) == 0:
-            return handle, indices, matched_virtual_mask
-
-        if self.drop_aware_eviction:
-            return handle, indices, matched_virtual_mask
-
-        from minisgl.kvcache.radix_cache import RadixPrefixCache
-
-        if not isinstance(self.prefix_cache, RadixPrefixCache):
-            raise RuntimeError("A non-Radix prefix cache returned a negative page slot.")
-        valid_prefix_len = int(holes[0].item())
-        released = self.prefix_cache.prune_suffix(radix_query, valid_prefix_len, virtual_mask)
-        if released is None:
-            return None
-        self._free(released)
-
-        result = self.prefix_cache.match_prefix(radix_query, virtual_mask)
-        handle = result.cuda_handle
-        indices = self._matched_indices(handle)
-        matched_virtual_mask = (
-            handle.get_matched_virtual_mask()
-            if handle.cached_len > 0
-            else torch.empty(0, dtype=torch.bool, device="cpu")
-        )
-        value_virtual_mask = matched_virtual_mask.to(device=indices.device, non_blocking=True)
-        if handle.cached_len != valid_prefix_len or bool(
-            torch.any((indices < 0) & (~value_virtual_mask)).item()
-        ):
-            raise RuntimeError(
-                "Radix legacy-hole pruning did not leave the expected safe prefix:"
-                f" expected={valid_prefix_len}, actual={handle.cached_len}"
-            )
         return handle, indices, matched_virtual_mask
 
     @staticmethod
@@ -155,9 +112,7 @@ class CacheManager:
     def match_req(self, req: PendingReq) -> ContextMatchResult | None:
         assert req.input_len > 0, "Input length must be greater than 0."
         radix_query, query_virtual_mask = self._radix_query_prefix(req)
-        matched = self._match_and_prune_legacy_holes(radix_query, query_virtual_mask)
-        if matched is None:
-            return None
+        matched = self._match_prefix(radix_query, query_virtual_mask)
         handle, key_match_indices, matched_virtual_mask = matched
         used_retry = False
         if req.radix_match_ids is not None and req.radix_match_ids.ndim == 2:
@@ -179,12 +134,10 @@ class CacheManager:
             if retry_handle.cached_len > handle.cached_len:
                 retry_indices = self._matched_indices(retry_handle)[: retry_handle.cached_len]
                 retry_virtual = retry_handle.get_matched_virtual_mask()[: retry_handle.cached_len]
-                value_virtual = retry_virtual.to(device=retry_indices.device, non_blocking=True)
-                if not bool(torch.any((retry_indices < 0) & (~value_virtual)).item()):
-                    handle = retry_handle
-                    key_match_indices = retry_indices
-                    matched_virtual_mask = retry_virtual
-                    used_retry = True
+                handle = retry_handle
+                key_match_indices = retry_indices
+                matched_virtual_mask = retry_virtual
+                used_retry = True
         full_match_indices = key_match_indices[
             (~matched_virtual_mask).to(device=key_match_indices.device, non_blocking=True)
         ]
@@ -247,29 +200,8 @@ class CacheManager:
                 dtype=torch.bool,
                 non_blocking=True,
             )
-            if self.drop_aware_eviction:
-                kept_indices = full_match_indices[keep_mask]
-                kept_holes = torch.nonzero(kept_indices < 0, as_tuple=False).view(-1)
-                active_cached_len = (
-                    int(kept_holes[0].item()) if len(kept_holes) > 0 else len(kept_indices)
-                )
-                active_match_indices = kept_indices[:active_cached_len]
-                active_full_positions = torch.nonzero(keep_mask_cpu, as_tuple=False).view(-1)[
-                    :active_cached_len
-                ]
-            else:
-                active_match_indices = full_match_indices[keep_mask]
-                active_full_positions = torch.nonzero(keep_mask_cpu, as_tuple=False).view(-1)
-        elif self.drop_aware_eviction and len(full_match_indices) > 0:
-            holes = torch.nonzero(full_match_indices < 0, as_tuple=False).view(-1)
-            active_cached_len = int(holes[0].item()) if len(holes) > 0 else len(full_match_indices)
-            active_match_indices = full_match_indices[:active_cached_len]
-            active_full_positions = active_full_positions[:active_cached_len]
-        if self.drop_aware_eviction:
-            from minisgl.kvcache.radix_cache import RadixPrefixCache
-
-            assert isinstance(self.prefix_cache, RadixPrefixCache)
-            handle = self.prefix_cache.with_pinned_slots(handle, active_match_indices)
+            active_match_indices = full_match_indices[keep_mask]
+            active_full_positions = torch.nonzero(keep_mask_cpu, as_tuple=False).view(-1)
         return ContextMatchResult(
             handle=handle,
             full_match_indices=full_match_indices,
@@ -309,28 +241,17 @@ class CacheManager:
     def match_full_req(self, req: PendingReq) -> FullMatchResult | None:
         assert req.input_len > 0, "Input length must be greater than 0."
         radix_query, query_virtual_mask = self._radix_query_prefix(req)
-        matched = self._match_and_prune_legacy_holes(radix_query, query_virtual_mask)
-        if matched is None:
-            return None
+        matched = self._match_prefix(radix_query, query_virtual_mask)
         handle, key_match_indices, matched_virtual_mask = matched
         full_match_indices = key_match_indices[
             (~matched_virtual_mask).to(device=key_match_indices.device, non_blocking=True)
         ]
-        safe_match_indices = full_match_indices
-        if self.drop_aware_eviction and len(full_match_indices) > 0:
-            holes = torch.nonzero(full_match_indices < 0, as_tuple=False).view(-1)
-            safe_len = int(holes[0].item()) if len(holes) > 0 else len(full_match_indices)
-            safe_match_indices = full_match_indices[:safe_len]
-            from minisgl.kvcache.radix_cache import RadixPrefixCache
-
-            assert isinstance(self.prefix_cache, RadixPrefixCache)
-            handle = self.prefix_cache.with_pinned_slots(handle, safe_match_indices)
         return FullMatchResult(
             handle=handle,
             full_match_indices=full_match_indices,
             full_cached_len=len(full_match_indices),
-            safe_match_indices=safe_match_indices,
-            safe_cached_len=len(safe_match_indices),
+            safe_match_indices=full_match_indices,
+            safe_cached_len=len(full_match_indices),
         )
 
     @property
@@ -357,13 +278,6 @@ class CacheManager:
             _write_page_table(self.page_table, allocated, allocation_info, self.page_size)
 
     def cache_req(self, req: Req, *, finished: bool) -> None:
-        if self.drop_aware_eviction:
-            if req.radix_key_virtual_mask is not None:
-                if finished:
-                    self._cache_finished_drop_aware_delta_req(req)
-                return
-            self._cache_drop_aware_linear_req(req, finished=finished)
-            return
         if req.radix_key_virtual_mask is not None:
             if not finished:
                 return
@@ -381,169 +295,6 @@ class CacheManager:
             self._cache_finished_sparse_req(req)
             return
         self._cache_linear_req(req, finished=finished)
-
-    def _cache_finished_drop_aware_delta_req(self, req: Req) -> None:
-        from minisgl.kvcache.radix_cache import RadixPrefixCache
-
-        if self.page_size != 1:
-            raise RuntimeError("Drop-aware delta commit requires page_size=1.")
-        if not isinstance(self.prefix_cache, RadixPrefixCache):
-            raise RuntimeError("Drop-aware delta commit requires the Radix prefix cache.")
-        assert req.radix_key_virtual_mask is not None
-        assert req.radix_key_to_token is not None
-        assert req.radix_token_to_key is not None
-
-        old_handle = req.cache_handle
-        all_active_indices = self.page_table[req.table_idx, : req.cached_len]
-        all_active_positions = req.raw_positions[: req.cached_len].to(
-            dtype=torch.int64, device="cpu"
-        )
-        key_prefix_len = self._delta_key_prefix_len(req)
-        try:
-            key_virtual_mask = req.radix_key_virtual_mask[:key_prefix_len]
-            key_to_token = req.radix_key_to_token[:key_prefix_len]
-            full_token_prefix_len = int(torch.count_nonzero(~key_virtual_mask).item())
-            within_prefix = all_active_positions < full_token_prefix_len
-            active_indices = all_active_indices[
-                within_prefix.to(
-                    device=all_active_indices.device,
-                    dtype=torch.bool,
-                    non_blocking=True,
-                )
-            ]
-            active_positions = all_active_positions[within_prefix]
-            excluded_indices = all_active_indices[
-                (~within_prefix).to(
-                    device=all_active_indices.device,
-                    dtype=torch.bool,
-                    non_blocking=True,
-                )
-            ]
-            if req.initial_active_cached_len > len(active_indices):
-                raise RuntimeError("Initial active cache prefix exceeds the commit boundary.")
-
-            full_indices = torch.full(
-                (full_token_prefix_len,),
-                -1,
-                dtype=torch.int32,
-                device=active_indices.device,
-            )
-            initial_full_len = min(len(req.initial_full_match_indices), full_token_prefix_len)
-            if initial_full_len > 0:
-                full_indices[:initial_full_len] = req.initial_full_match_indices[:initial_full_len]
-
-            active_positions_device = active_positions.to(
-                device=active_indices.device, non_blocking=True
-            )
-            active_slots = torch.arange(
-                len(active_indices), dtype=torch.int64, device=active_indices.device
-            )
-            initially_matched = active_slots < req.initial_active_cached_len
-            if bool(torch.any(initially_matched).item()):
-                matched_positions = active_positions_device[initially_matched]
-                previous = full_indices[matched_positions]
-                current = active_indices[initially_matched]
-                if bool(torch.any(previous < 0).item()) or not torch.equal(previous, current):
-                    raise RuntimeError("Matched Drop-aware tokens use different KV slots.")
-            newly_computed = ~initially_matched
-            if bool(torch.any(newly_computed).item()):
-                computed_positions = active_positions_device[newly_computed]
-                computed_indices = active_indices[newly_computed]
-                missing = full_indices[computed_positions] < 0
-                full_indices[computed_positions[missing]] = computed_indices[missing]
-
-            keep_mask = torch.ones(full_token_prefix_len, dtype=torch.bool, device="cpu")
-            if req.full_keep_mask is not None:
-                # Context metadata describes the original prompt only. Decode
-                # appends generated tokens to the Radix/token axes, and those
-                # positions are always visible for the finished request.
-                keep_len = min(len(req.full_keep_mask), full_token_prefix_len)
-                keep_mask[:keep_len] = req.full_keep_mask[:keep_len] != 0
-            else:
-                if req.prefix_keep_mask is not None:
-                    keep_len = min(len(req.prefix_keep_mask), full_token_prefix_len)
-                    keep_mask[:keep_len] = req.prefix_keep_mask[:keep_len] != 0
-            kept_device = keep_mask.to(device=full_indices.device, non_blocking=True)
-            # Dropped slots are deliberately not pinned and may have been evicted
-            # and reassigned after the initial structural match. Never reuse that
-            # stale snapshot during the finished commit. Existing resident nodes
-            # remain canonical inside commit_drop_prefix; holes stay holes.
-            full_indices[~kept_device] = -1
-            missing_kept = torch.nonzero(kept_device & (full_indices < 0), as_tuple=False).view(-1)
-            if len(missing_kept) > 0:
-                raise RuntimeError(
-                    "Kept Drop-aware tokens are missing KV slots at commit: "
-                    f"{missing_kept[:16].tolist()}"
-                )
-
-            key_indices = torch.full(
-                (key_prefix_len,), -1, dtype=torch.int32, device=active_indices.device
-            )
-            real_key_mask = ~key_virtual_mask
-            real_token_positions = key_to_token[real_key_mask]
-            key_indices[real_key_mask.to(device=active_indices.device)] = full_indices[
-                real_token_positions.to(device=active_indices.device)
-            ]
-            result = self.prefix_cache.commit_drop_prefix(
-                req.radix_match_ids[:key_prefix_len],
-                key_indices,
-                key_virtual_mask,
-                key_to_token,
-                keep_mask,
-            )
-
-            newly_allocated = active_slots >= req.initial_active_cached_len
-            active_key_positions = req.radix_token_to_key[active_positions]
-            canonical_active = result.canonical_indices[
-                active_key_positions.to(device=active_indices.device)
-            ]
-            adopted = canonical_active == active_indices
-            self._free(
-                torch.cat(
-                    [
-                        active_indices[newly_allocated & (~adopted)],
-                        excluded_indices,
-                    ]
-                )
-            )
-        finally:
-            self.unlock(old_handle)
-
-    def _cache_drop_aware_linear_req(self, req: Req, *, finished: bool) -> None:
-        from minisgl.kvcache.radix_cache import RadixPrefixCache
-
-        if not isinstance(self.prefix_cache, RadixPrefixCache):
-            raise RuntimeError("Drop-aware linear commit requires the Radix prefix cache.")
-        if self.page_size != 1:
-            raise RuntimeError("Drop-aware linear commit requires page_size=1.")
-        old_handle = req.cache_handle
-        candidates = self.page_table[req.table_idx, : req.cached_len].clone()
-        input_ids = req.radix_input_ids[: req.cached_len]
-        virtual_mask = torch.zeros(len(input_ids), dtype=torch.bool, device="cpu")
-        key_to_token = torch.arange(len(input_ids), dtype=torch.int64, device="cpu")
-        keep_mask = torch.ones(len(input_ids), dtype=torch.bool, device="cpu")
-        try:
-            result = self.prefix_cache.commit_drop_prefix(
-                input_ids,
-                candidates,
-                virtual_mask,
-                key_to_token,
-                keep_mask,
-            )
-            canonical = result.canonical_indices
-            slots = torch.arange(len(candidates), dtype=torch.int64, device=candidates.device)
-            newly_allocated = slots >= req.initial_active_cached_len
-            duplicates = newly_allocated & (canonical != candidates)
-            self.page_table[req.table_idx, : req.cached_len].copy_(canonical)
-            self.unlock(old_handle)
-            self._free(candidates[duplicates])
-            if not finished:
-                new_handle = self.prefix_cache.with_pinned_slots(result.handle, canonical)
-                req.cache_handle = new_handle
-                self.lock(new_handle)
-        except Exception:
-            # The old handle remains the request's lease unless commit reached the explicit unlock.
-            raise
 
     @staticmethod
     def _delta_key_prefix_len(req: Req) -> int:
@@ -897,28 +648,6 @@ class CacheManager:
                 f" free_pages({len(self.free_slots)}) +"
                 f" cache_pages({cache_pages}) != num_pages({self.num_pages})"
             )
-        if self.drop_aware_eviction:
-            from minisgl.kvcache.radix_cache import RadixPrefixCache
-
-            assert isinstance(self.prefix_cache, RadixPrefixCache)
-            free_slots = [int(slot) for slot in self.free_slots.tolist()]
-            free_set = set(free_slots)
-            if len(free_set) != len(free_slots):
-                raise RuntimeError("Drop-aware CacheManager contains duplicate free KV slots.")
-            resident = set(self.prefix_cache.resident_slots)
-            overlap = free_set & resident
-            if overlap:
-                raise RuntimeError(
-                    f"Drop-aware free/resident KV slot overlap: {sorted(overlap)[:16]}"
-                )
-            expected = set(range(self.num_pages))
-            if free_set | resident != expected:
-                missing = expected - free_set - resident
-                unexpected = (free_set | resident) - expected
-                raise RuntimeError(
-                    "Drop-aware KV slot partition is incomplete: "
-                    f"missing={sorted(missing)[:16]}, unexpected={sorted(unexpected)[:16]}"
-                )
         if self.page_size > 1:
             assert torch.all(self.free_slots % self.page_size == 0)
 

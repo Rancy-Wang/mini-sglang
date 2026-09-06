@@ -19,7 +19,6 @@ class SchedulerConfig(EngineConfig):
     radix_drop_key_mode: Literal["bitmask", "symbol", "delta-marker"] = "delta-marker"
     contextual_prefill_mode: Literal["staged", "mask"] = "mask"
     mask_free_context_prefill: bool = True
-    drop_aware_eviction: bool = False
     offline_mode: bool = False
 
     # networking config
