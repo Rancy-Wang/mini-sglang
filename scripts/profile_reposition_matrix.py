@@ -93,11 +93,6 @@ MINISGL_TARGETS = (
     ProfileTarget(
         "integrity", "minisgl/kvcache/radix_cache.py", "RadixPrefixCache.check_integrity"
     ),
-    ProfileTarget(
-        "integrity",
-        "minisgl/kvcache/radix_cache.py",
-        "RadixPrefixCache._check_drop_aware_integrity",
-    ),
     ProfileTarget("allocation", "minisgl/scheduler/cache.py", "CacheManager._allocate"),
     ProfileTarget("allocation", "minisgl/scheduler/cache.py", "CacheManager._free"),
     ProfileTarget("evict", "minisgl/kvcache/radix_cache.py", "RadixPrefixCache.evict"),

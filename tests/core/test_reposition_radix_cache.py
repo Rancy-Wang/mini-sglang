@@ -115,6 +115,17 @@ def test_structured_exact_index_survives_edge_split() -> None:
     cache.check_integrity()
 
 
+def test_radix_integrity_check_does_not_traverse_the_tree() -> None:
+    class NoTraversalDict(dict):
+        def values(self):
+            raise AssertionError("Radix integrity check traversed the full tree")
+
+    cache = _cache()
+    cache.root_node.children = NoTraversalDict(cache.root_node.children)
+
+    cache.check_integrity()
+
+
 def test_multi_range_delta_edge_uses_the_complete_block_for_child_lookup() -> None:
     cache = _cache()
     first = _records(

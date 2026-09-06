@@ -55,14 +55,6 @@ ForwardData: TypeAlias = "Tuple[ForwardInput, ForwardOutput]"
 
 class Scheduler(SchedulerIOMixin):
     def __init__(self, config: SchedulerConfig):
-        if config.drop_aware_eviction and config.cache_type != "radix":
-            raise ValueError("--enable-drop-aware-eviction requires --cache-type radix.")
-        if config.drop_aware_eviction and config.radix_drop_key_mode != "delta-marker":
-            raise ValueError(
-                "--enable-drop-aware-eviction requires --radix-drop-key-mode delta-marker."
-            )
-        if config.drop_aware_eviction and config.page_size != 1:
-            raise ValueError("--enable-drop-aware-eviction requires --page-size 1.")
         if config.radix_drop_key_mode == "delta-marker" and config.page_size != 1:
             raise ValueError("Delta-marker Radix mode requires --page-size 1.")
         if config.radix_drop_key_mode == "delta-marker" and "trtllm" in config.attention_backend:
@@ -103,7 +95,6 @@ class Scheduler(SchedulerIOMixin):
             config.page_size,
             self.engine.page_table,
             config.cache_type,
-            drop_aware_eviction=config.drop_aware_eviction,
         )
         self.decode_manager = DecodeManager(config.page_size)
         rotary_config = config.model_config.rotary_config
@@ -401,11 +392,6 @@ class Scheduler(SchedulerIOMixin):
             try:
                 if self.radix_drop_key_mode != "delta-marker":
                     raise ValueError("Reposition requires --radix-drop-key-mode delta-marker.")
-                if self.cache_manager.drop_aware_eviction:
-                    raise ValueError(
-                        "Reposition currently supports ordinary Radix eviction only; "
-                        "disable Drop-aware eviction."
-                    )
                 if msg.uid in self.context_sequence_uids:
                     raise ValueError(f"Duplicate Reposition sequence UID: {msg.uid}")
                 self.context_sequence_uids.add(msg.uid)

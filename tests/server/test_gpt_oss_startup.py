@@ -6,7 +6,6 @@ import torch
 from minisgl.distributed import DistributedInfo
 from minisgl.engine.engine import _validate_runtime_config
 from minisgl.models.config import ModelConfig
-from minisgl.scheduler.scheduler import Scheduler
 from minisgl.server.args import parse_args
 
 
@@ -62,36 +61,12 @@ def test_exact_tp4_cli_resolves_gpt_oss_dtype_before_engine_startup():
     assert args.tp_info == DistributedInfo(0, 4)
     assert args.server_port == 8000
     assert args.attention_backend == "fi"
-    assert not args.drop_aware_eviction
+    assert not hasattr(args, "drop_aware_eviction")
 
 
-def test_drop_aware_eviction_is_explicit_and_default_remains_disabled():
-    hf_config = _gpt_oss_120b_hf_config()
-    with patch("minisgl.utils.cached_load_hf_config", return_value=hf_config):
-        default_args, _ = parse_args(["--model", "unused"])
-        enabled_args, _ = parse_args(
-            ["--model", "unused", "--enable-drop-aware-eviction"]
-        )
-
-    assert not default_args.drop_aware_eviction
-    assert enabled_args.drop_aware_eviction
-
-
-def test_drop_aware_eviction_rejects_incompatible_cache_key_mode_and_page_size():
-    common = {
-        "drop_aware_eviction": True,
-        "cache_type": "radix",
-        "radix_drop_key_mode": "delta-marker",
-        "page_size": 1,
-    }
-    invalid = [
-        ({**common, "cache_type": "chunk"}, "requires --cache-type radix"),
-        ({**common, "radix_drop_key_mode": "symbol"}, "requires --radix-drop-key-mode"),
-        ({**common, "page_size": 8}, "requires --page-size 1"),
-    ]
-    for values, message in invalid:
-        with pytest.raises(ValueError, match=message):
-            Scheduler(SimpleNamespace(**values))
+def test_removed_drop_aware_eviction_flag_is_rejected():
+    with pytest.raises(SystemExit):
+        parse_args(["--model", "unused", "--enable-drop-aware-eviction"])
 
 
 def test_gpt_oss_120b_tp4_passes_capability_validation():

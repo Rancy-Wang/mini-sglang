@@ -39,8 +39,13 @@ def _pending_req() -> PendingReq:
         prefix_keep_mask=keep_mask[:-1],
         full_input_ids=full_ids,
         full_token_visible_until=torch.tensor(
-            [torch.iinfo(torch.int32).max, 4, 4, torch.iinfo(torch.int32).max,
-             torch.iinfo(torch.int32).max],
+            [
+                torch.iinfo(torch.int32).max,
+                4,
+                4,
+                torch.iinfo(torch.int32).max,
+                torch.iinfo(torch.int32).max,
+            ],
             dtype=torch.int32,
         ),
         full_keep_mask=keep_mask,
@@ -68,51 +73,52 @@ def test_mask_free_context_accepts_drop_before_first_uncached_active_token() -> 
 def test_mask_free_context_rejects_token_that_still_needs_dropped_context() -> None:
     req = _pending_req()
 
-    assert _mask_free_context_reason(
-        req,
-        active_cached_len=1,
-        has_sliding_window=False,
-    ) == "visibility_changes_within_extend"
+    assert (
+        _mask_free_context_reason(
+            req,
+            active_cached_len=1,
+            has_sliding_window=False,
+        )
+        == "visibility_changes_within_extend"
+    )
 
 
 def test_mask_free_context_rejects_sliding_window_models() -> None:
     req = _pending_req()
 
-    assert _mask_free_context_reason(
-        req,
-        active_cached_len=2,
-        has_sliding_window=True,
-    ) == "sliding_window_requires_absolute_key_selection"
+    assert (
+        _mask_free_context_reason(
+            req,
+            active_cached_len=2,
+            has_sliding_window=True,
+        )
+        == "sliding_window_requires_absolute_key_selection"
+    )
 
 
-def test_drop_aware_full_match_derives_active_pages_across_dropped_holes() -> None:
+def test_full_match_derives_drop_skipped_active_pages_without_cache_holes() -> None:
     core.set_global_ctx(core.Context(page_size=1))
     cache_manager = CacheManager(
         num_pages=32,
         page_size=1,
         page_table=torch.full((2, 32), -1, dtype=torch.int32),
         type="radix",
-        drop_aware_eviction=True,
     )
-    handle = cache_manager.prefix_cache.match_prefix(
-        torch.empty(0, dtype=torch.int64)
-    ).cuda_handle
+    handle = cache_manager.prefix_cache.match_prefix(torch.empty(0, dtype=torch.int64)).cuda_handle
     full_match = FullMatchResult(
         handle=handle,
-        full_match_indices=torch.tensor([20, -1, -1, 23], dtype=torch.int32),
+        full_match_indices=torch.tensor([20, 21, 22, 23], dtype=torch.int32),
         full_cached_len=4,
-        safe_match_indices=torch.tensor([20], dtype=torch.int32),
-        safe_cached_len=1,
+        safe_match_indices=torch.tensor([20, 21, 22, 23], dtype=torch.int32),
+        safe_cached_len=4,
     )
-    req = SimpleNamespace(
-        prefix_keep_mask=torch.tensor([1, 0, 0, 1], dtype=torch.int32)
-    )
+    req = SimpleNamespace(prefix_keep_mask=torch.tensor([1, 0, 0, 1], dtype=torch.int32))
 
     active = cache_manager.derive_active_match(req, full_match)
 
     assert active.active_cached_len == 2
     assert active.active_match_indices.tolist() == [20, 23]
-    assert active.handle.pinned_slots == (20, 23)
+    assert not hasattr(active.handle, "pinned_slots")
 
 
 class _PlanCache:
@@ -133,9 +139,7 @@ class _PlanCache:
             active_match_indices=active_indices,
             active_cached_len=active_cached_len,
             initial_active_cached_len=active_cached_len,
-            active_full_positions=torch.tensor([0, 3], dtype=torch.int64)[
-                :active_cached_len
-            ],
+            active_full_positions=torch.tensor([0, 3], dtype=torch.int64)[:active_cached_len],
         )
 
     def match_full_req(self, req):
@@ -277,9 +281,7 @@ def test_two_eligible_context_warmups_batch_as_ordinary_extend(monkeypatch) -> N
 
 
 def _exact_attention_req(*, full_len: int, cached_len: int, drop_at: int):
-    visible_until = torch.full(
-        (full_len,), torch.iinfo(torch.int32).max, dtype=torch.int32
-    )
+    visible_until = torch.full((full_len,), torch.iinfo(torch.int32).max, dtype=torch.int32)
     visible_until[:25] = drop_at
     return SimpleNamespace(
         table_idx=0,
