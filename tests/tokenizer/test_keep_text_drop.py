@@ -85,8 +85,7 @@ def test_partial_keep_preserves_template_and_boundary_crossing_tokens() -> None:
         keep_spans=((6, 12),),  # "assist" cuts through the token " assistant".
     )
     manager = TokenizeManager(_FakeTokenizer())
-    events = manager._compile_rule_position_events(
-        rule,
+    context = manager._drop_compile_context(
         raw_messages=list(rule.full_messages),
         owner_ranges={0: [(0, 4)], 1: [(4, 5)]},
         provenance=provenance,
@@ -94,7 +93,13 @@ def test_partial_keep_preserves_template_and_boundary_crossing_tokens() -> None:
         owners=provenance.owners,
         target_offset=0,
         normalized_message_count=1,
+        compile_events=lambda events: manager._build_position_range_drop_plan(
+            events,
+            manager._query_epochs_from_owners(provenance.owners, 1),
+            1,
+        ),
     )
+    events = rule.position_events(context)
 
     # Only the complete non-selected content token "alpha" is dropped.  [U], [/U],
     # the generation prompt, and the boundary-crossing " assistant" token remain.
@@ -118,8 +123,7 @@ def test_unselected_message_drops_its_template_tokens_too() -> None:
         keep_spans=(None, (0, 0)),
     )
     manager = TokenizeManager(_FakeTokenizer())
-    events = manager._compile_rule_position_events(
-        rule,
+    context = manager._drop_compile_context(
         raw_messages=list(rule.full_messages),
         owner_ranges={0: [(0, 2)], 1: [(2, 3)], 2: [(3, 4)]},
         provenance=provenance,
@@ -127,5 +131,11 @@ def test_unselected_message_drops_its_template_tokens_too() -> None:
         owners=provenance.owners,
         target_offset=0,
         normalized_message_count=2,
+        compile_events=lambda events: manager._build_position_range_drop_plan(
+            events,
+            manager._query_epochs_from_owners(provenance.owners, 2),
+            2,
+        ),
     )
+    events = rule.position_events(context)
     assert events == {1: [(0, 2)]}

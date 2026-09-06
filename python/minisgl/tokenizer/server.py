@@ -84,7 +84,6 @@ def _build_user_msg(msg: TokenizeMsg, t: Any) -> UserMsg:
         drop_range_offsets=t.drop_range_offsets,
         drop_position_ranges=t.drop_position_ranges,
         drop_effective_event_count=t.drop_effective_event_count,
-        radix_commit_token_len=t.radix_commit_token_len,
         radix_commit_key_len=t.radix_commit_key_len,
         enable_thinking=msg.enable_thinking,
         stop=msg.stop,

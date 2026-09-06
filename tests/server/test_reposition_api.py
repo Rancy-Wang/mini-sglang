@@ -86,15 +86,16 @@ def test_empty_reposition_preserves_ordinary_mode_compatibility() -> None:
 
 
 def test_tokenizer_treats_empty_reposition_as_ordinary_with_warning(caplog) -> None:
-    manager = TokenizeManager(SimpleNamespace(name_or_path="fake"))
+    manager = TokenizeManager(SimpleNamespace(name_or_path="fake", is_fast=True))
     manager._build_template_messages = lambda messages, safe_mode: (messages, 0)
-    manager._round_by_round_no_gen = lambda messages, enable_thinking, tools: (
-        [10, 11],
-        [0, 0],
-        [0, 0],
-        0,
+    manager._build_template_provenance = lambda *args, **kwargs: TemplateTokenProvenance(
+        input_ids=[10, 11, 12],
+        owners=[0, 0, 1],
+        offsets=[(0, 1), (1, 2), (2, 3)],
+        rendered_text="abc",
+        char_owners=[0, 0, 1],
+        cross_owner_tokens=0,
     )
-    manager._apply_chat_template = lambda *args, **kwargs: [10, 11, 12]
 
     def tokenize(reposition, **kwargs):
         return manager._chat_tokenize(

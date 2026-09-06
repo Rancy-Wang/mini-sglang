@@ -370,3 +370,47 @@ def test_template_tools_follow_sglang_wrapper_then_flat_fallback() -> None:
     ) == [1, 2]
     assert tokenizer.tool_shapes == ["wrapper", "bare"]
     assert manager._effective_template_tools(TOOLS) == [TOOLS[0]["function"]]
+
+
+def test_template_provenance_preserves_wrapper_then_flat_fallback() -> None:
+    class _BareOnlyFastTokenizer:
+        name_or_path = "Qwen3"
+        is_fast = True
+        special_tokens_map: dict[str, str] = {}
+
+        def __init__(self) -> None:
+            self.tool_shapes = []
+            self.encode_calls = 0
+
+        def get_chat_template(self, *, tools=None):
+            self.tool_shapes.append("wrapper" if "function" in tools[0] else "bare")
+            if self.tool_shapes[-1] == "wrapper":
+                raise ValueError("bare tools required")
+            return (
+                "{% for message in messages %}{{ message['content'] }}{% endfor %}"
+                "{% if add_generation_prompt %}{{ '<assistant>' }}{% endif %}"
+            )
+
+        def __call__(self, text, *, add_special_tokens, return_offsets_mapping):
+            assert not add_special_tokens
+            assert return_offsets_mapping
+            self.encode_calls += 1
+            return {
+                "input_ids": [ord(char) for char in text],
+                "offset_mapping": [(index, index + 1) for index in range(len(text))],
+            }
+
+    tokenizer = _BareOnlyFastTokenizer()
+    manager = TokenizeManager(tokenizer)
+    provenance = manager._build_template_provenance(
+        [{"role": "user", "content": "hello"}],
+        enable_thinking=None,
+        tools=TOOLS,
+    )
+
+    assert provenance.rendered_text == "hello<assistant>"
+    assert tokenizer.tool_shapes == ["wrapper", "bare"]
+    assert tokenizer.encode_calls == 1
+    assert manager._chat_template_invocations == 2
+    assert manager._tokenize_invocations == 2
+    assert manager._effective_template_tools(TOOLS) == [TOOLS[0]["function"]]

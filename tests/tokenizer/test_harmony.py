@@ -23,9 +23,8 @@ class _GptOssTokenizer:
 
 def _render(messages):
     manager = TokenizeManager(_GptOssTokenizer())
-    ids = manager._render_harmony_tokens(
+    ids, _, _ = manager._render_harmony_message_drop(
         messages,
-        add_generation_prompt=True,
         enable_thinking=None,
         tools=TOOLS,
     )

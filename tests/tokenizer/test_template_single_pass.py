@@ -43,6 +43,41 @@ class _SinglePassTokenizer:
         return [ord(char) for char in text]
 
 
+def test_ordinary_chat_renders_and_encodes_exactly_once() -> None:
+    tokenizer = _SinglePassTokenizer()
+    manager = TokenizeManager(tokenizer)
+    result = manager._chat_tokenize(
+        TokenizeMsg(
+            uid=30,
+            text=[
+                {"role": "user", "content": "old"},
+                {"role": "assistant", "content": "answer"},
+                {"role": "user", "content": "new"},
+            ],
+            sampling_params=SamplingParams(max_tokens=1),
+        )
+    )
+
+    expected = "<user>old<assistant>answer<user>new<assistant>"
+    assert result.input_ids.tolist() == [ord(char) for char in expected]
+    assert result.tokenize_invocations == 1
+    assert result.chat_template_invocations == 1
+    assert tokenizer.encode_calls == 1
+    assert tokenizer.apply_calls == 0
+    assert result.message_meta["gen_prompt_start"] == len(expected) - len("<assistant>")
+    assert result.message_meta["radix_state_starts"]
+    for removed in (
+        "message_starts",
+        "owner_starts",
+        "unstable_rounds",
+        "no_gen_with_gen_unstable",
+        "no_gen_with_gen_lcp",
+        "no_gen_with_gen_lcsuf",
+    ):
+        assert removed not in result.message_meta
+    assert not hasattr(result, "radix_commit_token_len")
+
+
 def test_structured_drop_and_reposition_render_and_encode_exactly_once() -> None:
     tokenizer = _SinglePassTokenizer()
     manager = TokenizeManager(tokenizer)

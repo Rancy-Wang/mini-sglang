@@ -418,9 +418,7 @@ class Scheduler(SchedulerIOMixin):
         elif isinstance(msg, UserMsg):
             logger.debug_rank0("Received user msg: %s", msg)
             if self.radix_symbol_registry is not None and msg.message_meta is not None:
-                state_starts = msg.message_meta.get(
-                    "radix_state_starts", msg.message_meta.get("message_starts", [])
-                )
+                state_starts = msg.message_meta.get("radix_state_starts", [])
                 if not isinstance(state_starts, list):
                     raise ValueError("message_meta.radix_state_starts must be a list.")
                 if msg.radix_match_ids is None:

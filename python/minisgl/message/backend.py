@@ -58,7 +58,6 @@ class UserMsg(BaseBackendMsg):
     radix_repos_info: torch.Tensor | None = None  # CPU 1D int32, last effective R boundary
     radix_next_position: int | None = None
     radix_current_reposition: int = -1
-    radix_commit_token_len: int | None = None  # full-token warmup commit boundary
     enable_thinking: bool | None = None
     stop: List[str] | None = None
     stop_token_seqs: List[List[int]] | None = None
