@@ -10,11 +10,10 @@ import asyncio
 import json
 from types import SimpleNamespace
 
-import pytest
-import torch
-
 import minisgl.core as core
 import minisgl.server.api_server as api
+import pytest
+import torch
 from minisgl.attention.base import build_context_attention_batch
 from minisgl.core import SamplingParams
 from minisgl.kernel.radix_reposition import compile_radix_reposition_layout

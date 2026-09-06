@@ -146,12 +146,12 @@ mask Prefill 和 mask-free Extend 均可有非零 `drop_skipped_tokens`。一个
 `choices: []` 的最终 usage chunk，其口径与非流式响应相同。
 
 实现依据：`Req.record_context_cache_usage` 和 `reported_cached_tokens` 分别固定实际复用
-集合的分类及返回普通复用数（`python/minisgl/core.py`）；
+集合的分类及返回普通复用数（`python/minisgl/core.py:310-353`）；
 `build_context_attention_batch` 从实际 full-attention segment 提供缓存位置
-（`python/minisgl/attention/base.py`）；`PrefillAdder` 保存 Retry 的转换标记并传递分块
-计数（`python/minisgl/scheduler/prefill.py`）；`CacheUsageReport.from_reply` 与
+（`python/minisgl/attention/base.py:363-439`）；`PrefillAdder` 保存 Retry 的转换标记并传递分块
+计数（`python/minisgl/scheduler/prefill.py:468-531,617-627`）；`CacheUsageReport.from_reply` 与
 `_build_usage` 在 HTTP 边界保留完整报告、校验三项总和
-（`python/minisgl/server/api_server.py`）。
+（`python/minisgl/server/api_server.py:440-481`）。
 
 ## Overlap Scheduling
 

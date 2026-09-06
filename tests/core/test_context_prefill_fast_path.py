@@ -2,10 +2,9 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import minisgl.core as core
 import pytest
 import torch
-
-import minisgl.core as core
 from minisgl.attention.base import build_context_attention_batch
 from minisgl.attention.fa import is_fa_context_mask_supported
 from minisgl.core import SamplingParams
