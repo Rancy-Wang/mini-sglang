@@ -216,9 +216,12 @@ def test_reposition_uses_one_public_tokenization_without_frontend_warmups() -> N
     assert sent == []
 
 
-def test_drop_only_staged_warmup_preserves_legacy_key_mode() -> None:
+@pytest.mark.parametrize(
+    "mode,hit_ratio,dispatches", [("mask", 0.0, 1), ("staged", 0.95, 1), ("staged", 0.94, 3)]
+)
+def test_drop_only_warmup_preserves_complete_usage(mode, hit_ratio, dispatches) -> None:
     manager = FrontendManager(
-        config=SimpleNamespace(contextual_prefill_mode="staged"),
+        config=SimpleNamespace(contextual_prefill_mode=mode),
         send_tokenizer=None,
         recv_tokenizer=None,
     )
@@ -230,9 +233,9 @@ def test_drop_only_staged_warmup_preserves_legacy_key_mode() -> None:
     async def wait_for_warmup(uid: int) -> WarmupReply:
         return WarmupReply(
             uid=uid,
-            hit_ratio=0.0,
-            cached_tokens=0,
-            drop_skipped_tokens=0,
+            hit_ratio=hit_ratio,
+            cached_tokens=2 if len(sent) == 1 else 20,
+            drop_skipped_tokens=3 if len(sent) == 1 else 30,
             finished=True,
         )
 
@@ -248,7 +251,7 @@ def test_drop_only_staged_warmup_preserves_legacy_key_mode() -> None:
         "drop_messages": {"1": [0]},
     }
 
-    asyncio.run(
+    report = asyncio.run(
         manager.run_contextual_warmup(
             messages,
             drop_rule,
@@ -260,5 +263,6 @@ def test_drop_only_staged_warmup_preserves_legacy_key_mode() -> None:
         )
     )
 
-    assert len(sent) == 3
+    assert (report.cached_tokens, report.drop_skipped_tokens) == (2, 3)
+    assert len(sent) == dispatches
     assert all(msg.reposition is None for msg in sent)

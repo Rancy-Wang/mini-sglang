@@ -106,20 +106,52 @@ sliding window 时保守回退到原始 mask Prefill。启动时添加
 }
 ```
 
-`prompt_tokens` 始终是完整 chat-template prompt 的 token 数；`cached_tokens` 是本次
-contextual prefill 真正复用的 KV token 数；`drop_skipped_tokens` 是因为等价的
-mask-free Drop 而没有进入 Prefill Attention 的完整 prompt token 数。只有 mask-free
-路径会报告非零 `drop_skipped_tokens`；mask fallback、staged 和无 Drop 请求均报告零。
-当两个明细值都为零时，响应省略 `prompt_tokens_details`。流式请求需要设置
-`"stream_options":{"include_usage":true}`，服务器会在 `[DONE]` 前发送一个
-`choices: []` 的最终 usage chunk。旧的顶层 `cache_hit_ratio` 不再返回。
+`prompt_tokens` 始终是完整 chat-template prompt 的 token 数；`completion_tokens` 是输出
+计数，`total_tokens` 为两者之和。缓存明细必须整体来自同一阶段：普通 Drop 请求有独立
+warmup 时采用该 warmup 的报告（legacy staged fallback 也保留首次探测的完整报告）；
+没有 warmup 时采用生成请求的报告。Reposition 采用最后一个 scheduler stage 的报告，
+不累计前置 stage，也不从累计性能指标中拼接 Drop 数。
 
-实现依据：tokenizer 将规则编译为按位置排序的稀疏 event/range wire，并在边界合并不
-可判定时标记回退（`python/minisgl/tokenizer/tokenize.py:1004`）；CPU AOT kernel 只
-检查未缓存 query 与有效 Drop 区间是否冲突
-（`python/minisgl/kernel/csrc/src/context_plan.cpp:21`）；调度器的快速路径与 O(N)
-精确参考回退位于 `python/minisgl/scheduler/prefill.py:68`，usage 的边界检查与结构位于
-`python/minisgl/server/api_server.py:405`。
+Reposition 请求的 `prompt_tokens_details` 包含三项，即使全部为零也返回：
+
+```json
+{"cached_tokens": 4, "drop_skipped_tokens": 2, "repos_tokens": 2}
+```
+
+- `cached_tokens`：该 stage 从 Radix 取得、实际参与 Prefill/Extend attention、且本
+  stage 没有通过 Retry 做 RoPE 转换的不同 token 数。
+- `repos_tokens`：该 stage 通过 Retry 成功做 RoPE 转换，并实际参与 attention 复用的
+  不同 token 数。不能用 Retry plan 长度或累计转换次数替代，因为转换可能涉及本 stage
+  不使用的页。
+- `drop_skipped_tokens`：该 stage 从 Radix 匹配到，但因 Drop 完全没有参与该 stage
+  attention 的不同 token 数。只包含已匹配的物理缓存 token，不包含未命中输入或虚拟标记。
+
+设 R 为该阶段匹配的物理缓存 token 集合，U 为其中实际参与 attention 的集合，T 为
+其中经过本阶段 Retry RoPE 的集合。三项分别为 `|U \ T|`、`|R \ U|`、`|U ∩ T|`，
+互斥且总和为 `|R| <= prompt_tokens`。普通请求没有 `repos_tokens` 字段；两个普通
+明细均为零时，仍省略 `prompt_tokens_details`。
+
+mask Prefill 和 mask-free Extend 均可有非零 `drop_skipped_tokens`。一个缓存 token
+先被本 stage 的 query 使用、后来才被 Drop，仍计入复用：普通 KV 归 `cached_tokens`，
+本 stage Retry RoPE 的 KV 归 `repos_tokens`。例如 Drop 在 query 49 前隐藏 token 0–24：
+已缓存 49 个 token 时，这 25 个 token 全程跳过；只缓存 46 个时，query 46–48 仍需使用
+它们，因此不能计为跳过。计数在最终 KV 压缩前固定，不随 decode、层数或 segment 数累加。
+这里按完整 attention 的可见性计数，不把 sliding-window 层的窗口裁剪视为 Drop。
+
+最后一个 Reposition stage 可以复用同一 HTTP 请求前置 stage 写入的 KV；这些 usage
+不是整个 HTTP 请求开始前已有缓存的命中量，也不是累计计算成本。性能指标中的转换
+操作量、耗时和传输字节继续按原来的累计口径记录。
+
+流式请求设置 `"stream_options":{"include_usage":true}` 后，会在 `[DONE]` 前收到
+`choices: []` 的最终 usage chunk，其口径与非流式响应相同。
+
+实现依据：`Req.record_context_cache_usage` 和 `reported_cached_tokens` 分别固定实际复用
+集合的分类及返回普通复用数（`python/minisgl/core.py`）；
+`build_context_attention_batch` 从实际 full-attention segment 提供缓存位置
+（`python/minisgl/attention/base.py`）；`PrefillAdder` 保存 Retry 的转换标记并传递分块
+计数（`python/minisgl/scheduler/prefill.py`）；`CacheUsageReport.from_reply` 与
+`_build_usage` 在 HTTP 边界保留完整报告、校验三项总和
+（`python/minisgl/server/api_server.py`）。
 
 ## Overlap Scheduling
 

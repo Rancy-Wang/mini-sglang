@@ -199,7 +199,7 @@ def test_tokenizer_sequence_reuses_one_precompiled_layout_between_scheduler_turn
     assert final.radix_match_ns == 11
     assert final.retry_plan_ns == 0
     assert final.reposition_transition_count == 0
-    assert final.prior_drop_skipped_tokens == 3
+    assert not hasattr(final, "prior_drop_skipped_tokens")
 
     assert not any(field.name.startswith("staged_") for field in fields(Req))
     assert not any(field.name.startswith("staged_") for field in fields(PendingReq))
@@ -249,8 +249,11 @@ def test_scheduler_closes_final_warmup_sequence_but_keeps_intermediate_stage() -
     assert scheduler.context_sequence_uids == set()
 
 
+@pytest.mark.parametrize("drop_positions,drop_ranges", [([4], [0, 3]), ([2, 7], [0, 1, 3, 4])])
 def test_each_scheduler_turn_reuses_the_previous_partial_radix_prefix(
     monkeypatch: pytest.MonkeyPatch,
+    drop_positions,
+    drop_ranges,
 ) -> None:
     monkeypatch.setattr(torch.Tensor, "pin_memory", lambda self: self)
     real_empty = torch.empty
@@ -262,8 +265,8 @@ def test_each_scheduler_turn_reuses_the_previous_partial_radix_prefix(
     monkeypatch.setattr(torch, "empty", cpu_empty)
     state = _sequence(
         max_tokens=1,
-        drop_positions=[4],
-        drop_ranges=[0, 3],
+        drop_positions=drop_positions,
+        drop_ranges=drop_ranges,
     )
     state.activate(step_token_budget=64)
     page_table = torch.full((2, 64), -1, dtype=torch.int32)
@@ -291,6 +294,25 @@ def test_each_scheduler_turn_reuses_the_previous_partial_radix_prefix(
         assert batch is not None and len(batch.reqs) == 1
         req = batch.reqs[0]
         cache.allocate_paged(batch.reqs)
+        if req.use_context_mask:
+            from minisgl.attention.base import build_context_attention_batch
+
+            context = build_context_attention_batch([req])
+            req.record_context_cache_usage(context.cached_tokens[0], context.cached_positions[0])
+        used = (
+            req.full_token_visible_until[req.raw_positions[: req.initial_active_cached_len].long()]
+            > req.raw_positions[req.cached_len]
+            if req.use_context_mask
+            else torch.ones(req.initial_active_cached_len, dtype=torch.bool)
+        )
+        transformed = (
+            req.retry_transformed_mask
+            if req.retry_transformed_mask is not None
+            else torch.zeros_like(used)
+        )
+        assert req.reported_cached_tokens == int((used & ~transformed).sum())
+        assert req.reported_repos_tokens == int((used & transformed).sum())
+        assert req.drop_skipped_tokens == req.radix_cached_tokens - int(used.sum())
         req.complete_one()
         cached_counts.append(req.radix_cached_tokens)
         active_cached_counts.append(req.initial_active_cached_len)
@@ -312,7 +334,7 @@ def test_each_scheduler_turn_reuses_the_previous_partial_radix_prefix(
     assert cached_counts[1] > active_cached_counts[1]
     assert active_cached_counts[1] > 0
     assert drop_skipped_counts == [0, cached_counts[1] - active_cached_counts[1]]
-    assert context_mask_flags == [True, False]
+    assert context_mask_flags == [True, drop_positions != [4]]
     assert kv_cache.calls
     cache.check_integrity()
 
@@ -441,6 +463,7 @@ def test_final_mask_prefill_compacts_decode_view_and_retains_owned_drop_pages() 
         uid=9,
         sampling_params=SamplingParams(max_tokens=2),
         cache_handle=SimpleNamespace(),
+        radix_cached_tokens=3,
         full_input_ids=prompt,
         full_token_visible_until=torch.full((5,), 6, dtype=torch.int32),
         full_keep_mask=keep_mask,
@@ -448,6 +471,15 @@ def test_final_mask_prefill_compacts_decode_view_and_retains_owned_drop_pages() 
         context_compact_stream=True,
         context_post_prefill_keep_mask=keep_mask,
         retry_transformed_mask=torch.tensor([False, True, False]),
+    )
+    from minisgl.attention.base import build_context_attention_batch
+
+    context = build_context_attention_batch([req])
+    req.record_context_cache_usage(context.cached_tokens[0], context.cached_positions[0])
+    assert (req.reported_cached_tokens, req.reported_repos_tokens, req.drop_skipped_tokens) == (
+        2,
+        1,
+        0,
     )
     page_table[0, :5] = torch.tensor([10, 11, 12, 13, 14], dtype=torch.int32)
     token_pool[0, :6] = torch.tensor([10, 11, 12, 13, 14, 99], dtype=torch.int32)
@@ -471,3 +503,9 @@ def test_final_mask_prefill_compacts_decode_view_and_retains_owned_drop_pages() 
     assert (req.cached_len, req.device_len, req.max_device_len) == (3, 4, 5)
     assert not req.use_context_mask
     assert req.context_post_prefill_keep_mask is None
+    # The Retry hit used before Drop remains counted after its ownership mask shrinks.
+    assert (req.reported_cached_tokens, req.reported_repos_tokens, req.drop_skipped_tokens) == (
+        2,
+        1,
+        0,
+    )

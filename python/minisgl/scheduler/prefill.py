@@ -617,6 +617,11 @@ class PrefillAdder:
             cache_reuse_ratio=cache_reuse_ratio,
             radix_cached_tokens=radix_cached_tokens,
             usage_cached_tokens=usage_cached_tokens,
+            usage_repos_tokens=(
+                pending_req.chunked_req.usage_repos_tokens
+                if pending_req.chunked_req is not None
+                else None
+            ),
             drop_skipped_tokens=(
                 radix_cached_tokens - usage_cached_tokens if usage_cached_tokens is not None else 0
             ),

@@ -243,6 +243,7 @@ class Scheduler(SchedulerIOMixin):
                             hit_ratio=req.cache_reuse_ratio,
                             cached_tokens=req.reported_cached_tokens,
                             drop_skipped_tokens=req.drop_skipped_tokens,
+                            repos_tokens=req.reported_repos_tokens,
                             finished=finished,
                             radix_match_ns=req.radix_match_ns,
                             retry_plan_ns=req.retry_plan_ns,
@@ -280,10 +281,7 @@ class Scheduler(SchedulerIOMixin):
                         visible = not (finished and next_token in self.eos_token_ids)
                         metrics_state.observe_token(generated_ns, visible=visible)
                         if finished:
-                            metrics_state.drop_skipped_tokens = max(
-                                metrics_state.drop_skipped_tokens,
-                                req.drop_skipped_tokens,
-                            )
+                            metrics_state.drop_skipped_tokens = req.drop_skipped_tokens
                             server_metrics = metrics_state.finish(generated_ns)
                             self.request_metrics.pop(req.uid, None)
                     reply.append(
@@ -294,6 +292,8 @@ class Scheduler(SchedulerIOMixin):
                             finish_reason=finish_reason if finished else None,
                             matched_stop=matched_stop,
                             cached_tokens=(req.reported_cached_tokens if finished else None),
+                            drop_skipped_tokens=req.drop_skipped_tokens if finished else 0,
+                            repos_tokens=req.reported_repos_tokens if finished else 0,
                             prompt_tokens=req.prompt_tokens if finished else None,
                             completion_tokens=req.completion_tokens if finished else None,
                             server_metrics=server_metrics,
@@ -503,7 +503,6 @@ class Scheduler(SchedulerIOMixin):
                     context_stage_count=msg.context_stage_count,
                     radix_compile_ns=msg.radix_compile_ns,
                     reposition_ipc_tensor_bytes=msg.reposition_ipc_tensor_bytes,
-                    drop_skipped_tokens=msg.prior_drop_skipped_tokens,
                 )
                 self.request_metrics[msg.uid].observe_reposition(
                     radix_match_ns=msg.radix_match_ns,

@@ -319,3 +319,93 @@ def test_context_mask_flash_attention_is_fa3_only(monkeypatch, major, expected) 
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device=None: (major, 0))
 
     assert is_fa_context_mask_supported() is expected
+
+
+@pytest.mark.parametrize("expiry", [4, 5, 8])
+@pytest.mark.parametrize("transformed", [[False] * 4, [True, True, False, True]])
+def test_retry_usage_intersects_actual_full_attention_hits(expiry, transformed):
+    full = torch.arange(7, dtype=torch.int32)
+    visible = torch.tensor([expiry, 5, 8, 8, 8, 8, 8], dtype=torch.int32)
+    req = core.Req(
+        input_ids=full,
+        true_positions=full,
+        raw_positions=full,
+        radix_input_ids=full.long(),
+        radix_match_ids=full.long(),
+        initial_full_match_indices=torch.arange(4, dtype=torch.int32),
+        initial_active_cached_len=4,
+        true_seq_len=7,
+        table_idx=0,
+        cached_len=4,
+        output_len=1,
+        uid=1,
+        sampling_params=SamplingParams(max_tokens=1),
+        cache_handle=SimpleNamespace(),
+        radix_cached_tokens=4,
+        is_warmup=True,
+        full_input_ids=full,
+        full_token_visible_until=visible,
+        full_keep_mask=(visible > 6).int(),
+        use_context_mask=True,
+        retry_transformed_mask=torch.tensor(transformed),
+    )
+    context = build_context_attention_batch([req])
+    req.record_context_cache_usage(context.cached_tokens[0], context.cached_positions[0])
+    # Independent per-query oracle, not the segment compiler's first-segment rule.
+    used = {
+        key for key in range(4) if any(key < query < int(visible[key]) for query in range(4, 7))
+    }
+    repos = sum(transformed[key] for key in used)
+    assert req.reported_cached_tokens == len(used) - repos
+    assert req.reported_repos_tokens == repos
+    assert req.drop_skipped_tokens == 4 - len(used)
+    assert req.reported_cached_tokens + req.reported_repos_tokens + req.drop_skipped_tokens == 4
+
+
+def test_chunked_mask_usage_keeps_initial_retry_partition(monkeypatch):
+    monkeypatch.setattr(torch.Tensor, "pin_memory", lambda self: self)
+    pending = _pending_req()
+    pending.input_ids = torch.tensor([10, 13, 14, 15, 16], dtype=torch.int32)
+    pending.true_positions = torch.tensor([0, 3, 4, 5, 6], dtype=torch.int32)
+    pending.raw_positions = pending.true_positions
+    pending.radix_input_ids = pending.input_ids.long()
+    pending.full_input_ids = torch.arange(10, 17, dtype=torch.int32)
+    pending.radix_match_ids = pending.full_input_ids.long()
+    pending.full_keep_mask = torch.tensor([1, 0, 0, 1, 1, 1, 1], dtype=torch.int32)
+    pending.prefix_keep_mask = pending.full_keep_mask[:-1]
+    pending.full_token_visible_until = torch.tensor([8, 4, 4, 8, 8, 8, 8], dtype=torch.int32)
+    pending.prompt_tokens = 7
+    cache = _PlanCache(active_cached_len=1)
+    table = SimpleNamespace(
+        available_size=4,
+        token_pool=torch.zeros((4, 16), dtype=torch.int32),
+        page_table=torch.full((4, 16), -1, dtype=torch.int32),
+        allocate=lambda: 0,
+        free=lambda _: None,
+    )
+    manager = PrefillManager(cache, table, SimpleNamespace(inflight_tokens=0))
+    manager.pending_list.append(pending)
+    batch = manager.schedule_next_batch(prefill_budget=1)
+    assert batch is not None
+    first = batch.reqs[0]
+    # Model the already-completed Retry allocation; the continuation must retain
+    # the count for the initial hits, not classify newly computed chunk KV.
+    first.retry_transformed_mask = torch.tensor([True, True, False, False])
+    context = build_context_attention_batch([first])
+    first.record_context_cache_usage(context.cached_tokens[0], context.cached_positions[0])
+    assert (
+        first.reported_cached_tokens,
+        first.reported_repos_tokens,
+        first.drop_skipped_tokens,
+    ) == (1, 1, 2)
+    first.complete_one()
+    for _ in range(2):
+        batch = manager.schedule_next_batch(prefill_budget=1)
+        assert batch is not None
+        req = batch.reqs[0]
+        assert (req.reported_cached_tokens, req.reported_repos_tokens, req.drop_skipped_tokens) == (
+            1,
+            1,
+            2,
+        )
+        req.complete_one()

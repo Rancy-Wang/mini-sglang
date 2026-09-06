@@ -151,3 +151,31 @@ def test_server_metrics_report_template_dispatch_ipc_and_retry_transfer_separate
     assert metrics["reposition_h2d_bytes"] == 100
     assert metrics["reposition_d2h_bytes"] == 0
     assert metrics["drop_skipped_tokens"] == 7
+
+
+@pytest.mark.parametrize("cached,skipped,repos", [(4, 2, 2), (0, 0, 0), (0, 0, 3)])
+def test_reposition_usage_has_three_disjoint_details(cached, skipped, repos):
+    usage = _build_usage(
+        prompt_tokens=10,
+        completion_tokens=1,
+        cached_tokens=cached,
+        drop_skipped_tokens=skipped,
+        repos_tokens=repos,
+    )
+    assert usage["prompt_tokens_details"] == {
+        "cached_tokens": cached,
+        "drop_skipped_tokens": skipped,
+        "repos_tokens": repos,
+    }
+
+
+@pytest.mark.parametrize("cached,skipped,repos", [(8, 1, 2), (0, 0, -1), (-1, 0, 2), (1, -1, 0)])
+def test_reposition_usage_rejects_invalid_partition(cached, skipped, repos):
+    with pytest.raises(ValueError, match="prompt_tokens"):
+        _build_usage(
+            prompt_tokens=10,
+            completion_tokens=0,
+            cached_tokens=cached,
+            drop_skipped_tokens=skipped,
+            repos_tokens=repos,
+        )

@@ -100,12 +100,20 @@ def test_server_metrics_round_trip_through_tokenizer_message_serialization():
         finished=True,
         finish_reason="stop",
         server_metrics=_metrics(),
+        cached_tokens=2,
+        drop_skipped_tokens=3,
+        repos_tokens=4,
     )
 
     restored = BaseTokenizerMsg.decoder(BaseTokenizerMsg.encoder(original))
 
     assert isinstance(restored, DetokenizeMsg)
     assert restored.server_metrics == _metrics()
+    assert (restored.cached_tokens, restored.drop_skipped_tokens, restored.repos_tokens) == (
+        2,
+        3,
+        4,
+    )
 
 
 def test_stream_terminal_chunk_exposes_server_metrics_without_a_second_usage_result():

@@ -88,7 +88,8 @@ class Req:
     is_warmup: bool = False
     cache_reuse_ratio: float = 1.0
     radix_cached_tokens: int = 0
-    usage_cached_tokens: int | None = None
+    usage_cached_tokens: int | None = None  # all reused KV, including Retry RoPE
+    usage_repos_tokens: int | None = None  # frozen before post-Prefill compaction
     drop_skipped_tokens: int = 0
     full_input_ids: torch.Tensor | None = None
     full_token_visible_until: torch.Tensor | None = None
@@ -247,6 +248,16 @@ class Req:
             raise ValueError("radix_cached_tokens must be non-negative.")
         if self.usage_cached_tokens is not None:
             self._validate_context_cache_usage(self.usage_cached_tokens)
+            if self.usage_repos_tokens is None:
+                if self.use_context_mask:
+                    raise ValueError("Recorded Context usage requires a frozen Retry count.")
+                self.usage_repos_tokens = (
+                    int(self.retry_transformed_mask.sum().item())
+                    if self.retry_transformed_mask is not None
+                    else 0
+                )
+            if not 0 <= self.usage_repos_tokens <= self.usage_cached_tokens:
+                raise ValueError("Retry usage exceeds the reused cache prefix.")
         assert self.true_seq_len >= int(self.true_positions[self.device_len - 1].item()) + 1
 
         context_tensors = (
@@ -296,7 +307,9 @@ class Req:
                 f"{cached_tokens}, {self.radix_cached_tokens}."
             )
 
-    def record_context_cache_usage(self, cached_tokens: int) -> None:
+    def record_context_cache_usage(
+        self, cached_tokens: int, cached_positions: torch.Tensor | None = None
+    ) -> None:
         """Record distinct Radix-hit tokens that enter full Context attention."""
 
         self._validate_context_cache_usage(cached_tokens)
@@ -307,6 +320,23 @@ class Req:
                     f"{self.usage_cached_tokens} != {cached_tokens}."
                 )
             return
+        repos_tokens = 0
+        if self.retry_transformed_mask is not None:
+            if cached_positions is None:
+                raise ValueError("Retry usage requires the attention cache positions.")
+            if (
+                not cached_positions.is_cpu
+                or cached_positions.ndim != 1
+                or len(cached_positions) != cached_tokens
+                or len(torch.unique(cached_positions)) != cached_tokens
+                or bool(torch.any(cached_positions < 0).item())
+                or bool(torch.any(cached_positions >= self.initial_active_cached_len).item())
+            ):
+                raise ValueError("Attention cache positions must identify distinct initial hits.")
+            repos_tokens = int(
+                self.retry_transformed_mask[cached_positions.to(torch.int64)].sum().item()
+            )
+        self.usage_repos_tokens = repos_tokens
         self.usage_cached_tokens = cached_tokens
         self.drop_skipped_tokens = self.radix_cached_tokens - cached_tokens
 
@@ -314,7 +344,13 @@ class Req:
     def reported_cached_tokens(self) -> int:
         if self.usage_cached_tokens is None:
             raise RuntimeError("Context cache usage was not recorded before reporting.")
-        return self.usage_cached_tokens
+        return self.usage_cached_tokens - self.reported_repos_tokens
+
+    @property
+    def reported_repos_tokens(self) -> int:
+        if self.usage_repos_tokens is None:
+            raise RuntimeError("Retry cache usage was not recorded before reporting.")
+        return self.usage_repos_tokens
 
     @property
     def remain_len(self) -> int:

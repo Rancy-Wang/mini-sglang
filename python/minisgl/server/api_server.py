@@ -440,6 +440,13 @@ class ModelList(BaseModel):
 class CacheUsageReport:
     cached_tokens: int
     drop_skipped_tokens: int = 0
+    repos_tokens: int = 0
+
+    @classmethod
+    def from_reply(cls, reply: UserReply | WarmupReply) -> CacheUsageReport:
+        if reply.cached_tokens is None:
+            raise ValueError("Cache usage requires a complete stage reply.")
+        return cls(reply.cached_tokens, reply.drop_skipped_tokens, reply.repos_tokens)
 
 
 def _build_usage(
@@ -448,24 +455,28 @@ def _build_usage(
     completion_tokens: int,
     cached_tokens: int | None,
     drop_skipped_tokens: int = 0,
+    repos_tokens: int | None = None,
 ) -> Dict[str, Any]:
     cached = int(cached_tokens or 0)
     skipped = int(drop_skipped_tokens)
-    if cached < 0 or skipped < 0 or cached + skipped > prompt_tokens:
+    repos = int(repos_tokens or 0)
+    if min(cached, skipped, repos) < 0 or cached + skipped + repos > prompt_tokens:
         raise ValueError(
-            "Usage counts must satisfy 0 <= cached_tokens + drop_skipped_tokens "
-            f"<= prompt_tokens, got {cached} + {skipped} > {prompt_tokens}."
+            "Usage counts must satisfy 0 <= cached_tokens + drop_skipped_tokens + repos_tokens "
+            f"<= prompt_tokens, got {cached} + {skipped} + {repos} > {prompt_tokens}."
         )
     usage = {
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
         "total_tokens": prompt_tokens + completion_tokens,
     }
-    if cached > 0 or skipped > 0:
+    if cached > 0 or skipped > 0 or repos_tokens is not None:
         usage["prompt_tokens_details"] = {
             "cached_tokens": cached,
             "drop_skipped_tokens": skipped,
         }
+        if repos_tokens is not None:
+            usage["prompt_tokens_details"]["repos_tokens"] = repos
     return usage
 
 
@@ -618,12 +629,9 @@ class FrontendManager:
         )
         warmup_ack = await self.wait_for_warmup(warmup_uid)
         if use_context_mask:
-            return CacheUsageReport(
-                cached_tokens=warmup_ack.cached_tokens,
-                drop_skipped_tokens=warmup_ack.drop_skipped_tokens,
-            )
+            return CacheUsageReport.from_reply(warmup_ack)
         if warmup_ack.hit_ratio >= 0.95:
-            return CacheUsageReport(cached_tokens=warmup_ack.cached_tokens)
+            return CacheUsageReport.from_reply(warmup_ack)
 
         # Fallback: staged prefill by message prefixes.
         for end in range(1, len(messages)):
@@ -653,7 +661,7 @@ class FrontendManager:
                 )
             )
             await self.wait_for_warmup(staged_uid)
-        return CacheUsageReport(cached_tokens=warmup_ack.cached_tokens)
+        return CacheUsageReport.from_reply(warmup_ack)
 
     async def stream_generate(self, uid: int):
         try:
@@ -679,11 +687,10 @@ class FrontendManager:
         model: str = "",
         include_usage: bool = False,
         cache_report: CacheUsageReport | None = None,
+        reposition_usage: bool = False,
     ):
         final_finish_reason = "stop"
         matched_stop: str | None = None
-        cached_tokens: int | None = cache_report.cached_tokens if cache_report is not None else None
-        drop_skipped_tokens = cache_report.drop_skipped_tokens if cache_report is not None else 0
         prompt_tokens = 0
         completion_tokens = 0
         server_metrics: ServerMetrics | None = None
@@ -733,17 +740,14 @@ class FrontendManager:
                     final_finish_reason = ack.finish_reason
                 if ack.matched_stop is not None:
                     matched_stop = ack.matched_stop
-                if cached_tokens is None and ack.cached_tokens is not None:
-                    cached_tokens = ack.cached_tokens
+                if cache_report is None and ack.cached_tokens is not None:
+                    cache_report = CacheUsageReport.from_reply(ack)
                 if ack.prompt_tokens is not None:
                     prompt_tokens = ack.prompt_tokens
                 if ack.completion_tokens is not None:
                     completion_tokens = ack.completion_tokens
                 if ack.server_metrics is not None:
                     server_metrics = ack.server_metrics
-                    drop_skipped_tokens = max(
-                        drop_skipped_tokens, server_metrics.drop_skipped_tokens
-                    )
                 if ack.incremental_output or ack.incremental_token_ids:
                     encoded = encode_piece(
                         parser.feed(
@@ -795,8 +799,13 @@ class FrontendManager:
                 "usage": _build_usage(
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
-                    cached_tokens=cached_tokens,
-                    drop_skipped_tokens=drop_skipped_tokens,
+                    cached_tokens=cache_report.cached_tokens if cache_report else None,
+                    drop_skipped_tokens=cache_report.drop_skipped_tokens if cache_report else 0,
+                    repos_tokens=(
+                        (cache_report.repos_tokens if cache_report else 0)
+                        if reposition_usage
+                        else None
+                    ),
                 ),
             }
             yield f"data: {json.dumps(usage_chunk)}\n\n".encode()
@@ -986,6 +995,7 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
                         req.stream_options is not None and req.stream_options.include_usage
                     ),
                     cache_report=cache_report,
+                    reposition_usage=bool(req.reposition),
                 ),
                 request,
                 uid,
@@ -997,8 +1007,6 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
     full_content = ""
     full_token_ids: List[int] = []
     finish_reason = "stop"
-    cached_tokens: int | None = cache_report.cached_tokens if cache_report is not None else None
-    drop_skipped_tokens = cache_report.drop_skipped_tokens if cache_report is not None else 0
     prompt_tokens = 0
     completion_tokens = 0
     server_metrics: ServerMetrics | None = None
@@ -1010,17 +1018,14 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
             full_token_ids.extend(ack.incremental_token_ids)
             if ack.finish_reason is not None:
                 finish_reason = ack.finish_reason
-            if cached_tokens is None and ack.cached_tokens is not None:
-                cached_tokens = ack.cached_tokens
+            if cache_report is None and ack.cached_tokens is not None:
+                cache_report = CacheUsageReport.from_reply(ack)
             if ack.prompt_tokens is not None:
                 prompt_tokens = ack.prompt_tokens
             if ack.completion_tokens is not None:
                 completion_tokens = ack.completion_tokens
             if ack.server_metrics is not None:
                 server_metrics = ack.server_metrics
-                drop_skipped_tokens = max(
-                    drop_skipped_tokens, server_metrics.drop_skipped_tokens
-                )
             if ack.finished:
                 break
     except RequestRejected as exc:
@@ -1062,8 +1067,11 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
         "usage": _build_usage(
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
-            cached_tokens=cached_tokens,
-            drop_skipped_tokens=drop_skipped_tokens,
+            cached_tokens=cache_report.cached_tokens if cache_report else None,
+            drop_skipped_tokens=cache_report.drop_skipped_tokens if cache_report else 0,
+            repos_tokens=(
+                (cache_report.repos_tokens if cache_report else 0) if req.reposition else None
+            ),
         ),
     }
     if server_metrics is not None:

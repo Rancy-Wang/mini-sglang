@@ -83,19 +83,29 @@ def test_serialize_deserialize():
         hit_ratio=0.5,
         cached_tokens=4,
         drop_skipped_tokens=7,
+        repos_tokens=2,
         finished=True,
     )
     restored = WarmupAckMsg.decoder(warmup.encoder(warmup))
     assert restored.drop_skipped_tokens == 7
+    assert restored.repos_tokens == 2
 
     reply = UserReply(
         uid=4,
         incremental_output="answer",
         finished=True,
         incremental_token_ids=[10, 11],
+        cached_tokens=4,
+        drop_skipped_tokens=3,
+        repos_tokens=2,
     )
     restored_reply = BaseFrontendMsg.decoder(BaseFrontendMsg.encoder(reply))
     assert restored_reply.incremental_token_ids == [10, 11]
+    assert (
+        restored_reply.cached_tokens,
+        restored_reply.drop_skipped_tokens,
+        restored_reply.repos_tokens,
+    ) == (4, 3, 2)
 
     legacy_reply = BaseFrontendMsg.encoder(reply)
     legacy_reply.pop("incremental_token_ids")
