@@ -43,11 +43,6 @@ MINISGL_TARGETS = (
     ProfileTarget("decode", "minisgl/engine/engine.py", "Engine.forward_batch", phase="decode"),
     ProfileTarget("decode", "minisgl/scheduler/decode.py", "DecodeManager.schedule_next_batch"),
     ProfileTarget("radix_match", "minisgl/scheduler/cache.py", "CacheManager.match_req"),
-    ProfileTarget(
-        "radix_match",
-        "minisgl/scheduler/cache.py",
-        "CacheManager._match_and_prune_legacy_holes",
-    ),
     ProfileTarget("radix_match", "minisgl/scheduler/cache.py", "CacheManager._derive_active_match"),
     ProfileTarget("radix_match", "minisgl/kvcache/radix_cache.py", "RadixPrefixCache.match_prefix"),
     ProfileTarget("radix_match", "minisgl/kvcache/radix_cache.py", "RadixPrefixCache._tree_walk"),
