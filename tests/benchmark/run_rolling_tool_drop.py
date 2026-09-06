@@ -294,10 +294,17 @@ def summarize(rows, wall_s):
             stats = {}
             for key in ("ttft_s", "tpot_s", "e2e_s"):
                 values = [sample[key] for sample in samples if sample[key] is not None]
+                units = {
+                    (row["case_id"], row["trial"], row["logical_turn"])
+                    for row in good
+                    if row.get(clock) and row[clock][key] is not None
+                }
                 stats[key] = {
                     "count": len(values),
                     "sum": sum(values) if values else None,
                     "mean": sum(values) / len(values) if values else None,
+                    "case_turn_count": len(units),
+                    "mean_case_turn_sum": sum(values) / len(units) if units else None,
                 }
             eligible = [sample for sample in samples if sample["tpot_s"] is not None]
             intervals = sum(sample["decode_intervals"] for sample in eligible)

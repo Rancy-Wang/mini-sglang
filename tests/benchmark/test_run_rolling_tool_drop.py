@@ -194,7 +194,15 @@ def test_aggregate_turns_retries_weighting_and_failures():
     rows.append(dict(rows[0], ok=False, client=runner.timings(0, None, 20, None)))
     result = runner.summarize(rows, 10)
     assert result["global_stats"]["errors"] == 1
-    assert result["global_stats"]["client"]["ttft_s"] == {"count": 3, "sum": 4, "mean": 4 / 3}
+    assert result["global_stats"]["client"]["ttft_s"] == {
+        "count": 3,
+        "sum": 4,
+        "mean": 4 / 3,
+        "case_turn_count": 2,
+        "mean_case_turn_sum": 2,
+    }
+    # A retried case contributes its summed logical-turn cost once to the case mean.
+    assert result["per_turn"][0]["client"]["e2e_s"]["mean_case_turn_sum"] == 13
     assert result["global_stats"]["client"]["weighted_tpot_s"] == 2
     assert result["global_stats"]["server"]["ttft_s"]["sum"] is None
     assert result["per_case_turn"][0]["client"]["e2e_s"]["sum"] == 13
