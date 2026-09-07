@@ -53,6 +53,33 @@ def messages(index=0):
     ]
 
 
+def request_body(model, request, max_tokens):
+    return api.OpenAICompletionRequest(
+        model=model,
+        **request,
+        temperature=0,
+        seed=17,
+        max_tokens=max_tokens,
+        ignore_eos=True,
+        stream=False,
+    )
+
+
+def preflight(model):
+    # Validate every public request shape before allocating/loading the model.
+    for case in ("no_drop", "cold_mask", "partial", "high", "multiple", "rolling"):
+        for turn in range(3 if case == "rolling" else 1):
+            for request in inputs(case, 4, turn):
+                body = request_body(model, request, 16)
+                api._parse_request_drop_rule(
+                    drop_rule=body.drop_rule,
+                    legacy_drop_message=body.drop_message,
+                    messages=[msg.model_dump() for msg in body.messages],
+                    radix_drop_key_mode="delta-marker",
+                )
+    print("R5 request preflight PASS", flush=True)
+
+
 def inputs(case, bs, turn=0):
     result = []
     for i in range(bs):
@@ -238,14 +265,7 @@ class Runner:
             tasks = [
                 asyncio.create_task(
                     api.v1_completions(
-                        api.OpenAICompletionRequest(
-                            **request,
-                            temperature=0,
-                            seed=17,
-                            max_tokens=max_tokens,
-                            ignore_eos=True,
-                            stream=False,
-                        ),
+                        request_body(self.model, request, max_tokens),
                         SimpleNamespace(),
                     ),
                     name=str(i),
@@ -381,17 +401,7 @@ def compare(a, b):
                     errors.append(f"{key} differs for input {x['owner']}")
         for key in ("finish_reason", "completion_tokens"):
             if x["terminal"][key] != y["terminal"][key]:
-                if key == "tokens":
-                    first = next(
-                        (i for i, (u, v) in enumerate(zip(x[key], y[key])) if u != v),
-                        min(len(x[key]), len(y[key])),
-                    )
-                    errors.append(
-                        f"tokens differ for input {x['owner']} at index {first}: "
-                        f"{x[key][first : first + 1]} vs {y[key][first : first + 1]}"
-                    )
-                else:
-                    errors.append(f"{key} differs for input {x['owner']}")
+                errors.append(f"{key} differs for input {x['owner']}")
     return errors
 
 
@@ -467,6 +477,7 @@ async def experiment(runner, emit):
 @torch.inference_mode()
 def run():
     output = Path(os.environ.get("MINISGL_R5_OUTPUT", "/tmp/minisgl-mask-staged-r5.jsonl"))
+    preflight(os.environ["MINISGL_R3_MODEL"])
     started = time.monotonic()
     with output.open("x") as handle:
 
