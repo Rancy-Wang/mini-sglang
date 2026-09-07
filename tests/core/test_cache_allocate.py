@@ -198,6 +198,14 @@ class TestAllocateEvictPageAlignment:
         _assert_all_page_aligned(allocated, page_size, "allocated after evict")
         _assert_all_page_aligned(cm.free_slots, page_size, "_free_slots after evict")
 
+    def test_check_integrity_still_detects_global_page_accounting_mismatch(self):
+        cm = _make_cache_manager(num_pages=4, page_size=1)
+
+        cm._allocate(1)
+
+        with pytest.raises(RuntimeError, match=r"free_pages\(3\).*num_pages\(4\)"):
+            cm.check_integrity()
+
 
 if __name__ == "__main__":
     pytest.main([__file__])

@@ -1,0 +1,53 @@
+{
+  "configurations": [
+    {
+      "name": "qwen-default",
+      "command": [
+        ".venv/bin/python",
+        "-m",
+        "minisgl"
+      ],
+      "cwd": "..",
+      "host": "127.0.0.1",
+      "port": 30001,
+      "env": {
+        "CUDA_VISIBLE_DEVICES": "0"
+      },
+      "args": [
+        "--model-path",
+        "/share/futianyu/guest/renzhongqi/models/AgenticQwen-8B",
+        "--tp-size",
+        "1",
+        "--dtype",
+        "bfloat16",
+        "--disable-pynccl",
+        "--memory-ratio",
+        "0.90",
+        "--max-running-requests",
+        "4",
+        "--cuda-graph-max-bs",
+        "4",
+        "--max-seq-len-override",
+        "40960",
+        "--max-prefill-length",
+        "8192",
+        "--request-timeout",
+        "1200",
+        "--cache-type",
+        "radix",
+        "--page-size",
+        "1",
+        "--attention-backend",
+        "fi",
+        "--radix-drop-key-mode",
+        "delta-marker",
+        "--contextual-prefill-mode",
+        "mask",
+        "--tool-call-parser",
+        "qwen",
+        "--reasoning-parser",
+        "qwen3"
+      ]
+    }
+  ]
+}

@@ -51,6 +51,154 @@ Adopting the original design from [SGLang](https://github.com/sgl-project/sglang
 ![radix](https://lmsys.org/images/blog/sglang/radix_attn.jpg)
 *Illustration of Radix Attention from [LMSYS Blog](https://lmsys.org/blog/2024-01-17-sglang/).*
 
+## Keep-text Drop Rule
+
+`keep_text_drop` lets a stateless chat request expose only the ordered text that should remain
+visible while supplying the complete history used for Radix matching:
+
+```json
+{
+  "messages": [
+    {"role": "user", "content": "multiply it by 3"}
+  ],
+  "drop_rule": {
+    "type": "keep_text_drop",
+    "full_messages": [
+      {"role": "user", "content": "What is 15 + 27?"},
+      {"role": "assistant", "content": "15 + 27 = 42."},
+      {"role": "user", "content": "Then multiply it by 3."}
+    ],
+    "force": false
+  }
+}
+```
+
+Visible messages are matched in order from right to left, so repeated text selects the latest
+compatible messages by default. Role and tool-call protocol metadata must also match. A selected
+substring keeps every overlapping token, including tokens cut by either substring boundary, and
+keeps that message's chat-template wrapper tokens. Unselected messages are dropped completely.
+
+If projection fails, the default is an HTTP 400 response. Setting `force` to `true` instead runs a
+normal inference using the outer `messages` as the complete prompt and does not reuse the supplied
+hidden history.
+
+## Contextual Prefill Usage
+
+默认 `mask` 模式下，无 Reposition 的正式请求只分配一个 UID、执行一次完整模板
+编码，不再先发一个独立 warmup 请求。调度器匹配复用 KV 后，用稀疏 Drop event/range
+判断所有未缓存 query 的可见集合：如果提前删除最终 Drop 的 KV 仍保持语义，直接执行
+active-token Extend；否则对历史 full-token 流执行 mask Prefill。本次前向采样的首个
+输出 token 被保留，随后整理最终 active KV，保留幸存 token 的绝对位置，再按需 decode。
+预算足够时只有一次 Prefill/Extend；预算不足时仍允许同一请求分块，仅最终块输出采样结果。
+
+普通 Extend 已支持按绝对位置选择 sliding window，因此 full-attention 可见集合等价
+时，与相同窗口取交集后也等价，不再仅因模型含 sliding window 就强制 Context mask。
+不等价或必要元数据缺失时保留 mask Prefill。启动时添加
+`--disable-mask-free-context-prefill` 可以强制回退，供算法对照实验使用。
+
+无 Drop、无 Reposition 请求直接走普通 chat-template 编码（保留 tools/thinking/Harmony
+语义），不构造 Drop provenance、范围和 Context mask，不调用通用 Reposition 布局编译器。
+仍生成兼容的基础 Radix records `[0, token_id, -1, absolute_position]`，省去事件映射数组和
+Retry 查询，保证普通请求和后续 Drop 请求能共享合法前缀。空的或只包含未来 Message Drop
+事件的请求也走此路径；需要 token 边界才能判定无效的规则在完成判定后降级。
+
+Overlap 调度在最终 masked Prefill 结束时先处理该批结果、整理 KV 和保存首 token，
+然后才调度下一批，防止 decode 读取尚未整理的页表。mask-free 路径已经处于 active
+状态，无需再整理。Reposition 前置 stage、显式 staged 模式、现有 batch/分块预算规则保留。
+
+流程依据：`v1_completions` 的 `single_context_prefill`（`python/minisgl/server/api_server.py:942-991`）、
+`_build_user_msg`（`python/minisgl/tokenizer/server.py:66-108`）、`plan_context_prefill`
+（`python/minisgl/scheduler/prefill.py:241-352`）；无事件路径见 `_ordinary_result` 与
+`_chat_tokenize`（`python/minisgl/tokenizer/tokenize.py:182-208,1355-1458`），直接匹配见
+`CacheManager.match_req`（`python/minisgl/scheduler/cache.py:112-153`）；KV 转换及 overlap
+顺序见 `Scheduler.overlap_loop` / `_compact_context_after_prefill`
+（`python/minisgl/scheduler/scheduler.py:162-194,322-393`）。
+
+非流式 OpenAI chat-completions 响应使用 SGLang 风格的 usage：
+
+```json
+{
+  "usage": {
+    "prompt_tokens": 82000,
+    "completion_tokens": 96,
+    "total_tokens": 82096,
+    "prompt_tokens_details": {
+      "cached_tokens": 50000,
+      "drop_skipped_tokens": 31000
+    }
+  }
+}
+```
+
+`prompt_tokens` 始终是完整 chat-template prompt 的 token 数；`completion_tokens` 是输出
+计数，`total_tokens` 为两者之和。缓存明细必须整体来自同一阶段：默认 mask 模式的
+普通 Drop 请求采用正式生成请求的报告；显式 legacy staged 模式保留独立 warmup，
+以及首次探测的完整报告。Reposition 采用最后一个 scheduler stage 的报告，
+不累计前置 stage，也不从累计性能指标中拼接 Drop 数。
+
+Reposition 请求的 `prompt_tokens_details` 包含三项，即使全部为零也返回：
+
+```json
+{"cached_tokens": 4, "drop_skipped_tokens": 2, "repos_tokens": 2}
+```
+
+- `cached_tokens`：该 stage 从 Radix 取得、实际参与 Prefill/Extend attention、且本
+  stage 没有通过 Retry 做 RoPE 转换的不同 token 数。
+- `repos_tokens`：该 stage 通过 Retry 成功做 RoPE 转换，并实际参与 attention 复用的
+  不同 token 数。不能用 Retry plan 长度或累计转换次数替代，因为转换可能涉及本 stage
+  不使用的页。
+- `drop_skipped_tokens`：该 stage 从 Radix 匹配到，但因 Drop 完全没有参与该 stage
+  attention 的不同 token 数。只包含已匹配的物理缓存 token，不包含未命中输入或虚拟标记。
+
+设 R 为该阶段匹配的物理缓存 token 集合，U 为其中实际参与 attention 的集合，T 为
+其中经过本阶段 Retry RoPE 的集合。三项分别为 `|U \ T|`、`|R \ U|`、`|U ∩ T|`，
+互斥且总和为 `|R| <= prompt_tokens`。普通请求没有 `repos_tokens` 字段；两个普通
+明细均为零时，仍省略 `prompt_tokens_details`。
+
+mask Prefill 和 mask-free Extend 均可有非零 `drop_skipped_tokens`。一个缓存 token
+先被本 stage 的 query 使用、后来才被 Drop，仍计入复用：普通 KV 归 `cached_tokens`，
+本 stage Retry RoPE 的 KV 归 `repos_tokens`。例如 Drop 在 query 49 前隐藏 token 0–24：
+已缓存 49 个 token 时，这 25 个 token 全程跳过；只缓存 46 个时，query 46–48 仍需使用
+它们，因此不能计为跳过。计数在最终 KV 压缩前固定，不随 decode、层数或 segment 数累加。
+这里按完整 attention 的可见性计数，不把 sliding-window 层的窗口裁剪视为 Drop。
+
+最后一个 Reposition stage 可以复用同一 HTTP 请求前置 stage 写入的 KV；这些 usage
+不是整个 HTTP 请求开始前已有缓存的命中量，也不是累计计算成本。性能指标中的转换
+操作量、耗时和传输字节继续按原来的累计口径记录。
+
+流式请求设置 `"stream_options":{"include_usage":true}` 后，会在 `[DONE]` 前收到
+`choices: []` 的最终 usage chunk，其口径与非流式响应相同。
+
+实现依据：`Req.record_context_cache_usage` 和 `reported_cached_tokens` 分别固定实际复用
+集合的分类及返回普通复用数（`python/minisgl/core.py:308-351`）；
+`build_context_attention_batch` 从实际 full-attention segment 提供缓存位置
+（`python/minisgl/attention/base.py:363-439`）；`PrefillAdder` 保存 Retry 的转换标记并传递分块
+计数（`python/minisgl/scheduler/prefill.py:470-533,619-629`）；`CacheUsageReport.from_reply` 与
+`_build_usage` 在 HTTP 边界保留完整报告、校验三项总和
+（`python/minisgl/server/api_server.py:440-481`）。
+
+R3 的单请求回归入口为 `tests/contextual/test_single_request_prefill.py`。CPU 测试使用真实
+Radix、页表和调度生命周期，采样 token 为测试输入；覆盖并发 1/4、冷/热缓存、分块、
+EOS/stop、取消、overlap 顺序、跨普通/Drop 的合法前缀复用及逐 query 可见集合对照。
+它不代替实际模型前向或性能测量。
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 CUDA_VISIBLE_DEVICES= PYTHONPATH=python \
+python -B -m pytest -q -p no:cacheprovider -o addopts= \
+  tests/server/test_reposition_api.py tests/server/test_context_usage_regression.py \
+  tests/server/test_usage_reporting.py tests/tokenizer/test_template_single_pass.py \
+  tests/tokenizer/test_harmony.py tests/core/test_context_prefill_fast_path.py \
+  tests/core/test_reposition_radix_cache.py tests/core/test_reposition_generated_cacheback.py \
+  tests/misc/test_serialize.py tests/contextual/test_single_request_prefill.py
+```
+
+在独占测试 GPU 上，设置 `CUDA_VISIBLE_DEVICES` 和本地模型路径 `MINISGL_R3_MODEL` 后运行
+同一入口中的 `test_real_model_single_request_prefill_and_decode`，会启动独立进程加载模型，
+检查 concurrency=1/4 的冷 mask/热 extend/普通请求各一次正式 Prefill 后 decode，并逐
+query 重算 dense attention，对比 logits（BF16：atol=0.15、rtol=0.02）及贪心 token。
+数值对照的额外模型调用只存在于测试内，不计作调度 stage；不设置模型环境变量时明确跳过。
+该测试要求 FA3 与可用 CUDA；未运行时不能宣称 GPU 数值、TTFT 或吞吐验证通过。
+
 ## Overlap Scheduling
 
 To further reduce CPU overhead, Mini-SGLang employs overlap scheduling, a technique proposed in [NanoFlow](https://arxiv.org/abs/2408.12757). This approach overlaps the CPU scheduling overhead with GPU computation, improving overall system throughput.
