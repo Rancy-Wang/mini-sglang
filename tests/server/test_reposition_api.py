@@ -121,7 +121,7 @@ def test_tokenizer_treats_empty_reposition_as_ordinary_with_warning(caplog) -> N
     assert ordinary.reposition_insert_offsets is None
     assert retry_source.reposition_raw_boundaries is None
     assert retry_source.reposition_insert_offsets is None
-    assert torch.equal(ordinary.radix_match_ids, retry_source.radix_match_ids)
+    assert ordinary.radix_match_ids.tolist() == retry_source.radix_match_ids.tolist()
     assert retry_source.reposition_input_ids is None
     assert "Ignoring empty Reposition list" in caplog.text
 
