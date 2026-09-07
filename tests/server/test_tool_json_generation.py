@@ -190,6 +190,28 @@ def run_live(base_url: str, input_path: Path, output_path: Path, timeout: float)
         model_id = model_response.json()["data"][0]["id"]
         cases = _load_bcp_cases(input_path)
         for case in cases:
+            # Prime and validate the exact prompt before comparing transports.
+            # A cold prefill and an exact Radix hit are different numerical
+            # execution paths, so comparing those two generations would test
+            # cache-path equivalence rather than full/stream serialization.
+            priming_request = dict(case["request"])
+            priming_request.update(
+                model=model_id,
+                temperature=0,
+                seed=17,
+                max_tokens=512,
+                ignore_eos=False,
+                stream=False,
+            )
+            priming_response = client.post(endpoint, json=priming_request)
+            priming_response.raise_for_status()
+            priming_choice = priming_response.json()["choices"][0]
+            priming_message = dict(priming_choice["message"])
+            priming_message["finish_reason"] = priming_choice.get("finish_reason")
+            priming_normalized = validate_tool_calls(
+                priming_message.get("tool_calls") or []
+            )
+
             expected = None
             modes = []
             for stream in (False, True):
@@ -221,7 +243,16 @@ def run_live(base_url: str, input_path: Path, output_path: Path, timeout: float)
                         f"{expected!r} != {normalized!r}"
                     )
                 modes.append({"stream": stream, "message": message, "normalized": normalized})
-            results.append({"case_id": case["case_id"], "modes": modes})
+            results.append(
+                {
+                    "case_id": case["case_id"],
+                    "priming": {
+                        "message": priming_message,
+                        "normalized": priming_normalized,
+                    },
+                    "modes": modes,
+                }
+            )
 
         choice_results = []
         for label, case, tool_choice in (
