@@ -9,6 +9,7 @@ from minisgl.core import Batch, Req, get_global_ctx
 from minisgl.kernel.context_plan import first_mask_free_conflict_event
 from minisgl.utils import init_logger
 
+from .staged_reference import PrivateCacheHandle, StagedReferenceState
 from .utils import PendingReq
 
 if TYPE_CHECKING:
@@ -76,6 +77,23 @@ class ChunkedReq(Req):
     @property
     def can_decode(self) -> bool:
         return False  # avoid being added to decode manager
+
+
+@dataclass
+class ReferencePendingReq(PendingReq):
+    reference_state: StagedReferenceState | None = None
+    reference_req: Req | None = None
+
+
+@dataclass(frozen=True)
+class ReferenceCapacityError(RuntimeError):
+    uid: int
+    required_pages: int
+    available_pages: int
+
+    def __str__(self) -> str:
+        return (f"Staged reference needs {self.required_pages} private KV pages, "
+                f"but only {self.available_pages} can be allocated.")
 
 
 @dataclass(frozen=True)
@@ -657,6 +675,59 @@ class PrefillAdder:
             reposition_d2h_bytes=pending_req.reposition_d2h_bytes,
         )
 
+    def _add_reference(self, pending: ReferencePendingReq) -> Req | None:
+        state = pending.reference_state
+        assert state is not None
+        req = pending.reference_req
+        if req is None:
+            needed = len(state.full_ids) + pending.output_len
+            available = self.cache_manager.available_size - self.reserved_size
+            if needed > self.cache_manager.num_pages:
+                raise ReferenceCapacityError(pending.uid, needed, self.cache_manager.num_pages)
+            if needed > available or not self.table_manager.available_size:
+                return None
+            end = state.next_end(self.token_budget)
+            table_idx = self.table_manager.allocate()
+            try:
+                positions = torch.arange(end, dtype=torch.int32)
+                req = Req(
+                    input_ids=state.full_ids[:end], true_positions=positions,
+                    raw_positions=positions,
+                    radix_input_ids=state.full_ids[:end].to(torch.int64),
+                    radix_match_ids=state.full_ids.to(torch.int64),
+                    initial_full_match_indices=torch.empty(
+                        0, dtype=torch.int32, device=self.cache_manager.device
+                    ),
+                    initial_active_cached_len=0, true_seq_len=end, table_idx=table_idx,
+                    cached_len=0, output_len=pending.output_len, uid=pending.uid,
+                    sampling_params=pending.sampling_params, cache_handle=PrivateCacheHandle(0),
+                    staged_reference=state, prompt_tokens=pending.prompt_tokens,
+                    stop=pending.stop, stop_token_seqs=pending.stop_token_seqs,
+                    usage_cached_tokens=0, usage_repos_tokens=0,
+                    tokenize_invocations=pending.tokenize_invocations,
+                )
+                pending.reference_req = req
+            except Exception:
+                self.table_manager.free(table_idx)
+                raise
+            self.reserved_size += needed
+        else:
+            end = state.next_end(self.token_budget)
+            new_ids = state.full_ids[state.cursor:end]
+            positions = torch.arange(state.cursor, end, dtype=torch.int32)
+            req.input_ids = torch.cat((req.input_ids, new_ids))
+            req.true_positions = torch.cat((req.true_positions, positions))
+            req.raw_positions = torch.cat((req.raw_positions, positions))
+            req.radix_input_ids = req.input_ids.to(torch.int64)
+            req.device_len = len(req.input_ids)
+            req.true_seq_len = end
+        req.max_device_len = req.device_len + len(state.full_ids) - end + req.output_len
+        self.token_budget -= end - state.cursor
+        self.table_manager.token_pool[req.table_idx, req.cached_len:req.device_len].copy_(
+            req.input_ids[req.cached_len:].pin_memory(), non_blocking=True
+        )
+        return req
+
     def try_add_one(
         self,
         pending_req: PendingReq,
@@ -664,6 +735,9 @@ class PrefillAdder:
     ) -> Req | None:
         if self.token_budget <= 0:
             return None
+
+        if isinstance(pending_req, ReferencePendingReq):
+            return self._add_reference(pending_req)
 
         if chunked_req := pending_req.chunked_req:
             result = self._add_one_req(
@@ -727,7 +801,7 @@ class PrefillManager:
                     "Context-mask Prefill requires a full token stream and Radix keys."
                 )
         self.pending_list.append(
-            PendingReq(
+            (ReferencePendingReq if req.staged_reference else PendingReq)(
                 uid=req.uid,
                 input_ids=req.input_ids,
                 true_positions=req.true_positions,
@@ -766,6 +840,8 @@ class PrefillManager:
                 reposition_transition_count=req.reposition_transition_count,
                 reposition_h2d_bytes=req.reposition_h2d_bytes,
                 reposition_d2h_bytes=req.reposition_d2h_bytes,
+                **({"reference_state": StagedReferenceState.from_message(req)}
+                   if req.staged_reference else {}),
             )
         )
 
@@ -782,7 +858,12 @@ class PrefillManager:
         # estimated offset due to in-flight decode
         adder = PrefillAdder(
             token_budget=prefill_budget,
-            reserved_size=self.decode_manager.inflight_tokens,
+            reserved_size=self.decode_manager.inflight_tokens + sum(
+                p.reference_state.remaining_input + p.output_len
+                for p in self.pending_list
+                if isinstance(p, ReferencePendingReq) and p.reference_req is not None
+                and p.reference_state is not None
+            ),
             cache_manager=self.cache_manager,
             table_manager=self.table_manager,
             has_sliding_window=self.has_sliding_window,
@@ -813,6 +894,10 @@ class PrefillManager:
                     break
             try:
                 req = adder.try_add_one(pending_req, context_plan)
+            except ReferenceCapacityError:
+                if reqs:
+                    break  # retain already-admitted work; reject the oversized head next turn
+                raise
             except RepositionCapacityError as exc:
                 previous = self._reposition_capacity_failures.get(exc.uid)
                 self._reposition_capacity_failures[exc.uid] = exc.signature
@@ -822,7 +907,9 @@ class PrefillManager:
             if req:
                 self._reposition_capacity_failures.pop(pending_req.uid, None)
                 pending_req.chunked_req = None
-                if isinstance(req, ChunkedReq):
+                if isinstance(pending_req, ReferencePendingReq):
+                    chunked_list.append(pending_req)
+                elif isinstance(req, ChunkedReq):
                     pending_req.chunked_req = req
                     chunked_list.append(pending_req)
                 reqs.append(req)
@@ -835,11 +922,20 @@ class PrefillManager:
         self.pending_list = chunked_list + self.pending_list[len(reqs) :]
         return Batch(reqs=reqs, phase="prefill")
 
+    def complete_reference(self, req: Req) -> None:
+        for i, pending in enumerate(self.pending_list):
+            if isinstance(pending, ReferencePendingReq) and pending.reference_req is req:
+                self.pending_list.pop(i)
+                return
+        raise RuntimeError("Completed reference is missing from the pending queue.")
+
     def abort_req(self, uid: int) -> Req | PendingReq | None:
         self._reposition_capacity_failures.pop(uid, None)
         for i, req in enumerate(self.pending_list):
             if req.uid == uid:
                 self.pending_list.pop(i)
+                if isinstance(req, ReferencePendingReq):
+                    return req.reference_req or req
                 return req.chunked_req or req
         return None
 

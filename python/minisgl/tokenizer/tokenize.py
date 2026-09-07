@@ -43,6 +43,7 @@ class TokenizedResult:
     radix_match_ids: torch.Tensor | None
     prefix_keep_mask: torch.Tensor
     prompt_tokens: int
+    staged_reference: bool = False
     full_input_ids: torch.Tensor | None = None
     full_token_visible_until: torch.Tensor | None = None
     full_keep_mask: torch.Tensor | None = None
@@ -1589,6 +1590,39 @@ class TokenizeManager:
         if token_drop_events is not None:
             for start, end in token_drop_events.effective_ranges:
                 keep_mask[start:end] = False
+
+        if (
+            msg.staged_reference
+            and not has_reposition
+            and token_drop_events is not None
+            and token_drop_events.effective_event_count > 0
+        ):
+            # One canonical template, no prefix rendering and no Radix compilation.
+            # The scheduler applies these events only AFTER their preceding queries.
+            positions = torch.arange(len(full_with_gen_tensor), dtype=torch.int32)
+            return TokenizedResult(
+                input_ids=full_with_gen_tensor,
+                true_positions=positions,
+                raw_positions=positions,
+                radix_input_ids=full_with_gen_tensor.to(torch.int64),
+                radix_match_ids=None,
+                prefix_keep_mask=torch.ones(len(positions), dtype=torch.int32),
+                prompt_tokens=len(positions),
+                staged_reference=True,
+                drop_event_positions=token_drop_events.event_insert_offsets,
+                drop_range_offsets=token_drop_events.range_offsets,
+                drop_position_ranges=token_drop_events.raw_ranges,
+                drop_effective_event_count=token_drop_events.effective_event_count,
+                stop_token_seqs=self._build_stop_token_seqs(msg.stop),
+                message_meta={
+                    "gen_prompt_start": gen_prompt_start,
+                    "normalized_messages": len(messages),
+                    "target_offset": target_offset,
+                    "drop_rule_type": drop_rule.type,
+                },
+                tokenize_invocations=self._tokenize_invocations,
+                chat_template_invocations=self._chat_template_invocations,
+            )
 
         input_ids = full_with_gen_tensor[keep_mask].contiguous()
         true_positions = torch.arange(len(full_with_gen_tensor), dtype=torch.int32)[keep_mask]

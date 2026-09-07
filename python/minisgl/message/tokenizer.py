@@ -109,6 +109,7 @@ class TokenizeMsg(BaseTokenizerMsg):
     is_warmup: bool = False
     internal_uid: int | None = None
     use_context_mask: bool = False
+    staged_reference: bool = False  # validation-only, effective Drop without Reposition
     request_received_ns: int | None = None
 
 

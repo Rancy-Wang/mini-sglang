@@ -8,7 +8,6 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any, Dict, List
 
-
 SUPPORTED_TOOL_CALL_PARSERS = ("qwen", "qwen25", "qwen3_coder", "llama3", "gpt-oss")
 SUPPORTED_REASONING_PARSERS = ("qwen3", "deepseek-r1", "gpt-oss")
 
@@ -150,25 +149,166 @@ class _ReasoningParser:
         return (text, "") if self.in_reasoning else ("", text)
 
 
-def _parse_qwen(text: str, tools: List[Dict[str, Any]]) -> tuple[str, list[dict]]:
-    begin, end = "<tool_call>\n", "\n</tool_call>"
-    first = text.find(begin)
-    if first < 0:
-        return text, []
-    names = {_tool_name(tool) for tool in tools}
-    calls: list[dict] = []
-    pattern = re.compile(re.escape(begin) + r"(.*?)" + re.escape(end), re.DOTALL)
-    for match in pattern.finditer(text):
-        try:
-            item = json.loads(match.group(1).strip())
-        except json.JSONDecodeError:
-            continue
-        items = item if isinstance(item, list) else [item]
-        for raw in items:
-            if not isinstance(raw, dict) or raw.get("name") not in names:
+@dataclass(frozen=True)
+class ToolParseDiagnostic:
+    reason: str
+    offset: int  # character offset in the content stream after reasoning extraction
+    block_index: int
+
+
+class _QwenToolStream:
+    """Single-pass framing shared by full/stream; JSON is decoded once per block.
+
+    Only complete, valid calls are executable. Broken blocks remain verbatim text.
+    The pending marker is bounded by marker length; the block is a character list
+    so character-sized network chunks do not repeatedly copy/parse the history.
+    """
+
+    begin, end = "<tool_call>", "</tool_call>"
+
+    def __init__(self, tools: List[Dict[str, Any]]) -> None:
+        self.names = {_tool_name(tool) for tool in tools} - {None}
+        self.pending = ""
+        self.body: list[str] | None = None
+        self.in_string = False
+        self.escaped = False
+        self.depth = 0
+        self.invalid_lexical = False
+        self.offset = 0
+        self.block_start = 0
+        self.block_index = 0
+        self.emitted_calls = 0
+        self.diagnostics: list[ToolParseDiagnostic] = []
+        self.closed = False
+
+    def _literal(self, char: str, content: list[str]) -> None:
+        if self.body is None:
+            content.append(char)
+            return
+        self.body.append(char)
+        if self.in_string:
+            if ord(char) < 32:
+                self.invalid_lexical = True
+            if self.escaped:
+                self.escaped = False
+            elif char == "\\":
+                self.escaped = True
+            elif char == '"':
+                self.in_string = False
+        elif char == '"':
+            self.in_string = True
+        elif char in "{[":
+            self.depth += 1
+        elif char in "}]":
+            self.depth -= 1
+            if self.depth < 0:
+                self.invalid_lexical = True
+
+    def _start(self, offset: int) -> None:
+        self.body = []
+        self.block_start = offset
+        self.in_string = self.escaped = self.invalid_lexical = False
+        self.depth = 0
+
+    @staticmethod
+    def _invalid_constant(value: str) -> None:
+        raise ValueError(f"Invalid JSON constant: {value}")
+
+    def _close(self, content: list[str], calls: list[dict], *, complete: bool) -> None:
+        assert self.body is not None
+        body = "".join(self.body)
+        raw = self.begin + body + (self.end if complete else "")
+        reason = None
+        items = []
+        if not complete:
+            reason = "incomplete_tool_block"
+        else:
+            try:
+                item = json.loads(body, parse_constant=self._invalid_constant)
+                items = item if isinstance(item, list) else [item]
+                if not items or any(not isinstance(x, dict) or not isinstance(x.get("name"), str)
+                                    for x in items):
+                    reason = "invalid_tool_object"
+                elif any(x["name"] not in self.names for x in items):
+                    reason = "unknown_tool"
+            except (json.JSONDecodeError, ValueError):
+                reason = "invalid_json"
+        if reason is not None:
+            content.append(raw)
+            self.diagnostics.append(ToolParseDiagnostic(reason, self.block_start, self.block_index))
+        else:
+            for item in items:
+                arguments = json.dumps(item.get("arguments", {}), ensure_ascii=False,
+                                       separators=(",", ":"), allow_nan=False)
+                calls.append(_tool_call(item["name"], arguments, self.emitted_calls))
+                self.emitted_calls += 1
+        self.block_index += 1
+        self.body = None
+        self.in_string = self.escaped = self.invalid_lexical = False
+        self.depth = 0
+
+    def feed(self, text: str) -> StreamPiece:
+        if self.closed:
+            raise RuntimeError("Cannot feed a finished Qwen parser.")
+        content: list[str] = []
+        calls: list[dict] = []
+        for char in text:
+            self.offset += 1
+            # Within a valid JSON string, tags are literal argument data.
+            if not self.pending and (char != "<" or
+                    (self.body is not None and self.in_string and not self.invalid_lexical)):
+                self._literal(char, content)
                 continue
-            calls.append(_tool_call(raw["name"], raw.get("arguments", {}), len(calls)))
-    return text[:first].strip(), calls
+            self.pending += char
+            markers = (self.begin,) if self.body is None else (self.begin, self.end)
+            while self.pending and not any(m.startswith(self.pending) for m in markers):
+                self._literal(self.pending[0], content)
+                self.pending = self.pending[1:]
+            if self.pending == self.begin:
+                if self.body is not None:
+                    self._close(content, calls, complete=False)
+                self._start(self.offset - len(self.begin))
+                self.pending = ""
+            elif self.body is not None and self.pending == self.end:
+                self._close(content, calls, complete=True)
+                self.pending = ""
+        return StreamPiece(content="".join(content), tool_calls=calls)
+
+    def finish(self) -> StreamPiece:
+        if self.closed:
+            return StreamPiece()
+        content: list[str] = []
+        calls: list[dict] = []
+        for char in self.pending:
+            self._literal(char, content)
+        self.pending = ""
+        if self.body is not None:
+            # An unterminated JSON string may have swallowed framing. At EOS it
+            # cannot become a valid call: retain the bad block and recover later
+            # blocks. Valid strings containing tags have already closed normally.
+            body = "".join(self.body)
+            close = body.find(self.end)
+            if close >= 0:
+                tail = body[close + len(self.end):]
+                self.body = list(body[:close])
+                self._close(content, calls, complete=True)
+                self.offset -= len(tail)
+                piece = self.feed(tail)
+                content.append(piece.content)
+                calls.extend(piece.tool_calls)
+                piece = self.finish()
+                content.append(piece.content)
+                calls.extend(piece.tool_calls)
+            else:
+                self._close(content, calls, complete=False)
+        self.closed = True
+        return StreamPiece(content="".join(content), tool_calls=calls)
+
+
+def _parse_qwen(text: str, tools: List[Dict[str, Any]]) -> tuple[str, list[dict]]:
+    stream = _QwenToolStream(tools)
+    first, last = stream.feed(text), stream.finish()
+    return first.content + last.content, first.tool_calls + last.tool_calls
 
 
 def _schema_properties(tools: List[Dict[str, Any]], name: str) -> dict:
@@ -721,7 +861,8 @@ class ChatResponseParser:
             tool_marker=tool_marker,
         )
         self.tool_stream = (
-            _BufferedToolStream(self.tool_parser, self.tools)
+            (_QwenToolStream(self.tools) if self.tool_parser == "qwen"
+             else _BufferedToolStream(self.tool_parser, self.tools))
             if self.tool_parser in {"qwen", "qwen3_coder", "llama3"}
             else None
         )
@@ -731,6 +872,9 @@ class ChatResponseParser:
             else None
         )
         self.has_tool_calls = False
+        self.diagnostics: list[ToolParseDiagnostic] = (
+            self.tool_stream.diagnostics if isinstance(self.tool_stream, _QwenToolStream) else []
+        )
 
     def parse_full(
         self,
@@ -742,7 +886,10 @@ class ChatResponseParser:
         reasoning, content = self.reasoning.parse_full(text)
         calls: list[dict] = []
         if self.tool_parser == "qwen":
-            content, calls = _parse_qwen(content, self.tools)
+            stream = _QwenToolStream(self.tools)
+            first, last = stream.feed(content), stream.finish()
+            content, calls = first.content + last.content, first.tool_calls + last.tool_calls
+            self.diagnostics[:] = stream.diagnostics
         elif self.tool_parser == "qwen3_coder":
             content, calls = _parse_qwen3_coder(content, self.tools)
         elif self.tool_parser == "llama3":

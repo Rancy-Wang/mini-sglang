@@ -3,15 +3,14 @@ from __future__ import annotations
 import json
 
 from minisgl.message import DetokenizeMsg
+from minisgl.scheduler.prefill import _calculate_cache_reuse_ratio
 from minisgl.server.response_parser import (
     ChatResponseParser,
     infer_reasoning_parser,
     infer_tool_call_parser,
 )
-from minisgl.scheduler.prefill import _calculate_cache_reuse_ratio
 from minisgl.tokenizer.detokenize import DetokenizeManager
 from minisgl.tokenizer.tokenize import TokenizeManager
-
 
 TOOLS = [
     {
@@ -62,7 +61,7 @@ def test_qwen_native_tool_call_and_no_generic_json_guessing() -> None:
         'checking\n<tool_call>\n{"name":"search","arguments":{"query":"kv cache"}}\n'
         "</tool_call>"
     )
-    assert parsed.content == "checking"
+    assert parsed.content == "checking\n"
     assert parsed.tool_calls is not None
     assert parsed.tool_calls[0]["function"] == {
         "name": "search",
@@ -414,3 +413,52 @@ def test_template_provenance_preserves_wrapper_then_flat_fallback() -> None:
     assert manager._chat_template_invocations == 2
     assert manager._tokenize_invocations == 2
     assert manager._effective_template_tools(TOOLS) == [TOOLS[0]["function"]]
+
+
+def test_qwen_lossless_full_stream_all_cuts() -> None:
+    import random
+    from dataclasses import asdict
+
+    bad822 = ('<tool_call>\n{"name": "search", "arguments": {"query": '
+              '"\\"studied anthropology\\" \\"musician\\" \\"University\\" \\"1980\\"}}\n'
+              '</tool_call>')
+    bad844 = '<tool_call>{"name":"search","arguments":{"query":"\\"teacher\\" "author""}}</tool_call>'
+    good = '<tool_call>{"name":"search","arguments":{}}</tool_call>'
+    nested = '<tool_call>' + json.dumps({"name": "search", "arguments": {
+        "query": "  中文🙂 </tool_call> <tool_call> \\\"  ",
+        "nested": [{"x": [1, True, None]}, []],
+    }}, ensure_ascii=False) + '</tool_call>'
+    cases = [bad822, bad844, good, nested, 'before\n' + good + '\nafter',
+             good + good, bad822 + '\nnext\n' + good, bad844 + good,
+             '<tool_call>{"name":"unknown","arguments":{}}</tool_call>' + good,
+             '<tool_call>{"name":"search","arguments":{"query":"truncated',
+             '<tool_call>{"name":"search","arguments":{"query":"bad</tool_call>' + good,
+             '<tool_call>{"name":"search","arguments":NaN}</tool_call>',
+             '<tool_call> [ {"name":"search","arguments":[]} ] </tool_call>',
+             'plain {"name":"search"} <tool_ca']
+
+    def normalized(calls):
+        return [{k: v for k, v in call.items() if k != "id"} for call in calls or []]
+
+    for text in cases:
+        whole = _parser("Qwen/Qwen2.5")
+        expected = whole.parse_full(text)
+        cuts = [[text], list(text)] + [[text[:i], text[i:]] for i in range(len(text) + 1)]
+        rng = random.Random(17)
+        for _ in range(10):
+            positions = sorted({0, len(text), *(rng.randrange(len(text) + 1) for _ in range(12))})
+            cuts.append([text[a:b] for a, b in zip(positions, positions[1:])])
+        for chunks in cuts:
+            parser = _parser("Qwen/Qwen2.5")
+            pieces = [parser.feed(chunk) for chunk in chunks] + [parser.finish()]
+            assert ''.join(p.content for p in pieces) == expected.content, (text, chunks)
+            assert normalized([c for p in pieces for c in p.tool_calls]) == normalized(expected.tool_calls)
+            assert [asdict(d) for d in parser.diagnostics] == [asdict(d) for d in whole.diagnostics]
+        if text in (bad822, bad844):
+            assert expected.content == text and expected.tool_calls is None
+            assert whole.diagnostics[0].reason == 'invalid_json'
+        if text == nested:
+            arguments = json.loads(expected.tool_calls[0]['function']['arguments'])
+            assert arguments['query'] == "  中文🙂 </tool_call> <tool_call> \\\"  "
+        for call in expected.tool_calls or []:
+            json.loads(call['function']['arguments'])

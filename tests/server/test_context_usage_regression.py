@@ -133,12 +133,12 @@ def _response(
     sent = []
 
     async def warmup(*args):
-        assert mode == "staged", "Mask requests must not dispatch an independent warmup."
-        return warm
+        raise AssertionError("Public mask/staged must not dispatch frontend warmups.")
 
     async def send_one(msg):
         sent.append(msg)
         assert not msg.is_warmup
+        assert msg.staged_reference == (mode == "staged" and not reposition)
         assert msg.use_context_mask == (mode == "mask" and not reposition)
 
     async def connected():
@@ -178,25 +178,13 @@ def _response(
 
 
 @pytest.mark.parametrize("stream", [False, True])
-@pytest.mark.parametrize(
-    "warm_prefix,expected", [(8, (8, 0)), (3, (3, 0)), (0, (0, 0)), (9, (4, 5))]
-)
-def test_legacy_staged_http_keeps_one_real_warmup_snapshot(
-    monkeypatch, producer, stream, warm_prefix, expected
-):
-    warm = producer(warm_prefix, True)
-    final = producer(9, False)
-    assert (warm.cached_tokens, warm.drop_skipped_tokens) == expected
-    assert (final.cached_tokens, final.drop_skipped_tokens) == (4, 5)
-    usage = _response(monkeypatch, warm, final, stream=stream, mode="staged")
+def test_staged_http_uses_private_reference_final_snapshot(monkeypatch, stream):
+    usage = _response(monkeypatch, api.CacheUsageReport(8, 0), api.CacheUsageReport(0, 0),
+                      stream=stream, mode="staged")
     assert usage["prompt_tokens"] == 10
+    assert usage["completion_tokens"] == 2
     assert usage["total_tokens"] == 12
-    if expected == (0, 0):
-        assert "prompt_tokens_details" not in usage
-    else:
-        assert usage["prompt_tokens_details"] == dict(
-            zip(("cached_tokens", "drop_skipped_tokens"), expected)
-        )
+    assert "prompt_tokens_details" not in usage
 
 
 def test_real_warmup_stream_without_usage_still_finishes(monkeypatch, producer):

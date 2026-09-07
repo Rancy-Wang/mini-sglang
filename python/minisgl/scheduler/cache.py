@@ -280,8 +280,28 @@ class CacheManager:
         if needed_pages > 0:
             allocated = self._page_to_token(self._allocate(needed_pages))
             _write_page_table(self.page_table, allocated, allocation_info, self.page_size)
+            for req in reqs:
+                if req.staged_reference is not None:
+                    req.staged_reference.register_pages(
+                        self.page_table[req.table_idx, req.cached_len:req.device_len]
+                    )
+
+    def free_reference_pages(self, pages: torch.Tensor) -> None:
+        if self.page_size != 1:
+            raise RuntimeError("Private staged KV requires page_size=1.")
+        self._free(pages)
 
     def cache_req(self, req: Req, *, finished: bool) -> None:
+        if req.staged_reference is not None:
+            state = req.staged_reference
+            if state.released:
+                raise RuntimeError("Reference pages were released twice.")
+            if finished:
+                if state.owned_pages is not None:
+                    self.free_reference_pages(state.owned_pages)
+                    state.owned_pages = None
+                state.released = True
+            return  # Never insert, match, lock or unlock reference KV in Radix.
         if req.radix_key_virtual_mask is not None:
             if not finished:
                 return

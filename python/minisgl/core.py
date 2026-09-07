@@ -47,6 +47,7 @@ if TYPE_CHECKING:
     from minisgl.attention import BaseAttnBackend, BaseAttnMetadata
     from minisgl.kvcache import BaseCacheHandle, BaseKVCachePool
     from minisgl.moe import BaseMoeBackend
+    from minisgl.scheduler.staged_reference import StagedReferenceState
 
 
 @dataclass
@@ -81,6 +82,7 @@ class Req:
     uid: int
     sampling_params: SamplingParams
     cache_handle: BaseCacheHandle
+    staged_reference: StagedReferenceState | None = None
     prompt_tokens: int = 0
     stop: List[str] | None = None
     stop_token_seqs: List[List[int]] | None = None
@@ -359,6 +361,12 @@ class Req:
         return self.device_len - self.cached_len
 
     def complete_one(self) -> None:
+        if self.staged_reference is not None and not self.staged_reference.prefill_done:
+            if self.staged_reference.forward_complete:
+                raise RuntimeError("Reference forward completed twice without a stage transition.")
+            self.cached_len = self.device_len
+            self.staged_reference.forward_complete = True
+            return  # intermediate samples never extend the generated stream
         # `complete_one` is called immediately after forward.
         # Update position metadata here so both overlap and normal loops
         # can schedule the next batch with consistent absolute positions.
@@ -459,6 +467,8 @@ class Req:
 
     @property
     def can_decode(self) -> bool:
+        if self.staged_reference is not None and not self.staged_reference.prefill_done:
+            return False
         return self.remain_len > 0
 
     @property

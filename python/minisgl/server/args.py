@@ -283,7 +283,7 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         help=(
             "How contextual warmup is Prefilled. 'mask' is the default and lets "
             "the selected Prefill attention backend compile its native exact mask; "
-            "'staged' keeps the legacy cache-hit and per-message fallback. The "
+            "'staged' is a cold, request-private sequential semantic reference for validation. The "
             "backend-specific mask names are deprecated aliases for 'mask'."
         ),
     )
