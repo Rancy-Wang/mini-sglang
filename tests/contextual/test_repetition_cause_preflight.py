@@ -6,14 +6,14 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tests.contextual.reference_runtime_adapter import (
+from reference_runtime_adapter import (
     ReferenceCase,
     compact_dynamic_cache,
     render_case,
     short_reference_cases,
     validate_case_plan,
 )
-from tests.contextual.repetition_cause_runner import diagnose_reference
+from repetition_cause_runner import diagnose_reference
 
 
 class PrefixTokenizer:
@@ -115,7 +115,7 @@ def test_case_schema_rejects_drop_without_trigger():
 
 
 def test_retained_drop_rows_must_be_unique_members(monkeypatch):
-    from tests.contextual import reference_runtime_adapter as adapter
+    import reference_runtime_adapter as adapter
 
     class EmptyCache:
         def __init__(self, config=None):
