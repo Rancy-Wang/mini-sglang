@@ -174,3 +174,18 @@ def test_same_boundary_events_and_invalid_future_drop(monkeypatch):
     s.cache_manager.check_integrity()
     with pytest.raises(ValueError, match='before'):
         s.prefill_manager.add_one_req(message(length=6, events=((3, ((0, 4),)),)))
+
+
+def test_runner_backend_fixtures_validate_before_model_load():
+    import importlib.util
+    from pathlib import Path
+    path = Path(__file__).parents[1] / "contextual" / "mask_staged_runner.py"
+    spec = importlib.util.spec_from_file_location("r7_fixture_preflight", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    from minisgl.tokenizer.tokenize import TokenizeManager
+    # Only integer token fixtures are used; tokenizer files and GPU are unnecessary.
+    manager = TokenizeManager.__new__(TokenizeManager)
+    manager.radix_drop_key_mode = "delta-marker"
+    manager._tokenize_invocations = manager._chat_template_invocations = 0
+    module.preflight_backend_fixtures(manager)

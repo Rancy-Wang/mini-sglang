@@ -47,7 +47,7 @@ if TYPE_CHECKING:
     from minisgl.attention import BaseAttnBackend, BaseAttnMetadata
     from minisgl.kvcache import BaseCacheHandle, BaseKVCachePool
     from minisgl.moe import BaseMoeBackend
-    from minisgl.scheduler.reference_state import StagedReferenceState
+    from minisgl.scheduler.staged_reference import StagedReferenceState
 
 
 @dataclass

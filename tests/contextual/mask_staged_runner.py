@@ -828,13 +828,38 @@ def private_result(tokenized, cuts=None):
     positions = torch.arange(len(full), dtype=torch.int32)
     return TokenizedResult(
         input_ids=full, raw_positions=positions, true_positions=positions,
-        radix_input_ids=full.long(), prompt_tokens=len(full), staged_reference=True,
+        radix_input_ids=full.long(), radix_match_ids=None,
+        prefix_keep_mask=torch.ones(max(len(full) - 1, 0), dtype=torch.int32),
+        prompt_tokens=len(full), staged_reference=True,
         drop_event_positions=tokenized.drop_event_positions if cuts is None else torch.tensor(cuts, dtype=torch.int32),
         drop_range_offsets=tokenized.drop_range_offsets if cuts is None else torch.zeros(len(cuts) + 1, dtype=torch.int32),
         drop_position_ranges=tokenized.drop_position_ranges if cuts is None else torch.empty(0, dtype=torch.int32),
         drop_effective_event_count=tokenized.drop_effective_event_count if cuts is None else len(cuts),
         tokenize_invocations=1, chat_template_invocations=1,
     )
+
+
+def preflight_backend_fixtures(manager):
+    from minisgl.message.metrics import RequestMetricsState
+    from minisgl.scheduler.staged_reference import StagedReferenceState
+    fixture = token_fixture93()
+    msg = TokenizeMsg(uid=0, text="token fixture", sampling_params=core.SamplingParams(max_tokens=2, ignore_eos=True))
+    examples = [fixture, private_result(fixture)]
+    for length in (46, 49, 93, 1024):
+        full = torch.arange(length, dtype=torch.int32) % 1000 + 1000
+        ordinary = replace(manager._ordinary_result(msg, full), tokenize_invocations=1)
+        examples.extend([ordinary, private_result(ordinary, [length // 3, 2 * length // 3])])
+    for result in examples:
+        backend = _build_user_msg(replace(msg, staged_reference=result.staged_reference), result)
+        backend = BaseBackendMsg.decoder(BaseBackendMsg.encoder(backend))
+        metrics = RequestMetricsState(request_received_ns=0, prompt_tokens=result.prompt_tokens,
+                                      active_prompt_tokens=len(result.input_ids),
+                                      tokenize_invocations=backend.tokenize_invocations)
+        metrics.observe_token(1, visible=True)
+        metrics.finish(2)
+        if result.staged_reference:
+            state = StagedReferenceState.from_message(backend)
+            assert state.next_end(49152) > 0
 
 
 def backend_generate(runner, msg, tokenized):
@@ -917,7 +942,7 @@ async def reference_experiment(runner, cases, prepared, out, dump):
         runner.clear()
         observer.reset({"0": ideal})
         seed_msg = TokenizeMsg(uid=100, text="seed", sampling_params=core.SamplingParams(max_tokens=1, ignore_eos=True))
-        seed = runner.tokenizer._ordinary_result(seed_msg, fixture.full_input_ids[:hit])
+        seed = replace(runner.tokenizer._ordinary_result(seed_msg, fixture.full_input_ids[:hit]), tokenize_invocations=1)
         seed_result = backend_generate(runner, seed_msg, seed)
         seed_trace = observer.trace
         observer.reset({"0": ideal}, preserve_pages=True)
@@ -941,7 +966,7 @@ async def reference_experiment(runner, cases, prepared, out, dump):
     for length in (93, 1024):
         full = torch.arange(length, dtype=torch.int32) % 1000 + 1000
         msg = TokenizeMsg(uid=200, text="no drop control", sampling_params=core.SamplingParams(max_tokens=2, ignore_eos=True))
-        normal = runner.tokenizer._ordinary_result(msg, full)
+        normal = replace(runner.tokenizer._ordinary_result(msg, full), tokenize_invocations=1)
         pair = []
         for name, tokenized in (("full", normal), ("repeat", normal), ("split", private_result(normal, [length // 3, 2 * length // 3]))):
             runner.clear()
@@ -1067,6 +1092,7 @@ def run_reference_alignment():
     started = time.monotonic()
     tokenizer = load_tokenizer(model)
     manager = TokenizeManager(tokenizer)
+    preflight_backend_fixtures(manager)
     prepared = {}
     for case in cases:
         a = reference_tokenize(manager, model, case["request"], "mask")
@@ -1075,6 +1101,16 @@ def run_reference_alignment():
         assert a[1].prompt_tokens + 1536 < 49152
         assert a[1].tokenize_invocations == b[1].tokenize_invocations == 1
         assert visibility_oracle(a[1]) == visibility_oracle(b[1])
+        starts = {row["msg_id"]: row["raw_start"] for row in a[1].message_meta["radix_state_starts"]}
+        expected_expiry = [2**31 - 1] * len(b[1].input_ids)
+        rule = case["request"]["drop_rule"]
+        assert rule["type"] == "message_drop" and a[1].message_meta["target_offset"] == 0
+        for event, owners in rule["drop_messages"].items():
+            boundary = starts[int(event) + 1]
+            for owner in owners:
+                for raw in range(starts[int(owner)], starts[int(owner) + 1]):
+                    expected_expiry[raw] = min(expected_expiry[raw], boundary)
+        assert expected_expiry == visibility_oracle(b[1])["expiry"]
         prepared[str(case["case_id"])] = a
     dump("preflight", {"input_sha256": hashlib.sha256(input_path.read_bytes()).hexdigest(),
          "canonical": {k: {"token_ids": visibility_oracle(v[1])["ids"], "metadata": v[1].message_meta} for k, v in prepared.items()},

@@ -247,7 +247,13 @@ class Scheduler(SchedulerIOMixin):
 
                 if req.reference_state is not None and req.reference_state.forward_complete:
                     state = req.reference_state
-                    if not state.finish_segment(req, self.table_manager, self.cache_manager):
+                    done = state.finish_segment(req, self.table_manager, self.cache_manager)
+                    metrics_state = self.request_metrics.get(req.uid)
+                    if metrics_state is not None:
+                        metrics_state.context_stage_count = state.segments
+                        if done:
+                            metrics_state.active_prompt_tokens = len(req.input_ids)
+                    if not done:
                         continue
                     self.prefill_manager.complete_reference(req)
                     # The final segment's sample was held out of intermediate state.

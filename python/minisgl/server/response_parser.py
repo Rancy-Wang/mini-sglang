@@ -220,6 +220,7 @@ class _QwenToolStream:
         raw = self.begin + body + (self.end if complete else "")
         reason = None
         items = []
+        encoded_arguments = []
         if not complete:
             reason = "incomplete_tool_block"
         else:
@@ -231,15 +232,23 @@ class _QwenToolStream:
                     reason = "invalid_tool_object"
                 elif any(x["name"] not in self.names for x in items):
                     reason = "unknown_tool"
-            except (json.JSONDecodeError, ValueError):
+                else:
+                    # Validate the whole block before publishing any call. A
+                    # numeric overflow must not escape as a serving exception.
+                    try:
+                        encoded_arguments = [json.dumps(
+                            x.get("arguments", {}), ensure_ascii=False,
+                            separators=(",", ":"), allow_nan=False,
+                        ) for x in items]
+                    except (ValueError, RecursionError):
+                        reason = "unrepresentable_arguments"
+            except (json.JSONDecodeError, ValueError, RecursionError):
                 reason = "invalid_json"
         if reason is not None:
             content.append(raw)
             self.diagnostics.append(ToolParseDiagnostic(reason, self.block_start, self.block_index))
         else:
-            for item in items:
-                arguments = json.dumps(item.get("arguments", {}), ensure_ascii=False,
-                                       separators=(",", ":"), allow_nan=False)
+            for item, arguments in zip(items, encoded_arguments, strict=True):
                 calls.append(_tool_call(item["name"], arguments, self.emitted_calls))
                 self.emitted_calls += 1
         self.block_index += 1

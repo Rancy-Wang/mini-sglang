@@ -434,6 +434,7 @@ def test_qwen_lossless_full_stream_all_cuts() -> None:
              '<tool_call>{"name":"search","arguments":{"query":"truncated',
              '<tool_call>{"name":"search","arguments":{"query":"bad</tool_call>' + good,
              '<tool_call>{"name":"search","arguments":NaN}</tool_call>',
+             '<tool_call>{"name":"search","arguments":{"query":1e999}}</tool_call>',
              '<tool_call> [ {"name":"search","arguments":[]} ] </tool_call>',
              'plain {"name":"search"} <tool_ca']
 
@@ -460,5 +461,8 @@ def test_qwen_lossless_full_stream_all_cuts() -> None:
         if text == nested:
             arguments = json.loads(expected.tool_calls[0]['function']['arguments'])
             assert arguments['query'] == "  中文🙂 </tool_call> <tool_call> \\\"  "
+        if '1e999' in text:
+            assert expected.content == text and expected.tool_calls is None
+            assert whole.diagnostics[0].reason == 'unrepresentable_arguments'
         for call in expected.tool_calls or []:
             json.loads(call['function']['arguments'])
