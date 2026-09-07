@@ -701,7 +701,7 @@ class PrefillAdder:
                     initial_active_cached_len=0, true_seq_len=end, table_idx=table_idx,
                     cached_len=0, output_len=pending.output_len, uid=pending.uid,
                     sampling_params=pending.sampling_params, cache_handle=PrivateCacheHandle(0),
-                    staged_reference=state, prompt_tokens=pending.prompt_tokens,
+                    reference_state=state, prompt_tokens=pending.prompt_tokens,
                     stop=pending.stop, stop_token_seqs=pending.stop_token_seqs,
                     usage_cached_tokens=0, usage_repos_tokens=0,
                     tokenize_invocations=pending.tokenize_invocations,

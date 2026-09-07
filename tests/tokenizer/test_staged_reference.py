@@ -24,7 +24,8 @@ def test_reference_uses_one_full_template_even_when_prefix_is_not_concatenable(m
     assert result.staged_reference
     assert result.input_ids.tolist() == list(map(ord, '3<user>same<assistant>same<user>last<assistant>'))
     assert result.raw_positions.tolist() == list(range(len(result.input_ids)))
-    assert tok.apply_calls == tok.encode_calls == 1
+    assert tok.apply_calls == 0  # provenance renders the full Jinja template directly
+    assert tok.encode_calls == result.tokenize_invocations == result.chat_template_invocations == 1
     assert result.radix_match_ids is None and result.reposition_layout is None
     assert result.full_token_visible_until is None
     other = manager.tokenize([replace(msg, drop_message={1:[1]})])[0]

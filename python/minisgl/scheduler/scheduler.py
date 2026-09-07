@@ -177,7 +177,7 @@ class Scheduler(SchedulerIOMixin):
         # A final masked prefill must compact before an overlapping decode reads
         # its page table. Process the sampled token once, then resume overlap.
         if last_data is not None and any(
-            (req.staged_reference is not None and req.staged_reference.forward_complete)
+            (req.reference_state is not None and req.reference_state.forward_complete)
             or (not isinstance(req, ChunkedReq) and req.context_post_prefill_keep_mask is not None)
             for req in last_data[0].batch.reqs
         ):
@@ -245,8 +245,8 @@ class Scheduler(SchedulerIOMixin):
                     new_finished_reqs.add(req)
                     continue
 
-                if req.staged_reference is not None and req.staged_reference.forward_complete:
-                    state = req.staged_reference
+                if req.reference_state is not None and req.reference_state.forward_complete:
+                    state = req.reference_state
                     if not state.finish_segment(req, self.table_manager, self.cache_manager):
                         continue
                     self.prefill_manager.complete_reference(req)

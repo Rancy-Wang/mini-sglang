@@ -35,6 +35,8 @@ def message(uid=7, *, length=93, events=((49, ((0, 25),)), (79, ((25, 49),))), o
 def scheduler(monkeypatch, pages=256):
     monkeypatch.setattr(torch.Tensor, 'pin_memory', lambda self: self)
     monkeypatch.setattr(core, '_GLOBAL_CTX', core.Context(page_size=1))
+    import minisgl.distributed.info as info
+    monkeypatch.setattr(info, '_TP_INFO', info.DistributedInfo(0, 1))
     s = Scheduler.__new__(Scheduler)
     table = torch.full((5, pages), -1, dtype=torch.int32)
     s.table_manager = TableManager(4, table)
@@ -103,7 +105,7 @@ def test_each_query_visibility_and_final_sample(monkeypatch, budget):
     terminal = s.replies[-1]
     assert (terminal.prompt_tokens, terminal.completion_tokens) == (93, 3)
     assert (terminal.cached_tokens, terminal.drop_skipped_tokens, terminal.repos_tokens) == (0, 0, 0)
-    assert req.staged_reference.released
+    assert req.reference_state.released
     s.cache_manager.check_integrity()
     assert s.table_manager.available_size == 4
 
@@ -133,7 +135,7 @@ def test_cancel_releases_only_private_pages(monkeypatch, when):
     assert s.cache_manager.prefix_cache.size_info.total_size == 3
     assert s.table_manager.available_size == 4
     if req is not None:
-        assert req.staged_reference.released
+        assert req.reference_state.released
         with pytest.raises(RuntimeError, match='twice'):
             s.cache_manager.cache_req(req, finished=True)
 
@@ -153,7 +155,7 @@ def test_capacity_reject_and_batch_isolation(monkeypatch):
         batch = s.prefill_manager.schedule_next_batch(32)
         assert len(batch.reqs) == 4
         advance(s, batch, 9)
-        all_pages = [r.staged_reference.owned_pages for r in batch.reqs]
+        all_pages = [r.reference_state.owned_pages for r in batch.reqs]
         flat = torch.cat([p for p in all_pages if p is not None]) if any(p is not None for p in all_pages) else torch.empty(0)
         assert len(torch.unique(flat)) == len(flat)
     s.cache_manager.check_integrity()

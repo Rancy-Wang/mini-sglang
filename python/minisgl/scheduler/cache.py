@@ -281,8 +281,8 @@ class CacheManager:
             allocated = self._page_to_token(self._allocate(needed_pages))
             _write_page_table(self.page_table, allocated, allocation_info, self.page_size)
             for req in reqs:
-                if req.staged_reference is not None:
-                    req.staged_reference.register_pages(
+                if req.reference_state is not None:
+                    req.reference_state.register_pages(
                         self.page_table[req.table_idx, req.cached_len:req.device_len]
                     )
 
@@ -292,8 +292,8 @@ class CacheManager:
         self._free(pages)
 
     def cache_req(self, req: Req, *, finished: bool) -> None:
-        if req.staged_reference is not None:
-            state = req.staged_reference
+        if req.reference_state is not None:
+            state = req.reference_state
             if state.released:
                 raise RuntimeError("Reference pages were released twice.")
             if finished:
