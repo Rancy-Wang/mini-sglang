@@ -30,24 +30,28 @@ Reference 的三个外部复用计数恒为 `cached_tokens=drop_skipped_tokens=r
 
 R7 的 parser 保真结论不变；R8 没有给 parser 增加补引号、重试或事后修复。对于
 AgenticQwen/Qwen3（不含 Qwen3-Coder）的有效工具请求，tokenizer 额外生成一个可序列化
-的 grammar descriptor，包含所选工具、`auto` / `required` / 指定函数、thinking 模式
-和结构标签版本。无工具、`tool_choice=none`、warmup、模板降级 safe mode 及不兼容模型都
-不生成 descriptor（`TokenizeManager.__init__`、`_set_tool_grammar`，
-`python/minisgl/tokenizer/tokenize.py:121-145,919-952`）。
+的 grammar descriptor，包含所选工具、`auto` / `required` / 指定函数、结构标签版本，以及
+canonical generation prompt 是否已经打开 `<think>`。这里不能直接使用 nullable 的
+`enable_thinking` 偏好：AgenticQwen 接受该参数，但它的 generation prompt 不一定实际输出
+开始标签；XGrammar 的 reasoning 形式却假设 prompt 已经打开 `<think>`，否则会把工具块当成
+任意 reasoning 文本。当前实现因此从最终 prompt 尾部推导该状态。无工具、
+`tool_choice=none`、warmup、模板降级 safe mode 及不兼容模型都不生成 descriptor
+（`TokenizeManager.__init__`、`_set_tool_grammar`，
+`python/minisgl/tokenizer/tokenize.py:121-145,919-964`）。
 
 采样器使用 XGrammar 的 Qwen3 structural tag，在 GPU logits 上只屏蔽本请求当前语法状态
 不允许的 token；不存在全局 token 黑名单或硬编码 token ID。编译结果按 tokenizer、词表、
 stop token 和完整 descriptor 缓存，而 matcher 始终按 `Req` 对象隔离。CPU matcher 在独立
 线程中接受已经提交的 token 并准备下一步 bitmask，与下一次 GPU forward 重叠；GPU 侧只在
 采样前等待该请求的 bitmask（`ToolGrammarManager._compile`、`prepare`、`apply`、
-`accept_sampled_tokens`，`python/minisgl/engine/tool_grammar.py:27-47,55-179,206-243`；
-`Sampler.prepare`、`sample`，`python/minisgl/engine/sample.py:57-116`）。
+`accept_sampled_tokens`，`python/minisgl/engine/tool_grammar.py:26-46,68-241`；
+`Sampler.prepare`、`sample`，`python/minisgl/engine/sample.py:57-124`）。
 
 普通 prefill 的第一个生成 token 受约束且 matcher 只前进一次。staged reference 的中间段
 sample 和 `ChunkedReq` padding 不创建也不推进 matcher；只有最后一段保留的首 token 才推进
 （`Req.sample_is_committed`，`python/minisgl/core.py:398-410`）。批次换序通过 `Req` 身份重新
 定位 mask；完成、取消或 UID 复用时丢弃 matcher（`Scheduler._free_req_resources`，
-`python/minisgl/scheduler/scheduler.py:577-584`）。无 descriptor 的路径不导入 XGrammar、
+`python/minisgl/scheduler/scheduler.py:579-595`）。无 descriptor 的路径不导入 XGrammar、
 不创建 executor/matcher/cache，也不等待 D2H event。
 
 依赖固定为 PyPI 实际发布且可安装的 `xgrammar==0.2.5.post1`；它要求
@@ -60,7 +64,33 @@ R8 验证同时覆盖：822/844 的旧 logits 从何处首次被 grammar 拒绝�
 与嵌套 JSON；编译共享、matcher 隔离、批次换序、取消/UID 复用、无工具零初始化和 CUDA
 Graph replay。对应入口为 `tests/contextual/mask_staged_runner.py:1138-1346`、
 `tests/engine/test_tool_grammar.py:149-226` 和
-`tests/server/test_tool_json_generation.py:17-307`。
+`tests/server/test_tool_json_generation.py:17-349`。
+
+## R8 实测结果：已知 BCP JSON 故障通过
+
+2026-09-07，AgenticQwen-30B-A3B，A800 80GB，BF16、TP1、生产 FlashAttention 与开启的
+CUDA Graph。生产修复运行于 `50cef9ac0cd443b6e9620f8746fc13b937017ad9`；最终 HTTP
+验证脚本运行于 `e5d3bb0506605df4a6d418fb76392f832ccf0c81`，后续两个 commit 只调整测试
+请求的 `model` 字段与 full/stream 对照隔离，没有改变生产 grammar。冻结输入 gzip SHA256
+为 `cfd6f2ed4246cab31c6bb0729b2b63e48bcd02bef372745faafae0d0e114ff8c`。
+
+| 检查 | 结果 |
+|---|---|
+| 旧 logits 首次拒绝点 | 822 在 step 32 拒绝原 token 11248，改选 95642；844 在 step 30 拒绝原 token 11248，改选 330。两条旧轨迹的 parser 诊断均为 `invalid_json` |
+| 真实自由生成 | 822 的 mask/staged 均生成 35 token，844 均生成 34 token；四条结果都能标准 JSON 解码、parser diagnostics 为空并以 `finish_reason=tool_calls` 完成 |
+| 已知失败请求 | 822 生成 `search` 参数 `{"query":"\"studied anthropology\" \"musician\" \"University\" \"1980\""}`；844 生成包含 `university instructor`、`books translated`、`twenty languages`、`editor` 的合法 `search` 参数；原来的缺闭合引号错误未再出现 |
+| grammar 与 graph | 两个 case 共用一个编译结果；in-process 共发生 135 次 graph replay。无工具控制不初始化 grammar，仍正常生成 `OK`，没有以关闭 CUDA Graph 换取通过 |
+| 真实 HTTP | 822/844 的 cold priming、相同 exact-Radix 热路径 full、热路径 stream 全部产生可解码对象；每个 case 的热 full/stream 归一化调用完全相同。`required` 与指定函数均通过 |
+| 截断 | `max_tokens=1` 返回 `finish_reason=length` 和原始 `<tool_call>`，没有伪造为完整 `tool_calls` |
+
+HTTP 对照先验证 cold priming，再比较同一热缓存路径的 full/stream。一次诊断中 cold 与 hot
+的 844 查询文字不同，但都为合法 JSON；这是不同 prefill/Radix 数值路径，而不是流式组装
+差异，所以测试没有用 cold-full 对 hot-stream 作错误的 transport 等价比较。最终 HTTP
+结果为 `PASS`，服务端实际捕获 batch size 1/2/4 的 CUDA Graph。
+
+由此，R7 中明确保留的 822/844 原始 JSON 格式失败已经关闭。此结论只保证 grammar 支持的
+AgenticQwen/Qwen3 有效工具请求生成结构合法；它不保证工具参数的事实正确性，也不把截断、
+不兼容模型或 safe-mode 请求伪装成成功调用。
 
 ## 验证方法与边界
 

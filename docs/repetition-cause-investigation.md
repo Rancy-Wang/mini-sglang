@@ -17,10 +17,10 @@
 
 1. tokenizer 用完整 chat template 生成 canonical token 流，并把最终被删范围置为
    `keep_mask=False`；存活 token 保留原绝对位置（`TokenizeManager._chat_tokenize`，
-   `python/minisgl/tokenizer/tokenize.py:1650-1653,1695-1700,1793-1810`）。
+   `python/minisgl/tokenizer/tokenize.py:1625-1667,1710-1715,1801-1826`）。
 2. mask 流在 Drop 发生前仍允许后续幸存 token 看见尚未到期的前缀；注意力 segment 根据
    `visible_until > query_raw` 选择可见 KV（`build_context_attention_segments`，
-   `python/minisgl/attention/base.py:290-293,347-358`）。所以某个消息自己的 KV 行被删前，
+   `python/minisgl/attention/base.py:290-293,333-360`）。所以某个消息自己的 KV 行被删前，
    它的信息已经进入随后 token 的隐藏状态和更深层 KV。
 3. 最终 mask Prefill 后，`Scheduler._compact_context_after_prefill` 只按 keep mask 重排
    page table、token pool 与请求元数据；它没有重新执行幸存 token 的模型前向
@@ -60,6 +60,38 @@
 24 个最小保留干预中，单独保留 raw 1（`user`）或 raw 2（换行）会恢复正确答案；单独
 保留 raw 5 或 raw 7 仍重复。这只作为敏感性证据，不能替代“重算全部幸存 KV”的因果
 判据。
+
+## 实测指纹与硬判定
+
+独立 runtime 的实际环境为 Python 3.11.15、PyTorch 2.9.1+cu128、Transformers 4.57.1、
+CUDA 12.8、NVIDIA A800-SXM4-80GB，attention=`eager`。它使用
+`transformers.DynamicCache` 直接执行同一模型，不导入 mini-sglang scheduler、Radix、Drop
+compiler 或 attention backend。模型 manifest 同时冻结 chat template、config、generation
+config、tokenizer 与权重索引 SHA256；适配器记录这些字段的代码位于
+`tests/contextual/reference_runtime_adapter.py:326-449`。
+
+最终判定器在当前测试代码上复查了 11 个硬门，全部为 true：canonical prompt 相同；短、长
+Drop 都重复；复制全部幸存 KV 后两者仍逐 token 保持故障；从相同幸存 token IDs 与相同原
+绝对位置完整重算后两者都恢复 no-drop 基线；中间 Drop、保留 system、连续 orphan
+assistant、question-only 四组控制均正常。判定结果只能因此输出
+`stale_survivor_kv_after_drop`（`diagnose_reference`，
+`tests/contextual/repetition_cause_runner.py:48-139`）。
+
+冻结产物位于 `InfiniAI-BUS-2:/share/wangruoxi/local/`，没有纳入仓库：
+
+| 文件 | SHA256 |
+|---|---|
+| `r9_reference_a888596_eager.json` | `4bc47675eafa3717e662f3dbbcba9e960d7db81e581d59723c405284c3f1db4a` |
+| `r9_reference_retention_a888596_eager.json` | `e46500bfe4976074c1cfcde94f2cfe99dafec86ee86e002a6dc71640e7dcdcd7` |
+| `r9_reference_orphan_a888596_eager.json` | `35f18602cac59f64d9f58b47797672f8a2bb7429f93d21ede0212bb9874f33df` |
+| `r9_reference_rebuild_a888596_eager.json` | `4657729e602f7655a4791dc9120e59d05ed95ce98d4018ce52dcf66f5ece9c40` |
+| `r9_diagnosis_a888596.json` | `c2c1fa61daee1fe2d88bb3d1e0d9ffd8d0d8eb3cce78d984ad930a98b2dc48cd` |
+
+主短用例的 no-drop 与 rebuild token 均为
+`[785,1372,9733,572,220,19,17,13,151645]`，文本为
+`The number mentioned was 42.<|im_end|>`；Drop 与 copied 则逐 token 相同并连续输出 `The`。
+这同时满足“故障在独立系统复现”和“只改变幸存 KV 是否重算即可关闭故障”两个条件，因此
+不能把本故障归为模型本身问题。
 
 ## 运行与判定
 
