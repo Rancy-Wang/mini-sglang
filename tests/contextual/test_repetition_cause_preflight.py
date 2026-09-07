@@ -5,7 +5,6 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-
 from reference_runtime_adapter import (
     ReferenceCase,
     compact_dynamic_cache,
