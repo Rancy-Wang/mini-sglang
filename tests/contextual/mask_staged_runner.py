@@ -1135,8 +1135,95 @@ def run_reference_alignment():
              "peak_allocated_bytes": torch.cuda.max_memory_allocated(), "dtype": "bfloat16", "attention": "fa"})
 
 
+@torch.inference_mode()
+def run_projection_replay():
+    """Second bounded probe: replay the actual linear operator, not a full model oracle."""
+    import gzip
+    import subprocess
+
+    from minisgl.layers.linear import _LinearTPImpl
+    from safetensors import safe_open
+
+    source = Path(os.environ["MINISGL_R7_INPUT"])
+    out = Path(os.environ["MINISGL_R7_OUTPUT"])
+    out.mkdir(exist_ok=False)
+    model = Path(os.environ["MINISGL_R3_MODEL"])
+    index = json.loads((model / "model.safetensors.index.json").read_text())["weight_map"]
+    weights = []
+    for part in ("q", "k", "v"):
+        key = f"model.layers.0.self_attn.{part}_proj.weight"
+        with safe_open(model / index[key], framework="pt", device="cpu") as handle:
+            weights.append(handle.get_tensor(key))
+    op = _LinearTPImpl.__new__(_LinearTPImpl)
+    op.weight, op.bias = torch.cat(weights).to(device="cuda", dtype=torch.bfloat16), None
+    results = []
+    started = time.monotonic()
+    for case in ("806", "844"):
+        pair = [torch.load(source / f"{case}_{mode}_operators.pt", weights_only=True)
+                for mode in ("mask", "staged")]
+        a, b = pair
+        name = "00_qkv_projection_input"
+        assert torch.equal(a[name]["raw"], b[name]["raw"])
+        assert torch.equal(a[name]["values"], b[name]["values"])
+        n = a[name]["batch_shapes"][0][0]
+        selected = a[name]["raw"] >= n - 3
+        raw, x = a[name]["raw"][selected], a[name]["values"][selected].cuda()
+        replayed = []
+        for mode, snapshot, length in (("mask", a, n), ("staged", b, 3)):
+            rows = raw if mode == "mask" else raw - (n - 3)
+            inputs = torch.zeros((length, x.shape[-1]), device="cuda", dtype=x.dtype)
+            inputs[rows] = x
+            # Other rows cannot affect a linear projection; keep exact observed row offsets.
+            eager = op.forward(inputs)[rows].clone()
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                for _ in range(2):
+                    op.forward(inputs)
+            torch.cuda.current_stream().wait_stream(stream)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                projected = op.forward(inputs)
+            graph.replay()
+            actual = projected[rows].cpu()
+            captured = snapshot["00_qkv_projection"]["values"][selected]
+            results.append({"case": case, "mode": mode, "raw": raw.tolist(),
+                            "shape": list(inputs.shape), "graph_replays": 1,
+                            "equals_captured": torch.equal(actual, captured),
+                            "max_abs_vs_captured": float((actual.float() - captured.float()).abs().max()),
+                            "graph_equals_eager": torch.equal(actual, eager.cpu())})
+            replayed.append(actual)
+            del graph, projected, inputs, eager
+        results.append({"case": case, "shape_only_max_abs": float(
+            (replayed[0].float() - replayed[1].float()).abs().max())})
+        for mode, snapshot in zip(("mask", "staged"), pair, strict=True):
+            invalid, max_weight_error = [], 0.0
+            for key, entry in snapshot.items():
+                if not key.endswith("_router"):
+                    continue
+                scores = entry["values"].float()
+                ids = snapshot[key.replace("_router", "_expert_ids")]["values"].long()
+                actual_weights = snapshot[key.replace("_router", "_expert_weights")]["values"]
+                picked = scores.gather(1, ids)
+                excluded = scores.clone().scatter_(1, ids, -torch.inf)
+                bad = picked.min(dim=1).values < excluded.max(dim=1).values
+                invalid.extend((key, int(entry["raw"][i])) for i in bad.nonzero().flatten())
+                expected_weights = picked.softmax(dim=1)
+                max_weight_error = max(max_weight_error, float((expected_weights - actual_weights).abs().max()))
+            results.append({"case": case, "mode": mode, "router_invalid_topk": invalid,
+                            "router_max_weight_error": max_weight_error})
+    with gzip.open(out / "projection_replay.json.gz", "wt") as handle:
+        json.dump({"probe_round": 2, "head": subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], text=True).strip(), "rows": results,
+            "seconds": time.monotonic() - started, "full_model_initializations": 0,
+            "weight_shape": list(op.weight.shape), "dtype": str(op.weight.dtype)}, handle)
+    print(json.dumps(results), flush=True)
+
+
 if __name__ == "__main__":
     if os.environ.get("MINISGL_R7_SUITE") == "reference_alignment":
         run_reference_alignment()
+    elif os.environ.get("MINISGL_R7_SUITE") == "projection_replay":
+        run_projection_replay()
     else:
         run()
