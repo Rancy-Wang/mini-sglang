@@ -108,8 +108,8 @@ Overlap 调度在最终 masked Prefill 结束时先处理该批结果、整理 K
 
 流程依据：`v1_completions` 的 `single_context_prefill`（`python/minisgl/server/api_server.py:942-991`）、
 `_build_user_msg`（`python/minisgl/tokenizer/server.py:66-108`）、`plan_context_prefill`
-（`python/minisgl/scheduler/prefill.py:241-350`）；无事件路径见 `_ordinary_result` 与
-`_chat_tokenize`（`python/minisgl/tokenizer/tokenize.py:182-208,1352-1477`），直接匹配见
+（`python/minisgl/scheduler/prefill.py:241-352`）；无事件路径见 `_ordinary_result` 与
+`_chat_tokenize`（`python/minisgl/tokenizer/tokenize.py:182-208,1355-1458`），直接匹配见
 `CacheManager.match_req`（`python/minisgl/scheduler/cache.py:112-153`）；KV 转换及 overlap
 顺序见 `Scheduler.overlap_loop` / `_compact_context_after_prefill`
 （`python/minisgl/scheduler/scheduler.py:162-194,322-393`）。
@@ -176,6 +176,28 @@ mask Prefill 和 mask-free Extend 均可有非零 `drop_skipped_tokens`。一个
 计数（`python/minisgl/scheduler/prefill.py:470-533,619-629`）；`CacheUsageReport.from_reply` 与
 `_build_usage` 在 HTTP 边界保留完整报告、校验三项总和
 （`python/minisgl/server/api_server.py:440-481`）。
+
+R3 的单请求回归入口为 `tests/contextual/test_single_request_prefill.py`。CPU 测试使用真实
+Radix、页表和调度生命周期，采样 token 为测试输入；覆盖并发 1/4、冷/热缓存、分块、
+EOS/stop、取消、overlap 顺序、跨普通/Drop 的合法前缀复用及逐 query 可见集合对照。
+它不代替实际模型前向或性能测量。
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 CUDA_VISIBLE_DEVICES= PYTHONPATH=python \
+python -B -m pytest -q -p no:cacheprovider -o addopts= \
+  tests/server/test_reposition_api.py tests/server/test_context_usage_regression.py \
+  tests/server/test_usage_reporting.py tests/tokenizer/test_template_single_pass.py \
+  tests/tokenizer/test_harmony.py tests/core/test_context_prefill_fast_path.py \
+  tests/core/test_reposition_radix_cache.py tests/core/test_reposition_generated_cacheback.py \
+  tests/misc/test_serialize.py tests/contextual/test_single_request_prefill.py
+```
+
+在独占测试 GPU 上，设置 `CUDA_VISIBLE_DEVICES` 和本地模型路径 `MINISGL_R3_MODEL` 后运行
+同一入口中的 `test_real_model_single_request_prefill_and_decode`，会启动独立进程加载模型，
+检查 concurrency=1/4 的冷 mask/热 extend/普通请求各一次正式 Prefill 后 decode，并逐
+query 重算 dense attention，对比 logits（BF16：atol=0.15、rtol=0.02）及贪心 token。
+数值对照的额外模型调用只存在于测试内，不计作调度 stage；不设置模型环境变量时明确跳过。
+该测试要求 FA3 与可用 CUDA；未运行时不能宣称 GPU 数值、TTFT 或吞吐验证通过。
 
 ## Overlap Scheduling
 

@@ -232,7 +232,8 @@ class TokenizeManager:
             begin = int(events.range_offsets[event_index])
             end = int(events.range_offsets[event_index + 1])
             event_ranges = [
-                (int(start), int(finish)) for start, finish in ranges[begin:end].tolist()
+                (int(start), int(finish))
+                for start, finish in ranges[begin:end].tolist()
             ]
             effective_ranges: list[tuple[int, int]] = []
             for start, finish in event_ranges:
@@ -626,7 +627,9 @@ class TokenizeManager:
                 if thinking_source is None:
                     continue
                 raw_message_id, source = thinking_source
-                token_bytes = [bytes(decode_bytes([token_id])) for token_id in input_ids[start:end]]
+                token_bytes = [
+                    bytes(decode_bytes([token_id])) for token_id in input_ids[start:end]
+                ]
                 byte_offsets = [0]
                 for value in token_bytes:
                     byte_offsets.append(byte_offsets[-1] + len(value))
@@ -1647,7 +1650,9 @@ class TokenizeManager:
         effective_reposition = False
         ignored_reposition_boundaries: list[int] = []
         if layout is not None and reposition_raw_boundaries is not None:
-            effective_reposition = bool(torch.any(layout.effective_reposition_stages > 0).item())
+            effective_reposition = bool(
+                torch.any(layout.effective_reposition_stages > 0).item()
+            )
             ignored_reposition_boundaries = reposition_raw_boundaries[
                 layout.ignored_repositions
             ].tolist()
@@ -1717,7 +1722,9 @@ class TokenizeManager:
             radix_positions=(layout.positions if layout is not None else None),
             radix_repos_info=(layout.repos_info if layout is not None else None),
             radix_next_position=(layout.next_position if layout is not None else None),
-            radix_current_reposition=(layout.current_reposition if layout is not None else -1),
+            radix_current_reposition=(
+                layout.current_reposition if layout is not None else -1
+            ),
             reposition_layout=layout,
             stop_token_seqs=self._build_stop_token_seqs(msg.stop),
             message_meta={

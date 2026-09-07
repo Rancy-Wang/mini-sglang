@@ -302,6 +302,78 @@ def test_ordinary_cache_match_does_not_invoke_retry(runtime, monkeypatch):
     scheduler.cache_manager.check_integrity()
 
 
+def test_different_ordinary_requests_batch_without_context_work(runtime, monkeypatch):
+    scheduler, replies = runtime
+    _seed(scheduler.cache_manager, 8)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Ordinary requests must bypass Context planning and Retry.")
+
+    monkeypatch.setattr(
+        scheduler.prefill_manager.cache_manager.prefix_cache, "match_retry_prefix", forbidden
+    )
+    for uid in range(4):
+        msg = _tokens(uid, drop=False)
+        msg.input_ids[-1] += uid
+        msg.radix_input_ids[-1, 1] = msg.input_ids[-1]
+        scheduler.prefill_manager.add_one_req(msg)
+    batch = scheduler.prefill_manager.schedule_next_batch(32)
+    assert len(batch.reqs) == 4
+    assert all(
+        not req.use_context_mask and req.context_post_prefill_keep_mask is None
+        for req in batch.reqs
+    )
+    _forward_cpu(scheduler, batch)
+    _forward_cpu(scheduler, scheduler.decode_manager.schedule_next_batch())
+    assert len(replies) == 8
+    assert all(reply.cached_tokens == 8 for reply in replies if reply.finished)
+    scheduler.cache_manager.check_integrity()
+
+
+def test_first_token_stop_sequence_finishes_without_decode(runtime):
+    scheduler, replies = runtime
+    msg = _tokens()
+    msg.stop, msg.stop_token_seqs = ["stop"], [[42]]
+    scheduler.prefill_manager.add_one_req(msg)
+    _forward_cpu(scheduler, scheduler.prefill_manager.schedule_next_batch(32))
+    assert len(replies) == 1 and replies[0].matched_stop == "stop"
+    assert replies[0].finished and not scheduler.decode_manager.runnable
+    scheduler.cache_manager.check_integrity()
+
+
+def _dense_model_attention(backend, q, k, v, layer_id, batch, *, sinks=None, sliding_window=None):
+    """Per-query oracle uses raw lifetimes and true positions, never segment metadata."""
+    backend.kvcache.store_kv(k, v, batch.out_loc, layer_id)
+    heads, dim = q.shape[1:]
+    keys = backend.kvcache.k_cache(layer_id)
+    values = backend.kvcache.v_cache(layer_id)
+    kv_heads = keys.shape[-2]
+    keys, values = keys.reshape(-1, kv_heads, dim), values.reshape(-1, kv_heads, dim)
+    output = torch.empty_like(q)
+    offset = 0
+    for req in batch.padded_reqs:
+        raw = req.raw_positions[: req.device_len]
+        true = req.true_positions[: req.device_len]
+        for slot in range(req.cached_len, req.device_len):
+            allowed = torch.arange(req.device_len) <= slot
+            if req.use_context_mask:
+                allowed &= req.full_token_visible_until[raw.long()] > raw[slot]
+            if sliding_window is not None:
+                allowed &= true >= true[slot] - sliding_window
+            pages = core.get_global_ctx().page_table[req.table_idx, : req.device_len]
+            selected = pages[allowed.to(pages.device)].long()
+            key = keys[selected].repeat_interleave(heads // kv_heads, dim=1).float()
+            value = values[selected].repeat_interleave(heads // kv_heads, dim=1).float()
+            logits = torch.einsum("hd,khd->hk", q[offset].float(), key) * backend.scale
+            if sinks is not None:
+                logits = torch.cat((logits, sinks.float().view(heads, 1)), dim=1)
+            probabilities = torch.softmax(logits, dim=-1)[:, : len(selected)]
+            output[offset] = torch.einsum("hk,khd->hd", probabilities, value).to(q.dtype)
+            offset += 1
+    assert offset == len(q)
+    return output
+
+
 @pytest.mark.skipif(
     not os.environ.get("MINISGL_R3_MODEL"), reason="set MINISGL_R3_MODEL on an isolated CUDA device"
 )
@@ -331,6 +403,28 @@ def _real_model():
     )
     scheduler = Scheduler(config)
     tokenizer = TokenizeManager(load_tokenizer(model))
+    backend = scheduler.engine.attn_backend
+    fast_attention = backend.forward
+    model_forward = scheduler.engine.model.forward
+    checked_logits = []
+
+    def checked_model_forward():
+        actual = model_forward()
+        backend.forward = lambda *args, **kwargs: _dense_model_attention(backend, *args, **kwargs)
+        try:
+            reference = model_forward()
+        finally:
+            backend.forward = fast_attention
+        torch.testing.assert_close(actual.float(), reference.float(), atol=0.15, rtol=0.02)
+        assert torch.equal(actual.argmax(-1), reference.argmax(-1))
+        # The oracle wrote reference KV. Restore production KV before the next
+        # decode; these extra model calls are validation only, not scheduler stages.
+        restored = model_forward()
+        torch.testing.assert_close(restored, actual, atol=0, rtol=0)
+        checked_logits.append(True)
+        return actual
+
+    scheduler.engine.model.forward = checked_model_forward
     messages = [
         {"role": "user", "content": "Remember the number 42."},
         {"role": "assistant", "content": "I remember 42."},
@@ -338,7 +432,12 @@ def _real_model():
     ]
     try:
         for concurrency in (1, 4):
-            for drop in (False, True):
+            for case, drop in (("ordinary", False), ("cold_mask", True), ("warm_extend", True)):
+                if case != "warm_extend":
+                    evicted = scheduler.cache_manager.prefix_cache.evict(
+                        scheduler.cache_manager.prefix_cache.size_info.total_size
+                    )
+                    scheduler.cache_manager._free(evicted)
                 replies = []
                 scheduler.send_result = replies.extend
                 for uid in range(concurrency):
@@ -357,18 +456,32 @@ def _real_model():
                     )
                     scheduler._process_one_msg(_build_user_msg(msg, tokenized))
                 phases = []
+                masks = []
+                checked_logits.clear()
                 with scheduler.engine_stream_ctx:
                     while scheduler.prefill_manager.runnable or scheduler.decode_manager.runnable:
                         forward = scheduler._schedule_next_batch()
                         assert forward is not None
                         phases.append((forward.batch.is_prefill, len(forward.batch.reqs)))
+                        if forward.batch.is_prefill:
+                            masks.extend(req.use_context_mask for req in forward.batch.reqs)
                         assert all(not req.is_warmup for req in forward.batch.reqs)
                         scheduler._process_last_data((forward, scheduler._forward(forward)))
                 assert phases == [(True, concurrency), (False, concurrency)], phases
+                assert len(checked_logits) == 2
+                assert masks == [case == "cold_mask"] * concurrency
                 assert len(replies) == concurrency * 2
                 assert all(reply.completion_tokens == 2 for reply in replies if reply.finished)
                 scheduler.cache_manager.check_integrity()
-                print({"concurrency": concurrency, "drop": drop, "phases": phases}, flush=True)
+                print(
+                    {
+                        "concurrency": concurrency,
+                        "case": case,
+                        "phases": phases,
+                        "dense_logits_and_greedy": "pass",
+                    },
+                    flush=True,
+                )
     finally:
         scheduler.shutdown()
 
