@@ -75,6 +75,13 @@ def _tokens(uid=1, drop=True):
 @pytest.fixture
 def runtime(monkeypatch):
     monkeypatch.setattr(torch.Tensor, "pin_memory", lambda self: self)
+    empty = torch.empty
+
+    def cpu_empty(*args, **kwargs):
+        kwargs.pop("pin_memory", None)
+        return empty(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", cpu_empty)
     ctx = core.Context(page_size=1)
     ctx.attn_backend = SimpleNamespace(supports_multi_context_mask_prefill=True)
     monkeypatch.setattr(core, "_GLOBAL_CTX", ctx)

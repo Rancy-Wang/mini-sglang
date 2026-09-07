@@ -1365,6 +1365,11 @@ class TokenizeManager:
             allow_internal=True,
         )
         has_reposition = bool(msg.reposition)
+        if msg.reposition == []:
+            logger.warning(
+                "Ignoring empty Reposition list for request %s; using the ordinary path.",
+                msg.uid,
+            )
         if (drop_rule is not None or has_reposition) and self.radix_drop_key_mode != "delta-marker":
             raise ValueError(
                 "Token-position Drop/Reposition requires radix_drop_key_mode='delta-marker'; "
@@ -1652,11 +1657,6 @@ class TokenizeManager:
                     msg.uid,
                     ignored_reposition_boundaries,
                 )
-        if msg.reposition == []:
-            logger.warning(
-                "Ignoring empty Reposition list for request %s; using the ordinary path.",
-                msg.uid,
-            )
         if layout is None:
             radix_input_ids = radix_match_ids[keep_mask].contiguous()
             radix_commit_key_len = None

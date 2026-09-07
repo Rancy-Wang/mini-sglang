@@ -86,7 +86,13 @@ def test_empty_reposition_preserves_ordinary_mode_compatibility() -> None:
 
 
 def test_tokenizer_treats_empty_reposition_as_ordinary_with_warning(caplog) -> None:
-    manager = TokenizeManager(SimpleNamespace(name_or_path="fake", is_fast=True))
+    manager = TokenizeManager(
+        SimpleNamespace(
+            name_or_path="fake",
+            is_fast=True,
+            apply_chat_template=lambda *args, **kwargs: [10, 11, 12],
+        )
+    )
     manager._build_template_messages = lambda messages, safe_mode: (messages, 0)
     manager._build_template_provenance = lambda *args, **kwargs: TemplateTokenProvenance(
         input_ids=[10, 11, 12],
@@ -113,10 +119,9 @@ def test_tokenizer_treats_empty_reposition_as_ordinary_with_warning(caplog) -> N
 
     assert ordinary.reposition_raw_boundaries is None
     assert ordinary.reposition_insert_offsets is None
-    assert retry_source.reposition_raw_boundaries is not None
-    assert retry_source.reposition_raw_boundaries.numel() == 0
-    assert retry_source.reposition_insert_offsets is not None
-    assert retry_source.reposition_insert_offsets.numel() == 0
+    assert retry_source.reposition_raw_boundaries is None
+    assert retry_source.reposition_insert_offsets is None
+    assert torch.equal(ordinary.radix_match_ids, retry_source.radix_match_ids)
     assert retry_source.reposition_input_ids is None
     assert "Ignoring empty Reposition list" in caplog.text
 
