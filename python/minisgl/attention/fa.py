@@ -220,11 +220,14 @@ class FlashAttentionBackend(BaseAttnBackend):
                     masked_reqs, sliding_window=sliding_window
                 )
                 if sliding_window is None:
-                    for req, cached_tokens in zip(
-                        masked_reqs, context_batch.cached_tokens, strict=True
+                    for req, cached_tokens, cached_positions in zip(
+                        masked_reqs,
+                        context_batch.cached_tokens,
+                        context_batch.cached_positions,
+                        strict=True,
                     ):
                         if req.usage_cached_tokens is None:
-                            req.record_context_cache_usage(cached_tokens)
+                            req.record_context_cache_usage(cached_tokens, cached_positions)
                 return _compile_fa_segments(context_batch)
 
             context_segments = _compile_fa_context(None)

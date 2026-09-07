@@ -131,6 +131,17 @@ class TokenizeManager:
         tokenizer_name = str(getattr(tokenizer, "name_or_path", "")).lower()
         tokenizer_class = type(tokenizer).__name__.lower()
         self.is_gpt_oss = "gpt-oss" in tokenizer_name or "gptoss" in tokenizer_class
+        qwen_name = tokenizer_name.replace("_", "-")
+        self._tool_grammar_model = (
+            "qwen_3"
+            if (
+                "agenticqwen" in qwen_name
+                or "qwen3" in qwen_name
+                or "qwen-3" in qwen_name
+            )
+            and "coder" not in qwen_name
+            else None
+        )
         self._reasoning_effort: str | None = None
         self._harmony_encoding = None
         self._preserve_harmony_thinking = False
@@ -177,6 +188,33 @@ class TokenizeManager:
             ranges,
             reposition_raw_boundaries if reposition_raw_boundaries is not None else empty,
             reposition_insert_offsets if reposition_insert_offsets is not None else empty,
+        )
+
+    def _ordinary_result(
+        self, msg: TokenizeMsg, input_ids: torch.Tensor, *, message_meta: dict | None = None
+    ) -> TokenizedResult:
+        """Canonical base keys without event compilation or identity layout arrays."""
+        positions = torch.arange(len(input_ids), dtype=torch.int32, device="cpu")
+        if self.radix_drop_key_mode == "delta-marker":
+            records = torch.empty((len(input_ids), 4), dtype=torch.int32, device="cpu")
+            records[:, 0] = 0
+            records[:, 1] = input_ids
+            records[:, 2] = -1
+            records[:, 3] = positions
+        else:
+            records = input_ids.to(torch.int64)
+        return TokenizedResult(
+            input_ids=input_ids,
+            true_positions=positions,
+            raw_positions=positions,
+            radix_input_ids=records,
+            radix_match_ids=records,
+            prefix_keep_mask=torch.ones(max(len(input_ids) - 1, 0), dtype=torch.int32),
+            prompt_tokens=len(input_ids),
+            stop_token_seqs=self._build_stop_token_seqs(msg.stop),
+            message_meta=message_meta,
+            tokenize_invocations=self._tokenize_invocations,
+            chat_template_invocations=self._chat_template_invocations,
         )
 
     @staticmethod
@@ -877,6 +915,53 @@ class TokenizeManager:
         # Keep all tools as fallback if we cannot find an exact match.
         return selected if len(selected) > 0 else tools
 
+    def _set_tool_grammar(
+        self,
+        msg: TokenizeMsg,
+        tools: List[Dict[str, Any]] | None,
+        *,
+        mode: str,
+        forced_tool_name: str | None,
+        safe_mode: bool,
+        prompt_ids: List[int] | torch.Tensor,
+    ) -> None:
+        msg.sampling_params.tool_grammar = None
+        if (
+            self._tool_grammar_model is None
+            or not tools
+            or mode == "none"
+            or safe_mode
+            or msg.is_warmup
+        ):
+            return
+        if mode == "function" and forced_tool_name is not None:
+            tool_choice: str | dict[str, Any] = {
+                "type": "function",
+                "function": {"name": forced_tool_name},
+            }
+        else:
+            tool_choice = mode
+        # Detach the grammar descriptor from request-owned mutable tool objects.
+        frozen_tools = json.loads(json.dumps(tools, ensure_ascii=False))
+        tail_ids = (
+            prompt_ids[-32:].tolist()
+            if isinstance(prompt_ids, torch.Tensor)
+            else prompt_ids[-32:]
+        )
+        prompt_tail = self.tokenizer.decode(tail_ids, skip_special_tokens=False)
+        msg.sampling_params.tool_grammar = {
+            "version": 1,
+            "model": self._tool_grammar_model,
+            "tools": frozen_tools,
+            "tool_choice": tool_choice,
+            # XGrammar's reasoning form assumes the prompt has already opened
+            # ``<think>`` and constrains only after ``</think>``.  Derive that
+            # fact from the rendered canonical prompt, not the nullable request
+            # preference: AgenticQwen accepts ``enable_thinking`` but does not
+            # emit an opening tag in its generation prompt.
+            "reasoning": prompt_tail.rstrip().endswith("<think>"),
+        }
+
     @staticmethod
     def _flatten_tools(
         tools: List[Dict[str, Any]] | None,
@@ -1334,6 +1419,7 @@ class TokenizeManager:
         self._harmony_thinking_ranges = {}
         self._chat_template_override = None
         self._chat_template_kwargs = {}
+        msg.sampling_params.tool_grammar = None
         drop_rule = parse_drop_rule(
             getattr(msg, "drop_rule", None),
             msg.text,
@@ -1341,11 +1427,27 @@ class TokenizeManager:
             allow_internal=True,
         )
         has_reposition = bool(msg.reposition)
+        if msg.reposition == []:
+            logger.warning(
+                "Ignoring empty Reposition list for request %s; using the ordinary path.",
+                msg.uid,
+            )
         if (drop_rule is not None or has_reposition) and self.radix_drop_key_mode != "delta-marker":
             raise ValueError(
                 "Token-position Drop/Reposition requires radix_drop_key_mode='delta-marker'; "
                 f"got {self.radix_drop_key_mode!r}."
             )
+        if not has_reposition and not msg.is_warmup:
+            if isinstance(drop_rule, MessageDropRule) and not any(
+                trigger < len(msg.text) and ids for trigger, ids in drop_rule.drop_messages.items()
+            ):
+                drop_rule = None
+            elif isinstance(drop_rule, TextDropRule) and not any(
+                selection is not None for selection in drop_rule.selections
+            ):
+                drop_rule = None
+            elif isinstance(drop_rule, KeepTextDropRule) and not drop_rule.has_drop():
+                drop_rule = None
         tool_choice_mode, forced_tool_name = self._normalize_tool_choice(msg.tool_choice)
         selected_tools = self._select_tools_for_choice(
             msg.tools,
@@ -1371,6 +1473,50 @@ class TokenizeManager:
             messages, target_offset = self._build_template_messages(
                 msg.text,
                 safe_mode=False,
+            )
+        if drop_rule is None and not has_reposition and not msg.is_warmup:
+            safe_mode = False
+            if self.is_gpt_oss:
+                ids, _, _ = self._render_harmony_message_drop(
+                    messages, enable_thinking=msg.enable_thinking, tools=selected_tools
+                )
+            else:
+                try:
+                    ids = self._apply_chat_template(
+                        messages,
+                        add_generation_prompt=True,
+                        enable_thinking=msg.enable_thinking,
+                        tools=template_tools,
+                    )
+                except Exception:
+                    messages, target_offset = self._build_template_messages(
+                        msg.text, safe_mode=True
+                    )
+                    safe_mode = True
+                    ids = self._apply_chat_template(
+                        messages,
+                        add_generation_prompt=True,
+                        enable_thinking=msg.enable_thinking,
+                        tools=None,
+                    )
+            self._set_tool_grammar(
+                msg,
+                selected_tools,
+                mode=tool_choice_mode,
+                forced_tool_name=forced_tool_name,
+                safe_mode=safe_mode,
+                prompt_ids=ids,
+            )
+            return self._ordinary_result(
+                msg,
+                torch.tensor(ids, dtype=torch.int32, device="cpu"),
+                message_meta={
+                    "safe_mode": int(safe_mode),
+                    "normalized_messages": len(messages),
+                    "target_offset": target_offset,
+                    "radix_drop_key_mode": self.radix_drop_key_mode,
+                    "drop_rule_type": None,
+                },
             )
         safe_mode = False
         provenance: TemplateTokenProvenance | None = None
@@ -1494,6 +1640,20 @@ class TokenizeManager:
             compiled_drop_events = drop_rule.compile_token_drop_events(drop_context)
             if len(compiled_drop_events.event_insert_offsets) > 0:
                 token_drop_events = compiled_drop_events
+        if token_drop_events is None and not has_reposition and not msg.is_warmup:
+            self._set_tool_grammar(
+                msg,
+                selected_tools,
+                mode=tool_choice_mode,
+                forced_tool_name=forced_tool_name,
+                safe_mode=safe_mode,
+                prompt_ids=full_with_gen_tensor,
+            )
+            return self._ordinary_result(
+                msg,
+                full_with_gen_tensor,
+                message_meta={"safe_mode": int(safe_mode), "drop_rule_type": None},
+            )
         warmup_commit_token_len = (
             bisect_right(query_epoch_with_gen, len(messages) - 1)
             if msg.is_warmup and not msg.use_context_mask
@@ -1577,11 +1737,6 @@ class TokenizeManager:
                     msg.uid,
                     ignored_reposition_boundaries,
                 )
-        if msg.reposition == []:
-            logger.warning(
-                "Ignoring empty Reposition list for request %s; using the ordinary path.",
-                msg.uid,
-            )
         if layout is None:
             radix_input_ids = radix_match_ids[keep_mask].contiguous()
             radix_commit_key_len = None
@@ -1601,6 +1756,14 @@ class TokenizeManager:
                 )
             )
 
+        self._set_tool_grammar(
+            msg,
+            selected_tools,
+            mode=tool_choice_mode,
+            forced_tool_name=forced_tool_name,
+            safe_mode=safe_mode,
+            prompt_ids=full_with_gen_tensor,
+        )
         return TokenizedResult(
             input_ids=input_ids,
             true_positions=true_positions,
@@ -1673,51 +1836,13 @@ class TokenizeManager:
             if isinstance(msg.text, list):
                 results.append(self._chat_tokenize(msg))
             else:
+                msg.sampling_params.tool_grammar = None
                 prompt = msg.text
                 input_ids: torch.Tensor = (  # type: ignore
                     self.tokenizer.encode(prompt, return_tensors="pt")
                 )
                 input_ids = input_ids.view(-1).to(torch.int32)
-                layout = self._compile_delta_layout(
-                    input_ids,
-                    None,
-                    torch.ones(len(input_ids), dtype=torch.bool, device="cpu"),
-                    None,
-                    None,
-                )
-                radix_match_ids = (
-                    layout.records if layout is not None else input_ids.to(torch.int64)
-                )
-                radix_input_ids = (
-                    layout.records[layout.token_to_key]
-                    if layout is not None
-                    else input_ids.to(torch.int64)
-                )
-                results.append(
-                    TokenizedResult(
-                        input_ids=input_ids,
-                        true_positions=torch.arange(len(input_ids), dtype=torch.int32),
-                        raw_positions=torch.arange(len(input_ids), dtype=torch.int32),
-                        radix_input_ids=radix_input_ids,
-                        radix_match_ids=radix_match_ids,
-                        prefix_keep_mask=torch.ones(
-                            max(len(input_ids) - 1, 0), dtype=torch.int32, device="cpu"
-                        ),
-                        prompt_tokens=len(input_ids),
-                        radix_key_virtual_mask=(
-                            layout.virtual_mask if layout is not None else None
-                        ),
-                        radix_key_to_token=(layout.key_to_token if layout is not None else None),
-                        radix_token_to_key=(layout.token_to_key if layout is not None else None),
-                        radix_positions=(layout.positions if layout is not None else None),
-                        radix_repos_info=(layout.repos_info if layout is not None else None),
-                        radix_next_position=(layout.next_position if layout is not None else None),
-                        radix_current_reposition=(
-                            layout.current_reposition if layout is not None else -1
-                        ),
-                        reposition_layout=layout,
-                        stop_token_seqs=self._build_stop_token_seqs(msg.stop),
-                        message_meta=None,
-                    )
-                )
+                self._tokenize_invocations = 1
+                self._chat_template_invocations = 0
+                results.append(self._ordinary_result(msg, input_ids))
         return results

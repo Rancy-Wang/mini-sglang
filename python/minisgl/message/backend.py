@@ -68,7 +68,7 @@ class UserMsg(BaseBackendMsg):
     full_input_ids: torch.Tensor | None = None  # CPU 1D int32 full token stream
     full_token_visible_until: torch.Tensor | None = None  # CPU 1D int32 first hidden query pos
     full_keep_mask: torch.Tensor | None = None  # CPU 1D int32 final full-to-active mask
-    use_context_mask: bool = False  # internal warmup: Prefill the full stream with a custom mask
+    use_context_mask: bool = False  # planner selects ordinary Extend or masked Prefill
     context_compact_stream: bool = False  # mask metadata accompanies an already compact stream
     context_post_prefill_keep_mask: torch.Tensor | None = None  # final raw keep-set
     request_received_ns: int | None = None  # frontend monotonic clock, public requests only
@@ -82,7 +82,6 @@ class UserMsg(BaseBackendMsg):
     reposition_h2d_bytes: int = 0
     reposition_d2h_bytes: int = 0
     reposition_ipc_tensor_bytes: int = 0
-    prior_drop_skipped_tokens: int = 0
 
 
 @dataclass

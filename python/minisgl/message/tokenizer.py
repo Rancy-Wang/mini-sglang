@@ -51,6 +51,8 @@ class DetokenizeMsg(BaseTokenizerMsg):
     finish_reason: str | None = None
     matched_stop: str | None = None
     cached_tokens: int | None = None
+    drop_skipped_tokens: int = 0
+    repos_tokens: int = 0
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
     server_metrics: ServerMetrics | None = None
@@ -63,6 +65,7 @@ class WarmupAckMsg(BaseTokenizerMsg):
     cached_tokens: int
     drop_skipped_tokens: int
     finished: bool
+    repos_tokens: int = 0
     radix_match_ns: int = 0
     retry_plan_ns: int = 0
     reposition_transition_count: int = 0

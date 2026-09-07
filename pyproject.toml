@@ -36,7 +36,8 @@ dependencies = [
     "fastapi",
     "prompt_toolkit",
     "openai",
-    "apache-tvm-ffi>=0.1.4",
+    "apache-tvm-ffi>=0.1.9",
+    "xgrammar==0.2.5.post1",
     "sgl_kernel==0.3.21",
     "quack-kernels",
 ]

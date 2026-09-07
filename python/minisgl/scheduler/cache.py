@@ -115,7 +115,11 @@ class CacheManager:
         matched = self._match_prefix(radix_query, query_virtual_mask)
         handle, key_match_indices, matched_virtual_mask = matched
         used_retry = False
-        if req.radix_match_ids is not None and req.radix_match_ids.ndim == 2:
+        if (
+            req.radix_match_ids is not None
+            and req.radix_match_ids.ndim == 2
+            and req.radix_key_to_token is not None
+        ):
             from minisgl.kvcache.radix_cache import RadixCacheHandle, RadixPrefixCache
 
             if not isinstance(self.prefix_cache, RadixPrefixCache) or not isinstance(
@@ -505,7 +509,13 @@ class CacheManager:
         candidate_key_positions = candidate_key_positions.to(
             device=candidates.device, dtype=torch.int64, non_blocking=True
         )
-        canonical_indices = insert_result.handle.get_matched_indices()
+        # A cold staged Drop can leave no contiguous prefix to commit. The
+        # returned root handle has no index chunks and adopts no request pages.
+        canonical_indices = (
+            insert_result.handle.get_matched_indices()
+            if insert_result.handle.cached_len > 0
+            else candidates.new_empty((0,))
+        )
 
         def adopted_pages(pages: torch.Tensor, key_positions: torch.Tensor) -> torch.Tensor:
             key_positions = key_positions.to(

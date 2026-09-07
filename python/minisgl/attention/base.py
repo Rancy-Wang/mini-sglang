@@ -37,6 +37,7 @@ class ContextAttentionBatch:
     cu_seqlens_k: torch.Tensor
     max_seqlen_q: int
     max_seqlen_k: int
+    cached_positions: tuple[torch.Tensor, ...] = ()
 
     @property
     def num_segments(self) -> int:
@@ -380,6 +381,7 @@ def build_context_attention_batch(
     query_lengths = []
     key_lengths = []
     cached_tokens = []
+    cached_positions = []
     expected_query_offset = 0
     for req in reqs:
         if req.full_token_visible_until is None:
@@ -404,6 +406,11 @@ def build_context_attention_batch(
         first_segment = segments[0]
         first_query_length = first_segment.query_end - first_segment.query_start
         cached_tokens.append(len(first_segment.key_positions) - first_query_length)
+        # Drop visibility only decreases: initial hits used by any query are
+        # exactly those present in the first full-attention segment.
+        cached_positions.append(
+            first_segment.key_positions[first_segment.key_positions < req.cached_len]
+        )
         local_query_offset = 0
         for segment in segments:
             if segment.query_start != local_query_offset:
@@ -424,6 +431,7 @@ def build_context_attention_batch(
         raise RuntimeError("Context batch query layout diverged from flattened Prefill Q.")
     return ContextAttentionBatch(
         cached_tokens=tuple(cached_tokens),
+        cached_positions=tuple(cached_positions),
         segment_table_indices=torch.tensor(segment_table_indices, dtype=torch.int32),
         key_positions=torch.cat(key_positions),
         cu_seqlens_q=cu_seqlens_q,

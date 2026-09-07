@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Dict, List, NamedTuple, NoReturn, Set, Tuple, 
 
 import torch
 from minisgl.core import Batch, Req
+from minisgl.engine.tool_grammar import ToolGrammarManager
 from minisgl.env import ENV
 from minisgl.kernel.context_plan import preload_context_plan_kernel
 from minisgl.layers import get_rope
@@ -147,6 +148,11 @@ class Scheduler(SchedulerIOMixin):
         self.eos_token_ids = {int(token_id) for token_id in eos_values if token_id is not None}
         if config.model_config.is_gpt_oss:
             self.eos_token_ids.update(get_gpt_oss_terminal_stop_token_ids())
+        self.engine.sampler.tool_grammar = ToolGrammarManager(
+            self.tokenizer,
+            config.model_config.vocab_size,
+            self.eos_token_ids,
+        )
         self.token_pool = self.table_manager.token_pool
         self.prefill_budget = config.max_extend_tokens
         # self.config = config
@@ -173,6 +179,15 @@ class Scheduler(SchedulerIOMixin):
         )
         for msg in self.receive_msg(blocking=blocking):
             self._process_one_msg(msg)
+
+        # A final masked prefill must compact before an overlapping decode reads
+        # its page table. Process the sampled token once, then resume overlap.
+        if last_data is not None and any(
+            not isinstance(req, ChunkedReq) and req.context_post_prefill_keep_mask is not None
+            for req in last_data[0].batch.reqs
+        ):
+            self._process_last_data(last_data)
+            last_data = None
 
         forward_input = self._schedule_next_batch()
         ongoing_data = None
@@ -243,6 +258,7 @@ class Scheduler(SchedulerIOMixin):
                             hit_ratio=req.cache_reuse_ratio,
                             cached_tokens=req.reported_cached_tokens,
                             drop_skipped_tokens=req.drop_skipped_tokens,
+                            repos_tokens=req.reported_repos_tokens,
                             finished=finished,
                             radix_match_ns=req.radix_match_ns,
                             retry_plan_ns=req.retry_plan_ns,
@@ -280,10 +296,7 @@ class Scheduler(SchedulerIOMixin):
                         visible = not (finished and next_token in self.eos_token_ids)
                         metrics_state.observe_token(generated_ns, visible=visible)
                         if finished:
-                            metrics_state.drop_skipped_tokens = max(
-                                metrics_state.drop_skipped_tokens,
-                                req.drop_skipped_tokens,
-                            )
+                            metrics_state.drop_skipped_tokens = req.drop_skipped_tokens
                             server_metrics = metrics_state.finish(generated_ns)
                             self.request_metrics.pop(req.uid, None)
                     reply.append(
@@ -294,6 +307,8 @@ class Scheduler(SchedulerIOMixin):
                             finish_reason=finish_reason if finished else None,
                             matched_stop=matched_stop,
                             cached_tokens=(req.reported_cached_tokens if finished else None),
+                            drop_skipped_tokens=req.drop_skipped_tokens if finished else 0,
+                            repos_tokens=req.reported_repos_tokens if finished else 0,
                             prompt_tokens=req.prompt_tokens if finished else None,
                             completion_tokens=req.completion_tokens if finished else None,
                             server_metrics=server_metrics,
@@ -311,7 +326,7 @@ class Scheduler(SchedulerIOMixin):
         self.send_result(reply)
 
     def _compact_context_after_prefill(self, req: Req) -> None:
-        """Switch the final masked Reposition Prefill to its active Decode view."""
+        """Switch the final masked Prefill to its active Decode view."""
 
         keep_mask = req.context_post_prefill_keep_mask
         if keep_mask is None:
@@ -324,7 +339,7 @@ class Scheduler(SchedulerIOMixin):
             raise RuntimeError("Post-Prefill keep mask does not cover the prompt raw positions.")
         keep = (keep_mask[prompt_raw] != 0).to(dtype=torch.bool, device="cpu")
         if not bool(torch.any(keep).item()):
-            raise RuntimeError("Reposition cannot Drop every prompt token before generation.")
+            raise RuntimeError("Cannot Drop every prompt token before generation.")
 
         pages = self.table_manager.page_table[req.table_idx, :prompt_len].clone()
         keep_device = keep.to(device=pages.device, non_blocking=True)
@@ -503,7 +518,6 @@ class Scheduler(SchedulerIOMixin):
                     context_stage_count=msg.context_stage_count,
                     radix_compile_ns=msg.radix_compile_ns,
                     reposition_ipc_tensor_bytes=msg.reposition_ipc_tensor_bytes,
-                    drop_skipped_tokens=msg.prior_drop_skipped_tokens,
                 )
                 self.request_metrics[msg.uid].observe_reposition(
                     radix_match_ns=msg.radix_match_ns,
@@ -543,6 +557,9 @@ class Scheduler(SchedulerIOMixin):
         return True
 
     def _free_req_resources(self, req: Req) -> None:
+        engine = getattr(self, "engine", None)
+        if engine is not None:
+            engine.sampler.discard(req)
         try:
             self.cache_manager.cache_req(req, finished=True)
         finally:
