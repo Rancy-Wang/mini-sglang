@@ -18,7 +18,7 @@ import torch
 from minisgl.attention.base import build_context_attention_batch, build_context_attention_segments
 from minisgl.core import SamplingParams
 from minisgl.kernel.radix_reposition import compile_radix_reposition_layout
-from minisgl.message import TokenizeMsg
+from minisgl.message import TokenizeMsg, WarmupAckMsg
 from minisgl.scheduler.cache import CacheManager
 from minisgl.scheduler.decode import DecodeManager
 from minisgl.scheduler.prefill import ChunkedReq, PrefillManager
@@ -169,6 +169,58 @@ def test_single_formal_prefill_then_decode(runtime, concurrency, hit, expected, 
     )
     match = scheduler.cache_manager.match_req(pending)
     assert match.active_cached_len == 9
+
+
+@pytest.mark.parametrize("concurrency", [1, 4])
+@pytest.mark.parametrize("hit,commit_tokens", [(0, 0), (0, 9), (8, 9)])
+def test_staged_warmup_commit_preserves_page_ownership(
+    runtime, monkeypatch, concurrency, hit, commit_tokens
+):
+    scheduler, replies = runtime
+    cache = scheduler.cache_manager
+    _seed(cache, hit)
+    ordinary_key = _tokens(drop=False).radix_match_ids
+    _, seed_pages, _ = cache._match_prefix(ordinary_key[:hit])
+    seed_pages = seed_pages.clone()
+    committed = []
+    insert_prefix = cache.prefix_cache.insert_prefix
+
+    def record_insert(*args, **kwargs):
+        result = insert_prefix(*args, **kwargs)
+        committed.append(result.handle)
+        return result
+
+    monkeypatch.setattr(cache.prefix_cache, "insert_prefix", record_insert)
+    # Repeat to expose leaked pages and duplicate frees across completed batches.
+    for turn in range(2):
+        for index in range(concurrency):
+            msg = _tokens(uid=10 + turn * concurrency + index)
+            msg.is_warmup, msg.use_context_mask = True, False
+            msg.context_post_prefill_keep_mask = None
+            msg.sampling_params = SamplingParams(max_tokens=1, ignore_eos=True)
+            msg.radix_commit_key_len = int(msg.radix_token_to_key[commit_tokens])
+            scheduler.prefill_manager.add_one_req(msg)
+        batch = scheduler.prefill_manager.schedule_next_batch(128)
+        assert batch is not None and len(batch.reqs) == concurrency
+        assert all(req.is_warmup and not req.use_context_mask for req in batch.reqs)
+        assert all(req.raw_positions.tolist() == [5, 6, 7, 8, 9] for req in batch.reqs)
+        _forward_cpu(scheduler, batch)
+        assert len(replies) == (turn + 1) * concurrency
+        assert all(isinstance(reply, WarmupAckMsg) and reply.finished for reply in replies)
+        assert not scheduler.prefill_manager.runnable and not scheduler.decode_manager.runnable
+        assert scheduler.table_manager.available_size == 8
+        cache.check_integrity()
+        assert len(committed) == (turn + 1) * concurrency
+        assert all(handle.physical_cached_len == (9 if hit else 0) for handle in committed)
+        _, retained_seed, _ = cache._match_prefix(ordinary_key[:hit])
+        assert torch.equal(retained_seed, seed_pages)
+        handle = committed[-1]
+        cached_pages = handle.get_matched_indices() if hit else cache.free_slots.new_empty((0,))
+        cached_pages = cached_pages[cached_pages >= 0]
+        # Every physical page is either in Radix or free, exactly once. This also
+        # checks excluded pages and competing inserts of the same cached prefix.
+        all_pages = torch.cat([cache.free_slots, cached_pages]).sort().values
+        assert torch.equal(all_pages, torch.arange(cache.num_pages, dtype=all_pages.dtype))
 
 
 @pytest.mark.parametrize("budget", [1, 2, 32])

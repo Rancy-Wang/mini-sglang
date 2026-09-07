@@ -509,7 +509,13 @@ class CacheManager:
         candidate_key_positions = candidate_key_positions.to(
             device=candidates.device, dtype=torch.int64, non_blocking=True
         )
-        canonical_indices = insert_result.handle.get_matched_indices()
+        # A cold staged Drop can leave no contiguous prefix to commit. The
+        # returned root handle has no index chunks and adopts no request pages.
+        canonical_indices = (
+            insert_result.handle.get_matched_indices()
+            if insert_result.handle.cached_len > 0
+            else candidates.new_empty((0,))
+        )
 
         def adopted_pages(pages: torch.Tensor, key_positions: torch.Tensor) -> torch.Tensor:
             key_positions = key_positions.to(
