@@ -393,7 +393,7 @@ def _real_model():
         tp_info=DistributedInfo(0, 1),
         dtype=torch.bfloat16,
         offline_mode=True,
-        attention_backend="fa3",
+        attention_backend="fa",
         cuda_graph_bs=[],
         use_pynccl=False,
         max_running_req=8,
