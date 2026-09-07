@@ -184,6 +184,10 @@ def run_live(base_url: str, input_path: Path, output_path: Path, timeout: float)
         endpoint += "/v1/chat/completions"
     results = []
     with httpx.Client(timeout=timeout, trust_env=False) as client:
+        models_endpoint = endpoint.removesuffix("/chat/completions") + "/models"
+        model_response = client.get(models_endpoint)
+        model_response.raise_for_status()
+        model_id = model_response.json()["data"][0]["id"]
         cases = _load_bcp_cases(input_path)
         for case in cases:
             expected = None
@@ -191,6 +195,7 @@ def run_live(base_url: str, input_path: Path, output_path: Path, timeout: float)
             for stream in (False, True):
                 request = dict(case["request"])
                 request.update(
+                    model=model_id,
                     temperature=0,
                     seed=17,
                     max_tokens=512,
@@ -232,6 +237,7 @@ def run_live(base_url: str, input_path: Path, output_path: Path, timeout: float)
         ):
             request = dict(case["request"])
             request.update(
+                model=model_id,
                 temperature=0,
                 seed=17,
                 max_tokens=512,
@@ -260,6 +266,7 @@ def run_live(base_url: str, input_path: Path, output_path: Path, timeout: float)
 
         truncated_request = dict(cases[0]["request"])
         truncated_request.update(
+            model=model_id,
             temperature=0,
             seed=17,
             max_tokens=1,
