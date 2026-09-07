@@ -1135,6 +1135,217 @@ def run_reference_alignment():
              "peak_allocated_bytes": torch.cuda.max_memory_allocated(), "dtype": "bfloat16", "attention": "fa"})
 
 
+def _r8_validate_quality(tokenizer, tokens, request):
+    import re
+
+    quality = response_quality(tokenizer, tokens, request)
+    assert quality["diagnostics"] == [], quality["diagnostics"]
+    parsed_calls = quality["parsed"]["tool_calls"] or []
+    assert parsed_calls, quality
+    text = tokenizer.decode(tokens, skip_special_tokens=True)
+    assert text.count("<tool_call>") == text.count("</tool_call>") > 0
+    blocks = re.findall(r"<tool_call>(.*?)</tool_call>", text, re.DOTALL)
+    raw_calls = []
+    for block in blocks:
+        item = json.loads(block)
+        raw_calls.extend(item if isinstance(item, list) else [item])
+    parsed = [
+        {
+            "name": call["function"]["name"],
+            "arguments": json.loads(call["function"]["arguments"]),
+        }
+        for call in parsed_calls
+    ]
+    expected = [
+        {"name": item["name"], "arguments": item.get("arguments", {})}
+        for item in raw_calls
+    ]
+    assert parsed == expected
+    assert all(isinstance(call["arguments"], dict) for call in parsed)
+    return {**quality, "raw_tool_calls": expected}
+
+
+def _r8_replay_saved_logits(manager, descriptor, logits, tokens):
+    class ReplayReq:
+        sample_is_committed = True
+
+        def __init__(self):
+            self.sampling_params = core.SamplingParams(tool_grammar=descriptor)
+
+    req = ReplayReq()
+    first_rejected = None
+    for step, token in enumerate(tokens):
+        prepared = manager.prepare([req])
+        assert prepared is not None
+        row = logits[step : step + 1].to("cuda")
+        manager.apply(row, prepared)
+        if not torch.isfinite(row[0, token]):
+            replacement = int(row.argmax(dim=-1).item())
+            manager.accept_sampled_tokens([req], torch.tensor([replacement]), None)
+            # Surface any matcher rejection immediately rather than during shutdown.
+            manager.prepare([req])
+            manager.apply(torch.zeros_like(row), [req])
+            first_rejected = {
+                "step": step,
+                "baseline_token": int(token),
+                "constrained_token": replacement,
+            }
+            break
+        manager.accept_sampled_tokens([req], torch.tensor([token]), None)
+    manager.discard(req)
+    assert first_rejected is not None, "Invalid baseline unexpectedly passed the grammar."
+    return first_rejected
+
+
+@torch.inference_mode()
+def run_tool_json_generation():
+    import gzip
+    import hashlib
+    import subprocess
+    import traceback
+
+    from minisgl.engine.tool_grammar import ToolGrammarManager
+
+    out = Path(os.environ["MINISGL_R8_OUTPUT"])
+    out.mkdir(exist_ok=False)
+    input_path = Path(os.environ["MINISGL_R7_INPUT"])
+    baseline = Path(os.environ["MINISGL_R8_BASELINE"])
+    cases = [
+        case
+        for case in json.loads(gzip.decompress(input_path.read_bytes()))
+        if str(case["case_id"]) in {"822", "844"}
+    ]
+    assert {str(case["case_id"]) for case in cases} == {"822", "844"}
+    cases.sort(key=lambda case: str(case["case_id"]))
+    model = os.environ["MINISGL_R3_MODEL"]
+    tokenizer = load_tokenizer(model)
+    manager = TokenizeManager(tokenizer)
+    prepared = {
+        str(case["case_id"]): reference_tokenize(
+            manager, model, case["request"], "mask", max_tokens=512
+        )
+        for case in cases
+    }
+    for msg, result in prepared.values():
+        assert msg.sampling_params.tool_grammar is not None
+        assert result.prompt_tokens + 512 < 49152
+
+    def dump(name, value):
+        with gzip.open(out / f"{name}.json.gz", "xt", encoding="utf-8") as handle:
+            json.dump(value, handle, ensure_ascii=False)
+
+    dump(
+        "preflight",
+        {
+            "input_sha256": hashlib.sha256(input_path.read_bytes()).hexdigest(),
+            "head": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+            "cases": {
+                key: {
+                    "prompt_tokens": result.prompt_tokens,
+                    "tool_grammar": msg.sampling_params.tool_grammar,
+                }
+                for key, (msg, result) in prepared.items()
+            },
+        },
+    )
+    print("R8 preflight PASS; loading one model", flush=True)
+    started = time.monotonic()
+    runner = Runner(model, tokenizer=tokenizer, reference_alignment=True)
+    grammar = runner.scheduler.engine.sampler.tool_grammar
+    assert grammar is not None and grammar.compile_count == 0
+    status = "incomplete"
+    try:
+        runner.clear()
+        no_tools = asyncio.run(
+            runner.generate(
+                "mask",
+                [{"messages": [{"role": "user", "content": "Answer with OK."}]}],
+                2,
+            )
+        )
+        assert grammar.compile_count == 0
+        dump("no_tools_control", no_tools)
+
+        replay_manager = ToolGrammarManager(
+            tokenizer,
+            runner.scheduler.engine.sampler.vocab_size,
+            runner.scheduler.eos_token_ids,
+        )
+        replay_results = {}
+        try:
+            for case in cases:
+                key = str(case["case_id"])
+                with gzip.open(baseline / f"{key}_mask.json.gz", "rt", encoding="utf-8") as handle:
+                    old = json.load(handle)
+                reasons = [row["reason"] for row in old["quality"]["diagnostics"]]
+                assert reasons == ["invalid_json"]
+                old_tokens = old["records"][0]["tokens"]
+                old_logits = torch.load(
+                    baseline / f"{key}_mask_logits.pt",
+                    map_location="cpu",
+                    weights_only=True,
+                )
+                assert len(old_logits) == len(old_tokens)
+                replay_results[key] = {
+                    "old_diagnostics": reasons,
+                    "first_rejected": _r8_replay_saved_logits(
+                        replay_manager,
+                        prepared[key][0].sampling_params.tool_grammar,
+                        old_logits,
+                        old_tokens,
+                    ),
+                }
+        finally:
+            replay_manager.shutdown()
+        dump(
+            "saved_logits_replay",
+            {"cases": replay_results, "compile_count": replay_manager.compile_count},
+        )
+
+        results = {}
+        for case in cases:
+            key = str(case["case_id"])
+            results[key] = {}
+            for mode in ("mask", "staged"):
+                runner.clear()
+                result = asyncio.run(runner.generate(mode, [case["request"]], 512))
+                record = result["records"][0]
+                quality = _r8_validate_quality(tokenizer, record["tokens"], case["request"])
+                assert record["graph_replays"] == len(record["tokens"]) - 1
+                assert result["responses"][0]["choices"][0]["message"]["tool_calls"]
+                result["quality"] = quality
+                results[key][mode] = result
+                dump(f"{key}_{mode}", result)
+                print(
+                    "R8 BCP",
+                    key,
+                    mode,
+                    "tokens",
+                    len(record["tokens"]),
+                    "diagnostics",
+                    quality["diagnostics"],
+                    flush=True,
+                )
+        assert grammar.compile_count > 0
+        status = "PASS"
+        dump(
+            "summary",
+            {
+                "status": status,
+                "grammar_compile_count": grammar.compile_count,
+                "saved_logits_replay": replay_results,
+                "graph_replays": runner.replays,
+                "seconds": time.monotonic() - started,
+            },
+        )
+    except BaseException:
+        dump("failure", {"traceback": traceback.format_exc()})
+        raise
+    finally:
+        runner.scheduler.shutdown()
+        print(f"R8 status={status}; output={out}", flush=True)
+
+
 @torch.inference_mode()
 def run_projection_replay():
     """Second bounded probe: replay the actual linear operator, not a full model oracle."""
@@ -1221,7 +1432,9 @@ def run_projection_replay():
 
 
 if __name__ == "__main__":
-    if os.environ.get("MINISGL_R7_SUITE") == "reference_alignment":
+    if os.environ.get("MINISGL_R8_SUITE") == "tool_json_generation":
+        run_tool_json_generation()
+    elif os.environ.get("MINISGL_R7_SUITE") == "reference_alignment":
         run_reference_alignment()
     elif os.environ.get("MINISGL_R7_SUITE") == "projection_replay":
         run_projection_replay()

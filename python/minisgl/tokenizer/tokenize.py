@@ -132,6 +132,17 @@ class TokenizeManager:
         tokenizer_name = str(getattr(tokenizer, "name_or_path", "")).lower()
         tokenizer_class = type(tokenizer).__name__.lower()
         self.is_gpt_oss = "gpt-oss" in tokenizer_name or "gptoss" in tokenizer_class
+        qwen_name = tokenizer_name.replace("_", "-")
+        self._tool_grammar_model = (
+            "qwen_3"
+            if (
+                "agenticqwen" in qwen_name
+                or "qwen3" in qwen_name
+                or "qwen-3" in qwen_name
+            )
+            and "coder" not in qwen_name
+            else None
+        )
         self._reasoning_effort: str | None = None
         self._harmony_encoding = None
         self._preserve_harmony_thinking = False
@@ -905,6 +916,41 @@ class TokenizeManager:
         # Keep all tools as fallback if we cannot find an exact match.
         return selected if len(selected) > 0 else tools
 
+    def _set_tool_grammar(
+        self,
+        msg: TokenizeMsg,
+        tools: List[Dict[str, Any]] | None,
+        *,
+        mode: str,
+        forced_tool_name: str | None,
+        safe_mode: bool,
+    ) -> None:
+        msg.sampling_params.tool_grammar = None
+        if (
+            self._tool_grammar_model is None
+            or not tools
+            or mode == "none"
+            or safe_mode
+            or msg.is_warmup
+        ):
+            return
+        if mode == "function" and forced_tool_name is not None:
+            tool_choice: str | dict[str, Any] = {
+                "type": "function",
+                "function": {"name": forced_tool_name},
+            }
+        else:
+            tool_choice = mode
+        # Detach the grammar descriptor from request-owned mutable tool objects.
+        frozen_tools = json.loads(json.dumps(tools, ensure_ascii=False))
+        msg.sampling_params.tool_grammar = {
+            "version": 1,
+            "model": self._tool_grammar_model,
+            "tools": frozen_tools,
+            "tool_choice": tool_choice,
+            "reasoning": msg.enable_thinking is not False,
+        }
+
     @staticmethod
     def _flatten_tools(
         tools: List[Dict[str, Any]] | None,
@@ -1362,6 +1408,7 @@ class TokenizeManager:
         self._harmony_thinking_ranges = {}
         self._chat_template_override = None
         self._chat_template_kwargs = {}
+        msg.sampling_params.tool_grammar = None
         drop_rule = parse_drop_rule(
             getattr(msg, "drop_rule", None),
             msg.text,
@@ -1441,6 +1488,13 @@ class TokenizeManager:
                         enable_thinking=msg.enable_thinking,
                         tools=None,
                     )
+            self._set_tool_grammar(
+                msg,
+                selected_tools,
+                mode=tool_choice_mode,
+                forced_tool_name=forced_tool_name,
+                safe_mode=safe_mode,
+            )
             return self._ordinary_result(
                 msg,
                 torch.tensor(ids, dtype=torch.int32, device="cpu"),
@@ -1575,6 +1629,13 @@ class TokenizeManager:
             if len(compiled_drop_events.event_insert_offsets) > 0:
                 token_drop_events = compiled_drop_events
         if token_drop_events is None and not has_reposition and not msg.is_warmup:
+            self._set_tool_grammar(
+                msg,
+                selected_tools,
+                mode=tool_choice_mode,
+                forced_tool_name=forced_tool_name,
+                safe_mode=safe_mode,
+            )
             return self._ordinary_result(
                 msg,
                 full_with_gen_tensor,
@@ -1600,6 +1661,13 @@ class TokenizeManager:
             # One canonical template, no prefix rendering and no Radix compilation.
             # The scheduler applies these events only AFTER their preceding queries.
             positions = torch.arange(len(full_with_gen_tensor), dtype=torch.int32)
+            self._set_tool_grammar(
+                msg,
+                selected_tools,
+                mode=tool_choice_mode,
+                forced_tool_name=forced_tool_name,
+                safe_mode=safe_mode,
+            )
             return TokenizedResult(
                 input_ids=full_with_gen_tensor,
                 true_positions=positions,
@@ -1715,6 +1783,13 @@ class TokenizeManager:
                 )
             )
 
+        self._set_tool_grammar(
+            msg,
+            selected_tools,
+            mode=tool_choice_mode,
+            forced_tool_name=forced_tool_name,
+            safe_mode=safe_mode,
+        )
         return TokenizedResult(
             input_ids=input_ids,
             true_positions=true_positions,
@@ -1787,6 +1862,7 @@ class TokenizeManager:
             if isinstance(msg.text, list):
                 results.append(self._chat_tokenize(msg))
             else:
+                msg.sampling_params.tool_grammar = None
                 prompt = msg.text
                 input_ids: torch.Tensor = (  # type: ignore
                     self.tokenizer.encode(prompt, return_tensors="pt")

@@ -1,4 +1,4 @@
-# Staged 顺序参考与 Qwen 解析验证（R7）
+# Staged 顺序参考与 Qwen 工具调用验证（R7/R8）
 
 `contextual_prefill_mode=staged` 在无 Reposition、存在有效 Drop 时运行一个请求内的顺序参考。它用于检查 mask 的语义，不是缓存命中率或速度的对照基线。默认生产模式仍是 mask；无有效 Drop 请求仍走普通 prefill/extend。
 
@@ -25,6 +25,42 @@ Reference 的三个外部复用计数恒为 `cached_tokens=drop_skipped_tokens=r
 非法、未知或未完成的块保留在 `content`，并产生内部 `ToolParseDiagnostic`，包含原因、字符偏移和块序号。参数无法以标准 JSON 表达时同样保留原文。一个块中的多调用先整体校验再发布，防止部分发布后抛异常。默认日志只记录诊断位置与类型。
 
 这修复了错误块及调用前后正文被吞、full/stream 结果不一致等问题。它不修改模型已经生成的 token，不补引号，不重试，也不提供 JSON grammar 约束。模型原始 JSON 非法与 parser 是否保真是两个独立的检查结果。
+
+## R8：生成期工具 JSON 结构约束
+
+R7 的 parser 保真结论不变；R8 没有给 parser 增加补引号、重试或事后修复。对于
+AgenticQwen/Qwen3（不含 Qwen3-Coder）的有效工具请求，tokenizer 额外生成一个可序列化
+的 grammar descriptor，包含所选工具、`auto` / `required` / 指定函数、thinking 模式
+和结构标签版本。无工具、`tool_choice=none`、warmup、模板降级 safe mode 及不兼容模型都
+不生成 descriptor（`TokenizeManager.__init__`、`_set_tool_grammar`，
+`python/minisgl/tokenizer/tokenize.py:121-145,919-952`）。
+
+采样器使用 XGrammar 的 Qwen3 structural tag，在 GPU logits 上只屏蔽本请求当前语法状态
+不允许的 token；不存在全局 token 黑名单或硬编码 token ID。编译结果按 tokenizer、词表、
+stop token 和完整 descriptor 缓存，而 matcher 始终按 `Req` 对象隔离。CPU matcher 在独立
+线程中接受已经提交的 token 并准备下一步 bitmask，与下一次 GPU forward 重叠；GPU 侧只在
+采样前等待该请求的 bitmask（`ToolGrammarManager._compile`、`prepare`、`apply`、
+`accept_sampled_tokens`，`python/minisgl/engine/tool_grammar.py:27-47,55-179,206-243`；
+`Sampler.prepare`、`sample`，`python/minisgl/engine/sample.py:57-116`）。
+
+普通 prefill 的第一个生成 token 受约束且 matcher 只前进一次。staged reference 的中间段
+sample 和 `ChunkedReq` padding 不创建也不推进 matcher；只有最后一段保留的首 token 才推进
+（`Req.sample_is_committed`，`python/minisgl/core.py:398-410`）。批次换序通过 `Req` 身份重新
+定位 mask；完成、取消或 UID 复用时丢弃 matcher（`Scheduler._free_req_resources`，
+`python/minisgl/scheduler/scheduler.py:577-584`）。无 descriptor 的路径不导入 XGrammar、
+不创建 executor/matcher/cache，也不等待 D2H event。
+
+依赖固定为 PyPI 实际发布且可安装的 `xgrammar==0.2.5.post1`；它要求
+`apache-tvm-ffi>=0.1.9`。grammar 要求完整 JSON schema、合法转义、Unicode、嵌套对象/数组
+和闭合的 tool marker 后才允许 stop token。若 `max_tokens` 先耗尽，服务仍返回
+`finish_reason=length`，parser 保留未完成原文与诊断，不把它修成 `tool_calls`。
+
+R8 验证同时覆盖：822/844 的旧 logits 从何处首次被 grammar 拒绝；mask/staged 的真实自由
+生成；full/stream HTTP 一致性；`required` 和指定函数；长度截断；多个调用、Unicode、转义
+与嵌套 JSON；编译共享、matcher 隔离、批次换序、取消/UID 复用、无工具零初始化和 CUDA
+Graph replay。对应入口为 `tests/contextual/mask_staged_runner.py:1138-1346`、
+`tests/engine/test_tool_grammar.py:149-226` 和
+`tests/server/test_tool_json_generation.py:17-307`。
 
 ## 验证方法与边界
 

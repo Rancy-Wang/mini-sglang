@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import json
 
-from minisgl.message import DetokenizeMsg
+from minisgl.core import SamplingParams
+from minisgl.message import DetokenizeMsg, TokenizeMsg
 from minisgl.scheduler.prefill import _calculate_cache_reuse_ratio
 from minisgl.server.response_parser import (
     ChatResponseParser,
@@ -369,6 +370,95 @@ def test_template_tools_follow_sglang_wrapper_then_flat_fallback() -> None:
     ) == [1, 2]
     assert tokenizer.tool_shapes == ["wrapper", "bare"]
     assert manager._effective_template_tools(TOOLS) == [TOOLS[0]["function"]]
+
+
+def test_agentic_qwen_tool_grammar_descriptor_tracks_choice_and_safe_paths() -> None:
+    class _AgenticTokenizer:
+        name_or_path = "local/AgenticQwen-30B-A3B"
+
+    manager = TokenizeManager(_AgenticTokenizer())
+    msg = TokenizeMsg(
+        uid=1,
+        text=[{"role": "user", "content": "search"}],
+        sampling_params=SamplingParams(),
+        enable_thinking=None,
+        tools=TOOLS,
+    )
+    manager._set_tool_grammar(
+        msg,
+        TOOLS,
+        mode="auto",
+        forced_tool_name=None,
+        safe_mode=False,
+    )
+    descriptor = msg.sampling_params.tool_grammar
+    assert descriptor == {
+        "version": 1,
+        "model": "qwen_3",
+        "tools": TOOLS,
+        "tool_choice": "auto",
+        "reasoning": True,
+    }
+    assert descriptor["tools"] is not TOOLS
+
+    manager._set_tool_grammar(
+        msg,
+        TOOLS,
+        mode="function",
+        forced_tool_name="search",
+        safe_mode=False,
+    )
+    assert msg.sampling_params.tool_grammar["tool_choice"] == {
+        "type": "function",
+        "function": {"name": "search"},
+    }
+
+    manager._set_tool_grammar(
+        msg,
+        TOOLS,
+        mode="none",
+        forced_tool_name=None,
+        safe_mode=False,
+    )
+    assert msg.sampling_params.tool_grammar is None
+    manager._set_tool_grammar(
+        msg,
+        TOOLS,
+        mode="required",
+        forced_tool_name=None,
+        safe_mode=True,
+    )
+    assert msg.sampling_params.tool_grammar is None
+
+    msg.is_warmup = True
+    manager._set_tool_grammar(
+        msg,
+        TOOLS,
+        mode="required",
+        forced_tool_name=None,
+        safe_mode=False,
+    )
+    assert msg.sampling_params.tool_grammar is None
+
+
+def test_qwen3_coder_does_not_use_incompatible_qwen3_structural_tags() -> None:
+    class _CoderTokenizer:
+        name_or_path = "Qwen/Qwen3-Coder-30B"
+
+    manager = TokenizeManager(_CoderTokenizer())
+    msg = TokenizeMsg(
+        uid=1,
+        text=[{"role": "user", "content": "search"}],
+        sampling_params=SamplingParams(),
+    )
+    manager._set_tool_grammar(
+        msg,
+        TOOLS,
+        mode="required",
+        forced_tool_name=None,
+        safe_mode=False,
+    )
+    assert msg.sampling_params.tool_grammar is None
 
 
 def test_template_provenance_preserves_wrapper_then_flat_fallback() -> None:

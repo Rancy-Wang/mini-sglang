@@ -46,7 +46,23 @@ def test_serialize_deserialize():
                 true_positions=torch.arange(len(t), dtype=torch.int32),
                 raw_positions=torch.arange(len(t), dtype=torch.int32),
                 radix_input_ids=t.to(torch.int64),
-                sampling_params=SamplingParams(),
+                sampling_params=SamplingParams(
+                    tool_grammar={
+                        "version": 1,
+                        "model": "qwen_3",
+                        "tools": [
+                            {
+                                "type": "function",
+                                "function": {
+                                    "name": "search",
+                                    "parameters": {"type": "object"},
+                                },
+                            }
+                        ],
+                        "tool_choice": "required",
+                        "reasoning": False,
+                    }
+                ),
                 drop_effective_event_count=2,
             )
         ]
@@ -55,6 +71,18 @@ def test_serialize_deserialize():
     logger.info(u)
     logger.info(result)
     assert result.data[0].drop_effective_event_count == 2
+    assert result.data[0].sampling_params.tool_grammar == {
+        "version": 1,
+        "model": "qwen_3",
+        "tools": [
+            {
+                "type": "function",
+                "function": {"name": "search", "parameters": {"type": "object"}},
+            }
+        ],
+        "tool_choice": "required",
+        "reasoning": False,
+    }
 
     records = torch.tensor(
         [[0, 10, -1, 0], [1, -1, -2, -1], [0, 11, 0, 1]],

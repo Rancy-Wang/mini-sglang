@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, List, Literal
+from typing import TYPE_CHECKING, Any, List, Literal
 
 import torch
 
@@ -58,6 +58,7 @@ class SamplingParams:
     ignore_eos: bool = False
     max_tokens: int = 1024
     seed: int | None = None
+    tool_grammar: dict[str, Any] | None = None
 
     @property
     def is_greedy(self) -> bool:
@@ -393,6 +394,20 @@ class Req:
                 torch.tensor([raw_position], dtype=torch.int32, device="cpu"),
             ]
         )
+
+    @property
+    def sample_is_committed(self) -> bool:
+        """Whether this forward's sampled token belongs to the generated stream."""
+
+        # ChunkedReq deliberately overrides append_host because its sampled row
+        # is padding, not output.  Avoid importing the scheduler subclass here.
+        if type(self).append_host is not Req.append_host:
+            return False
+        if self.reference_state is None or self.reference_state.prefill_done:
+            return True
+        # The final staged Prefill sample is retained after the last Drop.  All
+        # earlier staged samples are discarded and must not advance a grammar.
+        return self.reference_state.segment_end == len(self.reference_state.full_ids)
 
     def append_host(self, next_token: torch.Tensor) -> None:
         # Overlap scheduling can finish the following decode before this sampled

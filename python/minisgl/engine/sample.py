@@ -7,7 +7,9 @@ import torch
 from minisgl.utils import is_sm90_supported, nvtx_annotate
 
 if TYPE_CHECKING:
-    from minisgl.core import Batch
+    from minisgl.core import Batch, Req
+
+    from .tool_grammar import ToolGrammarManager
 
 
 @dataclass
@@ -17,6 +19,7 @@ class BatchSamplingArgs:
     top_p: torch.Tensor | None = None
     seeds: torch.Tensor | None = None
     offsets: torch.Tensor | None = None
+    grammar_reqs: tuple[Req, ...] | None = None
 
 
 def make_device_tensor(data: List, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
@@ -55,11 +58,15 @@ def sample_impl(
 class Sampler:
     device: torch.device
     vocab_size: int
+    tool_grammar: ToolGrammarManager | None = None
 
     def prepare(self, batch: Batch) -> BatchSamplingArgs:
         params = [r.sampling_params for r in batch.reqs]
+        grammar_reqs = (
+            self.tool_grammar.prepare(batch.reqs) if self.tool_grammar is not None else None
+        )
         if all(p.is_greedy for p in params):
-            return BatchSamplingArgs(temperatures=None)
+            return BatchSamplingArgs(temperatures=None, grammar_reqs=grammar_reqs)
 
         MIN_P = MIN_T = 1e-6
         ts = [max(0.0 if p.is_greedy else p.temperature, MIN_T) for p in params]
@@ -82,12 +89,20 @@ class Sampler:
                 [r.completion_tokens for r in batch.reqs], torch.int64, self.device
             )
         return BatchSamplingArgs(
-            temperatures, top_k=top_k, top_p=top_p, seeds=seeds, offsets=offsets
+            temperatures,
+            top_k=top_k,
+            top_p=top_p,
+            seeds=seeds,
+            offsets=offsets,
+            grammar_reqs=grammar_reqs,
         )
 
     @nvtx_annotate("Sampler")
     def sample(self, logits: torch.Tensor, args: BatchSamplingArgs) -> torch.Tensor:
         with torch.cuda.nvtx.range("Sampler"):
+            if args.grammar_reqs is not None:
+                assert self.tool_grammar is not None
+                self.tool_grammar.apply(logits, args.grammar_reqs)
             if args.temperatures is None:  # greedy sampling
                 return torch.argmax(logits, dim=-1)
             return sample_impl(
@@ -98,3 +113,20 @@ class Sampler:
                 args.seeds,
                 args.offsets,
             )
+
+    def accept_sampled_tokens(
+        self,
+        reqs: List[Req],
+        tokens: torch.Tensor,
+        ready_event: torch.cuda.Event,
+    ) -> None:
+        if self.tool_grammar is not None:
+            self.tool_grammar.accept_sampled_tokens(reqs, tokens, ready_event)
+
+    def discard(self, req: Req) -> None:
+        if self.tool_grammar is not None:
+            self.tool_grammar.discard(req)
+
+    def shutdown(self) -> None:
+        if self.tool_grammar is not None:
+            self.tool_grammar.shutdown()

@@ -80,6 +80,9 @@ def test_each_query_visibility_and_final_sample(monkeypatch, budget):
         assert batch is not None
         req = batch.reqs[0]
         assert not req.use_context_mask and req.usage_cached_tokens == 0
+        assert req.sample_is_committed == (
+            req.reference_state.segment_end == len(req.reference_state.full_ids)
+        )
         keys = req.raw_positions[:req.device_len].tolist()
         queries = req.raw_positions[req.cached_len:req.device_len].tolist()
         for q in queries:

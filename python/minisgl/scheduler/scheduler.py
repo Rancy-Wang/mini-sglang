@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Dict, List, NamedTuple, NoReturn, Set, Tuple, 
 
 import torch
 from minisgl.core import Batch, Req
+from minisgl.engine.tool_grammar import ToolGrammarManager
 from minisgl.env import ENV
 from minisgl.kernel.context_plan import preload_context_plan_kernel
 from minisgl.layers import get_rope
@@ -147,6 +148,11 @@ class Scheduler(SchedulerIOMixin):
         self.eos_token_ids = {int(token_id) for token_id in eos_values if token_id is not None}
         if config.model_config.is_gpt_oss:
             self.eos_token_ids.update(get_gpt_oss_terminal_stop_token_ids())
+        self.engine.sampler.tool_grammar = ToolGrammarManager(
+            self.tokenizer,
+            config.model_config.vocab_size,
+            self.eos_token_ids,
+        )
         self.token_pool = self.table_manager.token_pool
         self.prefill_budget = config.max_extend_tokens
         # self.config = config
@@ -571,6 +577,9 @@ class Scheduler(SchedulerIOMixin):
         return True
 
     def _free_req_resources(self, req: Req) -> None:
+        engine = getattr(self, "engine", None)
+        if engine is not None:
+            engine.sampler.discard(req)
         try:
             self.cache_manager.cache_req(req, finished=True)
         finally:
