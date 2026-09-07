@@ -187,5 +187,6 @@ def test_runner_backend_fixtures_validate_before_model_load():
     # Only integer token fixtures are used; tokenizer files and GPU are unnecessary.
     manager = TokenizeManager.__new__(TokenizeManager)
     manager.radix_drop_key_mode = "delta-marker"
+    manager.is_gpt_oss = False
     manager._tokenize_invocations = manager._chat_template_invocations = 0
     module.preflight_backend_fixtures(manager)

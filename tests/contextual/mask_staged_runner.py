@@ -896,6 +896,7 @@ def backend_generate(runner, msg, tokenized):
 
 def logit_metrics(a, b):
     assert a.shape == b.shape and a.ndim == 2
+    assert torch.isfinite(a).all() and torch.isfinite(b).all(), "Non-finite comparison logits"
     delta = a - b
     max_abs = delta.abs().amax(dim=1)
     rms = delta.square().mean(dim=1).sqrt() / a.square().mean(dim=1).sqrt().clamp_min(1e-12)
