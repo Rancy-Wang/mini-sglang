@@ -92,13 +92,16 @@ def producer(monkeypatch):
     return make
 
 
-def _response(monkeypatch, warm, final, *, stream, include_usage=True, reposition=False):
+def _response(
+    monkeypatch, warm, final, *, stream, include_usage=True, reposition=False, mode="mask"
+):
     manager = api.FrontendManager(
         config=SimpleNamespace(
             model_path="Qwen3-1.7B",
             tool_call_parser="auto",
             reasoning_parser="auto",
             radix_drop_key_mode="delta-marker",
+            contextual_prefill_mode=mode,
         ),
         send_tokenizer=None,
         recv_tokenizer=None,
@@ -127,11 +130,16 @@ def _response(monkeypatch, warm, final, *, stream, include_usage=True, repositio
             server_metrics=metrics.finish(2),
         )
 
+    sent = []
+
     async def warmup(*args):
+        assert mode == "staged", "Mask requests must not dispatch an independent warmup."
         return warm
 
     async def send_one(msg):
-        pass
+        sent.append(msg)
+        assert not msg.is_warmup
+        assert msg.use_context_mask == (mode == "mask" and not reposition)
 
     async def connected():
         return False
@@ -155,6 +163,7 @@ def _response(monkeypatch, warm, final, *, stream, include_usage=True, repositio
 
     async def run():
         response = await api.v1_completions(request, SimpleNamespace(is_disconnected=connected))
+        assert len(sent) == 1
         if not stream:
             return response["usage"]
         chunks = [
@@ -172,12 +181,14 @@ def _response(monkeypatch, warm, final, *, stream, include_usage=True, repositio
 @pytest.mark.parametrize(
     "warm_prefix,expected", [(8, (8, 0)), (3, (3, 0)), (0, (0, 0)), (9, (4, 5))]
 )
-def test_http_keeps_one_real_warmup_snapshot(monkeypatch, producer, stream, warm_prefix, expected):
+def test_legacy_staged_http_keeps_one_real_warmup_snapshot(
+    monkeypatch, producer, stream, warm_prefix, expected
+):
     warm = producer(warm_prefix, True)
     final = producer(9, False)
     assert (warm.cached_tokens, warm.drop_skipped_tokens) == expected
     assert (final.cached_tokens, final.drop_skipped_tokens) == (4, 5)
-    usage = _response(monkeypatch, warm, final, stream=stream)
+    usage = _response(monkeypatch, warm, final, stream=stream, mode="staged")
     assert usage["prompt_tokens"] == 10
     assert usage["total_tokens"] == 12
     if expected == (0, 0):

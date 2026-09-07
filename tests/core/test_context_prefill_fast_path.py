@@ -82,7 +82,7 @@ def test_mask_free_context_rejects_token_that_still_needs_dropped_context() -> N
     )
 
 
-def test_mask_free_context_rejects_sliding_window_models() -> None:
+def test_mask_free_context_accepts_absolute_sliding_window_models() -> None:
     req = _pending_req()
 
     assert (
@@ -91,7 +91,7 @@ def test_mask_free_context_rejects_sliding_window_models() -> None:
             active_cached_len=2,
             has_sliding_window=True,
         )
-        == "sliding_window_requires_absolute_key_selection"
+        is None
     )
 
 

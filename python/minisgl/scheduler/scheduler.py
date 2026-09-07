@@ -174,6 +174,15 @@ class Scheduler(SchedulerIOMixin):
         for msg in self.receive_msg(blocking=blocking):
             self._process_one_msg(msg)
 
+        # A final masked prefill must compact before an overlapping decode reads
+        # its page table. Process the sampled token once, then resume overlap.
+        if last_data is not None and any(
+            not isinstance(req, ChunkedReq) and req.context_post_prefill_keep_mask is not None
+            for req in last_data[0].batch.reqs
+        ):
+            self._process_last_data(last_data)
+            last_data = None
+
         forward_input = self._schedule_next_batch()
         ongoing_data = None
         if forward_input is not None:
@@ -311,7 +320,7 @@ class Scheduler(SchedulerIOMixin):
         self.send_result(reply)
 
     def _compact_context_after_prefill(self, req: Req) -> None:
-        """Switch the final masked Reposition Prefill to its active Decode view."""
+        """Switch the final masked Prefill to its active Decode view."""
 
         keep_mask = req.context_post_prefill_keep_mask
         if keep_mask is None:
@@ -324,7 +333,7 @@ class Scheduler(SchedulerIOMixin):
             raise RuntimeError("Post-Prefill keep mask does not cover the prompt raw positions.")
         keep = (keep_mask[prompt_raw] != 0).to(dtype=torch.bool, device="cpu")
         if not bool(torch.any(keep).item()):
-            raise RuntimeError("Reposition cannot Drop every prompt token before generation.")
+            raise RuntimeError("Cannot Drop every prompt token before generation.")
 
         pages = self.table_manager.page_table[req.table_idx, :prompt_len].clone()
         keep_device = keep.to(device=pages.device, non_blocking=True)

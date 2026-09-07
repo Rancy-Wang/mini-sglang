@@ -115,7 +115,11 @@ class CacheManager:
         matched = self._match_prefix(radix_query, query_virtual_mask)
         handle, key_match_indices, matched_virtual_mask = matched
         used_retry = False
-        if req.radix_match_ids is not None and req.radix_match_ids.ndim == 2:
+        if (
+            req.radix_match_ids is not None
+            and req.radix_match_ids.ndim == 2
+            and req.radix_key_to_token is not None
+        ):
             from minisgl.kvcache.radix_cache import RadixCacheHandle, RadixPrefixCache
 
             if not isinstance(self.prefix_cache, RadixPrefixCache) or not isinstance(

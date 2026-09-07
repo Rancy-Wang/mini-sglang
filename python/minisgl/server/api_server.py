@@ -579,6 +579,9 @@ class FrontendManager:
         tools: List[Dict[str, Any]] | None,
         tool_choice: str | Dict[str, Any] | None,
     ) -> CacheUsageReport | None:
+        if self.config.contextual_prefill_mode == "mask":
+            # The public request performs and retains its own first forward.
+            return None
         # Event n changes visibility only for messages after n. A future event
         # therefore needs no special warmup for the current generation prompt.
         parsed_rule = (
@@ -607,8 +610,7 @@ class FrontendManager:
             # template and make stage sources independently evictable.
             return None
 
-        use_context_mask = self.config.contextual_prefill_mode == "mask" and not reposition
-        warmup_target = len(messages) if use_context_mask else max(len(messages) - 1, 0)
+        warmup_target = max(len(messages) - 1, 0)
         warmup_uid = self.new_user()
         await self.send_one(
             TokenizeMsg(
@@ -624,12 +626,9 @@ class FrontendManager:
                 tool_choice=tool_choice,
                 is_warmup=True,
                 internal_uid=warmup_uid,
-                use_context_mask=use_context_mask,
             )
         )
         warmup_ack = await self.wait_for_warmup(warmup_uid)
-        if use_context_mask:
-            return CacheUsageReport.from_reply(warmup_ack)
         if warmup_ack.hit_ratio >= 0.95:
             return CacheUsageReport.from_reply(warmup_ack)
 
@@ -940,7 +939,18 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
     )
 
     cache_report: CacheUsageReport | None = None
-    if wire_drop_rule is not None and not req.reposition and isinstance(prompt, list):
+    single_context_prefill = (
+        wire_drop_rule is not None
+        and not req.reposition
+        and isinstance(prompt, list)
+        and getattr(state.config, "contextual_prefill_mode", "mask") == "mask"
+    )
+    if (
+        wire_drop_rule is not None
+        and not req.reposition
+        and isinstance(prompt, list)
+        and not single_context_prefill
+    ):
         try:
             cache_report = await state.run_contextual_warmup(
                 prompt,
@@ -977,6 +987,7 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
             tool_choice=normalized_tool_choice,
             stop=effective_stop,
             request_received_ns=request_received_ns,
+            use_context_mask=single_context_prefill,
         )
     )
 

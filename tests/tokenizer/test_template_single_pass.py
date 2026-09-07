@@ -34,18 +34,32 @@ class _SinglePassTokenizer:
             "offset_mapping": [(index, index + 1) for index in range(len(text))],
         }
 
-    def apply_chat_template(self, *args, **kwargs):
+    def apply_chat_template(self, messages, *, tokenize, add_generation_prompt, **kwargs):
+        from jinja2 import Template
+
         self.apply_calls += 1
-        raise AssertionError("The structured path must use the single traced render.")
+        text = Template(self.chat_template).render(
+            messages=messages, add_generation_prompt=add_generation_prompt, **kwargs
+        )
+        if tokenize:
+            self.encode_calls += 1
+            return self.encode(text)
+        return text
 
     def encode(self, text, *, add_special_tokens=False):
         del add_special_tokens
         return [ord(char) for char in text]
 
 
-def test_ordinary_chat_renders_and_encodes_exactly_once() -> None:
+def test_ordinary_chat_renders_and_encodes_exactly_once(monkeypatch) -> None:
     tokenizer = _SinglePassTokenizer()
     manager = TokenizeManager(tokenizer)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("No-event inference must bypass context compilers.")
+
+    monkeypatch.setattr(manager, "_build_template_provenance", forbidden)
+    monkeypatch.setattr(manager, "_compile_delta_layout", forbidden)
     result = manager._chat_tokenize(
         TokenizeMsg(
             uid=30,
@@ -63,9 +77,10 @@ def test_ordinary_chat_renders_and_encodes_exactly_once() -> None:
     assert result.tokenize_invocations == 1
     assert result.chat_template_invocations == 1
     assert tokenizer.encode_calls == 1
-    assert tokenizer.apply_calls == 0
-    assert result.message_meta["gen_prompt_start"] == len(expected) - len("<assistant>")
-    assert result.message_meta["radix_state_starts"]
+    assert tokenizer.apply_calls == 1
+    assert result.reposition_layout is None
+    assert result.radix_key_to_token is None
+    assert result.radix_match_ids[:, 1].tolist() == result.input_ids.tolist()
     for removed in (
         "message_starts",
         "owner_starts",
@@ -104,3 +119,36 @@ def test_structured_drop_and_reposition_render_and_encode_exactly_once() -> None
     assert tokenizer.apply_calls == 0
     assert result.message_meta["gen_prompt_start"] == len(expected) - len("<assistant>")
     assert torch.any(result.reposition_layout.records[:, 0] == 1)
+
+
+def test_empty_and_future_drop_use_ordinary_path(monkeypatch) -> None:
+    manager = TokenizeManager(_SinglePassTokenizer())
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Inactive events must not compile context metadata.")
+
+    monkeypatch.setattr(manager, "_build_template_provenance", forbidden)
+    monkeypatch.setattr(manager, "_compile_delta_layout", forbidden)
+    for drops in ({}, {0: []}, {9: [0]}):
+        result = manager._chat_tokenize(
+            TokenizeMsg(
+                uid=32,
+                text=[{"role": "user", "content": "hello"}],
+                sampling_params=SamplingParams(max_tokens=2),
+                drop_message=drops,
+                use_context_mask=True,
+            )
+        )
+        from minisgl.tokenizer.server import _build_user_msg
+
+        message = _build_user_msg(
+            TokenizeMsg(
+                uid=32,
+                text="unused",
+                sampling_params=SamplingParams(max_tokens=2),
+                use_context_mask=True,
+            ),
+            result,
+        )
+        assert not message.use_context_mask
+        assert message.context_post_prefill_keep_mask is None

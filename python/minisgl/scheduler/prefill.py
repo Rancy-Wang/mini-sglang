@@ -118,8 +118,9 @@ def _mask_free_context_reason_reference(
 ) -> str | None:
     """Return None only when compact causal Extend exactly equals the Drop mask."""
 
-    if has_sliding_window:
-        return "sliding_window_requires_absolute_key_selection"
+    # Ordinary attention already selects sliding windows by absolute positions.
+    # Equality of full visibility also proves equality after the same window intersection.
+    del has_sliding_window
     if (
         req.full_input_ids is None
         or req.full_token_visible_until is None
@@ -179,8 +180,9 @@ def _mask_free_context_reason(
 ) -> str | None:
     """Use the sparse CPU kernel, falling back to the proven O(N) reference."""
 
-    if has_sliding_window:
-        return "sliding_window_requires_absolute_key_selection"
+    # Ordinary attention already selects sliding windows by absolute positions.
+    # Equality of full visibility also proves equality after the same window intersection.
+    del has_sliding_window
     drop_wire = (
         req.drop_event_positions,
         req.drop_range_offsets,
@@ -277,7 +279,7 @@ class PrefillAdder:
             if active_match.active_cached_len > radix_cached_tokens:
                 raise RuntimeError("Active cache usage exceeds resident Radix matches.")
             logger.debug(
-                "Context warmup %s selected mask-free Extend with %d active cache hits.",
+                "Context request %s selected mask-free Extend with %d active cache hits.",
                 req.uid,
                 active_match.active_cached_len,
             )
@@ -330,7 +332,7 @@ class PrefillAdder:
         )
         assert full_radix_input_ids is not None
         logger.debug(
-            "Context warmup %s retained mask Prefill: %s.",
+            "Context request %s retained mask Prefill: %s.",
             req.uid,
             fallback_reason,
         )
@@ -632,7 +634,9 @@ class PrefillAdder:
             full_keep_mask=(pending_req.full_keep_mask if pending_req.use_context_mask else None),
             use_context_mask=pending_req.use_context_mask,
             context_compact_stream=pending_req.context_compact_stream,
-            context_post_prefill_keep_mask=pending_req.context_post_prefill_keep_mask,
+            context_post_prefill_keep_mask=(
+                pending_req.context_post_prefill_keep_mask if pending_req.use_context_mask else None
+            ),
             radix_key_virtual_mask=pending_req.radix_key_virtual_mask,
             radix_key_to_token=pending_req.radix_key_to_token,
             radix_token_to_key=pending_req.radix_token_to_key,
@@ -716,8 +720,7 @@ class PrefillManager:
         if req.use_context_mask:
             if not req.is_warmup and req.context_post_prefill_keep_mask is None:
                 raise ValueError(
-                    "Context-mask Prefill is restricted to internal warmup or "
-                    "Reposition requests."
+                    "Context-mask Prefill requires warmup or a final active keep mask."
                 )
             if req.full_input_ids is None or req.radix_match_ids is None:
                 raise ValueError(

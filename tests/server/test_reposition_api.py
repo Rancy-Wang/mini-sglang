@@ -217,7 +217,7 @@ def test_reposition_uses_one_public_tokenization_without_frontend_warmups() -> N
 
 
 @pytest.mark.parametrize(
-    "mode,hit_ratio,dispatches", [("mask", 0.0, 1), ("staged", 0.95, 1), ("staged", 0.94, 3)]
+    "mode,hit_ratio,dispatches", [("mask", 0.0, 0), ("staged", 0.95, 1), ("staged", 0.94, 3)]
 )
 def test_drop_only_warmup_preserves_complete_usage(mode, hit_ratio, dispatches) -> None:
     manager = FrontendManager(
@@ -263,6 +263,9 @@ def test_drop_only_warmup_preserves_complete_usage(mode, hit_ratio, dispatches) 
         )
     )
 
-    assert (report.cached_tokens, report.drop_skipped_tokens) == (2, 3)
+    if mode == "mask":
+        assert report is None
+    else:
+        assert (report.cached_tokens, report.drop_skipped_tokens) == (2, 3)
     assert len(sent) == dispatches
     assert all(msg.reposition is None for msg in sent)

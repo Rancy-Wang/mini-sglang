@@ -136,9 +136,7 @@ class Req:
         if self.use_context_mask and not (
             self.is_warmup or self.context_post_prefill_keep_mask is not None
         ):
-            raise ValueError(
-                "Context-mask Prefill is restricted to internal warmup or Reposition requests."
-            )
+            raise ValueError("Context-mask Prefill requires warmup or a final active keep mask.")
         if self.context_post_prefill_keep_mask is not None:
             keep_mask = self.context_post_prefill_keep_mask
             if (

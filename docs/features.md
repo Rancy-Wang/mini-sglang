@@ -84,11 +84,35 @@ hidden history.
 
 ## Contextual Prefill Usage
 
-默认的 `mask` contextual prefill 会先用完整 Radix key 做一次匹配。调度器随后用
-tokenizer 产生的稀疏 Drop event/range 元数据判断 compact causal Extend 是否与精确
-Context mask 等价：等价时直接执行 mask-free Extend，不等价、元数据异常或模型使用
-sliding window 时保守回退到原始 mask Prefill。启动时添加
+默认 `mask` 模式下，无 Reposition 的正式请求只分配一个 UID、执行一次完整模板
+编码，不再先发一个独立 warmup 请求。调度器匹配复用 KV 后，用稀疏 Drop event/range
+判断所有未缓存 query 的可见集合：如果提前删除最终 Drop 的 KV 仍保持语义，直接执行
+active-token Extend；否则对历史 full-token 流执行 mask Prefill。本次前向采样的首个
+输出 token 被保留，随后整理最终 active KV，保留幸存 token 的绝对位置，再按需 decode。
+预算足够时只有一次 Prefill/Extend；预算不足时仍允许同一请求分块，仅最终块输出采样结果。
+
+普通 Extend 已支持按绝对位置选择 sliding window，因此 full-attention 可见集合等价
+时，与相同窗口取交集后也等价，不再仅因模型含 sliding window 就强制 Context mask。
+不等价或必要元数据缺失时保留 mask Prefill。启动时添加
 `--disable-mask-free-context-prefill` 可以强制回退，供算法对照实验使用。
+
+无 Drop、无 Reposition 请求直接走普通 chat-template 编码（保留 tools/thinking/Harmony
+语义），不构造 Drop provenance、范围和 Context mask，不调用通用 Reposition 布局编译器。
+仍生成兼容的基础 Radix records `[0, token_id, -1, absolute_position]`，省去事件映射数组和
+Retry 查询，保证普通请求和后续 Drop 请求能共享合法前缀。空的或只包含未来 Message Drop
+事件的请求也走此路径；需要 token 边界才能判定无效的规则在完成判定后降级。
+
+Overlap 调度在最终 masked Prefill 结束时先处理该批结果、整理 KV 和保存首 token，
+然后才调度下一批，防止 decode 读取尚未整理的页表。mask-free 路径已经处于 active
+状态，无需再整理。Reposition 前置 stage、显式 staged 模式、现有 batch/分块预算规则保留。
+
+流程依据：`v1_completions` 的 `single_context_prefill`（`python/minisgl/server/api_server.py:942-991`）、
+`_build_user_msg`（`python/minisgl/tokenizer/server.py:66-108`）、`plan_context_prefill`
+（`python/minisgl/scheduler/prefill.py:241-350`）；无事件路径见 `_ordinary_result` 与
+`_chat_tokenize`（`python/minisgl/tokenizer/tokenize.py:182-208,1352-1477`），直接匹配见
+`CacheManager.match_req`（`python/minisgl/scheduler/cache.py:112-153`）；KV 转换及 overlap
+顺序见 `Scheduler.overlap_loop` / `_compact_context_after_prefill`
+（`python/minisgl/scheduler/scheduler.py:162-194,322-393`）。
 
 非流式 OpenAI chat-completions 响应使用 SGLang 风格的 usage：
 
@@ -107,9 +131,9 @@ sliding window 时保守回退到原始 mask Prefill。启动时添加
 ```
 
 `prompt_tokens` 始终是完整 chat-template prompt 的 token 数；`completion_tokens` 是输出
-计数，`total_tokens` 为两者之和。缓存明细必须整体来自同一阶段：普通 Drop 请求有独立
-warmup 时采用该 warmup 的报告（legacy staged fallback 也保留首次探测的完整报告）；
-没有 warmup 时采用生成请求的报告。Reposition 采用最后一个 scheduler stage 的报告，
+计数，`total_tokens` 为两者之和。缓存明细必须整体来自同一阶段：默认 mask 模式的
+普通 Drop 请求采用正式生成请求的报告；显式 legacy staged 模式保留独立 warmup，
+以及首次探测的完整报告。Reposition 采用最后一个 scheduler stage 的报告，
 不累计前置 stage，也不从累计性能指标中拼接 Drop 数。
 
 Reposition 请求的 `prompt_tokens_details` 包含三项，即使全部为零也返回：
@@ -146,10 +170,10 @@ mask Prefill 和 mask-free Extend 均可有非零 `drop_skipped_tokens`。一个
 `choices: []` 的最终 usage chunk，其口径与非流式响应相同。
 
 实现依据：`Req.record_context_cache_usage` 和 `reported_cached_tokens` 分别固定实际复用
-集合的分类及返回普通复用数（`python/minisgl/core.py:310-353`）；
+集合的分类及返回普通复用数（`python/minisgl/core.py:308-351`）；
 `build_context_attention_batch` 从实际 full-attention segment 提供缓存位置
 （`python/minisgl/attention/base.py:363-439`）；`PrefillAdder` 保存 Retry 的转换标记并传递分块
-计数（`python/minisgl/scheduler/prefill.py:468-531,617-627`）；`CacheUsageReport.from_reply` 与
+计数（`python/minisgl/scheduler/prefill.py:470-533,619-629`）；`CacheUsageReport.from_reply` 与
 `_build_usage` 在 HTTP 边界保留完整报告、校验三项总和
 （`python/minisgl/server/api_server.py:440-481`）。
 
