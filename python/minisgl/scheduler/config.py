@@ -17,7 +17,6 @@ class SchedulerConfig(EngineConfig):
     max_extend_tokens: int = 8192
     cache_type: str = "radix"
     radix_drop_key_mode: Literal["bitmask", "symbol", "delta-marker"] = "delta-marker"
-    # staged is a semantic reference, not a cache/throughput optimization.
     contextual_prefill_mode: Literal["staged", "mask"] = "mask"
     mask_free_context_prefill: bool = True
     offline_mode: bool = False

@@ -11,7 +11,7 @@ import asyncio
 import json
 import os
 import time
-from dataclasses import asdict, replace
+from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -148,16 +148,15 @@ class Runner:
             if self.reference_alignment:
                 sampled = sample(logits, args)
                 for i, req in enumerate(self.batch.reqs):
-                    state = req.reference_state
-                    official = state is None or state.prefill_done or state.segment_end == len(state.full_ids)
                     record = self.records[req.uid]
-                    record.setdefault("sample_rows", []).append({"official": official, "prefill": self.batch.is_prefill})
-                    if official:
-                        # GPU snapshots are exported once per request, never per layer/token.
-                        record.setdefault("logits_gpu", []).append(logits[i].detach().clone())
-                        step = len(record["logits_gpu"]) - 1
-                        if self.forced_tokens is not None and step < len(self.forced_tokens):
-                            sampled[i] = self.forced_tokens[step]
+                    record.setdefault("sample_rows", []).append(
+                        {"official": True, "prefill": self.batch.is_prefill}
+                    )
+                    # GPU snapshots are exported once per request, never per layer/token.
+                    record.setdefault("logits_gpu", []).append(logits[i].detach().clone())
+                    step = len(record["logits_gpu"]) - 1
+                    if self.forced_tokens is not None and step < len(self.forced_tokens):
+                        sampled[i] = self.forced_tokens[step]
                 return sampled
             # A small diagnostic read from the existing forward; never recompute KV.
             scores, ids = logits.topk(3, dim=-1)
@@ -318,7 +317,6 @@ class Runner:
                         },
                         "tokenize_invocations": tokenized.tokenize_invocations,
                         "chat_template_invocations": tokenized.chat_template_invocations,
-                        "reference": tokenized.staged_reference,
                     }
                     backend = _build_user_msg(msg, tokenized)
                     self.scheduler._process_one_msg(
@@ -385,18 +383,20 @@ def validate(result, case):
             ):
                 errors.append(f"usage provenance uid={r['uid']}: {stage['usage']}")
     for r in formal:
-        source = r
+        source = next(
+            (w for w in result["records"] if w["owner"] == r["owner"] and w["warmup"]), r
+        )
         response = result["responses"][int(r["owner"])]
         details = response["usage"].get("prompt_tokens_details", {})
         for field in ("cached_tokens", "drop_skipped_tokens"):
             if details.get(field, 0) != source["terminal"][field]:
                 errors.append(f"API usage source uid={r['uid']} field={field}")
-        if r["tokens"][0] != r["top3"][len(r["stages"]) - 1]["ids"][0]:
+        if r["tokens"][0] != r["top3"][0]["ids"][0]:
             errors.append(f"first prefill token was not retained uid={r['uid']}")
-        if (not r.get("reference") and len(r["stages"]) != 1) or r["graph_replays"] != len(r["tokens"]) - 1:
+        if len(r["stages"]) != 1 or r["graph_replays"] != len(r["tokens"]) - 1:
             errors.append(f"prefill/graph counts uid={r['uid']}")
         active = {k: r["first_decode"][k] for k in ("ids", "positions", "raw")}
-        if not r.get("reference") and active != r["input"]:
+        if active != r["input"]:
             errors.append(f"active state uid={r['uid']}")
         if result["mode"] == "mask":
             stage = r["stages"][0]
@@ -411,8 +411,8 @@ def validate(result, case):
     warmups = [r for r in result["records"] if r["warmup"]]
     if result["mode"] == "mask" and warmups:
         errors.append("mask submitted internal warmup")
-    if warmups:
-        errors.append("Unexpected frontend warmup")
+    if result["mode"] == "staged" and case != "no_drop" and not warmups:
+        errors.append("staged did not submit real warmup")
     return errors
 
 
@@ -421,7 +421,7 @@ def compare(a, b):
     aa = sorted((r for r in a["records"] if not r["warmup"]), key=lambda r: r["owner"])
     bb = sorted((r for r in b["records"] if not r["warmup"]), key=lambda r: r["owner"])
     for x, y in zip(aa, bb, strict=True):
-        for key in ("tokens",):
+        for key in ("input", "tokens"):
             if x[key] != y[key]:
                 if key == "tokens":
                     first = next(
@@ -550,369 +550,28 @@ def run():
             )
 
 
-# R7: a reference shares model/operators, but never the mask compiler or Radix.
-def intervals(xs):
-    result = []
-    for x in xs:
-        if result and result[-1][1] == x:
-            result[-1][1] = x + 1
-        else:
-            result.append([x, x + 1])
-    return result
-
-
 def reference_tokenize(manager, model, request, mode="mask", max_tokens=1536):
+    assert mode == "mask", "R8 validates the default production mask path."
     body = request_body(model, request, max_tokens, ignore_eos=False)
     rule, prompt = api._parse_request_drop_rule(
-        drop_rule=body.drop_rule, legacy_drop_message=body.drop_message,
-        messages=[x.model_dump() for x in body.messages], radix_drop_key_mode="delta-marker",
+        drop_rule=body.drop_rule,
+        legacy_drop_message=body.drop_message,
+        messages=[x.model_dump() for x in body.messages],
+        radix_drop_key_mode="delta-marker",
     )
     msg = TokenizeMsg(
-        uid=0, text=prompt, sampling_params=core.SamplingParams(max_tokens=max_tokens),
-        target_msg_id=len(prompt), drop_rule=rule, tools=body.tools,
+        uid=0,
+        text=prompt,
+        sampling_params=core.SamplingParams(max_tokens=max_tokens),
+        target_msg_id=len(prompt),
+        drop_rule=rule,
+        tools=body.tools,
         tool_choice=api._normalize_tool_choice(body.tools, body.tool_choice),
-        enable_thinking=body.enable_thinking, reasoning_effort=body.reasoning_effort,
-        use_context_mask=mode == "mask", staged_reference=mode == "staged",
+        enable_thinking=body.enable_thinking,
+        reasoning_effort=body.reasoning_effort,
+        use_context_mask=True,
     )
     return msg, manager.tokenize([msg])[0]
-
-
-def visibility_oracle(tokenized):
-    """Lifetime oracle from sparse event ranges; never reads the compiled mask."""
-    full = tokenized.full_input_ids
-    if full is None:
-        full = tokenized.input_ids
-    expiry = [2**31 - 1] * len(full)
-    if tokenized.drop_event_positions is not None:
-        offsets = tokenized.drop_range_offsets.tolist()
-        ranges = tokenized.drop_position_ranges.reshape(-1, 2).tolist()
-        for i, boundary in enumerate(tokenized.drop_event_positions.tolist()):
-            for start, end in ranges[offsets[i]:offsets[i + 1]]:
-                assert 0 <= start < end <= boundary <= len(full)
-                for k in range(start, end):
-                    expiry[k] = min(expiry[k], boundary)
-    return {"ids": full.tolist(), "expiry": expiry}
-
-
-class VisibilityObserver:
-    """Audit metadata actually consumed by FA, including inherited page provenance.
-
-    Each group has contiguous query raws and no intervening Drop. Causal keys add
-    exactly one corresponding token per query. Checking both endpoints plus that
-    suffix identity proves every interior query without quadratic enumeration.
-    """
-    def __init__(self, runner):
-        self.runner = runner
-        self.ideals, self.pages, self.trace = {}, {}, []
-        backend = runner.scheduler.engine.attn_backend
-        prepare, forward = backend.prepare_metadata, backend.forward
-
-        def observed_prepare(batch):
-            result = prepare(batch)
-            if batch.is_prefill:
-                self.inspect(batch)
-            return result
-
-        def observed_forward(q, k, v, layer_id, batch, **kwargs):
-            if batch.is_prefill:
-                self.trace[-1].setdefault("attention_layers", []).append(layer_id)
-            return forward(q, k, v, layer_id, batch, **kwargs)
-
-        backend.prepare_metadata, backend.forward = observed_prepare, observed_forward
-
-    def reset(self, ideals, *, preserve_pages=False):
-        self.ideals, self.trace = ideals, []
-        if not preserve_pages:
-            self.pages = {}
-
-    def inspect(self, batch):
-        inverse, queries, requests = {}, [], {}
-        page_table = core.get_global_ctx().page_table
-        for req in batch.reqs:
-            record = self.runner.records[req.uid]
-            ideal = self.ideals[record.get("owner", "0")]
-            raw = req.raw_positions[:req.device_len].tolist()
-            ids = req.input_ids[:req.device_len].tolist()
-            true = req.true_positions[:req.device_len].tolist()
-            pages = page_table[req.table_idx, :req.device_len].tolist()
-            for i, p in enumerate(pages):
-                assert p not in inverse, "Requests share a physical KV page"
-                inverse[p] = (req.uid, raw[i], ids[i], true[i])
-            queries.extend((req.uid, k) for k in raw[req.cached_len:])
-            requests[req.uid] = (req, ideal)
-        meta = batch.attn_metadata
-        seg = meta.context_segments or meta
-        cu, lengths, tables = seg.cu_seqlens_q.tolist(), seg.cache_seqlens.tolist(), seg.page_table.tolist()
-        event = {"uids": [r.uid for r in batch.reqs], "segments": [], "query_count": len(queries)}
-        assert cu[-1] == len(queries)
-        for j, (a, b) in enumerate(zip(cu, cu[1:])):
-            uid = queries[a][0]
-            assert all(u == uid for u, _ in queries[a:b])
-            req, ideal = requests[uid]
-            qraw = [q for _, q in queries[a:b]]
-            kp = tables[j][:lengths[j]]
-            mapped = [inverse[p] for p in kp]
-            assert all(u == uid for u, *_ in mapped)
-            kr = [x[1] for x in mapped]
-            nq = b - a
-            assert kr[-nq:] == qraw, "FA causal suffix does not match the queries"
-            assert all(ids == ideal["ids"][raw] and true == raw for _, raw, ids, true in mapped)
-            expiries = sorted(set(ideal["expiry"]))
-            cuts = [0] + [i for i in range(1, nq) if qraw[i] != qraw[i - 1] + 1 or any(qraw[i - 1] < e <= qraw[i] for e in expiries)] + [nq]
-            groups = []
-            for lo, hi in zip(cuts, cuts[1:]):
-                checks = []
-                for qi in sorted({lo, hi - 1}):
-                    q = qraw[qi]
-                    expected = [k for k in range(q + 1) if ideal["expiry"][k] > q]
-                    actual = kr[:len(kr) - nq + qi + 1]
-                    assert actual == expected, (uid, q, intervals(sorted(set(expected) - set(actual))), intervals(sorted(set(actual) - set(expected))))
-                    checks.append({"query": q, "visible_raw": intervals(actual)})
-                groups.append({"queries": [qraw[lo], qraw[hi - 1] + 1], "count": hi - lo, "checks": checks})
-            for p, (_, raw, ids, _) in zip(kp[:-nq], mapped[:-nq], strict=True):
-                assert self.pages.get(p) == (raw, ids, ideal["expiry"][raw]), ("Invalid cached provenance", p, raw)
-            for p, (_, raw, ids, _) in zip(kp[-nq:], mapped[-nq:], strict=True):
-                self.pages[p] = (raw, ids, ideal["expiry"][raw])
-            event["segments"].append({"uid": uid, "mask": req.use_context_mask,
-                "keys": intervals(kr), "pages": kp, "groups": groups,
-                "cached_len": req.cached_len,
-                "usage": [req.reported_cached_tokens, req.drop_skipped_tokens, req.reported_repos_tokens]})
-        self.trace.append(event)
-
-
-class OperatorProbe:
-    """Selected real prefill rows; graph decode stays captured and unchanged."""
-    def __init__(self, runner):
-        import minisgl.moe.fused as fused
-        self.runner, self.saved = runner, []
-        self.enabled, self.layer = False, -1
-        self.raws, self.indices, self.data, self.shapes = [], [], {}, {}
-        self.selected = set()
-        backend = runner.scheduler.engine.attn_backend
-        def wrap(obj, name, build):
-            original = getattr(obj, name)
-            self.saved.append((obj, name, original))
-            setattr(obj, name, build(original))
-        def prepare(original):
-            def call(batch):
-                result = original(batch)
-                if self.enabled and batch.is_prefill:
-                    raw = [int(q) for req in batch.reqs for q in req.raw_positions[req.cached_len:req.device_len]]
-                    self.indices = [i for i, q in enumerate(raw) if q in self.selected]
-                    self.raws = [raw[i] for i in self.indices]
-                return result
-            return call
-        wrap(backend, "prepare_metadata", prepare)
-        def attention(original):
-            def call(q, k, v, layer_id, batch, **kw):
-                self.capture("q_rope", q)
-                self.capture("k_rope", k)
-                self.capture("v", v)
-                result = original(q, k, v, layer_id, batch, **kw)
-                self.capture("attention_raw", result)
-                return result
-            return call
-        wrap(backend, "forward", attention)
-        def route(original):
-            def call(*args, **kwargs):
-                weights, ids = original(*args, **kwargs)
-                self.capture("expert_ids", ids)
-                self.capture("expert_weights", weights)
-                return weights, ids
-            return call
-        wrap(fused, "fused_topk", route)
-        for index, layer in enumerate(runner.scheduler.engine.model.model.layers.op_list):
-            def enter(original, index=index):
-                def call(x, residual=None):
-                    self.layer = index
-                    self.capture("layer_x", x)
-                    if residual is not None:
-                        self.capture("residual", residual)
-                    result = original(x, residual)
-                    self.capture("layer_output", result[0])
-                    self.capture("residual_output", result[1])
-                    return result
-                return call
-            wrap(layer, "forward", enter)
-            for name, op in (("qkv_projection", layer.self_attn.qkv_proj),
-                             ("attention_projection", layer.self_attn.o_proj),
-                             ("router", layer.mlp.gate), ("mlp", layer.mlp)):
-                def observe(original, name=name):
-                    def call(x, *args, **kwargs):
-                        self.capture(name + "_input", x)
-                        result = original(x, *args, **kwargs)
-                        self.capture(name, result)
-                        return result
-                    return call
-                wrap(op, "forward", observe)
-
-    def capture(self, name, tensor):
-        if not self.enabled or not core.get_global_ctx().batch.is_prefill or not self.indices:
-            return
-        key = f"{self.layer:02d}_{name}"
-        # Snapshot before in-place fused operators can overwrite their input.
-        self.data.setdefault(key, []).append((tuple(self.raws), tensor[self.indices].detach().clone()))
-        self.shapes.setdefault(key, []).append(tuple(tensor.shape))
-
-    def reset(self, raws):
-        self.selected, self.data, self.shapes = set(raws), {}, {}
-        self.enabled = True
-
-    def export(self):
-        self.enabled = False
-        result = {}
-        for key, items in self.data.items():
-            raw = [q for qs, _ in items for q in qs]
-            order = torch.tensor(sorted(range(len(raw)), key=raw.__getitem__))
-            result[key] = {"raw": torch.tensor(raw)[order],
-                           "values": torch.cat([t for _, t in items]).cpu()[order],
-                           "batch_shapes": self.shapes[key]}
-        self.data = {}
-        return result
-
-    def close(self):
-        for obj, name, original in reversed(self.saved):
-            setattr(obj, name, original)
-
-
-def compare_probes(a, b):
-    rows = []
-    for key in a:
-        assert key in b and torch.equal(a[key]["raw"], b[key]["raw"])
-        x, y = a[key]["values"].float().flatten(1), b[key]["values"].float().flatten(1)
-        d = x - y
-        for i, raw in enumerate(a[key]["raw"].tolist()):
-            row = {"operator": key, "raw": raw, "max_abs": float(d[i].abs().max()),
-                   "relative_l2": float(d[i].norm() / x[i].norm().clamp_min(1e-12)),
-                   "mask_shapes": a[key]["batch_shapes"], "reference_shapes": b[key]["batch_shapes"]}
-            if key.endswith("expert_ids"):
-                row["expert_sets_equal"] = sorted(x[i].tolist()) == sorted(y[i].tolist())
-                row["ids"] = [x[i].int().tolist(), y[i].int().tolist()]
-            if key.endswith("router"):
-                topk = a[key.replace("router", "expert_ids")]["values"].shape[-1]
-                for label, score in (("mask", x[i]), ("reference", y[i])):
-                    vals, ids = score.topk(topk + 1)
-                    row[label + "_boundary_margin"] = float(vals[-2] - vals[-1])
-                    row[label + "_top_experts"] = ids.tolist()
-            rows.append(row)
-    return rows
-
-
-def token_fixture93():
-    from minisgl.kernel.radix_reposition import compile_radix_reposition_layout
-    from minisgl.tokenizer.tokenize import TokenizedResult
-    full = torch.arange(1000, 1093, dtype=torch.int32)
-    empty = torch.empty(0, dtype=torch.int32)
-    events, offsets = torch.tensor([49, 79], dtype=torch.int32), torch.tensor([0, 1, 2], dtype=torch.int32)
-    spans = torch.tensor([0, 25, 25, 49], dtype=torch.int32)
-    layout = compile_radix_reposition_layout(full, events, offsets, spans, empty, empty)
-    keep = layout.keep_mask
-    raw = torch.arange(93, dtype=torch.int32)[keep]
-    visible = torch.full((93,), 2**31 - 1, dtype=torch.int32)
-    visible[:25], visible[25:49] = 49, 79
-    return TokenizedResult(
-        input_ids=full[keep], true_positions=raw, raw_positions=raw,
-        radix_input_ids=layout.records[layout.token_to_key[raw.long()]], radix_match_ids=layout.records,
-        prefix_keep_mask=keep[:-1].int(), prompt_tokens=93, full_input_ids=full,
-        full_token_visible_until=visible, full_keep_mask=keep.int(), drop_event_positions=events,
-        drop_range_offsets=offsets, drop_position_ranges=spans, drop_effective_event_count=2,
-        radix_key_virtual_mask=layout.virtual_mask, radix_key_to_token=layout.key_to_token,
-        radix_token_to_key=layout.token_to_key, radix_positions=layout.positions, radix_repos_info=layout.repos_info,
-    )
-
-
-def private_result(tokenized, cuts=None):
-    """Test-only virtual cuts support the no-drop numerical control."""
-    from minisgl.tokenizer.tokenize import TokenizedResult
-    full = tokenized.full_input_ids if tokenized.full_input_ids is not None else tokenized.input_ids
-    positions = torch.arange(len(full), dtype=torch.int32)
-    return TokenizedResult(
-        input_ids=full, raw_positions=positions, true_positions=positions,
-        radix_input_ids=full.long(), radix_match_ids=None,
-        prefix_keep_mask=torch.ones(max(len(full) - 1, 0), dtype=torch.int32),
-        prompt_tokens=len(full), staged_reference=True,
-        drop_event_positions=tokenized.drop_event_positions if cuts is None else torch.tensor(cuts, dtype=torch.int32),
-        drop_range_offsets=tokenized.drop_range_offsets if cuts is None else torch.zeros(len(cuts) + 1, dtype=torch.int32),
-        drop_position_ranges=tokenized.drop_position_ranges if cuts is None else torch.empty(0, dtype=torch.int32),
-        drop_effective_event_count=tokenized.drop_effective_event_count if cuts is None else len(cuts),
-        tokenize_invocations=1, chat_template_invocations=1,
-    )
-
-
-def preflight_backend_fixtures(manager):
-    from minisgl.message.metrics import RequestMetricsState
-    from minisgl.scheduler.staged_reference import StagedReferenceState
-    fixture = token_fixture93()
-    msg = TokenizeMsg(uid=0, text="token fixture", sampling_params=core.SamplingParams(max_tokens=2, ignore_eos=True))
-    examples = [fixture, private_result(fixture)]
-    for length in (46, 49, 93, 1024):
-        full = torch.arange(length, dtype=torch.int32) % 1000 + 1000
-        ordinary = replace(manager._ordinary_result(msg, full), tokenize_invocations=1)
-        examples.extend([ordinary, private_result(ordinary, [length // 3, 2 * length // 3])])
-    for result in examples:
-        backend = _build_user_msg(replace(msg, staged_reference=result.staged_reference), result)
-        backend = BaseBackendMsg.decoder(BaseBackendMsg.encoder(backend))
-        metrics = RequestMetricsState(request_received_ns=0, prompt_tokens=result.prompt_tokens,
-                                      active_prompt_tokens=len(result.input_ids),
-                                      tokenize_invocations=backend.tokenize_invocations)
-        metrics.observe_token(1, visible=True)
-        metrics.finish(2)
-        if result.staged_reference:
-            state = StagedReferenceState.from_message(backend)
-            assert state.next_end(49152) > 0
-
-
-def backend_generate(runner, msg, tokenized):
-    runner.records = {msg.uid: {"owner": "0", "tokens": [], "top3": [], "stages": [], "graph_replays": 0}}
-    replies = []
-    old_reply = runner.scheduler.send_result
-    def collect(items):
-        replies.extend(items)
-        for item in items:
-            if isinstance(item, DetokenizeMsg):
-                runner.records[item.uid]["tokens"].append(item.next_token)
-    runner.scheduler.send_result = collect
-    try:
-        runner.scheduler._process_one_msg(BaseBackendMsg.decoder(BaseBackendMsg.encoder(_build_user_msg(msg, tokenized))))
-        for _ in range(msg.sampling_params.max_tokens + 128):
-            with runner.scheduler.engine_stream_ctx:
-                fd = runner.scheduler._schedule_next_batch()
-                assert fd is not None
-                runner.batch = fd.batch
-                for req in fd.batch.reqs:
-                    runner.stage(req, fd.batch.is_prefill)
-                output = runner.scheduler._forward(fd)
-                runner.scheduler._process_last_data((fd, output))
-            if replies and replies[-1].finished:
-                break
-        else:
-            raise TimeoutError("Backend fixture exceeded bound")
-        runner.export_logits()
-        runner.scheduler.cache_manager.check_integrity()
-        return {"records": list(runner.records.values()), "replies": [asdict(x) for x in replies]}
-    finally:
-        runner.scheduler.send_result = old_reply
-
-
-def logit_metrics(a, b):
-    assert a.shape == b.shape and a.ndim == 2
-    assert torch.isfinite(a).all() and torch.isfinite(b).all(), "Non-finite comparison logits"
-    delta = a - b
-    max_abs = delta.abs().amax(dim=1)
-    rms = delta.square().mean(dim=1).sqrt() / a.square().mean(dim=1).sqrt().clamp_min(1e-12)
-    tv = (a.softmax(dim=1) - b.softmax(dim=1)).abs().sum(dim=1) * .5
-    ai, bi = a.argmax(dim=1), b.argmax(dim=1)
-    rows = torch.arange(len(a))
-    am = (a[rows, ai] - a[rows, bi]).abs()
-    bm = (b[rows, ai] - b[rows, bi]).abs()
-    return [{"max_abs": float(x), "relative_rms": float(y), "tv": float(z),
-             "argmax": [int(i), int(j)], "margins": [float(m), float(n)]}
-            for x, y, z, i, j, m, n in zip(max_abs, rms, tv, ai, bi, am, bm, strict=True)]
-
-
-def check_metrics(rows, limits):
-    return [i for i, row in enumerate(rows) if any(row[k] > v for k, v in limits.items())
-            or (row["argmax"][0] != row["argmax"][1] and max(row["margins"]) > 2 * row["max_abs"])]
 
 
 def response_quality(tokenizer, tokens, request):
@@ -930,209 +589,6 @@ def response_quality(tokenizer, tokens, request):
     return {"raw_text": raw, "parsed": asdict(parsed), "diagnostics": [asdict(x) for x in parser.diagnostics],
             "replacement_character": "\ufffd" in raw,
             "repeated_8grams": [{"ids": list(k), "count": v} for k, v in grams.items() if v >= 3]}
-
-
-async def reference_experiment(runner, cases, prepared, out, dump):
-    observer = VisibilityObserver(runner)
-    failures, controls = [], []
-    fixture = token_fixture93()
-    ideal = visibility_oracle(fixture)
-    # The numeric fixture deliberately fixes the screenshot's token positions;
-    # the actual model tokenizer does not assign those exact lengths to its text.
-    for hit, expected in ((49, (24, 25, 0)), (46, (46, 0, 0))):
-        runner.clear()
-        observer.reset({"0": ideal})
-        seed_msg = TokenizeMsg(uid=100, text="seed", sampling_params=core.SamplingParams(max_tokens=1, ignore_eos=True))
-        seed = replace(runner.tokenizer._ordinary_result(seed_msg, fixture.full_input_ids[:hit]), tokenize_invocations=1)
-        seed_result = backend_generate(runner, seed_msg, seed)
-        seed_trace = observer.trace
-        observer.reset({"0": ideal}, preserve_pages=True)
-        msg = replace(seed_msg, uid=101, use_context_mask=True, sampling_params=core.SamplingParams(max_tokens=2, ignore_eos=True))
-        result = backend_generate(runner, msg, fixture)
-        terminal = result["replies"][-1]
-        assert tuple(terminal[k] for k in ("cached_tokens", "drop_skipped_tokens", "repos_tokens")) == expected
-        rec = result["records"][0]
-        assert len(rec["stages"]) == 1 and rec["first_decode"]["raw"] == list(range(49, 93))
-        assert rec["graph_replays"] == 1 and rec["tokens"][0] == rec["top3"][0]["ids"][0]
-        dump(f"image93_hit{hit}", {**result, "trace": observer.trace, "seed": seed_result, "seed_trace": seed_trace})
-    runner.clear()
-    observer.reset({"0": ideal})
-    msg = TokenizeMsg(uid=102, text="reference fixture", staged_reference=True,
-                      sampling_params=core.SamplingParams(max_tokens=2, ignore_eos=True))
-    result = backend_generate(runner, msg, private_result(fixture))
-    assert result["records"][0]["first_decode"]["raw"] == list(range(49, 93))
-    dump("image93_reference", {**result, "trace": observer.trace})
-
-    # Freeze the limits before reading any BCP generation results.
-    for length in (93, 1024):
-        full = torch.arange(length, dtype=torch.int32) % 1000 + 1000
-        msg = TokenizeMsg(uid=200, text="no drop control", sampling_params=core.SamplingParams(max_tokens=2, ignore_eos=True))
-        normal = replace(runner.tokenizer._ordinary_result(msg, full), tokenize_invocations=1)
-        pair = []
-        for name, tokenized in (("full", normal), ("repeat", normal), ("split", private_result(normal, [length // 3, 2 * length // 3]))):
-            runner.clear()
-            observer.reset({"0": visibility_oracle(normal)})
-            runner.forced_tokens = None if not pair else pair[0][0]["records"][0]["tokens"]
-            result = backend_generate(runner, replace(msg, staged_reference=name == "split"), tokenized)
-            logits = runner.full_logits[200]
-            pair.append((result, logits))
-            dump(f"control{length}_{name}", {**result, "trace": observer.trace})
-        controls.extend(logit_metrics(pair[0][1], pair[1][1]))
-        controls.extend(logit_metrics(pair[0][1], pair[2][1]))
-    runner.forced_tokens = None
-    caps = {"max_abs": .1, "relative_rms": .01, "tv": .01}
-    limits = {k: min(cap, max(1e-6, 3 * max(row[k] for row in controls))) for k, cap in caps.items()}
-    control_failures = check_metrics(controls, caps)
-    dump("frozen_limits", {"controls": controls, "hard_caps": caps, "limits": limits, "failures": control_failures})
-    if control_failures:
-        failures.append({"control_exceeds_hard_cap": control_failures})
-    # Complete the ten frozen inputs even if numerical validation is failing;
-    # semantic/JSON evidence remains useful and is reported separately.
-    ordered = sorted(cases, key=lambda x: (str(x["case_id"]) not in ("806", "822", "844"), str(x["case_id"])))
-    for case in ordered:
-        key, request = str(case["case_id"]), case["request"]
-        ideal = visibility_oracle(prepared[key][1])
-        pair = []
-        for mode in ("mask", "staged"):
-            runner.clear()
-            observer.reset({"0": ideal})
-            started = time.monotonic()
-            result = await runner.generate(mode, [request], 1536)
-            rec = result["records"][0]
-            assert len(result["records"]) == 1 and not rec["warmup"]
-            assert rec["graph_replays"] == len(rec["tokens"]) - 1
-            assert rec["tokens"][0] == rec["top10"][0]["ids"][0]
-            if mode == "staged":
-                assert all(x == 0 for s in rec["stages"] for x in s["usage"])
-            else:
-                assert len(rec["stages"]) == 1
-            expected_active = [i for i, e in enumerate(ideal["expiry"]) if e > len(ideal["ids"]) - 1]
-            assert rec["first_decode"]["raw"] == expected_active
-            logits = runner.full_logits[rec["uid"]]
-            quality = response_quality(runner.tokenizer.tokenizer, rec["tokens"], request)
-            result.update(trace=observer.trace, quality=quality, seconds=time.monotonic() - started)
-            dump(f"{key}_{mode}", result)
-            torch.save(logits, out / f"{key}_{mode}_logits.pt")
-            pair.append((result, logits))
-            print("BCP", key, mode, "tokens", len(rec["tokens"]), "diagnostics", quality["diagnostics"], flush=True)
-        a, b = (x[0]["records"][0]["tokens"] for x in pair)
-        first = next((i for i, (x, y) in enumerate(zip(a, b)) if x != y), min(len(a), len(b)))
-        common_rows = min(first + 1, len(pair[0][1]), len(pair[1][1]))
-        rows = logit_metrics(pair[0][1][:common_rows], pair[1][1][:common_rows])
-        replay = None
-        if a != b:
-            runner.clear()
-            observer.reset({"0": ideal})
-            runner.forced_tokens = a
-            replay = await runner.generate("staged", [request], len(a))
-            runner.forced_tokens = None
-            rows = logit_metrics(pair[0][1], runner.full_logits[replay["records"][0]["uid"]])
-            dump(f"{key}_same_prefix", {**replay, "trace": observer.trace, "forced_tokens": a})
-        bad = check_metrics(rows, limits)
-        if bad:
-            failures.append({"case": key, "numeric_failures": bad})
-        dump(f"{key}_comparison", {"first_divergence": first if a != b else None,
-             "same_prefix_metrics": rows, "failures": bad, "limits": limits, "forced_replay": replay is not None})
-
-    probe_cases = {str(f["case"]) for f in failures if "case" in f} & {"806", "844"}
-    if probe_cases:
-        probe = OperatorProbe(runner)
-        try:
-            for key in sorted(probe_cases):
-                case = next(c for c in cases if str(c["case_id"]) == key)
-                ideal = visibility_oracle(prepared[key][1])
-                n = len(ideal["ids"])
-                boundaries = prepared[key][1].drop_event_positions.tolist()
-                selected = sorted({0, n - 1, n - 4, *[max(0, p - 1) for p in boundaries], *boundaries,
-                                   *[i * (n - 1) // 8 for i in range(9)]})
-                pair = []
-                for mode in ("mask", "staged"):
-                    runner.clear()
-                    observer.reset({"0": ideal})
-                    probe.reset(selected)
-                    await runner.generate(mode, [case["request"]], 1)
-                    snapshot = probe.export()
-                    torch.save(snapshot, out / f"{key}_{mode}_operators.pt")
-                    pair.append(snapshot)
-                dump(f"{key}_operator_comparison", {"probe_round": 1, "rows": compare_probes(*pair)})
-        finally:
-            probe.close()
-
-    for mode in ("mask", "staged"):
-        for drop in (False, True):
-            requests = inputs("cold_mask" if drop else "no_drop", 4)
-            ideals = {str(i): visibility_oracle(reference_tokenize(runner.tokenizer, runner.model, req)[1]) for i, req in enumerate(requests)}
-            runner.clear()
-            observer.reset(ideals)
-            result = await runner.generate(mode, requests, 4)
-            assert any(len(p["uids"]) == 4 and p["prefill"] for p in result["phases"])
-            assert all(r["graph_replays"] == len(r["tokens"]) - 1 for r in result["records"])
-            if not drop:
-                assert all(not r["reference"] and len(r["stages"]) == 1 for r in result["records"])
-            dump(f"c4_{mode}_{'drop' if drop else 'ordinary'}", {**result, "trace": observer.trace})
-    runner.clear()
-    dump("summary", {"semantic_status": "PASS", "numeric_status": "FAIL" if failures else "PASS",
-         "failures": failures, "graph_replays": runner.replays, "limits": limits})
-
-
-@torch.inference_mode()
-def run_reference_alignment():
-    import gzip
-    import hashlib
-    import subprocess
-    import traceback
-    out = Path(os.environ["MINISGL_R7_OUTPUT"])
-    out.mkdir(exist_ok=False)
-    def dump(name, value):
-        with gzip.open(out / f"{name}.json.gz", "wt", encoding="utf-8") as handle:
-            json.dump(value, handle, ensure_ascii=False)
-    input_path = Path(os.environ["MINISGL_R7_INPUT"])
-    cases = json.loads(gzip.decompress(input_path.read_bytes()))
-    assert len(cases) == 10 and len({str(c["case_id"]) for c in cases}) == 10
-    model = os.environ["MINISGL_R3_MODEL"]
-    started = time.monotonic()
-    tokenizer = load_tokenizer(model)
-    manager = TokenizeManager(tokenizer)
-    preflight_backend_fixtures(manager)
-    prepared = {}
-    for case in cases:
-        a = reference_tokenize(manager, model, case["request"], "mask")
-        b = reference_tokenize(manager, model, case["request"], "staged")
-        assert torch.equal(a[1].full_input_ids, b[1].input_ids)
-        assert a[1].prompt_tokens + 1536 < 49152
-        assert a[1].tokenize_invocations == b[1].tokenize_invocations == 1
-        assert visibility_oracle(a[1]) == visibility_oracle(b[1])
-        starts = {row["msg_id"]: row["raw_start"] for row in a[1].message_meta["radix_state_starts"]}
-        expected_expiry = [2**31 - 1] * len(b[1].input_ids)
-        rule = case["request"]["drop_rule"]
-        assert rule["type"] == "message_drop" and a[1].message_meta["target_offset"] == 0
-        for event, owners in rule["drop_messages"].items():
-            boundary = starts[int(event) + 1]
-            for owner in owners:
-                for raw in range(starts[int(owner)], starts[int(owner) + 1]):
-                    expected_expiry[raw] = min(expected_expiry[raw], boundary)
-        assert expected_expiry == visibility_oracle(b[1])["expiry"]
-        prepared[str(case["case_id"])] = a
-    dump("preflight", {"input_sha256": hashlib.sha256(input_path.read_bytes()).hexdigest(),
-         "canonical": {k: {"token_ids": visibility_oracle(v[1])["ids"], "metadata": v[1].message_meta} for k, v in prepared.items()},
-         "tokenizer_files": {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in Path(model).glob('*') if p.is_file() and (p.name.startswith('tokenizer') or p.name in ('config.json', 'generation_config.json', 'chat_template.jinja'))},
-         "head": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()})
-    print("R7 preflight PASS; loading one model", flush=True)
-    runner = Runner(model, tokenizer=tokenizer, reference_alignment=True)
-    loaded = time.monotonic()
-    status = "incomplete"
-    try:
-        asyncio.run(reference_experiment(runner, cases, prepared, out, dump))
-        status = "completed"
-    except BaseException:
-        dump("failure", {"traceback": traceback.format_exc()})
-        raise
-    finally:
-        runner.scheduler.shutdown()
-        dump("runtime", {"status": status, "initialization_seconds": loaded - started,
-             "experiment_seconds": time.monotonic() - loaded, "model_initializations": 1,
-             "tokenizer_initializations": 1, "cuda_graph_bs": [1, 4], "graph_replays": runner.replays,
-             "peak_allocated_bytes": torch.cuda.max_memory_allocated(), "dtype": "bfloat16", "attention": "fa"})
 
 
 def _r8_validate_quality(tokenizer, tokens, request):
@@ -1306,7 +762,7 @@ def run_tool_json_generation():
         for case in cases:
             key = str(case["case_id"])
             results[key] = {}
-            for mode in ("mask", "staged"):
+            for mode in ("mask",):
                 runner.clear()
                 result = asyncio.run(runner.generate(mode, [case["request"]], 512))
                 record = result["records"][0]
@@ -1346,97 +802,8 @@ def run_tool_json_generation():
         print(f"R8 status={status}; output={out}", flush=True)
 
 
-@torch.inference_mode()
-def run_projection_replay():
-    """Second bounded probe: replay the actual linear operator, not a full model oracle."""
-    import gzip
-    import subprocess
-
-    from minisgl.layers.linear import _LinearTPImpl
-    from safetensors import safe_open
-
-    source = Path(os.environ["MINISGL_R7_INPUT"])
-    out = Path(os.environ["MINISGL_R7_OUTPUT"])
-    out.mkdir(exist_ok=False)
-    model = Path(os.environ["MINISGL_R3_MODEL"])
-    index = json.loads((model / "model.safetensors.index.json").read_text())["weight_map"]
-    weights = []
-    for part in ("q", "k", "v"):
-        key = f"model.layers.0.self_attn.{part}_proj.weight"
-        with safe_open(model / index[key], framework="pt", device="cpu") as handle:
-            weights.append(handle.get_tensor(key))
-    op = _LinearTPImpl.__new__(_LinearTPImpl)
-    op.weight, op.bias = torch.cat(weights).to(device="cuda", dtype=torch.bfloat16), None
-    results = []
-    started = time.monotonic()
-    for case in ("806", "844"):
-        pair = [torch.load(source / f"{case}_{mode}_operators.pt", weights_only=True)
-                for mode in ("mask", "staged")]
-        a, b = pair
-        name = "00_qkv_projection_input"
-        assert torch.equal(a[name]["raw"], b[name]["raw"])
-        assert torch.equal(a[name]["values"], b[name]["values"])
-        n = a[name]["batch_shapes"][0][0]
-        selected = a[name]["raw"] >= n - 3
-        raw, x = a[name]["raw"][selected], a[name]["values"][selected].cuda()
-        replayed = []
-        for mode, snapshot, length in (("mask", a, n), ("staged", b, 3)):
-            rows = raw if mode == "mask" else raw - (n - 3)
-            inputs = torch.zeros((length, x.shape[-1]), device="cuda", dtype=x.dtype)
-            inputs[rows] = x
-            # Other rows cannot affect a linear projection; keep exact observed row offsets.
-            eager = op.forward(inputs)[rows].clone()
-            stream = torch.cuda.Stream()
-            stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(stream):
-                for _ in range(2):
-                    op.forward(inputs)
-            torch.cuda.current_stream().wait_stream(stream)
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                projected = op.forward(inputs)
-            graph.replay()
-            actual = projected[rows].cpu()
-            captured = snapshot["00_qkv_projection"]["values"][selected]
-            results.append({"case": case, "mode": mode, "raw": raw.tolist(),
-                            "shape": list(inputs.shape), "graph_replays": 1,
-                            "equals_captured": torch.equal(actual, captured),
-                            "max_abs_vs_captured": float((actual.float() - captured.float()).abs().max()),
-                            "graph_equals_eager": torch.equal(actual, eager.cpu())})
-            replayed.append(actual)
-            del graph, projected, inputs, eager
-        results.append({"case": case, "shape_only_max_abs": float(
-            (replayed[0].float() - replayed[1].float()).abs().max())})
-        for mode, snapshot in zip(("mask", "staged"), pair, strict=True):
-            invalid, max_weight_error = [], 0.0
-            for key, entry in snapshot.items():
-                if not key.endswith("_router"):
-                    continue
-                scores = entry["values"].float()
-                ids = snapshot[key.replace("_router", "_expert_ids")]["values"].long()
-                actual_weights = snapshot[key.replace("_router", "_expert_weights")]["values"]
-                picked = scores.gather(1, ids)
-                excluded = scores.clone().scatter_(1, ids, -torch.inf)
-                bad = picked.min(dim=1).values < excluded.max(dim=1).values
-                invalid.extend((key, int(entry["raw"][i])) for i in bad.nonzero().flatten())
-                expected_weights = picked.softmax(dim=1)
-                max_weight_error = max(max_weight_error, float((expected_weights - actual_weights).abs().max()))
-            results.append({"case": case, "mode": mode, "router_invalid_topk": invalid,
-                            "router_max_weight_error": max_weight_error})
-    with gzip.open(out / "projection_replay.json.gz", "wt") as handle:
-        json.dump({"probe_round": 2, "head": subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], text=True).strip(), "rows": results,
-            "seconds": time.monotonic() - started, "full_model_initializations": 0,
-            "weight_shape": list(op.weight.shape), "dtype": str(op.weight.dtype)}, handle)
-    print(json.dumps(results), flush=True)
-
-
 if __name__ == "__main__":
     if os.environ.get("MINISGL_R8_SUITE") == "tool_json_generation":
         run_tool_json_generation()
-    elif os.environ.get("MINISGL_R7_SUITE") == "reference_alignment":
-        run_reference_alignment()
-    elif os.environ.get("MINISGL_R7_SUITE") == "projection_replay":
-        run_projection_replay()
     else:
         run()

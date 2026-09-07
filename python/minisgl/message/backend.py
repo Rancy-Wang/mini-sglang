@@ -68,7 +68,6 @@ class UserMsg(BaseBackendMsg):
     full_input_ids: torch.Tensor | None = None  # CPU 1D int32 full token stream
     full_token_visible_until: torch.Tensor | None = None  # CPU 1D int32 first hidden query pos
     full_keep_mask: torch.Tensor | None = None  # CPU 1D int32 final full-to-active mask
-    staged_reference: bool = False  # canonical stream; private KV, no Radix reuse
     use_context_mask: bool = False  # planner selects ordinary Extend or masked Prefill
     context_compact_stream: bool = False  # mask metadata accompanies an already compact stream
     context_post_prefill_keep_mask: torch.Tensor | None = None  # final raw keep-set

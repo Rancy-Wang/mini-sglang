@@ -25,7 +25,11 @@ from minisgl.message import (
 )
 from minisgl.tokenizer.drop_rules import (
     KeepTextDropRule,
+    MessageDropRule,
+    TextDropRule,
+    ThinkingDropRule,
     parse_drop_rule,
+    project_drop_rule_for_prefix,
 )
 from minisgl.utils import ZmqAsyncPullQueue, ZmqAsyncPushQueue, init_logger
 from prompt_toolkit import PromptSession
@@ -575,9 +579,88 @@ class FrontendManager:
         tools: List[Dict[str, Any]] | None,
         tool_choice: str | Dict[str, Any] | None,
     ) -> CacheUsageReport | None:
-        # Compatibility entry point for callers that used to prime frontend
-        # warmups. Both mask and staged now execute one formal backend request.
-        return None
+        if self.config.contextual_prefill_mode == "mask":
+            # The public request performs and retains its own first forward.
+            return None
+        # Event n changes visibility only for messages after n. A future event
+        # therefore needs no special warmup for the current generation prompt.
+        parsed_rule = (
+            parse_drop_rule(drop_rule, messages, allow_internal=True)
+            if drop_rule is not None
+            else None
+        )
+        if isinstance(parsed_rule, MessageDropRule):
+            has_current_drop = any(
+                trigger < len(messages) and bool(message_ids)
+                for trigger, message_ids in parsed_rule.drop_messages.items()
+            )
+        elif isinstance(parsed_rule, TextDropRule):
+            has_current_drop = any(selection is not None for selection in parsed_rule.selections)
+        elif isinstance(parsed_rule, KeepTextDropRule):
+            has_current_drop = parsed_rule.has_drop()
+        else:
+            has_current_drop = isinstance(parsed_rule, ThinkingDropRule) and bool(
+                parsed_rule.thinking_by_message
+            )
+        if not has_current_drop and not reposition:
+            return None
+        if reposition:
+            # Reposition is materialized by the scheduler from the single complete
+            # token/provenance result. Frontend prefix warmups would repeat the chat
+            # template and make stage sources independently evictable.
+            return None
+
+        warmup_target = max(len(messages) - 1, 0)
+        warmup_uid = self.new_user()
+        await self.send_one(
+            TokenizeMsg(
+                uid=warmup_uid,
+                text=messages,
+                sampling_params=SamplingParams(max_tokens=1, ignore_eos=True),
+                target_msg_id=warmup_target,
+                drop_rule=drop_rule,
+                reposition=reposition,
+                enable_thinking=enable_thinking,
+                reasoning_effort=reasoning_effort,
+                tools=tools,
+                tool_choice=tool_choice,
+                is_warmup=True,
+                internal_uid=warmup_uid,
+            )
+        )
+        warmup_ack = await self.wait_for_warmup(warmup_uid)
+        if warmup_ack.hit_ratio >= 0.95:
+            return CacheUsageReport.from_reply(warmup_ack)
+
+        # Fallback: staged prefill by message prefixes.
+        for end in range(1, len(messages)):
+            staged_uid = self.new_user()
+            staged_rule = (
+                project_drop_rule_for_prefix(drop_rule, end) if drop_rule is not None else None
+            )
+            if staged_rule is not None and staged_rule.get("type") == "thinking_drop":
+                try:
+                    parse_drop_rule(staged_rule, messages[:end], allow_internal=True)
+                except ValueError:
+                    staged_rule = None
+            await self.send_one(
+                TokenizeMsg(
+                    uid=staged_uid,
+                    text=messages[:end],
+                    sampling_params=SamplingParams(max_tokens=1, ignore_eos=True),
+                    target_msg_id=end - 1,
+                    drop_rule=staged_rule,
+                    reposition=None,
+                    enable_thinking=enable_thinking,
+                    reasoning_effort=reasoning_effort,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    is_warmup=True,
+                    internal_uid=staged_uid,
+                )
+            )
+            await self.wait_for_warmup(staged_uid)
+        return CacheUsageReport.from_reply(warmup_ack)
 
     async def stream_generate(self, uid: int):
         try:
@@ -865,6 +948,25 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
         and isinstance(prompt, list)
         and getattr(state.config, "contextual_prefill_mode", "mask") == "mask"
     )
+    if (
+        wire_drop_rule is not None
+        and not req.reposition
+        and isinstance(prompt, list)
+        and not single_context_prefill
+    ):
+        try:
+            cache_report = await state.run_contextual_warmup(
+                prompt,
+                wire_drop_rule,
+                req.reposition,
+                req.enable_thinking,
+                req.reasoning_effort,
+                req.tools,
+                normalized_tool_choice,
+            )
+        except RequestRejected as exc:
+            raise _http_error(exc) from exc
+
     # TODO: support more sampling parameters
     uid = state.new_user()
     await state.send_one(
@@ -889,12 +991,6 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
             stop=effective_stop,
             request_received_ns=request_received_ns,
             use_context_mask=single_context_prefill,
-            staged_reference=(
-                wire_drop_rule is not None
-                and not req.reposition
-                and isinstance(prompt, list)
-                and getattr(state.config, "contextual_prefill_mode", "mask") == "staged"
-            ),
         )
     )
 

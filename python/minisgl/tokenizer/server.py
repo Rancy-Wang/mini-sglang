@@ -95,7 +95,6 @@ def _build_user_msg(msg: TokenizeMsg, t: Any) -> UserMsg:
         full_input_ids=t.full_input_ids,
         full_token_visible_until=t.full_token_visible_until,
         full_keep_mask=t.full_keep_mask,
-        staged_reference=t.staged_reference,
         use_context_mask=msg.use_context_mask and t.full_input_ids is not None,
         context_post_prefill_keep_mask=(
             t.full_keep_mask if msg.use_context_mask and not msg.is_warmup else None

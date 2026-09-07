@@ -47,7 +47,6 @@ if TYPE_CHECKING:
     from minisgl.attention import BaseAttnBackend, BaseAttnMetadata
     from minisgl.kvcache import BaseCacheHandle, BaseKVCachePool
     from minisgl.moe import BaseMoeBackend
-    from minisgl.scheduler.staged_reference import StagedReferenceState
 
 
 @dataclass
@@ -83,7 +82,6 @@ class Req:
     uid: int
     sampling_params: SamplingParams
     cache_handle: BaseCacheHandle
-    reference_state: StagedReferenceState | None = None
     prompt_tokens: int = 0
     stop: List[str] | None = None
     stop_token_seqs: List[List[int]] | None = None
@@ -362,12 +360,6 @@ class Req:
         return self.device_len - self.cached_len
 
     def complete_one(self) -> None:
-        if self.reference_state is not None and not self.reference_state.prefill_done:
-            if self.reference_state.forward_complete:
-                raise RuntimeError("Reference forward completed twice without a stage transition.")
-            self.cached_len = self.device_len
-            self.reference_state.forward_complete = True
-            return  # intermediate samples never extend the generated stream
         # `complete_one` is called immediately after forward.
         # Update position metadata here so both overlap and normal loops
         # can schedule the next batch with consistent absolute positions.
@@ -401,13 +393,7 @@ class Req:
 
         # ChunkedReq deliberately overrides append_host because its sampled row
         # is padding, not output.  Avoid importing the scheduler subclass here.
-        if type(self).append_host is not Req.append_host:
-            return False
-        if self.reference_state is None or self.reference_state.prefill_done:
-            return True
-        # The final staged Prefill sample is retained after the last Drop.  All
-        # earlier staged samples are discarded and must not advance a grammar.
-        return self.reference_state.segment_end == len(self.reference_state.full_ids)
+        return type(self).append_host is Req.append_host
 
     def append_host(self, next_token: torch.Tensor) -> None:
         # Overlap scheduling can finish the following decode before this sampled
@@ -482,8 +468,6 @@ class Req:
 
     @property
     def can_decode(self) -> bool:
-        if self.reference_state is not None and not self.reference_state.prefill_done:
-            return False
         return self.remain_len > 0
 
     @property

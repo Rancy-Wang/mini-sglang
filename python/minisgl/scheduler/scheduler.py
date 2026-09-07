@@ -29,7 +29,7 @@ from .cache import CacheManager
 from .config import SchedulerConfig
 from .decode import DecodeManager
 from .io import SchedulerIOMixin
-from .prefill import ChunkedReq, PrefillManager, ReferenceCapacityError, RepositionCapacityError
+from .prefill import ChunkedReq, PrefillManager, RepositionCapacityError
 from .radix_symbol import RadixSymbolRegistry, inject_radix_symbols
 from .table import TableManager
 from .utils import PendingReq
@@ -183,8 +183,7 @@ class Scheduler(SchedulerIOMixin):
         # A final masked prefill must compact before an overlapping decode reads
         # its page table. Process the sampled token once, then resume overlap.
         if last_data is not None and any(
-            (req.reference_state is not None and req.reference_state.forward_complete)
-            or (not isinstance(req, ChunkedReq) and req.context_post_prefill_keep_mask is not None)
+            not isinstance(req, ChunkedReq) and req.context_post_prefill_keep_mask is not None
             for req in last_data[0].batch.reqs
         ):
             self._process_last_data(last_data)
@@ -250,25 +249,6 @@ class Scheduler(SchedulerIOMixin):
                     # has drained, and never commit or unlock its cache twice.
                     new_finished_reqs.add(req)
                     continue
-
-                if req.reference_state is not None and req.reference_state.forward_complete:
-                    state = req.reference_state
-                    done = state.finish_segment(req, self.table_manager, self.cache_manager)
-                    metrics_state = self.request_metrics.get(req.uid)
-                    if metrics_state is not None:
-                        metrics_state.context_stage_count = state.segments
-                        if done:
-                            metrics_state.active_prompt_tokens = len(req.input_ids)
-                    if not done:
-                        continue
-                    self.prefill_manager.complete_reference(req)
-                    # The final segment's sample was held out of intermediate state.
-                    # Retain it once, after the final Drop and before normal Decode.
-                    self.token_pool[req.table_idx, req.device_len].copy_(
-                        last_data[1].next_tokens_gpu[i]
-                    )
-                    req.complete_one()
-                    self.decode_manager.filter_reqs([req])
 
                 if req.is_warmup:
                     finished = not req.can_decode
@@ -464,7 +444,7 @@ class Scheduler(SchedulerIOMixin):
                     state_starts,
                     self.radix_symbol_registry,
                 )
-            elif self.radix_drop_key_mode == "delta-marker" and not msg.staged_reference:
+            elif self.radix_drop_key_mode == "delta-marker":
                 if msg.radix_match_ids is None:
                     raise ValueError("Delta-marker Radix mode requires full radix_match_ids.")
                 if msg.radix_match_ids.ndim != 2 or msg.radix_match_ids.shape[1] != 4:
@@ -613,10 +593,8 @@ class Scheduler(SchedulerIOMixin):
         # TODO: support other policies: e.g. DECODE first
         try:
             batch = self.prefill_manager.schedule_next_batch(self.prefill_budget)
-        except (RepositionCapacityError, ReferenceCapacityError) as exc:
-            rejected = self.prefill_manager.abort_req(exc.uid)
-            if isinstance(rejected, Req):
-                self._free_req_resources(rejected)
+        except RepositionCapacityError as exc:
+            self.prefill_manager.abort_req(exc.uid)
             self.request_metrics.pop(exc.uid, None)
             self._close_context_sequence(exc.uid)
             self.send_result(
@@ -624,9 +602,7 @@ class Scheduler(SchedulerIOMixin):
                     RequestRejectMsg(
                         uid=exc.uid,
                         status_code=503,
-                        error_code=("reference_kv_capacity_exhausted"
-                                    if isinstance(exc, ReferenceCapacityError)
-                                    else "reposition_kv_capacity_exhausted"),
+                        error_code="reposition_kv_capacity_exhausted",
                         detail=str(exc),
                     )
                 ]
