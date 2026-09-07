@@ -376,6 +376,12 @@ def test_agentic_qwen_tool_grammar_descriptor_tracks_choice_and_safe_paths() -> 
     class _AgenticTokenizer:
         name_or_path = "local/AgenticQwen-30B-A3B"
 
+        @staticmethod
+        def decode(token_ids, *, skip_special_tokens):
+            assert not skip_special_tokens
+            pieces = {1: "<|im_start|>assistant\n", 2: "<think>\n"}
+            return "".join(pieces[token] for token in token_ids)
+
     manager = TokenizeManager(_AgenticTokenizer())
     msg = TokenizeMsg(
         uid=1,
@@ -390,6 +396,7 @@ def test_agentic_qwen_tool_grammar_descriptor_tracks_choice_and_safe_paths() -> 
         mode="auto",
         forced_tool_name=None,
         safe_mode=False,
+        prompt_ids=[1],
     )
     descriptor = msg.sampling_params.tool_grammar
     assert descriptor == {
@@ -397,7 +404,7 @@ def test_agentic_qwen_tool_grammar_descriptor_tracks_choice_and_safe_paths() -> 
         "model": "qwen_3",
         "tools": TOOLS,
         "tool_choice": "auto",
-        "reasoning": True,
+        "reasoning": False,
     }
     assert descriptor["tools"] is not TOOLS
 
@@ -407,11 +414,13 @@ def test_agentic_qwen_tool_grammar_descriptor_tracks_choice_and_safe_paths() -> 
         mode="function",
         forced_tool_name="search",
         safe_mode=False,
+        prompt_ids=[1, 2],
     )
     assert msg.sampling_params.tool_grammar["tool_choice"] == {
         "type": "function",
         "function": {"name": "search"},
     }
+    assert msg.sampling_params.tool_grammar["reasoning"] is True
 
     manager._set_tool_grammar(
         msg,
@@ -419,6 +428,7 @@ def test_agentic_qwen_tool_grammar_descriptor_tracks_choice_and_safe_paths() -> 
         mode="none",
         forced_tool_name=None,
         safe_mode=False,
+        prompt_ids=[1],
     )
     assert msg.sampling_params.tool_grammar is None
     manager._set_tool_grammar(
@@ -427,6 +437,7 @@ def test_agentic_qwen_tool_grammar_descriptor_tracks_choice_and_safe_paths() -> 
         mode="required",
         forced_tool_name=None,
         safe_mode=True,
+        prompt_ids=[1],
     )
     assert msg.sampling_params.tool_grammar is None
 
@@ -437,6 +448,7 @@ def test_agentic_qwen_tool_grammar_descriptor_tracks_choice_and_safe_paths() -> 
         mode="required",
         forced_tool_name=None,
         safe_mode=False,
+        prompt_ids=[1],
     )
     assert msg.sampling_params.tool_grammar is None
 
@@ -457,6 +469,7 @@ def test_qwen3_coder_does_not_use_incompatible_qwen3_structural_tags() -> None:
         mode="required",
         forced_tool_name=None,
         safe_mode=False,
+        prompt_ids=[1],
     )
     assert msg.sampling_params.tool_grammar is None
 

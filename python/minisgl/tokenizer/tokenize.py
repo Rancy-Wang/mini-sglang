@@ -924,6 +924,7 @@ class TokenizeManager:
         mode: str,
         forced_tool_name: str | None,
         safe_mode: bool,
+        prompt_ids: List[int] | torch.Tensor,
     ) -> None:
         msg.sampling_params.tool_grammar = None
         if (
@@ -943,12 +944,23 @@ class TokenizeManager:
             tool_choice = mode
         # Detach the grammar descriptor from request-owned mutable tool objects.
         frozen_tools = json.loads(json.dumps(tools, ensure_ascii=False))
+        tail_ids = (
+            prompt_ids[-32:].tolist()
+            if isinstance(prompt_ids, torch.Tensor)
+            else prompt_ids[-32:]
+        )
+        prompt_tail = self.tokenizer.decode(tail_ids, skip_special_tokens=False)
         msg.sampling_params.tool_grammar = {
             "version": 1,
             "model": self._tool_grammar_model,
             "tools": frozen_tools,
             "tool_choice": tool_choice,
-            "reasoning": msg.enable_thinking is not False,
+            # XGrammar's reasoning form assumes the prompt has already opened
+            # ``<think>`` and constrains only after ``</think>``.  Derive that
+            # fact from the rendered canonical prompt, not the nullable request
+            # preference: AgenticQwen accepts ``enable_thinking`` but does not
+            # emit an opening tag in its generation prompt.
+            "reasoning": prompt_tail.rstrip().endswith("<think>"),
         }
 
     @staticmethod
@@ -1494,6 +1506,7 @@ class TokenizeManager:
                 mode=tool_choice_mode,
                 forced_tool_name=forced_tool_name,
                 safe_mode=safe_mode,
+                prompt_ids=ids,
             )
             return self._ordinary_result(
                 msg,
@@ -1635,6 +1648,7 @@ class TokenizeManager:
                 mode=tool_choice_mode,
                 forced_tool_name=forced_tool_name,
                 safe_mode=safe_mode,
+                prompt_ids=full_with_gen_tensor,
             )
             return self._ordinary_result(
                 msg,
@@ -1667,6 +1681,7 @@ class TokenizeManager:
                 mode=tool_choice_mode,
                 forced_tool_name=forced_tool_name,
                 safe_mode=safe_mode,
+                prompt_ids=full_with_gen_tensor,
             )
             return TokenizedResult(
                 input_ids=full_with_gen_tensor,
@@ -1789,6 +1804,7 @@ class TokenizeManager:
             mode=tool_choice_mode,
             forced_tool_name=forced_tool_name,
             safe_mode=safe_mode,
+            prompt_ids=full_with_gen_tensor,
         )
         return TokenizedResult(
             input_ids=input_ids,
