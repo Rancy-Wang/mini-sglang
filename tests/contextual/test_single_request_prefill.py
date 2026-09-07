@@ -407,6 +407,7 @@ def _real_model():
     fast_attention = backend.forward
     model_forward = scheduler.engine.model.forward
     checked_logits = []
+    numerical_failures = []
 
     def checked_model_forward():
         actual = model_forward()
@@ -415,13 +416,21 @@ def _real_model():
             reference = model_forward()
         finally:
             backend.forward = fast_attention
-        torch.testing.assert_close(actual.float(), reference.float(), atol=0.15, rtol=0.02)
-        assert torch.equal(actual.argmax(-1), reference.argmax(-1))
+        close = torch.isclose(actual.float(), reference.float(), atol=0.15, rtol=0.02)
+        greedy_equal = torch.equal(actual.argmax(-1), reference.argmax(-1))
+        comparison = {
+            "max_abs_logit_error": (actual.float() - reference.float()).abs().max().item(),
+            "mismatched_logits": (~close).sum().item(),
+            "total_logits": actual.numel(),
+            "actual_greedy": actual.argmax(-1).tolist(),
+            "reference_greedy": reference.argmax(-1).tolist(),
+            "greedy_equal": greedy_equal,
+        }
         # The oracle wrote reference KV. Restore production KV before the next
         # decode; these extra model calls are validation only, not scheduler stages.
         restored = model_forward()
         torch.testing.assert_close(restored, actual, atol=0, rtol=0)
-        checked_logits.append(True)
+        checked_logits.append(comparison)
         return actual
 
     scheduler.engine.model.forward = checked_model_forward
@@ -473,15 +482,52 @@ def _real_model():
                 assert len(replies) == concurrency * 2
                 assert all(reply.completion_tokens == 2 for reply in replies if reply.finished)
                 scheduler.cache_manager.check_integrity()
+                usage = [
+                    {
+                        "uid": reply.uid,
+                        "prompt_tokens": reply.prompt_tokens,
+                        "cached_tokens": reply.cached_tokens,
+                        "drop_skipped_tokens": reply.drop_skipped_tokens,
+                        "repos_tokens": reply.repos_tokens,
+                        "completion_tokens": reply.completion_tokens,
+                    }
+                    for reply in replies
+                    if reply.finished
+                ]
+                assert len(usage) == concurrency
+                for item in usage:
+                    cached = item["cached_tokens"]
+                    skipped = item["drop_skipped_tokens"]
+                    repos = item["repos_tokens"]
+                    assert 0 <= cached + skipped + repos <= item["prompt_tokens"]
+                    assert min(cached, skipped, repos) >= 0
+                    assert repos == 0
+                    if case == "warm_extend":
+                        assert cached > 0 and skipped > 0
+                    else:
+                        assert cached == skipped == 0
+                failed = any(
+                    item["mismatched_logits"] or not item["greedy_equal"]
+                    for item in checked_logits
+                )
+                if failed:
+                    numerical_failures.append((concurrency, case, list(checked_logits)))
                 print(
                     {
                         "concurrency": concurrency,
                         "case": case,
                         "phases": phases,
-                        "dense_logits_and_greedy": "pass",
+                        "masks": masks,
+                        "usage": usage,
+                        "output_tokens": [(reply.uid, reply.next_token) for reply in replies],
+                        "numerical_checks": checked_logits,
+                        "dense_logits_and_greedy": "fail" if failed else "pass",
                     },
                     flush=True,
                 )
+        # Finish all usage/lifecycle scenarios before reporting strict numerical
+        # failures. The original atol/rtol and greedy equality remain required.
+        assert not numerical_failures, numerical_failures
     finally:
         scheduler.shutdown()
 
