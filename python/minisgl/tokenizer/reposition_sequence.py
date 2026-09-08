@@ -202,7 +202,10 @@ class RepositionSequenceState:
         raw_index = execution_raw.to(torch.int64)
         is_final = end == raw_count and next_reposition is None
         commit_key_len = len(self.layout.records) if is_final else self._commit_key_len(end)
-        records = self.current_records[:commit_key_len].contiguous()
+        # The Radix cache can retain this key after the Scheduler acknowledges
+        # the stage.  ``current_records`` is then updated in place for the next
+        # Reposition, so the dispatched key must own independent storage.
+        records = self.current_records[:commit_key_len].clone()
         virtual_mask = self.layout.virtual_mask[:commit_key_len].contiguous()
         key_to_token = self.layout.key_to_token[:commit_key_len].contiguous()
         token_to_key = self.layout.token_to_key[:end].contiguous()

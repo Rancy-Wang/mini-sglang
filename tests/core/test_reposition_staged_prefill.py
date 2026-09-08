@@ -183,9 +183,15 @@ def test_tokenizer_sequence_reuses_one_precompiled_layout_between_scheduler_turn
     assert first.use_context_mask
     assert first.is_warmup
     assert first.radix_match_ns == 5
+    first_radix_key = first.radix_match_ids.clone()
     with pytest.raises(RuntimeError, match="awaiting Scheduler"):
         state.build_next_msg()
     state.accept_ack(_ack(7, radix_match_ns=11, drop_skipped_tokens=3))
+    assert torch.equal(first.radix_match_ids, first_radix_key)
+    assert not torch.equal(
+        first.radix_match_ids,
+        state.current_records[: len(first.radix_match_ids)],
+    )
 
     final = state.build_next_msg()
     assert final.raw_positions.tolist() == [1, 2, 3, 4, 5, 6, 7, 8]
