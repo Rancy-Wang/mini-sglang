@@ -415,13 +415,14 @@ class CacheManager:
                 transformed = torch.zeros(len(active_indices), dtype=torch.bool, device="cpu")
                 if req.retry_transformed_mask is not None:
                     transformed[: len(req.retry_transformed_mask)] = req.retry_transformed_mask
-                if req.occurrence_terminal_owned_mask is not None:
-                    occurrence_owned_len = len(req.occurrence_terminal_owned_mask)
+                occurrence_owned = getattr(req, "occurrence_terminal_owned_mask", None)
+                if occurrence_owned is not None:
+                    occurrence_owned_len = len(occurrence_owned)
                     if occurrence_owned_len > len(active_indices):
                         raise RuntimeError(
                             "Occurrence-owned mask exceeds the active cache candidate prefix."
                         )
-                    transformed[:occurrence_owned_len] |= req.occurrence_terminal_owned_mask
+                    transformed[:occurrence_owned_len] |= occurrence_owned
                 ordinary_overlap = overlap & (~transformed)
                 ordinary_device = ordinary_overlap.to(
                     device=active_indices.device, non_blocking=True
@@ -564,8 +565,9 @@ class CacheManager:
             if len(transformed) > len(newly_allocated):
                 raise RuntimeError("Retry transformed-page mask exceeds the active cache prefix.")
             newly_allocated[: len(transformed)] |= transformed
-        if req.occurrence_terminal_owned_mask is not None:
-            occurrence_owned = req.occurrence_terminal_owned_mask.to(
+        occurrence_owned_mask = getattr(req, "occurrence_terminal_owned_mask", None)
+        if occurrence_owned_mask is not None:
+            occurrence_owned = occurrence_owned_mask.to(
                 device=candidates.device, dtype=torch.bool, non_blocking=True
             )
             if len(occurrence_owned) > len(newly_allocated):
