@@ -288,6 +288,17 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         ),
     )
     parser.add_argument(
+        "--reposition-execution-mode",
+        choices=["staged", "paged-occurrence"],
+        default=ServerArgs.reposition_execution_mode,
+        help=(
+            "How effective Reposition requests execute. 'paged-occurrence' is the default "
+            "and evaluates all stages in one model forward using separately allocated KV "
+            "pages per token/position occurrence. 'staged' keeps the legacy multi-forward "
+            "implementation for comparison."
+        ),
+    )
+    parser.add_argument(
         "--disable-mask-free-context-prefill",
         action="store_false",
         dest="mask_free_context_prefill",

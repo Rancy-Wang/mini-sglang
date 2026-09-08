@@ -38,6 +38,7 @@ class ContextAttentionBatch:
     max_seqlen_q: int
     max_seqlen_k: int
     cached_positions: tuple[torch.Tensor, ...] = ()
+    direct_pages: torch.Tensor | None = None
 
     @property
     def num_segments(self) -> int:
@@ -242,8 +243,40 @@ if triton is not None:
             mask=local_key_idx < max_seqlen_k,
         )
 
+    @triton.jit
+    def _compile_direct_page_tables_kernel(
+        direct_pages_ptr,
+        key_positions_ptr,
+        key_offsets_ptr,
+        flat_indices_ptr,
+        padded_page_table_ptr,
+        padded_stride,
+        max_seqlen_k,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        segment_idx = tl.program_id(0)
+        key_block_idx = tl.program_id(1)
+        local_key_idx = key_block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        key_start = tl.load(key_offsets_ptr + segment_idx)
+        key_end = tl.load(key_offsets_ptr + segment_idx + 1)
+        key_count = key_end - key_start
+        valid = local_key_idx < key_count
+        key_position = tl.load(
+            key_positions_ptr + key_start + local_key_idx,
+            mask=valid,
+            other=0,
+        )
+        page = tl.load(direct_pages_ptr + key_position, mask=valid, other=0)
+        tl.store(flat_indices_ptr + key_start + local_key_idx, page, mask=valid)
+        tl.store(
+            padded_page_table_ptr + segment_idx * padded_stride + local_key_idx,
+            page,
+            mask=local_key_idx < max_seqlen_k,
+        )
+
 else:
     _compile_context_page_tables_kernel = None
+    _compile_direct_page_tables_kernel = None
 
 
 def build_context_attention_segments(
@@ -441,6 +474,129 @@ def build_context_attention_batch(
     )
 
 
+def build_occurrence_attention_batch(
+    reqs: Sequence,
+    *,
+    sliding_window: int | None = None,
+) -> ContextAttentionBatch:
+    """Build request-major attention segments over physical occurrence pages."""
+
+    if not reqs:
+        raise ValueError("Occurrence attention batching requires at least one request.")
+    if sliding_window is not None and sliding_window < 0:
+        raise ValueError("sliding_window must be non-negative when provided.")
+
+    direct_page_parts = []
+    segment_table_indices = []
+    key_positions = []
+    query_lengths = []
+    key_lengths = []
+    cached_tokens = []
+    cached_positions = []
+    expected_query_offset = 0
+    occurrence_base = 0
+    for req in reqs:
+        if req.reposition_execution_mode != "paged-occurrence":
+            raise RuntimeError("Occurrence attention cannot mix execution modes.")
+        cpu_plan = (
+            req.occurrence_raw_tokens,
+            req.occurrence_positions,
+            req.occurrence_segment_query_starts,
+            req.occurrence_segment_query_ends,
+            req.occurrence_segment_key_offsets,
+            req.occurrence_segment_key_indices,
+        )
+        if not all(tensor is not None for tensor in cpu_plan) or req.occurrence_pages is None:
+            raise RuntimeError("Paged-occurrence request is missing runtime occurrence metadata.")
+        occurrence_raw, occurrence_positions, query_starts, query_ends, offsets, flat_keys = (
+            cpu_plan
+        )
+        assert occurrence_raw is not None
+        assert occurrence_positions is not None
+        assert query_starts is not None
+        assert query_ends is not None
+        assert offsets is not None
+        assert flat_keys is not None
+        if len(req.occurrence_pages) != len(occurrence_raw):
+            raise RuntimeError("Occurrence page allocation does not cover all occurrences.")
+        direct_page_parts.append(req.occurrence_pages)
+
+        local_query = req.cached_len
+        reused_raw_parts = []
+        for segment_index, (raw_start_tensor, raw_end_tensor) in enumerate(
+            zip(query_starts, query_ends, strict=True)
+        ):
+            raw_start = int(raw_start_tensor)
+            raw_end = int(raw_end_tensor)
+            if raw_end <= req.cached_len:
+                continue
+            query_start = max(raw_start, req.cached_len)
+            if query_start != local_query:
+                raise RuntimeError("Occurrence segments do not preserve flattened query order.")
+            key_start = int(offsets[segment_index])
+            key_end = int(offsets[segment_index + 1])
+            segment_keys = flat_keys[key_start:key_end].to(torch.int64)
+            prefix_length = len(segment_keys) - (raw_end - raw_start)
+            if prefix_length < 0:
+                raise RuntimeError("Occurrence segment has fewer keys than local queries.")
+
+            if sliding_window is None:
+                selected_keys = segment_keys
+                query_length = raw_end - query_start
+                segment_table_indices.append(0)
+                key_positions.append((selected_keys + occurrence_base).to(torch.int32))
+                query_lengths.append(query_length)
+                key_lengths.append(len(selected_keys))
+                selected_raw = occurrence_raw[selected_keys]
+                reused_raw_parts.append(selected_raw[selected_raw < req.cached_len])
+            else:
+                for raw_query in range(query_start, raw_end):
+                    causal_count = prefix_length + (raw_query - raw_start) + 1
+                    causal_keys = segment_keys[:causal_count]
+                    query_position = int(req.true_positions[raw_query])
+                    in_window = occurrence_positions[causal_keys] >= query_position - sliding_window
+                    selected_keys = causal_keys[in_window]
+                    if len(selected_keys) == 0:
+                        raise RuntimeError("Occurrence sliding window removed the query token.")
+                    segment_table_indices.append(0)
+                    key_positions.append((selected_keys + occurrence_base).to(torch.int32))
+                    query_lengths.append(1)
+                    key_lengths.append(len(selected_keys))
+                    reused_raw_parts.append(
+                        occurrence_raw[selected_keys][
+                            occurrence_raw[selected_keys] < req.cached_len
+                        ]
+                    )
+            local_query = raw_end
+
+        if local_query != req.device_len:
+            raise RuntimeError("Occurrence segments do not cover the request extension.")
+        if reused_raw_parts:
+            used_cached_positions = torch.unique(torch.cat(reused_raw_parts).to(torch.int64))
+        else:
+            used_cached_positions = torch.empty(0, dtype=torch.int64)
+        cached_tokens.append(len(used_cached_positions))
+        cached_positions.append(used_cached_positions)
+        expected_query_offset += req.extend_len
+        occurrence_base += len(occurrence_raw)
+
+    cu_seqlens_q = torch.tensor([0] + query_lengths, dtype=torch.int32).cumsum_(dim=0)
+    cu_seqlens_k = torch.tensor([0] + key_lengths, dtype=torch.int32).cumsum_(dim=0)
+    if int(cu_seqlens_q[-1]) != expected_query_offset:
+        raise RuntimeError("Occurrence attention queries diverged from flattened Prefill Q.")
+    return ContextAttentionBatch(
+        cached_tokens=tuple(cached_tokens),
+        cached_positions=tuple(cached_positions),
+        segment_table_indices=torch.tensor(segment_table_indices, dtype=torch.int32),
+        key_positions=torch.cat(key_positions),
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max(query_lengths),
+        max_seqlen_k=max(key_lengths),
+        direct_pages=torch.cat(direct_page_parts),
+    )
+
+
 def compile_context_page_tables(
     page_table: torch.Tensor,
     context_batch: ContextAttentionBatch,
@@ -459,9 +615,6 @@ def compile_context_page_tables(
     if page_table.is_cuda:
         if _compile_context_page_tables_kernel is None or triton is None:
             raise RuntimeError("CUDA Context mask compilation requires Triton.")
-        table_indices = context_batch.segment_table_indices.pin_memory().to(
-            page_table.device, non_blocking=True
-        )
         key_positions = context_batch.key_positions.pin_memory().to(
             page_table.device, non_blocking=True
         )
@@ -470,24 +623,46 @@ def compile_context_page_tables(
         )
         block_size = 256
         grid = (num_segments, triton.cdiv(context_batch.max_seqlen_k, block_size))
-        _compile_context_page_tables_kernel[grid](
-            page_table,
-            table_indices,
-            key_positions,
-            key_offsets,
-            flat_indices,
-            padded_page_table,
-            page_table.stride(0),
-            padded_page_table.stride(0),
-            context_batch.max_seqlen_k,
-            BLOCK_SIZE=block_size,
-        )
+        if context_batch.direct_pages is not None:
+            if _compile_direct_page_tables_kernel is None:
+                raise RuntimeError("CUDA occurrence page compilation requires Triton.")
+            _compile_direct_page_tables_kernel[grid](
+                context_batch.direct_pages,
+                key_positions,
+                key_offsets,
+                flat_indices,
+                padded_page_table,
+                padded_page_table.stride(0),
+                context_batch.max_seqlen_k,
+                BLOCK_SIZE=block_size,
+            )
+        else:
+            table_indices = context_batch.segment_table_indices.pin_memory().to(
+                page_table.device, non_blocking=True
+            )
+            _compile_context_page_tables_kernel[grid](
+                page_table,
+                table_indices,
+                key_positions,
+                key_offsets,
+                flat_indices,
+                padded_page_table,
+                page_table.stride(0),
+                padded_page_table.stride(0),
+                context_batch.max_seqlen_k,
+                BLOCK_SIZE=block_size,
+            )
     else:
         for segment_idx, table_idx in enumerate(context_batch.segment_table_indices.tolist()):
             key_start = int(context_batch.cu_seqlens_k[segment_idx])
             key_end = int(context_batch.cu_seqlens_k[segment_idx + 1])
             positions = context_batch.key_positions[key_start:key_end].to(dtype=torch.int64)
-            pages = page_table[table_idx].index_select(0, positions)
+            source = context_batch.direct_pages
+            pages = (
+                source.index_select(0, positions)
+                if source is not None
+                else page_table[table_idx].index_select(0, positions)
+            )
             flat_indices[key_start:key_end] = pages
             padded_page_table[segment_idx, : len(pages)] = pages
             padded_page_table[segment_idx, len(pages) :] = 0

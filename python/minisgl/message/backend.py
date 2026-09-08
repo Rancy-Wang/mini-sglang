@@ -82,6 +82,15 @@ class UserMsg(BaseBackendMsg):
     reposition_h2d_bytes: int = 0
     reposition_d2h_bytes: int = 0
     reposition_ipc_tensor_bytes: int = 0
+    reposition_execution_mode: str | None = None
+    occurrence_raw_tokens: torch.Tensor | None = None
+    occurrence_positions: torch.Tensor | None = None
+    occurrence_birth_indices: torch.Tensor | None = None
+    occurrence_terminal_indices: torch.Tensor | None = None
+    occurrence_segment_query_starts: torch.Tensor | None = None
+    occurrence_segment_query_ends: torch.Tensor | None = None
+    occurrence_segment_key_offsets: torch.Tensor | None = None
+    occurrence_segment_key_indices: torch.Tensor | None = None
 
 
 @dataclass

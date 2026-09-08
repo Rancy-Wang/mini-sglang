@@ -29,7 +29,12 @@ from .cache import CacheManager
 from .config import SchedulerConfig
 from .decode import DecodeManager
 from .io import SchedulerIOMixin
-from .prefill import ChunkedReq, PrefillManager, RepositionCapacityError
+from .prefill import (
+    ChunkedReq,
+    PrefillManager,
+    RepositionCapacityError,
+    RepositionForwardLimitError,
+)
 from .radix_symbol import RadixSymbolRegistry, inject_radix_symbols
 from .table import TableManager
 from .utils import PendingReq
@@ -88,6 +93,12 @@ class Scheduler(SchedulerIOMixin):
         # initialize other managers
         self.table_manager = TableManager(config.max_running_req, self.engine.page_table)
         self.radix_drop_key_mode = config.radix_drop_key_mode
+        if config.reposition_execution_mode not in {"staged", "paged-occurrence"}:
+            raise ValueError(
+                "reposition_execution_mode must be 'staged' or 'paged-occurrence', got "
+                f"{config.reposition_execution_mode!r}."
+            )
+        self.reposition_execution_mode = config.reposition_execution_mode
         self.radix_symbol_registry = (
             RadixSymbolRegistry() if self.radix_drop_key_mode == "symbol" else None
         )
@@ -120,7 +131,10 @@ class Scheduler(SchedulerIOMixin):
                 "contextual_prefill_mode must be 'mask' or 'staged', got "
                 f"{config.contextual_prefill_mode!r}."
             )
-        if config.contextual_prefill_mode == "mask":
+        if (
+            config.contextual_prefill_mode == "mask"
+            or config.reposition_execution_mode == "paged-occurrence"
+        ):
             if config.page_size != 1:
                 raise ValueError("Context-mask Prefill currently requires --page-size 1.")
             self.engine.attn_backend.validate_context_mask_prefill(self.device)
@@ -247,8 +261,15 @@ class Scheduler(SchedulerIOMixin):
                     # An abort or an earlier overlapping batch already released
                     # this request. Keep the tombstone until the stale GPU result
                     # has drained, and never commit or unlock its cache twice.
+                    if req.occurrence_abort_deferred:
+                        self._free_aborted_occurrence_resources(req)
                     new_finished_reqs.add(req)
                     continue
+
+                if req.occurrence_inflight:
+                    self._release_occurrence_transients(req)
+                if req.context_post_prefill_keep_mask is not None:
+                    self._compact_context_after_prefill(req)
 
                 if req.is_warmup:
                     finished = not req.can_decode
@@ -268,8 +289,6 @@ class Scheduler(SchedulerIOMixin):
                         )
                     )
                 else:
-                    if req.context_post_prefill_keep_mask is not None:
-                        self._compact_context_after_prefill(req)
                     next_token_tensor = next_tokens_cpu[i]
                     req.append_host(next_token_tensor.unsqueeze(0))
                     next_token = int(next_token_tensor.item())
@@ -347,6 +366,10 @@ class Scheduler(SchedulerIOMixin):
         owned = active_slots >= req.initial_active_cached_len
         if req.retry_transformed_mask is not None:
             owned[: len(req.retry_transformed_mask)] |= req.retry_transformed_mask
+        if req.occurrence_terminal_owned_mask is not None:
+            if len(req.occurrence_terminal_owned_mask) != prompt_len:
+                raise RuntimeError("Occurrence-owned pages do not cover the prompt stream.")
+            owned |= req.occurrence_terminal_owned_mask
         dropped_owned = (~keep) & owned
         if bool(torch.any(dropped_owned).item()):
             dropped_device = dropped_owned.to(device=pages.device, non_blocking=True)
@@ -374,8 +397,13 @@ class Scheduler(SchedulerIOMixin):
         queued_true_position = req.true_positions[prompt_len:].clone()
         queued_raw_position = req.raw_positions[prompt_len:].clone()
         req.input_ids = req.input_ids[keep].contiguous()
+        prompt_true_positions = req.true_positions[:prompt_len]
+        if req.reposition_execution_mode == "paged-occurrence":
+            if req.radix_positions is None:
+                raise RuntimeError("Paged-occurrence compaction requires final Radix positions.")
+            prompt_true_positions = req.radix_positions[prompt_raw]
         req.true_positions = torch.cat(
-            (req.true_positions[:prompt_len][keep].contiguous(), queued_true_position)
+            (prompt_true_positions[keep].contiguous(), queued_true_position)
         )
         req.raw_positions = torch.cat(
             (req.raw_positions[:prompt_len][keep].contiguous(), queued_raw_position)
@@ -386,6 +414,10 @@ class Scheduler(SchedulerIOMixin):
         req.initial_active_cached_len = int(torch.count_nonzero(initial_keep).item())
         if req.retry_transformed_mask is not None:
             req.retry_transformed_mask = req.retry_transformed_mask[initial_keep].contiguous()
+        if req.occurrence_terminal_owned_mask is not None:
+            req.occurrence_terminal_owned_mask = req.occurrence_terminal_owned_mask[
+                keep
+            ].contiguous()
         removed = prompt_len - kept_count
         req.cached_len = kept_count
         req.device_len = kept_count + 1
@@ -396,6 +428,19 @@ class Scheduler(SchedulerIOMixin):
         req.full_input_ids = None
         req.full_token_visible_until = None
         req.full_keep_mask = None
+        req.reposition_execution_mode = None
+        req.occurrence_raw_tokens = None
+        req.occurrence_positions = None
+        req.occurrence_birth_indices = None
+        req.occurrence_terminal_indices = None
+        req.occurrence_segment_query_starts = None
+        req.occurrence_segment_query_ends = None
+        req.occurrence_segment_key_offsets = None
+        req.occurrence_segment_key_indices = None
+        req.occurrence_pages = None
+        req.occurrence_fresh_source_pages = None
+        req.occurrence_fresh_destination_pages = None
+        req.occurrence_fresh_position_pairs = None
 
     def _process_one_msg(self, msg: BaseBackendMsg) -> None:
         if isinstance(msg, BatchBackendMsg):
@@ -407,6 +452,10 @@ class Scheduler(SchedulerIOMixin):
             try:
                 if self.radix_drop_key_mode != "delta-marker":
                     raise ValueError("Reposition requires --radix-drop-key-mode delta-marker.")
+                if self.reposition_execution_mode != "staged":
+                    raise ValueError(
+                        "RepositionOpenMsg is only valid with --reposition-execution-mode staged."
+                    )
                 if msg.uid in self.context_sequence_uids:
                     raise ValueError(f"Duplicate Reposition sequence UID: {msg.uid}")
                 self.context_sequence_uids.add(msg.uid)
@@ -432,6 +481,14 @@ class Scheduler(SchedulerIOMixin):
                 )
         elif isinstance(msg, UserMsg):
             logger.debug_rank0("Received user msg: %s", msg)
+            if (
+                msg.reposition_execution_mode is not None
+                and msg.reposition_execution_mode != self.reposition_execution_mode
+            ):
+                raise ValueError(
+                    "Tokenizer/Scheduler Reposition execution modes disagree: "
+                    f"{msg.reposition_execution_mode!r} != {self.reposition_execution_mode!r}."
+                )
             if self.radix_symbol_registry is not None and msg.message_meta is not None:
                 state_starts = msg.message_meta.get("radix_state_starts", [])
                 if not isinstance(state_starts, list):
@@ -540,7 +597,13 @@ class Scheduler(SchedulerIOMixin):
             if isinstance(req_to_free, PendingReq):
                 self._close_context_sequence(msg.uid)
             elif req_to_free is not None:
-                self._free_req_resources(req_to_free)
+                if req_to_free.occurrence_inflight:
+                    engine = getattr(self, "engine", None)
+                    if engine is not None:
+                        engine.sampler.discard(req_to_free)
+                    req_to_free.occurrence_abort_deferred = True
+                else:
+                    self._free_req_resources(req_to_free)
                 # The request may still be present in an overlapping GPU batch.
                 # _process_last_data uses this tombstone to discard that stale result.
                 self.finished_reqs.add(req_to_free)
@@ -574,20 +637,83 @@ class Scheduler(SchedulerIOMixin):
                     return
                 self._close_context_sequence(req.uid)
 
+    def _release_occurrence_transients(self, req: Req) -> None:
+        pages = req.occurrence_transient_pages
+        if pages is None:
+            raise RuntimeError("In-flight occurrence request has no transient-page metadata.")
+        self.cache_manager.free_occurrence_pages(pages)
+        req.occurrence_transient_pages = None
+        req.occurrence_inflight = False
+
+    def _free_aborted_occurrence_resources(self, req: Req) -> None:
+        pages = req.occurrence_pages
+        try:
+            if pages is not None:
+                self.cache_manager.free_occurrence_pages(pages)
+            self.cache_manager.unlock(req.cache_handle)
+        finally:
+            try:
+                self.table_manager.free(req.table_idx)
+            finally:
+                req.occurrence_pages = None
+                req.occurrence_transient_pages = None
+                req.occurrence_inflight = False
+                req.occurrence_abort_deferred = False
+                self._close_context_sequence(req.uid)
+
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
         self.engine.graph_runner.pad_batch(batch)
-        self.cache_manager.allocate_paged(batch.reqs)
+        occurrence_reqs = [
+            req for req in batch.reqs if req.reposition_execution_mode == "paged-occurrence"
+        ]
+        if occurrence_reqs and len(occurrence_reqs) != len(batch.reqs):
+            raise RuntimeError("Paged-occurrence Prefill cannot mix execution modes.")
+        if not occurrence_reqs:
+            self.cache_manager.allocate_paged(batch.reqs)
         batch.positions = _make_positions(batch, self.device)
         input_mapping = _make_input_tuple(batch, self.device)
         write_mapping = _make_write_tuple(batch, self.device)
-        batch.out_loc = self.engine.page_table[input_mapping]
+        if occurrence_reqs:
+            birth_pages = []
+            source_pages = []
+            destination_pages = []
+            position_pairs = []
+            for req in occurrence_reqs:
+                if req.occurrence_pages is None or req.occurrence_birth_indices is None:
+                    raise RuntimeError("Occurrence request is missing allocated birth pages.")
+                birth_ids = (
+                    req.occurrence_birth_indices[req.cached_len : req.device_len]
+                    .to(torch.int64)
+                    .pin_memory()
+                    .to(self.device, non_blocking=True)
+                )
+                birth_pages.append(req.occurrence_pages[birth_ids])
+                if (
+                    req.occurrence_fresh_source_pages is None
+                    or req.occurrence_fresh_destination_pages is None
+                    or req.occurrence_fresh_position_pairs is None
+                ):
+                    raise RuntimeError("Occurrence request is missing per-layer transforms.")
+                source_pages.append(req.occurrence_fresh_source_pages)
+                destination_pages.append(req.occurrence_fresh_destination_pages)
+                position_pairs.append(req.occurrence_fresh_position_pairs)
+            batch.out_loc = torch.cat(birth_pages)
+            batch.occurrence_source_pages = torch.cat(source_pages)
+            batch.occurrence_destination_pages = torch.cat(destination_pages)
+            batch.occurrence_position_pairs = torch.cat(position_pairs)
+            batch.occurrence_rope_cache = self.prefill_manager.retry_rope_cache
+        else:
+            batch.out_loc = self.engine.page_table[input_mapping]
         self.engine.attn_backend.prepare_metadata(batch)
-        return ForwardInput(
+        forward_input = ForwardInput(
             batch=batch,
             sample_args=self.engine.sampler.prepare(batch),
             input_tuple=input_mapping,
             write_tuple=write_mapping,
         )
+        for req in occurrence_reqs:
+            req.occurrence_inflight = True
+        return forward_input
 
     def _schedule_next_batch(self) -> ForwardInput | None:
         # TODO: support other policies: e.g. DECODE first
@@ -603,6 +729,21 @@ class Scheduler(SchedulerIOMixin):
                         uid=exc.uid,
                         status_code=503,
                         error_code="reposition_kv_capacity_exhausted",
+                        detail=str(exc),
+                    )
+                ]
+            )
+            batch = None
+        except RepositionForwardLimitError as exc:
+            self.prefill_manager.abort_req(exc.uid)
+            self.request_metrics.pop(exc.uid, None)
+            self._close_context_sequence(exc.uid)
+            self.send_result(
+                [
+                    RequestRejectMsg(
+                        uid=exc.uid,
+                        status_code=413,
+                        error_code="reposition_forward_limit_exceeded",
                         detail=str(exc),
                     )
                 ]
