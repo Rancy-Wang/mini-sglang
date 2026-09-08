@@ -11,6 +11,7 @@ from .base import (
     BaseAttnMetadata,
     batch_needs_gap_aware_sliding_window,
     build_context_attention_batch,
+    build_occurrence_attention_batch,
     build_sliding_window_attention_batch,
     compile_context_page_tables,
 )
@@ -118,6 +119,20 @@ class FlashAttentionBackend(BaseAttnBackend):
         metadata = batch.attn_metadata
         assert isinstance(metadata, FAMetadata)
         self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
+        if batch.occurrence_source_pages is not None:
+            if (
+                batch.occurrence_destination_pages is None
+                or batch.occurrence_position_pairs is None
+                or batch.occurrence_rope_cache is None
+            ):
+                raise RuntimeError("Occurrence layer transform metadata is incomplete.")
+            self.kvcache.reposition_layer(
+                batch.occurrence_source_pages,
+                batch.occurrence_destination_pages,
+                batch.occurrence_position_pairs,
+                batch.occurrence_rope_cache,
+                layer_id,
+            )
         segments = None
         window_size = (sliding_window, 0) if sliding_window is not None else (-1, -1)
         if sliding_window is not None and metadata.sliding_context_segments is not None:
@@ -158,6 +173,11 @@ class FlashAttentionBackend(BaseAttnBackend):
     def prepare_metadata(self, batch: Batch) -> None:
         reqs = batch.padded_reqs
         masked_reqs = [req for req in reqs if req.use_context_mask]
+        occurrence_reqs = [
+            req for req in reqs if req.reposition_execution_mode == "paged-occurrence"
+        ]
+        if occurrence_reqs and len(occurrence_reqs) != len(reqs):
+            raise RuntimeError("Paged-occurrence Prefill cannot mix execution modes.")
         if masked_reqs:
             if not batch.is_prefill or len(masked_reqs) != len(reqs):
                 raise RuntimeError(
@@ -186,11 +206,14 @@ class FlashAttentionBackend(BaseAttnBackend):
             cu_seqlens_q = cu_seqlens_q.to(self.kvcache.device, non_blocking=True)
 
         page_table = get_global_ctx().page_table
-        new_page_table = torch.stack(
-            [page_table[req.table_idx, : max_seqlen_k : self.page_size] for req in reqs]
-        )
-        if self.page_size > 1:
-            new_page_table.div_(self.page_size, rounding_mode="floor")
+        if occurrence_reqs:
+            new_page_table = torch.empty((padded_size, 0), dtype=page_table.dtype, device=device)
+        else:
+            new_page_table = torch.stack(
+                [page_table[req.table_idx, : max_seqlen_k : self.page_size] for req in reqs]
+            )
+            if self.page_size > 1:
+                new_page_table.div_(self.page_size, rounding_mode="floor")
 
         context_segments = None
         sliding_context_segments = None
@@ -213,11 +236,13 @@ class FlashAttentionBackend(BaseAttnBackend):
             if self.page_size != 1:
                 raise RuntimeError(
                     "FlashAttention context-mask Prefill currently requires page_size=1."
-                )
+            )
 
             def _compile_fa_context(sliding_window: int | None):
-                context_batch = build_context_attention_batch(
-                    masked_reqs, sliding_window=sliding_window
+                context_batch = (
+                    build_occurrence_attention_batch(occurrence_reqs, sliding_window=sliding_window)
+                    if occurrence_reqs
+                    else build_context_attention_batch(masked_reqs, sliding_window=sliding_window)
                 )
                 if sliding_window is None:
                     for req, cached_tokens, cached_positions in zip(
@@ -228,6 +253,8 @@ class FlashAttentionBackend(BaseAttnBackend):
                     ):
                         if req.usage_cached_tokens is None:
                             req.record_context_cache_usage(cached_tokens, cached_positions)
+                        elif req.usage_cached_tokens != cached_tokens:
+                            raise RuntimeError("Occurrence cache-usage accounting diverged.")
                 return _compile_fa_segments(context_batch)
 
             context_segments = _compile_fa_context(None)

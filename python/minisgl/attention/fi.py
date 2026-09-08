@@ -16,6 +16,7 @@ from .base import (
     BaseAttnMetadata,
     batch_needs_gap_aware_sliding_window,
     build_context_attention_batch,
+    build_occurrence_attention_batch,
     build_sliding_window_attention_batch,
     compile_context_page_tables,
 )
@@ -271,6 +272,20 @@ class FlashInferBackend(BaseAttnBackend):
         metadata = batch.attn_metadata
         assert isinstance(metadata, FIMetadata)
         self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
+        if batch.occurrence_source_pages is not None:
+            if (
+                batch.occurrence_destination_pages is None
+                or batch.occurrence_position_pairs is None
+                or batch.occurrence_rope_cache is None
+            ):
+                raise RuntimeError("Occurrence layer transform metadata is incomplete.")
+            self.kvcache.reposition_layer(
+                batch.occurrence_source_pages,
+                batch.occurrence_destination_pages,
+                batch.occurrence_position_pairs,
+                batch.occurrence_rope_cache,
+                layer_id,
+            )
         kv_cache = (self.kvcache.k_cache(layer_id), self.kvcache.v_cache(layer_id))
         kv_cache = (_flatten_cache(kv_cache[0]), _flatten_cache(kv_cache[1]))
         window_left = self._window_left(sliding_window)
@@ -342,6 +357,11 @@ class FlashInferBackend(BaseAttnBackend):
     def prepare_metadata(self, batch: Batch) -> None:
         reqs = batch.padded_reqs
         masked_reqs = [req for req in reqs if req.use_context_mask]
+        occurrence_reqs = [
+            req for req in reqs if req.reposition_execution_mode == "paged-occurrence"
+        ]
+        if occurrence_reqs and len(occurrence_reqs) != len(reqs):
+            raise RuntimeError("Paged-occurrence Prefill cannot mix execution modes.")
         if masked_reqs:
             if not batch.is_prefill or len(masked_reqs) != len(reqs):
                 raise RuntimeError(
@@ -391,8 +411,10 @@ class FlashInferBackend(BaseAttnBackend):
         if masked_reqs:
 
             def _compile_fi_context(sliding_window: int | None):
-                context_batch = build_context_attention_batch(
-                    masked_reqs, sliding_window=sliding_window
+                context_batch = (
+                    build_occurrence_attention_batch(occurrence_reqs, sliding_window=sliding_window)
+                    if occurrence_reqs
+                    else build_context_attention_batch(masked_reqs, sliding_window=sliding_window)
                 )
                 if sliding_window is None:
                     for req, cached_tokens, cached_positions in zip(
@@ -403,6 +425,8 @@ class FlashInferBackend(BaseAttnBackend):
                     ):
                         if req.usage_cached_tokens is None:
                             req.record_context_cache_usage(cached_tokens, cached_positions)
+                        elif req.usage_cached_tokens != cached_tokens:
+                            raise RuntimeError("Occurrence cache-usage accounting diverged.")
                 return _compile_fi_segments(context_batch, is_decode=False)
 
             context_segments = _compile_fi_context(None)

@@ -231,6 +231,23 @@ class CacheManager:
     def free_retry_pages(self, indices: torch.Tensor) -> None:
         self._free(indices)
 
+    def allocate_occurrence_pages(self, count: int) -> torch.Tensor:
+        """Allocate ordinary page-pool slots for one-shot Reposition occurrences."""
+
+        if self.page_size != 1:
+            raise RuntimeError("Paged-occurrence Reposition requires page_size=1.")
+        if count < 0:
+            raise ValueError("Occurrence page count must be non-negative.")
+        if count > self.available_size:
+            raise RuntimeError(
+                f"Paged-occurrence Reposition needs {count} KV pages, but only "
+                f"{self.available_size} pages can be made available."
+            )
+        return self._allocate(count)
+
+    def free_occurrence_pages(self, indices: torch.Tensor) -> None:
+        self._free(indices)
+
     def derive_active_match(
         self, req: PendingReq, full_match: FullMatchResult
     ) -> ContextMatchResult:
@@ -398,6 +415,14 @@ class CacheManager:
                 transformed = torch.zeros(len(active_indices), dtype=torch.bool, device="cpu")
                 if req.retry_transformed_mask is not None:
                     transformed[: len(req.retry_transformed_mask)] = req.retry_transformed_mask
+                occurrence_owned = getattr(req, "occurrence_terminal_owned_mask", None)
+                if occurrence_owned is not None:
+                    occurrence_owned_len = len(occurrence_owned)
+                    if occurrence_owned_len > len(active_indices):
+                        raise RuntimeError(
+                            "Occurrence-owned mask exceeds the active cache candidate prefix."
+                        )
+                    transformed[:occurrence_owned_len] |= occurrence_owned
                 ordinary_overlap = overlap & (~transformed)
                 ordinary_device = ordinary_overlap.to(
                     device=active_indices.device, non_blocking=True
@@ -540,6 +565,14 @@ class CacheManager:
             if len(transformed) > len(newly_allocated):
                 raise RuntimeError("Retry transformed-page mask exceeds the active cache prefix.")
             newly_allocated[: len(transformed)] |= transformed
+        occurrence_owned_mask = getattr(req, "occurrence_terminal_owned_mask", None)
+        if occurrence_owned_mask is not None:
+            occurrence_owned = occurrence_owned_mask.to(
+                device=candidates.device, dtype=torch.bool, non_blocking=True
+            )
+            if len(occurrence_owned) > len(newly_allocated):
+                raise RuntimeError("Occurrence-owned mask exceeds all candidate pages.")
+            newly_allocated[: len(occurrence_owned)] |= occurrence_owned
         adopted = adopted_pages(candidates, candidate_key_positions)
         released = candidates[newly_allocated & (~adopted)]
         inactive_positions = req.inactive_cached_positions

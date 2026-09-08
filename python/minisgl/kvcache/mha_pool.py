@@ -75,6 +75,29 @@ class MHAKVCache(BaseKVCachePool):
             cos_sin_cache,
         )
 
+    def reposition_layer(
+        self,
+        source_slots: torch.Tensor,
+        destination_slots: torch.Tensor,
+        position_pairs: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        layer_id: int,
+    ) -> None:
+        if self._kv_buffer.shape[3] != 1:
+            raise RuntimeError("Paged-occurrence Reposition requires page_size=1.")
+        if not 0 <= layer_id < self._num_layers:
+            raise ValueError(f"Invalid KV cache layer: {layer_id}.")
+        from minisgl.kernel import retry_reposition_kv
+
+        retry_reposition_kv(
+            self._k_buffer[layer_id : layer_id + 1, :, 0],
+            self._v_buffer[layer_id : layer_id + 1, :, 0],
+            source_slots,
+            destination_slots,
+            position_pairs,
+            cos_sin_cache,
+        )
+
     @property
     def device(self) -> torch.device:
         return self._device

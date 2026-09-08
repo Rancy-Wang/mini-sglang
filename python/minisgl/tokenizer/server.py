@@ -105,6 +105,79 @@ def _build_user_msg(msg: TokenizeMsg, t: Any) -> UserMsg:
     )
 
 
+def _build_occurrence_user_msg(msg: TokenizeMsg, t: Any) -> UserMsg:
+    from .reposition_occurrence import compile_reposition_occurrence_plan
+
+    if t.reposition_layout is None or t.reposition_input_ids is None:
+        raise ValueError("Paged-occurrence Reposition requires a precompiled layout.")
+    plan = compile_reposition_occurrence_plan(
+        t.reposition_layout,
+        t.full_token_visible_until,
+    )
+    token_count = len(t.reposition_input_ids)
+    visible_until = t.full_token_visible_until
+    if visible_until is None:
+        visible_until = torch.full((token_count,), token_count + 1, dtype=torch.int32, device="cpu")
+    keep_mask = t.reposition_layout.keep_mask.to(dtype=torch.int32).contiguous()
+    raw_positions = torch.arange(token_count, dtype=torch.int32, device="cpu")
+    message = UserMsg(
+        uid=msg.uid,
+        input_ids=t.reposition_input_ids,
+        true_positions=t.reposition_layout.birth_positions,
+        raw_positions=raw_positions,
+        radix_input_ids=t.reposition_layout.records[t.reposition_layout.token_to_key].contiguous(),
+        radix_match_ids=t.reposition_layout.records,
+        sampling_params=msg.sampling_params,
+        prompt_tokens=t.prompt_tokens,
+        radix_key_virtual_mask=t.reposition_layout.virtual_mask,
+        radix_key_to_token=t.reposition_layout.key_to_token,
+        radix_token_to_key=t.reposition_layout.token_to_key,
+        radix_positions=t.reposition_layout.positions,
+        radix_repos_info=t.reposition_layout.repos_info,
+        radix_next_position=t.reposition_layout.next_position,
+        radix_current_reposition=t.reposition_layout.current_reposition,
+        drop_event_positions=t.drop_event_positions,
+        drop_range_offsets=t.drop_range_offsets,
+        drop_position_ranges=t.drop_position_ranges,
+        drop_effective_event_count=t.drop_effective_event_count,
+        radix_commit_key_len=t.radix_commit_key_len,
+        enable_thinking=msg.enable_thinking,
+        stop=msg.stop,
+        stop_token_seqs=t.stop_token_seqs,
+        message_meta=t.message_meta,
+        is_warmup=msg.is_warmup,
+        internal_uid=msg.internal_uid,
+        prefix_keep_mask=torch.ones(token_count, dtype=torch.int32, device="cpu"),
+        full_input_ids=t.reposition_input_ids,
+        full_token_visible_until=visible_until,
+        full_keep_mask=keep_mask,
+        use_context_mask=True,
+        context_compact_stream=False,
+        context_post_prefill_keep_mask=keep_mask,
+        request_received_ns=msg.request_received_ns,
+        tokenize_invocations=t.tokenize_invocations,
+        chat_template_invocations=t.chat_template_invocations,
+        context_stage_count=1,
+        radix_compile_ns=t.reposition_layout.compile_ns,
+        reposition_transition_count=len(t.reposition_layout.transition_raw_tokens),
+        reposition_execution_mode="paged-occurrence",
+        occurrence_raw_tokens=plan.occurrence_raw_tokens,
+        occurrence_positions=plan.occurrence_positions,
+        occurrence_birth_indices=plan.birth_occurrences,
+        occurrence_terminal_indices=plan.terminal_occurrences,
+        occurrence_segment_query_starts=plan.segment_query_starts,
+        occurrence_segment_query_ends=plan.segment_query_ends,
+        occurrence_segment_key_offsets=plan.segment_key_offsets,
+        occurrence_segment_key_indices=plan.segment_key_occurrences,
+    )
+    message.reposition_ipc_tensor_bytes = sum(
+        value.numel() * value.element_size()
+        for value in vars(message).values()
+        if isinstance(value, torch.Tensor)
+    )
+    return message
+
+
 @torch.inference_mode()
 def tokenize_worker(
     *,
@@ -115,10 +188,13 @@ def tokenize_worker(
     frontend_addr: str,
     local_bs: int,
     radix_drop_key_mode: str = "delta-marker",
+    reposition_execution_mode: str = "paged-occurrence",
     tokenizer_id: int = -1,
     model_source: str = "huggingface",
     ack_queue: mp.Queue[str] | None = None,
 ) -> None:
+    if reposition_execution_mode not in {"staged", "paged-occurrence"}:
+        raise ValueError("reposition_execution_mode must be 'staged' or 'paged-occurrence'.")
     send_backend = ZmqPushQueue(backend_addr, create=False, encoder=BaseBackendMsg.encoder)
     send_frontend = ZmqPushQueue(frontend_addr, create=False, encoder=BaseFrontendMsg.encoder)
     recv_listener = ZmqPullQueue(addr, create=create, decoder=BatchTokenizerMsg.decoder)
@@ -294,12 +370,15 @@ def tokenize_worker(
                         if (
                             radix_drop_key_mode == "delta-marker"
                             and tokenized.reposition_input_ids is not None
+                            and reposition_execution_mode == "staged"
                         ):
                             if msg.uid in reposition_sequences:
                                 raise RuntimeError(f"Duplicate Reposition sequence UID: {msg.uid}")
                             state = RepositionSequenceState.pending(msg, tokenized)
                             reposition_sequences[msg.uid] = state
                             backend_msgs.append(state.open_msg())
+                        elif tokenized.reposition_input_ids is not None:
+                            backend_msgs.append(_build_occurrence_user_msg(msg, tokenized))
                         else:
                             backend_msgs.append(_build_user_msg(msg, tokenized))
                     batch_output = BatchBackendMsg(data=backend_msgs)

@@ -116,14 +116,33 @@ class Req:
     reposition_transition_count: int = 0
     reposition_h2d_bytes: int = 0
     reposition_d2h_bytes: int = 0
+    reposition_execution_mode: Literal["staged", "paged-occurrence"] | None = None
+    occurrence_raw_tokens: torch.Tensor | None = None
+    occurrence_positions: torch.Tensor | None = None
+    occurrence_birth_indices: torch.Tensor | None = None
+    occurrence_terminal_indices: torch.Tensor | None = None
+    occurrence_segment_query_starts: torch.Tensor | None = None
+    occurrence_segment_query_ends: torch.Tensor | None = None
+    occurrence_segment_key_offsets: torch.Tensor | None = None
+    occurrence_segment_key_indices: torch.Tensor | None = None
+    occurrence_pages: torch.Tensor | None = None
+    occurrence_transient_pages: torch.Tensor | None = None
+    occurrence_fresh_source_pages: torch.Tensor | None = None
+    occurrence_fresh_destination_pages: torch.Tensor | None = None
+    occurrence_fresh_position_pairs: torch.Tensor | None = None
+    occurrence_terminal_owned_mask: torch.Tensor | None = None
+    occurrence_inflight: bool = False
+    occurrence_abort_deferred: bool = False
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu
         assert self.true_positions.is_cpu
         if self.true_positions.ndim != 1:
             raise ValueError("true_positions must be one-dimensional.")
-        if len(self.true_positions) > 1 and bool(
-            torch.any(self.true_positions[1:] <= self.true_positions[:-1]).item()
+        if (
+            self.reposition_execution_mode != "paged-occurrence"
+            and len(self.true_positions) > 1
+            and bool(torch.any(self.true_positions[1:] <= self.true_positions[:-1]).item())
         ):
             raise ValueError("true_positions must be strictly increasing.")
         if self.raw_positions.ndim != 1 or not self.raw_positions.is_cpu:
@@ -257,7 +276,123 @@ class Req:
                 )
             if not 0 <= self.usage_repos_tokens <= self.usage_cached_tokens:
                 raise ValueError("Retry usage exceeds the reused cache prefix.")
-        assert self.true_seq_len >= int(self.true_positions[self.device_len - 1].item()) + 1
+        occurrence_plan = (
+            self.occurrence_raw_tokens,
+            self.occurrence_positions,
+            self.occurrence_birth_indices,
+            self.occurrence_terminal_indices,
+            self.occurrence_segment_query_starts,
+            self.occurrence_segment_query_ends,
+            self.occurrence_segment_key_offsets,
+            self.occurrence_segment_key_indices,
+        )
+        if self.reposition_execution_mode == "paged-occurrence":
+            if not all(tensor is not None for tensor in occurrence_plan):
+                raise ValueError("Paged-occurrence Reposition requires a complete occurrence plan.")
+            for tensor in occurrence_plan:
+                assert tensor is not None
+                if tensor.device.type != "cpu" or tensor.dtype != torch.int32:
+                    raise ValueError("Occurrence plan tensors must be CPU int32 tensors.")
+            assert self.occurrence_raw_tokens is not None
+            assert self.occurrence_positions is not None
+            assert self.occurrence_birth_indices is not None
+            assert self.occurrence_terminal_indices is not None
+            assert self.occurrence_segment_query_starts is not None
+            assert self.occurrence_segment_query_ends is not None
+            assert self.occurrence_segment_key_offsets is not None
+            assert self.occurrence_segment_key_indices is not None
+            occurrence_count = len(self.occurrence_raw_tokens)
+            if occurrence_count < len(self.input_ids):
+                raise ValueError("Occurrence plan has fewer occurrences than prompt tokens.")
+            if len(self.occurrence_positions) != occurrence_count:
+                raise ValueError("Occurrence token and position vectors have different lengths.")
+            if len(self.occurrence_birth_indices) != len(self.input_ids) or len(
+                self.occurrence_terminal_indices
+            ) != len(self.input_ids):
+                raise ValueError("Occurrence birth/terminal maps must cover the prompt stream.")
+            if (
+                len(self.occurrence_segment_query_starts) != len(self.occurrence_segment_query_ends)
+                or len(self.occurrence_segment_key_offsets)
+                != len(self.occurrence_segment_query_starts) + 1
+            ):
+                raise ValueError("Occurrence segment metadata has inconsistent lengths.")
+            if int(self.occurrence_segment_key_offsets[-1]) != len(
+                self.occurrence_segment_key_indices
+            ):
+                raise ValueError("Occurrence segment offsets do not cover their key indices.")
+            if int(self.occurrence_segment_key_offsets[0]) != 0 or bool(
+                torch.any(
+                    self.occurrence_segment_key_offsets[1:]
+                    < self.occurrence_segment_key_offsets[:-1]
+                ).item()
+            ):
+                raise ValueError(
+                    "Occurrence segment key offsets must start at zero and be monotonic."
+                )
+            if len(self.occurrence_segment_query_starts) == 0:
+                raise ValueError("Occurrence plan must contain at least one query segment.")
+            if (
+                int(self.occurrence_segment_query_starts[0]) != 0
+                or int(self.occurrence_segment_query_ends[-1]) != len(self.input_ids)
+                or bool(
+                    torch.any(
+                        self.occurrence_segment_query_starts[1:]
+                        != self.occurrence_segment_query_ends[:-1]
+                    ).item()
+                )
+                or bool(
+                    torch.any(
+                        self.occurrence_segment_query_ends <= self.occurrence_segment_query_starts
+                    ).item()
+                )
+            ):
+                raise ValueError("Occurrence query segments must contiguously cover the prompt.")
+            if bool(torch.any(self.occurrence_raw_tokens < 0).item()) or bool(
+                torch.any(self.occurrence_raw_tokens >= len(self.input_ids)).item()
+            ):
+                raise ValueError("Occurrence raw-token indices are outside the prompt stream.")
+            occurrence_refs = torch.cat(
+                (
+                    self.occurrence_birth_indices,
+                    self.occurrence_terminal_indices,
+                    self.occurrence_segment_key_indices,
+                )
+            )
+            if bool(torch.any(occurrence_refs < 0).item()) or bool(
+                torch.any(occurrence_refs >= occurrence_count).item()
+            ):
+                raise ValueError("Occurrence plan references an invalid occurrence index.")
+            prompt_raw = torch.arange(len(self.input_ids), dtype=torch.int32, device="cpu")
+            birth_refs = self.occurrence_birth_indices.to(torch.int64)
+            terminal_refs = self.occurrence_terminal_indices.to(torch.int64)
+            if not torch.equal(
+                self.occurrence_raw_tokens[birth_refs], prompt_raw
+            ) or not torch.equal(
+                self.occurrence_positions[birth_refs], self.true_positions.to(torch.int32)
+            ):
+                raise ValueError("Occurrence birth map disagrees with the prompt token stream.")
+            if not torch.equal(self.occurrence_raw_tokens[terminal_refs], prompt_raw):
+                raise ValueError("Occurrence terminal map does not cover raw tokens in order.")
+            terminal_positions = self.occurrence_positions[terminal_refs]
+            if self.radix_positions is not None and not torch.equal(
+                terminal_positions, self.radix_positions.to(torch.int32)
+            ):
+                raise ValueError("Occurrence terminal positions disagree with Radix positions.")
+            if self.true_seq_len < int(torch.max(terminal_positions).item()) + 1:
+                raise ValueError("true_seq_len does not cover terminal occurrence positions.")
+            if self.occurrence_terminal_owned_mask is not None and (
+                not self.occurrence_terminal_owned_mask.is_cpu
+                or self.occurrence_terminal_owned_mask.dtype != torch.bool
+                or self.occurrence_terminal_owned_mask.ndim != 1
+                or len(self.occurrence_terminal_owned_mask) != len(self.input_ids)
+            ):
+                raise ValueError(
+                    "Occurrence-owned mask must be a CPU bool vector covering the prompt."
+                )
+        elif any(tensor is not None for tensor in occurrence_plan):
+            raise ValueError("Occurrence metadata requires paged-occurrence execution mode.")
+        else:
+            assert self.true_seq_len >= int(self.true_positions[self.device_len - 1].item()) + 1
 
         context_tensors = (
             self.full_input_ids,
@@ -505,6 +640,10 @@ class Batch:
     positions: torch.Tensor = field(init=False)
     out_loc: torch.Tensor = field(init=False)
     padded_reqs: List[Req] = field(init=False)
+    occurrence_source_pages: torch.Tensor | None = field(default=None, init=False)
+    occurrence_destination_pages: torch.Tensor | None = field(default=None, init=False)
+    occurrence_position_pairs: torch.Tensor | None = field(default=None, init=False)
+    occurrence_rope_cache: torch.Tensor | None = field(default=None, init=False)
     # this field should be set by attention backend
     attn_metadata: BaseAttnMetadata = field(init=False)
 

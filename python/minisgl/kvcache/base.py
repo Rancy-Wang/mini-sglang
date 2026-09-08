@@ -33,6 +33,16 @@ class BaseKVCachePool(ABC):
         cos_sin_cache: torch.Tensor,
     ) -> None: ...
 
+    @abstractmethod
+    def reposition_layer(
+        self,
+        source_slots: torch.Tensor,
+        destination_slots: torch.Tensor,
+        position_pairs: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        layer_id: int,
+    ) -> None: ...
+
     @property
     @abstractmethod
     def device(self) -> torch.device: ...
