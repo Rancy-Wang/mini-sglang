@@ -423,10 +423,7 @@ class FlashInferBackend(BaseAttnBackend):
                         context_batch.cached_positions,
                         strict=True,
                     ):
-                        if req.usage_cached_tokens is None:
-                            req.record_context_cache_usage(cached_tokens, cached_positions)
-                        elif req.usage_cached_tokens != cached_tokens:
-                            raise RuntimeError("Occurrence cache-usage accounting diverged.")
+                        req.record_context_cache_usage(cached_tokens, cached_positions)
                 return _compile_fi_segments(context_batch, is_decode=False)
 
             context_segments = _compile_fi_context(None)

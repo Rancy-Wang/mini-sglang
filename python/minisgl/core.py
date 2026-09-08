@@ -91,6 +91,7 @@ class Req:
     radix_cached_tokens: int = 0
     usage_cached_tokens: int | None = None  # all reused KV, including Retry RoPE
     usage_repos_tokens: int | None = None  # frozen before post-Prefill compaction
+    context_usage_cached_positions: torch.Tensor | None = None
     drop_skipped_tokens: int = 0
     full_input_ids: torch.Tensor | None = None
     full_token_visible_until: torch.Tensor | None = None
@@ -131,6 +132,8 @@ class Req:
     occurrence_fresh_destination_pages: torch.Tensor | None = None
     occurrence_fresh_position_pairs: torch.Tensor | None = None
     occurrence_terminal_owned_mask: torch.Tensor | None = None
+    occurrence_initial_source_positions: torch.Tensor | None = None
+    occurrence_repositioned_cached_mask: torch.Tensor | None = None
     occurrence_inflight: bool = False
     occurrence_abort_deferred: bool = False
 
@@ -302,14 +305,15 @@ class Req:
             assert self.occurrence_segment_key_offsets is not None
             assert self.occurrence_segment_key_indices is not None
             occurrence_count = len(self.occurrence_raw_tokens)
-            if occurrence_count < len(self.input_ids):
+            plan_token_count = len(self.occurrence_birth_indices)
+            if occurrence_count < plan_token_count:
                 raise ValueError("Occurrence plan has fewer occurrences than prompt tokens.")
             if len(self.occurrence_positions) != occurrence_count:
                 raise ValueError("Occurrence token and position vectors have different lengths.")
-            if len(self.occurrence_birth_indices) != len(self.input_ids) or len(
-                self.occurrence_terminal_indices
-            ) != len(self.input_ids):
+            if len(self.occurrence_terminal_indices) != plan_token_count:
                 raise ValueError("Occurrence birth/terminal maps must cover the prompt stream.")
+            if len(self.input_ids) > plan_token_count:
+                raise ValueError("Chunked occurrence input exceeds the full prompt plan.")
             if (
                 len(self.occurrence_segment_query_starts) != len(self.occurrence_segment_query_ends)
                 or len(self.occurrence_segment_key_offsets)
@@ -333,7 +337,7 @@ class Req:
                 raise ValueError("Occurrence plan must contain at least one query segment.")
             if (
                 int(self.occurrence_segment_query_starts[0]) != 0
-                or int(self.occurrence_segment_query_ends[-1]) != len(self.input_ids)
+                or int(self.occurrence_segment_query_ends[-1]) != plan_token_count
                 or bool(
                     torch.any(
                         self.occurrence_segment_query_starts[1:]
@@ -348,7 +352,7 @@ class Req:
             ):
                 raise ValueError("Occurrence query segments must contiguously cover the prompt.")
             if bool(torch.any(self.occurrence_raw_tokens < 0).item()) or bool(
-                torch.any(self.occurrence_raw_tokens >= len(self.input_ids)).item()
+                torch.any(self.occurrence_raw_tokens >= plan_token_count).item()
             ):
                 raise ValueError("Occurrence raw-token indices are outside the prompt stream.")
             occurrence_refs = torch.cat(
@@ -362,13 +366,14 @@ class Req:
                 torch.any(occurrence_refs >= occurrence_count).item()
             ):
                 raise ValueError("Occurrence plan references an invalid occurrence index.")
-            prompt_raw = torch.arange(len(self.input_ids), dtype=torch.int32, device="cpu")
+            prompt_raw = torch.arange(plan_token_count, dtype=torch.int32, device="cpu")
             birth_refs = self.occurrence_birth_indices.to(torch.int64)
             terminal_refs = self.occurrence_terminal_indices.to(torch.int64)
             if not torch.equal(
                 self.occurrence_raw_tokens[birth_refs], prompt_raw
             ) or not torch.equal(
-                self.occurrence_positions[birth_refs], self.true_positions.to(torch.int32)
+                self.occurrence_positions[birth_refs[: len(self.input_ids)]],
+                self.true_positions[: len(self.input_ids)].to(torch.int32),
             ):
                 raise ValueError("Occurrence birth map disagrees with the prompt token stream.")
             if not torch.equal(self.occurrence_raw_tokens[terminal_refs], prompt_raw):
@@ -384,10 +389,26 @@ class Req:
                 not self.occurrence_terminal_owned_mask.is_cpu
                 or self.occurrence_terminal_owned_mask.dtype != torch.bool
                 or self.occurrence_terminal_owned_mask.ndim != 1
-                or len(self.occurrence_terminal_owned_mask) != len(self.input_ids)
+                or len(self.occurrence_terminal_owned_mask) != plan_token_count
             ):
                 raise ValueError(
                     "Occurrence-owned mask must be a CPU bool vector covering the prompt."
+                )
+            if self.occurrence_initial_source_positions is not None and (
+                not self.occurrence_initial_source_positions.is_cpu
+                or self.occurrence_initial_source_positions.dtype != torch.int32
+                or self.occurrence_initial_source_positions.ndim != 1
+                or len(self.occurrence_initial_source_positions) != self.initial_active_cached_len
+            ):
+                raise ValueError("Occurrence source positions must cover the initial cache hits.")
+            if self.occurrence_repositioned_cached_mask is not None and (
+                not self.occurrence_repositioned_cached_mask.is_cpu
+                or self.occurrence_repositioned_cached_mask.dtype != torch.bool
+                or self.occurrence_repositioned_cached_mask.ndim != 1
+                or len(self.occurrence_repositioned_cached_mask) != self.initial_active_cached_len
+            ):
+                raise ValueError(
+                    "Occurrence repositioned-cache mask must cover the initial cache hits."
                 )
         elif any(tensor is not None for tensor in occurrence_plan):
             raise ValueError("Occurrence metadata requires paged-occurrence execution mode.")
@@ -447,17 +468,18 @@ class Req:
         """Record distinct Radix-hit tokens that enter full Context attention."""
 
         self._validate_context_cache_usage(cached_tokens)
-        if self.usage_cached_tokens is not None:
-            if self.usage_cached_tokens != cached_tokens:
-                raise RuntimeError(
-                    "Context cache usage changed after it was recorded: "
-                    f"{self.usage_cached_tokens} != {cached_tokens}."
-                )
-            return
-        repos_tokens = 0
-        if self.retry_transformed_mask is not None:
-            if cached_positions is None:
-                raise ValueError("Retry usage requires the attention cache positions.")
+        if cached_positions is None:
+            if self.context_usage_cached_positions is not None:
+                raise ValueError("Chunked Context cache usage requires cache positions.")
+            if self.usage_cached_tokens is not None:
+                if self.usage_cached_tokens != cached_tokens:
+                    raise RuntimeError(
+                        "Context cache usage changed after it was recorded: "
+                        f"{self.usage_cached_tokens} != {cached_tokens}."
+                    )
+                return
+            used_positions = None
+        else:
             if (
                 not cached_positions.is_cpu
                 or cached_positions.ndim != 1
@@ -467,9 +489,24 @@ class Req:
                 or bool(torch.any(cached_positions >= self.initial_active_cached_len).item())
             ):
                 raise ValueError("Attention cache positions must identify distinct initial hits.")
-            repos_tokens = int(
-                self.retry_transformed_mask[cached_positions.to(torch.int64)].sum().item()
-            )
+            used_positions = cached_positions.to(dtype=torch.int64, device="cpu")
+            if self.context_usage_cached_positions is not None:
+                used_positions = torch.unique(
+                    torch.cat((self.context_usage_cached_positions, used_positions))
+                )
+            self.context_usage_cached_positions = used_positions
+            cached_tokens = len(used_positions)
+            self._validate_context_cache_usage(cached_tokens)
+        repos_tokens = 0
+        repositioned_mask = (
+            self.occurrence_repositioned_cached_mask
+            if self.occurrence_repositioned_cached_mask is not None
+            else self.retry_transformed_mask
+        )
+        if repositioned_mask is not None:
+            if used_positions is None:
+                raise ValueError("Retry usage requires the attention cache positions.")
+            repos_tokens = int(repositioned_mask[used_positions].sum().item())
         self.usage_repos_tokens = repos_tokens
         self.usage_cached_tokens = cached_tokens
         self.drop_skipped_tokens = self.radix_cached_tokens - cached_tokens

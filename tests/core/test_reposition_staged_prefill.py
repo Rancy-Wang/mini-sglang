@@ -345,7 +345,7 @@ def test_each_scheduler_turn_reuses_the_previous_partial_radix_prefix(
     cache.check_integrity()
 
 
-def test_reposition_capacity_failure_yields_once_then_becomes_terminal(
+def test_reposition_capacity_pressure_recomputes_from_an_evictable_prefix(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(torch.Tensor, "pin_memory", lambda self: self)
@@ -385,16 +385,15 @@ def test_reposition_capacity_failure_yields_once_then_becomes_terminal(
         )
     )
 
-    assert manager.schedule_next_batch(prefill_budget=8) is None
-    assert manager.pending_list[0].uid == 81
-    cache.check_integrity()
-    with pytest.raises(RepositionCapacityError) as raised:
-        manager.schedule_next_batch(prefill_budget=8)
+    batch = manager.schedule_next_batch(prefill_budget=8)
 
-    assert raised.value.required_pages == 3
-    assert raised.value.available_pages == 2
-    assert raised.value.matched_pages == 6
-    assert raised.value.retry_pages == 0
+    assert batch is not None and len(batch.reqs) == 1
+    req = batch.reqs[0]
+    assert req.cached_len == 0
+    assert req.initial_active_cached_len == 0
+    assert cache.prefix_cache.size_info.protected_size == 0
+    cache.unlock(req.cache_handle)
+    table.free(req.table_idx)
     cache.check_integrity()
 
 
@@ -424,8 +423,8 @@ def test_scheduler_rejects_terminal_reposition_capacity_failure() -> None:
     assert len(replies) == 1 and len(replies[0]) == 1
     reply = replies[0][0]
     assert reply.uid == 82
-    assert reply.status_code == 503
-    assert reply.error_code == "reposition_kv_capacity_exhausted"
+    assert reply.status_code == 413
+    assert reply.error_code == "reposition_working_set_exceeded"
 
 
 def test_terminal_reposition_dispatches_final_generation_without_new_raw_tokens() -> None:

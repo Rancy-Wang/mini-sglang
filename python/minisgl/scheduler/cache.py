@@ -180,6 +180,20 @@ class CacheManager:
             retry_plan_ns=retry_plan_ns,
         )
 
+    def match_empty_req(self, req: PendingReq) -> ContextMatchResult:
+        """Return the unlocked root match so a request can recompute after evicting its prefix."""
+
+        if req.radix_match_ids is None:
+            raise ValueError("Prefix matching requires radix_match_ids.")
+        empty_query = req.radix_match_ids[:0]
+        empty_virtual = (
+            req.radix_key_virtual_mask[:0] if req.radix_key_virtual_mask is not None else None
+        )
+        handle, key_indices, _ = self._match_prefix(empty_query, empty_virtual)
+        if len(key_indices) != 0 or handle.cached_len != 0:
+            raise RuntimeError("The empty Radix match unexpectedly contains cached pages.")
+        return self._derive_active_match(req, handle, key_indices)
+
     def _derive_active_match(
         self,
         req: PendingReq,
