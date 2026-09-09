@@ -313,9 +313,7 @@ def build_context_attention_segments(
     if raw_positions.ndim != 1 or not raw_positions.is_cpu or len(raw_positions) != key_length:
         raise ValueError("raw_positions must be a CPU vector covering the compact KV stream.")
     raw_positions = raw_positions.to(dtype=torch.int64)
-    if len(raw_positions) > 1 and bool(
-        torch.any(raw_positions[1:] <= raw_positions[:-1]).item()
-    ):
+    if len(raw_positions) > 1 and bool(torch.any(raw_positions[1:] <= raw_positions[:-1]).item()):
         raise ValueError("raw_positions must be strictly increasing.")
     if len(raw_positions) == 0 or int(raw_positions[-1]) >= len(full_token_visible_until):
         raise ValueError("Context raw positions exceed full_token_visible_until.")
@@ -437,13 +435,12 @@ def build_context_attention_batch(
             sliding_window=sliding_window,
         )
         first_segment = segments[0]
-        first_query_length = first_segment.query_end - first_segment.query_start
-        cached_tokens.append(len(first_segment.key_positions) - first_query_length)
-        # Drop visibility only decreases: initial hits used by any query are
-        # exactly those present in the first full-attention segment.
-        cached_positions.append(
-            first_segment.key_positions[first_segment.key_positions < req.cached_len]
-        )
+        # Cache-usage metrics describe the original Radix hits, not prompt KV
+        # produced by an earlier chunk of the same request.
+        initial_cached_len = getattr(req, "initial_active_cached_len", req.cached_len)
+        used_initial = first_segment.key_positions[first_segment.key_positions < initial_cached_len]
+        cached_tokens.append(len(used_initial))
+        cached_positions.append(used_initial)
         local_query_offset = 0
         for segment in segments:
             if segment.query_start != local_query_offset:
@@ -522,15 +519,17 @@ def build_occurrence_attention_batch(
         direct_page_parts.append(req.occurrence_pages)
 
         local_query = req.cached_len
+        initial_cached_len = getattr(req, "initial_active_cached_len", req.cached_len)
         reused_raw_parts = []
         for segment_index, (raw_start_tensor, raw_end_tensor) in enumerate(
             zip(query_starts, query_ends, strict=True)
         ):
             raw_start = int(raw_start_tensor)
             raw_end = int(raw_end_tensor)
-            if raw_end <= req.cached_len:
-                continue
             query_start = max(raw_start, req.cached_len)
+            query_end = min(raw_end, req.device_len)
+            if query_start >= query_end:
+                continue
             if query_start != local_query:
                 raise RuntimeError("Occurrence segments do not preserve flattened query order.")
             key_start = int(offsets[segment_index])
@@ -540,17 +539,18 @@ def build_occurrence_attention_batch(
             if prefix_length < 0:
                 raise RuntimeError("Occurrence segment has fewer keys than local queries.")
 
+            visible_key_count = prefix_length + query_end - raw_start
             if sliding_window is None:
-                selected_keys = segment_keys
-                query_length = raw_end - query_start
+                selected_keys = segment_keys[:visible_key_count]
+                query_length = query_end - query_start
                 segment_table_indices.append(0)
                 key_positions.append((selected_keys + occurrence_base).to(torch.int32))
                 query_lengths.append(query_length)
                 key_lengths.append(len(selected_keys))
                 selected_raw = occurrence_raw[selected_keys]
-                reused_raw_parts.append(selected_raw[selected_raw < req.cached_len])
+                reused_raw_parts.append(selected_raw[selected_raw < initial_cached_len])
             else:
-                for raw_query in range(query_start, raw_end):
+                for raw_query in range(query_start, query_end):
                     causal_count = prefix_length + (raw_query - raw_start) + 1
                     causal_keys = segment_keys[:causal_count]
                     query_position = int(req.true_positions[raw_query])
@@ -564,10 +564,10 @@ def build_occurrence_attention_batch(
                     key_lengths.append(len(selected_keys))
                     reused_raw_parts.append(
                         occurrence_raw[selected_keys][
-                            occurrence_raw[selected_keys] < req.cached_len
+                            occurrence_raw[selected_keys] < initial_cached_len
                         ]
                     )
-            local_query = raw_end
+            local_query = query_end
 
         if local_query != req.device_len:
             raise RuntimeError("Occurrence segments do not cover the request extension.")

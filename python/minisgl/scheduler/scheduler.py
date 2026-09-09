@@ -33,7 +33,6 @@ from .prefill import (
     ChunkedReq,
     PrefillManager,
     RepositionCapacityError,
-    RepositionForwardLimitError,
 )
 from .radix_symbol import RadixSymbolRegistry, inject_radix_symbols
 from .table import TableManager
@@ -256,6 +255,9 @@ class Scheduler(SchedulerIOMixin):
             for i, req in enumerate(batch.reqs):
                 if isinstance(req, ChunkedReq):
                     self.prefill_manager.complete_chunk(req)
+                    if req in self.finished_reqs and req.occurrence_abort_deferred:
+                        self._free_aborted_occurrence_resources(req)
+                        new_finished_reqs.add(req)
                     continue
                 if req in self.finished_reqs:
                     # An abort or an earlier overlapping batch already released
@@ -363,13 +365,14 @@ class Scheduler(SchedulerIOMixin):
         pages = self.table_manager.page_table[req.table_idx, :prompt_len].clone()
         keep_device = keep.to(device=pages.device, non_blocking=True)
         active_slots = torch.arange(prompt_len, dtype=torch.int64, device="cpu")
-        owned = active_slots >= req.initial_active_cached_len
-        if req.retry_transformed_mask is not None:
-            owned[: len(req.retry_transformed_mask)] |= req.retry_transformed_mask
         if req.occurrence_terminal_owned_mask is not None:
             if len(req.occurrence_terminal_owned_mask) != prompt_len:
                 raise RuntimeError("Occurrence-owned pages do not cover the prompt stream.")
-            owned |= req.occurrence_terminal_owned_mask
+            owned = req.occurrence_terminal_owned_mask.clone()
+        else:
+            owned = active_slots >= req.initial_active_cached_len
+            if req.retry_transformed_mask is not None:
+                owned[: len(req.retry_transformed_mask)] |= req.retry_transformed_mask
         dropped_owned = (~keep) & owned
         if bool(torch.any(dropped_owned).item()):
             dropped_device = dropped_owned.to(device=pages.device, non_blocking=True)
@@ -418,6 +421,10 @@ class Scheduler(SchedulerIOMixin):
             req.occurrence_terminal_owned_mask = req.occurrence_terminal_owned_mask[
                 keep
             ].contiguous()
+        if req.occurrence_repositioned_cached_mask is not None:
+            req.occurrence_repositioned_cached_mask = req.occurrence_repositioned_cached_mask[
+                initial_keep
+            ].contiguous()
         removed = prompt_len - kept_count
         req.cached_len = kept_count
         req.device_len = kept_count + 1
@@ -441,6 +448,8 @@ class Scheduler(SchedulerIOMixin):
         req.occurrence_fresh_source_pages = None
         req.occurrence_fresh_destination_pages = None
         req.occurrence_fresh_position_pairs = None
+        req.occurrence_initial_source_positions = None
+        req.occurrence_repositioned_cached_mask = None
 
     def _process_one_msg(self, msg: BaseBackendMsg) -> None:
         if isinstance(msg, BatchBackendMsg):
@@ -602,11 +611,19 @@ class Scheduler(SchedulerIOMixin):
                     if engine is not None:
                         engine.sampler.discard(req_to_free)
                     req_to_free.occurrence_abort_deferred = True
+                    # The request may still be present in an overlapping GPU
+                    # batch. Keep a tombstone until that stale result drains.
+                    self.finished_reqs.add(req_to_free)
+                elif isinstance(req_to_free, ChunkedReq):
+                    # A completed partial occurrence chunk is not a cacheable
+                    # finished request. Release its retained terminal pages and
+                    # matched-prefix lock without committing the partial plan.
+                    self._free_aborted_occurrence_resources(req_to_free)
                 else:
                     self._free_req_resources(req_to_free)
-                # The request may still be present in an overlapping GPU batch.
-                # _process_last_data uses this tombstone to discard that stale result.
-                self.finished_reqs.add(req_to_free)
+                    # Ordinary requests can still be present in an overlapping
+                    # GPU batch even after leaving the decode manager.
+                    self.finished_reqs.add(req_to_free)
             else:
                 self._close_context_sequence(msg.uid)
         else:
@@ -646,9 +663,19 @@ class Scheduler(SchedulerIOMixin):
         req.occurrence_inflight = False
 
     def _free_aborted_occurrence_resources(self, req: Req) -> None:
-        pages = req.occurrence_pages
         try:
-            if pages is not None:
+            transient = req.occurrence_transient_pages
+            if transient is not None:
+                self.cache_manager.free_occurrence_pages(transient)
+            owned = req.occurrence_terminal_owned_mask
+            if owned is not None and bool(torch.any(owned).item()):
+                owned_device = (
+                    torch.nonzero(owned, as_tuple=False)
+                    .view(-1)
+                    .pin_memory()
+                    .to(self.cache_manager.device, non_blocking=True)
+                )
+                pages = self.table_manager.page_table[req.table_idx, owned_device].clone()
                 self.cache_manager.free_occurrence_pages(pages)
             self.cache_manager.unlock(req.cache_handle)
         finally:
@@ -720,22 +747,12 @@ class Scheduler(SchedulerIOMixin):
         try:
             batch = self.prefill_manager.schedule_next_batch(self.prefill_budget)
         except RepositionCapacityError as exc:
-            self.prefill_manager.abort_req(exc.uid)
-            self.request_metrics.pop(exc.uid, None)
-            self._close_context_sequence(exc.uid)
-            self.send_result(
-                [
-                    RequestRejectMsg(
-                        uid=exc.uid,
-                        status_code=503,
-                        error_code="reposition_kv_capacity_exhausted",
-                        detail=str(exc),
-                    )
-                ]
-            )
-            batch = None
-        except RepositionForwardLimitError as exc:
-            self.prefill_manager.abort_req(exc.uid)
+            aborted = self.prefill_manager.abort_req(exc.uid)
+            if isinstance(aborted, ChunkedReq):
+                # A request may discover an intrinsically impossible later
+                # occurrence working set after earlier chunks have retained
+                # terminal pages. Release that partial state before rejecting it.
+                self._free_aborted_occurrence_resources(aborted)
             self.request_metrics.pop(exc.uid, None)
             self._close_context_sequence(exc.uid)
             self.send_result(
@@ -743,7 +760,7 @@ class Scheduler(SchedulerIOMixin):
                     RequestRejectMsg(
                         uid=exc.uid,
                         status_code=413,
-                        error_code="reposition_forward_limit_exceeded",
+                        error_code="reposition_working_set_exceeded",
                         detail=str(exc),
                     )
                 ]

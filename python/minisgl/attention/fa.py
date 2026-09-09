@@ -236,7 +236,7 @@ class FlashAttentionBackend(BaseAttnBackend):
             if self.page_size != 1:
                 raise RuntimeError(
                     "FlashAttention context-mask Prefill currently requires page_size=1."
-            )
+                )
 
             def _compile_fa_context(sliding_window: int | None):
                 context_batch = (
@@ -251,10 +251,7 @@ class FlashAttentionBackend(BaseAttnBackend):
                         context_batch.cached_positions,
                         strict=True,
                     ):
-                        if req.usage_cached_tokens is None:
-                            req.record_context_cache_usage(cached_tokens, cached_positions)
-                        elif req.usage_cached_tokens != cached_tokens:
-                            raise RuntimeError("Occurrence cache-usage accounting diverged.")
+                        req.record_context_cache_usage(cached_tokens, cached_positions)
                 return _compile_fa_segments(context_batch)
 
             context_segments = _compile_fa_context(None)
