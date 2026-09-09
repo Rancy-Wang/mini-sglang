@@ -4,6 +4,8 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
+
+import minisgl.attention.base as attention_base
 from minisgl.attention.base import (
     BaseAttnBackend,
     HybridBackend,
@@ -245,6 +247,39 @@ def _context_batch_requests():
             ),
         ),
     )
+
+
+def _assert_context_batches_equal(actual, expected):
+    assert actual.cached_tokens == expected.cached_tokens
+    assert actual.max_seqlen_q == expected.max_seqlen_q
+    assert actual.max_seqlen_k == expected.max_seqlen_k
+    assert len(actual.cached_positions) == len(expected.cached_positions)
+    for actual_positions, expected_positions in zip(
+        actual.cached_positions, expected.cached_positions, strict=True
+    ):
+        assert torch.equal(actual_positions, expected_positions)
+    for name in (
+        "segment_table_indices",
+        "key_positions",
+        "cu_seqlens_q",
+        "cu_seqlens_k",
+    ):
+        assert torch.equal(getattr(actual, name), getattr(expected, name))
+
+
+def test_context_sliding_aot_batch_matches_python_reference(monkeypatch):
+    requests = _context_batch_requests()
+    with monkeypatch.context() as fallback:
+        fallback.setattr(
+            attention_base,
+            "try_build_context_sliding_plan",
+            lambda *args, **kwargs: None,
+        )
+        expected = attention_base.build_context_attention_batch(requests, sliding_window=2)
+
+    actual = attention_base.build_context_attention_batch(requests, sliding_window=2)
+
+    _assert_context_batches_equal(actual, expected)
 
 
 def test_multi_request_context_batch_preserves_flattened_q_and_table_ownership():

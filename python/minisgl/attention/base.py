@@ -6,6 +6,11 @@ from typing import TYPE_CHECKING, List, Sequence
 
 import torch
 
+from minisgl.kernel.context_plan import (
+    try_build_context_sliding_plan,
+    try_build_occurrence_sliding_plan,
+)
+
 try:
     import triton
     import triton.language as tl
@@ -407,6 +412,14 @@ def build_context_attention_batch(
     if not reqs:
         raise ValueError("Context attention batching requires at least one request.")
 
+    if sliding_window is not None:
+        fast_batch = _try_build_context_sliding_attention_batch(
+            reqs,
+            sliding_window=sliding_window,
+        )
+        if fast_batch is not None:
+            return fast_batch
+
     segment_table_indices = []
     key_positions = []
     query_lengths = []
@@ -471,6 +484,87 @@ def build_context_attention_batch(
     )
 
 
+def _try_build_context_sliding_attention_batch(
+    reqs: Sequence,
+    *,
+    sliding_window: int,
+) -> ContextAttentionBatch | None:
+    """Pack exact sliding rows without constructing one Python segment per query."""
+
+    request_key_parts = []
+    request_offset_parts = []
+    segment_table_parts = []
+    cached_tokens = []
+    cached_positions = []
+    query_count = 0
+    key_count = 0
+    max_key_length = 0
+    for req in reqs:
+        if req.full_token_visible_until is None:
+            raise RuntimeError("Context-mask Prefill request is missing visibility metadata.")
+        raw_positions = (
+            req.raw_positions[: req.device_len]
+            if getattr(req, "raw_positions", None) is not None
+            else torch.arange(req.device_len, dtype=torch.int32, device="cpu")
+        )
+        true_positions = (
+            req.true_positions[: req.device_len]
+            if getattr(req, "true_positions", None) is not None
+            else raw_positions
+        )
+        plan = try_build_context_sliding_plan(
+            req.full_token_visible_until,
+            raw_positions,
+            true_positions,
+            query_start=req.cached_len,
+            query_length=req.extend_len,
+            sliding_window=sliding_window,
+        )
+        if plan is None:
+            return None
+        local_offsets, local_keys = plan
+        local_lengths = local_offsets[1:] - local_offsets[:-1]
+        if len(local_lengths) != req.extend_len:
+            return None
+        first_keys = local_keys[: int(local_offsets[1].item())]
+        initial_cached_len = getattr(req, "initial_active_cached_len", req.cached_len)
+        used_initial = first_keys[first_keys < initial_cached_len].to(torch.int64)
+        cached_tokens.append(len(used_initial))
+        cached_positions.append(used_initial)
+        request_key_parts.append(local_keys)
+        request_offset_parts.append(local_offsets[1:] + key_count)
+        segment_table_parts.append(
+            torch.full(
+                (req.extend_len,),
+                req.table_idx,
+                dtype=torch.int32,
+                device="cpu",
+            )
+        )
+        query_count += req.extend_len
+        key_count += len(local_keys)
+        max_key_length = max(
+            max_key_length,
+            int(torch.max(local_lengths).item()),
+        )
+
+    return ContextAttentionBatch(
+        cached_tokens=tuple(cached_tokens),
+        cached_positions=tuple(cached_positions),
+        segment_table_indices=torch.cat(segment_table_parts),
+        key_positions=torch.cat(request_key_parts),
+        cu_seqlens_q=torch.arange(query_count + 1, dtype=torch.int32, device="cpu"),
+        cu_seqlens_k=torch.cat(
+            (
+                torch.zeros(1, dtype=torch.int32, device="cpu"),
+                *request_offset_parts,
+            )
+        ),
+        max_seqlen_q=1,
+        max_seqlen_k=max_key_length,
+    )
+
+
 def build_occurrence_attention_batch(
     reqs: Sequence,
     *,
@@ -482,6 +576,14 @@ def build_occurrence_attention_batch(
         raise ValueError("Occurrence attention batching requires at least one request.")
     if sliding_window is not None and sliding_window < 0:
         raise ValueError("sliding_window must be non-negative when provided.")
+
+    if sliding_window is not None:
+        fast_batch = _try_build_occurrence_sliding_attention_batch(
+            reqs,
+            sliding_window=sliding_window,
+        )
+        if fast_batch is not None:
+            return fast_batch
 
     direct_page_parts = []
     segment_table_indices = []
@@ -593,6 +695,105 @@ def build_occurrence_attention_batch(
         cu_seqlens_k=cu_seqlens_k,
         max_seqlen_q=max(query_lengths),
         max_seqlen_k=max(key_lengths),
+        direct_pages=torch.cat(direct_page_parts),
+    )
+
+
+def _try_build_occurrence_sliding_attention_batch(
+    reqs: Sequence,
+    *,
+    sliding_window: int,
+) -> ContextAttentionBatch | None:
+    """Pack ordered occurrence windows with one AOT planner call per request."""
+
+    direct_page_parts = []
+    request_key_parts = []
+    request_offset_parts = []
+    cached_tokens = []
+    cached_positions = []
+    query_count = 0
+    key_count = 0
+    occurrence_base = 0
+    max_key_length = 0
+    for req in reqs:
+        if req.reposition_execution_mode != "paged-occurrence":
+            raise RuntimeError("Occurrence attention cannot mix execution modes.")
+        cpu_plan = (
+            req.occurrence_raw_tokens,
+            req.occurrence_positions,
+            req.occurrence_segment_query_starts,
+            req.occurrence_segment_query_ends,
+            req.occurrence_segment_key_offsets,
+            req.occurrence_segment_key_indices,
+        )
+        if not all(tensor is not None for tensor in cpu_plan) or req.occurrence_pages is None:
+            raise RuntimeError("Paged-occurrence request is missing runtime occurrence metadata.")
+        (
+            occurrence_raw,
+            occurrence_positions,
+            query_starts,
+            query_ends,
+            offsets,
+            flat_keys,
+        ) = cpu_plan
+        assert occurrence_raw is not None
+        assert occurrence_positions is not None
+        assert query_starts is not None
+        assert query_ends is not None
+        assert offsets is not None
+        assert flat_keys is not None
+        if len(req.occurrence_pages) != len(occurrence_raw):
+            raise RuntimeError("Occurrence page allocation does not cover all occurrences.")
+        if req.extend_len != req.device_len - req.cached_len:
+            return None
+        initial_cached_len = getattr(req, "initial_active_cached_len", req.cached_len)
+        plan = try_build_occurrence_sliding_plan(
+            occurrence_raw,
+            occurrence_positions,
+            query_starts,
+            query_ends,
+            offsets,
+            flat_keys,
+            req.true_positions,
+            cached_len=req.cached_len,
+            device_len=req.device_len,
+            initial_cached_len=initial_cached_len,
+            sliding_window=sliding_window,
+            occurrence_base=occurrence_base,
+        )
+        if plan is None:
+            return None
+        local_offsets, local_keys, used_cached_positions = plan
+        local_lengths = local_offsets[1:] - local_offsets[:-1]
+        if len(local_lengths) != req.extend_len:
+            return None
+        request_key_parts.append(local_keys)
+        request_offset_parts.append(local_offsets[1:] + key_count)
+        direct_page_parts.append(req.occurrence_pages)
+        cached_tokens.append(len(used_cached_positions))
+        cached_positions.append(used_cached_positions)
+        query_count += req.extend_len
+        key_count += len(local_keys)
+        occurrence_base += len(occurrence_raw)
+        max_key_length = max(
+            max_key_length,
+            int(torch.max(local_lengths).item()),
+        )
+
+    return ContextAttentionBatch(
+        cached_tokens=tuple(cached_tokens),
+        cached_positions=tuple(cached_positions),
+        segment_table_indices=torch.zeros(query_count, dtype=torch.int32, device="cpu"),
+        key_positions=torch.cat(request_key_parts),
+        cu_seqlens_q=torch.arange(query_count + 1, dtype=torch.int32, device="cpu"),
+        cu_seqlens_k=torch.cat(
+            (
+                torch.zeros(1, dtype=torch.int32, device="cpu"),
+                *request_offset_parts,
+            )
+        ),
+        max_seqlen_q=1,
+        max_seqlen_k=max_key_length,
         direct_pages=torch.cat(direct_page_parts),
     )
 

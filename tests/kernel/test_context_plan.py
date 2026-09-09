@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 import random
 
 import pytest
@@ -8,7 +9,11 @@ import torch
 pytest.importorskip("tvm_ffi")
 
 from minisgl.core import SamplingParams
-from minisgl.kernel.context_plan import first_mask_free_conflict_event
+from minisgl.kernel.context_plan import (
+    first_mask_free_conflict_event,
+    try_build_context_sliding_plan,
+    try_build_occurrence_sliding_plan,
+)
 from minisgl.scheduler.prefill import _mask_free_context_reason_reference
 from minisgl.scheduler.utils import PendingReq
 
@@ -150,3 +155,96 @@ def test_sparse_context_plan_rejects_invalid_wire() -> None:
             active_cached_len=1,
             effective_event_count=1,
         )
+
+
+def test_context_sliding_plan_matches_direct_reference() -> None:
+    rng = random.Random(20260910)
+    never = torch.iinfo(torch.int32).max
+    for _ in range(100):
+        full_token_count = rng.randint(8, 128)
+        kept_raw = [raw_position for raw_position in range(full_token_count) if rng.random() >= 0.2]
+        if len(kept_raw) < 2:
+            kept_raw = [0, full_token_count - 1]
+        raw = torch.tensor(kept_raw, dtype=torch.int32)
+        key_length = len(raw)
+        true_positions = torch.tensor(
+            list(itertools.accumulate(rng.randint(1, 4) for _ in range(key_length))),
+            dtype=torch.int32,
+        )
+        visible_until = torch.full((full_token_count,), never, dtype=torch.int32)
+        for raw_position in range(full_token_count - 1):
+            if rng.random() < 0.2:
+                visible_until[raw_position] = rng.randint(raw_position + 1, full_token_count)
+        query_start = rng.randrange(key_length)
+        query_count = key_length - query_start
+        window_left = rng.randint(0, 12)
+
+        result = try_build_context_sliding_plan(
+            visible_until,
+            raw,
+            true_positions,
+            query_start=query_start,
+            query_length=query_count,
+            sliding_window=window_left,
+        )
+
+        assert result is not None
+        offsets, keys = result
+        expected_offsets = [0]
+        expected_keys = []
+        for query in range(query_start, key_length):
+            threshold = int(true_positions[query]) - window_left
+            row = [
+                key
+                for key in range(query)
+                if int(visible_until[int(raw[key])]) > int(raw[query])
+                and int(true_positions[key]) >= threshold
+            ]
+            row.append(query)
+            expected_keys.extend(row)
+            expected_offsets.append(len(expected_keys))
+        assert offsets.tolist() == expected_offsets
+        assert keys.tolist() == expected_keys
+
+
+def test_occurrence_sliding_plan_matches_direct_reference() -> None:
+    rng = random.Random(20260911)
+    for _ in range(100):
+        key_length = rng.randint(8, 128)
+        raw = torch.arange(key_length, dtype=torch.int32)
+        positions = torch.tensor(
+            list(itertools.accumulate(rng.randint(1, 4) for _ in range(key_length))),
+            dtype=torch.int32,
+        )
+        query_start = rng.randrange(key_length)
+        window_left = rng.randint(0, 12)
+        occurrence_base = rng.randint(0, 1000)
+        result = try_build_occurrence_sliding_plan(
+            raw,
+            positions,
+            torch.tensor([0], dtype=torch.int32),
+            torch.tensor([key_length], dtype=torch.int32),
+            torch.tensor([0, key_length], dtype=torch.int32),
+            raw,
+            positions,
+            cached_len=query_start,
+            device_len=key_length,
+            initial_cached_len=query_start,
+            sliding_window=window_left,
+            occurrence_base=occurrence_base,
+        )
+
+        assert result is not None
+        offsets, keys, cached_positions = result
+        expected_offsets = [0]
+        expected_keys = []
+        expected_cached = set()
+        for query in range(query_start, key_length):
+            threshold = int(positions[query]) - window_left
+            row = [key for key in range(query + 1) if int(positions[key]) >= threshold]
+            expected_keys.extend(occurrence_base + key for key in row)
+            expected_offsets.append(len(expected_keys))
+            expected_cached.update(key for key in row if key < query_start)
+        assert offsets.tolist() == expected_offsets
+        assert keys.tolist() == expected_keys
+        assert cached_positions.tolist() == sorted(expected_cached)

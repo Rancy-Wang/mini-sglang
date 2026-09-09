@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from types import SimpleNamespace
 
+import minisgl.attention.base as attention_base
 import minisgl.core as core
 import minisgl.scheduler.prefill as prefill_module
 import pytest
@@ -183,6 +184,45 @@ def test_occurrence_attention_batches_partial_hits_for_multiple_requests() -> No
     )
     expected = batch.direct_pages[batch.key_positions.to(torch.int64)]
     assert torch.equal(compiled.flat_indices, expected)
+
+
+def test_occurrence_sliding_aot_batch_matches_python_reference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _plan()
+    reqs = [
+        _runtime_req(plan, cached_len=2, page_base=100, table_idx=3),
+        _runtime_req(plan, cached_len=4, page_base=200, table_idx=7),
+    ]
+    for req in reqs:
+        req.initial_active_cached_len = req.cached_len
+
+    with monkeypatch.context() as fallback:
+        fallback.setattr(
+            attention_base,
+            "try_build_occurrence_sliding_plan",
+            lambda *args, **kwargs: None,
+        )
+        expected = attention_base.build_occurrence_attention_batch(reqs, sliding_window=2)
+
+    actual = attention_base.build_occurrence_attention_batch(reqs, sliding_window=2)
+
+    assert actual.cached_tokens == expected.cached_tokens
+    assert actual.max_seqlen_q == expected.max_seqlen_q
+    assert actual.max_seqlen_k == expected.max_seqlen_k
+    assert len(actual.cached_positions) == len(expected.cached_positions)
+    for actual_positions, expected_positions in zip(
+        actual.cached_positions, expected.cached_positions, strict=True
+    ):
+        assert torch.equal(actual_positions, expected_positions)
+    for name in (
+        "segment_table_indices",
+        "key_positions",
+        "cu_seqlens_q",
+        "cu_seqlens_k",
+        "direct_pages",
+    ):
+        assert torch.equal(getattr(actual, name), getattr(expected, name))
 
 
 def test_occurrence_owned_prompt_prefix_allows_generated_cache_candidates() -> None:
