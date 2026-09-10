@@ -202,6 +202,17 @@ def test_r4_paired_gate_does_not_treat_turns_as_independent_samples(r4_harness):
         r4_harness.paired_noninferiority([100.] * 100, [100.] * 100)
 
 
+def test_r4_stress_decode_budget_preserves_prompt_and_schedule(r4_harness):
+    original = {"messages": [{"role": "user", "content": "hello"}],
+                "drop_message": {"13": [1]}, "reposition": [13], "max_tokens": 1}
+    assert r4_harness.wave_payload(original, None) == original
+    updated = r4_harness.wave_payload(original, 8)
+    assert updated == {**original, "max_tokens": 8, "ignore_eos": True}
+    assert original["max_tokens"] == 1
+    with pytest.raises(ValueError, match="positive"):
+        r4_harness.wave_payload(original, 0)
+
+
 @pytest.mark.parametrize("url", ["https://127.0.0.1", "http://example.com", "http://192.0.2.1",
                                  "http://user:password@127.0.0.1"])
 def test_r4_rejects_non_loopback_destinations(r4_harness, url):

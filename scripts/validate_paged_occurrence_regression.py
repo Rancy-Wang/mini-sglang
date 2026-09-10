@@ -580,6 +580,15 @@ async def replay(args) -> None:
                 raise RuntimeError("Post-replay inference health check failed.")
 
 
+def wave_payload(payload, max_tokens):
+    payload = dict(payload)
+    if max_tokens is not None:
+        if max_tokens < 1:
+            raise ValueError("Stress generation budget must be positive.")
+        payload.update(max_tokens=max_tokens, ignore_eos=True)
+    return payload
+
+
 async def wave(args) -> None:
     import httpx
 
@@ -588,7 +597,8 @@ async def wave(args) -> None:
     async with httpx.AsyncClient(timeout=args.timeout, trust_env=False,
                                  limits=httpx.Limits(max_connections=args.bs)) as client:
         results = await asyncio.gather(*[
-            send(client, args.url, json.loads((args.input / f"case_{item['case_id']}.json").read_text()),
+            send(client, args.url, wave_payload(
+                json.loads((args.input / f"case_{item['case_id']}.json").read_text()), args.max_tokens),
                  item["case_id"]) for item in selected
         ])
     with args.output.open("x") as log:
@@ -805,6 +815,8 @@ def main():
     wave_parser = commands.add_parser("wave")
     wave_parser.add_argument("--input", type=Path, required=True)
     wave_parser.add_argument("--bs", type=int, choices=[4, 8], required=True)
+    wave_parser.add_argument("--max-tokens", type=int,
+                             help="Override generation budget to cover decode/graph replay.")
     five_parser = commands.add_parser("five")
     five_parser.add_argument("--input", type=Path, required=True)
     five_parser.add_argument("--mode", choices=["no_drop", "rolling_drop"], required=True)
