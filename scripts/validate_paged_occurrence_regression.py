@@ -25,6 +25,27 @@ import time
 from urllib.parse import urlsplit
 
 
+def request_segment_ranges(cumulative_queries, query_lengths):
+    """Segment ownership follows flattened Q, not physical table IDs.
+
+    Occurrence plans deliberately use a single direct-page table (table ID 0).
+    Every request boundary must also be a segment boundary.
+    """
+    boundaries = cumulative_queries.tolist()
+    start = total = 0
+    for length in query_lengths:
+        total += length
+        end = start
+        while end < len(boundaries) and boundaries[end] < total:
+            end += 1
+        if end >= len(boundaries) or boundaries[end] != total:
+            raise ValueError("Request boundary is not covered by complete query segments.")
+        yield start, end
+        start = end
+    if total != boundaries[-1]:
+        raise ValueError("Query segments contain an unassigned request suffix.")
+
+
 def install_observers() -> None:
     """Test-only observers installed in each spawned worker, never in production imports."""
     import torch
@@ -149,10 +170,10 @@ def install_observers() -> None:
             emit(_name, uids=[req.uid for req in reqs], host_ns=time.perf_counter_ns() - started,
                  segments=result.num_segments, keys=len(result.key_positions))
             if mode == "exact":
-                segment_offset = occurrence_base = 0
-                for req in reqs:
-                    count = int((result.segment_table_indices == req.table_idx).sum())
-                    end = segment_offset + count
+                occurrence_base = 0
+                ranges = request_segment_ranges(
+                    result.cu_seqlens_q, [req.device_len - req.cached_len for req in reqs])
+                for req, (segment_offset, end) in zip(reqs, ranges, strict=True):
                     first_key, last_key = (int(result.cu_seqlens_k[index])
                                            for index in (segment_offset, end))
                     emit("csr", uid=req.uid, planner=_name, sliding_window=kwargs.get("sliding_window"),
@@ -161,7 +182,6 @@ def install_observers() -> None:
                                              result.cu_seqlens_q[segment_offset]),
                          offsets_sha256=digest(result.cu_seqlens_k[segment_offset:end + 1] - first_key),
                          keys_sha256=digest(result.key_positions[first_key:last_key] - occurrence_base))
-                    segment_offset = end
                     if _name == "build_occurrence_attention_batch":
                         occurrence_base += len(req.occurrence_raw_tokens)
             return result

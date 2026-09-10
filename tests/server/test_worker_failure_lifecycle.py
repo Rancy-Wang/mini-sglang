@@ -184,6 +184,15 @@ def test_r4_rolling_interface_counts_tool_responses_not_assistant_turns(r4_harne
     }
 
 
+def test_r4_csr_partition_uses_query_boundaries_for_shared_direct_table(r4_harness):
+    assert list(r4_harness.request_segment_ranges(torch.tensor([0, 2, 3, 5, 8]), [3, 5])) == [
+        (0, 2), (2, 4)]
+    with pytest.raises(ValueError, match="boundary"):
+        list(r4_harness.request_segment_ranges(torch.tensor([0, 2, 3]), [1, 2]))
+    with pytest.raises(ValueError, match="unassigned"):
+        list(r4_harness.request_segment_ranges(torch.tensor([0, 2, 3]), [2]))
+
+
 @pytest.mark.parametrize("url", ["https://127.0.0.1", "http://example.com", "http://192.0.2.1",
                                  "http://user:password@127.0.0.1"])
 def test_r4_rejects_non_loopback_destinations(r4_harness, url):
