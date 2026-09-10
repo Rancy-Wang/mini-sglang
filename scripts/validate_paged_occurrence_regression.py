@@ -213,6 +213,19 @@ def install_observers() -> None:
         return result
 
     observe_attention("compile_context_page_tables", page_tables)
+    import minisgl.scheduler.scheduler as scheduler_module
+
+    for name in ("_make_input_tuple", "_make_write_tuple"):
+        original_mapping = getattr(scheduler_module, name)
+
+        def mapping(batch, device, _original=original_mapping, _name=name):
+            started = time.perf_counter_ns()
+            result = _original(batch, device)
+            emit("mapping", operation=_name, uids=[req.uid for req in batch.reqs],
+                 host_ns=time.perf_counter_ns() - started)
+            return result
+
+        setattr(scheduler_module, name, mapping)
     original_reset_idle = Scheduler.run_when_idle
     reset_seen = set()
 
@@ -250,9 +263,15 @@ def install_observers() -> None:
     def commit(self, req, *, finished):
         result = original_commit(self, req, finished=finished)
         if finished:
+            ownership = {}
+            if (root / "record_owners.request").exists():
+                ownership["physical_owners"] = {
+                    str(slot): sorted(node.uuid for node in owners)
+                    for slot, owners in self.prefix_cache._ordinary_slot_nodes.items()
+                }
             emit("completed_tree", uid=req.uid, repos=req.radix_current_reposition,
                  nodes=[[node.uuid, node.ref_count, node.page_length,
-                         digest(node._key)] for node in nodes(self.prefix_cache)])
+                         digest(node._key)] for node in nodes(self.prefix_cache)], **ownership)
         return result
 
     CacheManager.cache_req = commit

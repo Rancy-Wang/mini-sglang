@@ -88,6 +88,9 @@ def test_r4_observers_preserve_forward_and_keyword_only_commit(
     monkeypatch.setattr(Sampler, "sample", lambda self, logits, args: logits.argmax(-1))
     monkeypatch.setattr(Req, "append_host", lambda self, token: token)
     monkeypatch.setattr(Scheduler, "run_when_idle", lambda self: None)
+    import minisgl.scheduler.scheduler as scheduler_module
+    for name in ("_make_input_tuple", "_make_write_tuple"):
+        monkeypatch.setattr(scheduler_module, name, lambda batch, device: ("mapping", device))
 
     def forward(self, batch, args):
         req = batch.reqs[0]
@@ -108,8 +111,13 @@ def test_r4_observers_preserve_forward_and_keyword_only_commit(
                              kv_cache=SimpleNamespace(num_layers=1, k_cache=lambda _: kv,
                                                       v_cache=lambda _: kv))
     assert Engine.forward_batch(engine, batch, None).tolist() == [1]
+    assert scheduler_module._make_input_tuple(batch, "cpu") == ("mapping", "cpu")
+    assert scheduler_module._make_write_tuple(batch, "cpu") == ("mapping", "cpu")
     assert Req.append_host(req, torch.tensor([12])).tolist() == [12]
-    manager = SimpleNamespace(prefix_cache=SimpleNamespace(root_node=SimpleNamespace(children={})))
+    manager = SimpleNamespace(prefix_cache=SimpleNamespace(
+        root_node=SimpleNamespace(children={}), _ordinary_slot_nodes={7: [SimpleNamespace(uuid=3)]}))
+    if mode == "pressure":
+        (tmp_path / "record_owners.request").touch()
     assert CacheManager.cache_req(manager, req, finished=True) == "committed"
     assert CacheManager.cache_req(manager, req, finished=False) == "committed"
     assert commits == [(req.uid, True), (req.uid, False)]
@@ -125,8 +133,11 @@ def test_r4_observers_preserve_forward_and_keyword_only_commit(
             for line in path.read_text().splitlines()]
     kinds = [row["kind"] for row in rows]
     assert "forward" in kinds and "page_tables" in kinds
+    assert kinds.count("mapping") == 2
     if mode == "pressure":
         assert kinds.count("completed_tree") == 1
+        assert next(row for row in rows if row["kind"] == "completed_tree")[
+            "physical_owners"] == {"7": [3]}
         # Exercise the genuine allocator/DFS with a tiny CPU pool as a harness
         # regression only. This does NOT satisfy R4's real model/GPU-pool gate.
         import minisgl.core as core
