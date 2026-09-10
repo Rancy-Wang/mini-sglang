@@ -133,9 +133,9 @@ def test_r4_observers_preserve_forward_and_keyword_only_commit(
 
         monkeypatch.setattr(core, "_GLOBAL_CTX", core.Context(page_size=1))
         cache = CacheManager(8, 1, torch.empty((1,)), type="radix")
-        pages = cache._allocate(4)
-        cache.prefix_cache.insert_prefix(torch.tensor([1, 2]), pages[:2])
-        cache.prefix_cache.insert_prefix(torch.tensor([3, 4]), pages[2:])
+        pages = cache._allocate(5)
+        cache.prefix_cache.insert_prefix(torch.tensor([1, 2, 7]), pages[:3])
+        cache.prefix_cache.insert_prefix(torch.tensor([3, 4]), pages[3:])
         # This newer branch shares the protected branch's physical pages; after
         # reclaiming all EXCLUSIVE evictable memory it can legitimately remain.
         cache.prefix_cache.insert_prefix(torch.tensor([5, 6]), pages[:2])
