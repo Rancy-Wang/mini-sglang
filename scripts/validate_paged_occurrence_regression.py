@@ -10,6 +10,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import copy
+import functools
+import gzip
 import hashlib
 import ipaddress
 import json
@@ -21,6 +23,210 @@ import subprocess
 import sys
 import time
 from urllib.parse import urlsplit
+
+
+def install_observers() -> None:
+    """Test-only observers installed in each spawned worker, never in production imports."""
+    import torch
+    import minisgl.attention.base as attention
+    from minisgl.core import Req
+    from minisgl.engine.engine import Engine
+    from minisgl.engine.sample import Sampler
+    from minisgl.scheduler.cache import CacheManager
+    from minisgl.scheduler.scheduler import Scheduler
+
+    root = Path(os.environ["MINISGL_R4_OBSERVE"])
+    mode = os.environ["MINISGL_R4_OBSERVE_MODE"]
+    batch_state = []
+
+    if os.environ.get("MINISGL_R4_REFERENCE_SHIM") == "1":
+        import inspect
+        import textwrap
+        import minisgl.core as core_module
+        import minisgl.engine.engine as engine_module
+
+        # Independent reference: original fixed table architecture with a larger
+        # raw-only allocation; original Python planner; active-only terminal
+        # guard. No production file, model position or RoPE formula is changed.
+        original_align = engine_module._align_up_32
+        engine_module._align_up_32 = lambda count: original_align(max(count, 262144))
+        source = textwrap.dedent(inspect.getsource(Req.__post_init__))
+        old = "torch.max(terminal_positions)"
+        assert source.count(old) == 1 and "active_terminal_positions" not in source
+        source = source.replace(old, "torch.max(terminal_positions[self.full_keep_mask.to(torch.bool)])")
+        namespace = dict(vars(core_module))
+        exec(compile(source, "<R4-independent-active-terminal-guard>", "exec"), namespace)
+        Req.__post_init__ = namespace["__post_init__"]
+        attention.try_build_occurrence_sliding_plan = lambda *args, **kwargs: None
+
+    def emit(kind, **fields):
+        with (root / f"observer-{os.getpid()}.jsonl").open("a") as stream:
+            stream.write(json.dumps({"kind": kind, "time_ns": time.perf_counter_ns(),
+                                     **fields}, separators=(",", ":")) + "\n")
+
+    def digest(tensor):
+        value = tensor.detach().contiguous().view(torch.uint8).cpu().numpy().tobytes()
+        return hashlib.sha256(value).hexdigest()
+
+    original_forward = Engine.forward_batch
+
+    @functools.wraps(original_forward)
+    def forward(self, batch, args):
+        batch_state[:] = [batch]
+        graph = self.graph_runner.can_use_cuda_graph(batch)
+        queries = [[req.uid, req.cached_len, req.device_len] for req in batch.reqs]
+        started = time.perf_counter_ns()
+        result = original_forward(self, batch, args)
+        if mode == "exact":
+            for req in batch.reqs:
+                if req.occurrence_pages is not None:
+                    pages = req.occurrence_pages[req.occurrence_pages >= 0].to(torch.int64)
+                else:
+                    pages = self.page_table[req.table_idx, :req.cached_len].to(torch.int64)
+                layer_hashes = []
+                for layer in range(self.kv_cache.num_layers):
+                    layer_hashes.append([
+                        digest(self.kv_cache.k_cache(layer).index_select(0, pages)),
+                        digest(self.kv_cache.v_cache(layer).index_select(0, pages)),
+                    ])
+                emit("kv", uid=req.uid, cached_len=req.cached_len, pages=len(pages),
+                     layers=layer_hashes, true_positions=digest(req.true_positions),
+                     raw_positions=digest(req.raw_positions))
+        emit("forward", queries=queries, size=batch.size, phase=batch.phase, graph=graph,
+             host_ns=time.perf_counter_ns() - started,
+             allocated_bytes=torch.cuda.memory_allocated(), reserved_bytes=torch.cuda.memory_reserved())
+        batch_state.clear()
+        return result
+
+    Engine.forward_batch = forward
+    original_sample = Sampler.sample
+
+    @functools.wraps(original_sample)
+    def sample(self, logits, args):
+        if mode == "exact" and batch_state:
+            for index, req in enumerate(batch_state[0].reqs):
+                emit("logits", uid=req.uid, cached_len=req.cached_len, sha256=digest(logits[index]))
+        return original_sample(self, logits, args)
+
+    Sampler.sample = sample
+    original_append = Req.append_host
+
+    @functools.wraps(original_append)
+    def append(self, token):
+        offset = len(self.input_ids)
+        if mode == "exact":
+            emit("token", uid=self.uid, token=token.tolist(),
+                 position=int(self.true_positions[offset]), raw_position=int(self.raw_positions[offset]))
+        return original_append(self, token)
+
+    Req.append_host = append
+    for name in ("build_context_attention_batch", "build_occurrence_attention_batch"):
+        original = getattr(attention, name)
+
+        def timed(reqs, *args, _original=original, _name=name, **kwargs):
+            started = time.perf_counter_ns()
+            result = _original(reqs, *args, **kwargs)
+            emit(_name, uids=[req.uid for req in reqs], host_ns=time.perf_counter_ns() - started,
+                 segments=result.num_segments, keys=len(result.key_positions))
+            if mode == "exact":
+                emit("csr", uids=[req.uid for req in reqs],
+                     query_sha256=digest(result.cu_seqlens_q),
+                     offsets_sha256=digest(result.cu_seqlens_k),
+                     keys_sha256=digest(result.key_positions))
+            return result
+
+        setattr(attention, name, timed)
+
+    original_allocate = CacheManager._allocate
+
+    @functools.wraps(original_allocate)
+    def allocate(self, count):
+        started = time.perf_counter_ns()
+        result = original_allocate(self, count)
+        emit("allocate", pages=count, host_ns=time.perf_counter_ns() - started,
+             free_pages=len(self.free_slots))
+        return result
+
+    CacheManager._allocate = allocate
+    if mode != "pressure":
+        return
+
+    def nodes(cache):
+        pending = list(cache.root_node.children.values())
+        found = []
+        while pending:
+            node = pending.pop()
+            found.append(node)
+            pending.extend(node.children.values())
+        return found
+
+    original_commit = CacheManager.cache_req
+
+    @functools.wraps(original_commit)
+    def commit(self, req, finished):
+        result = original_commit(self, req, finished)
+        if finished:
+            emit("completed_tree", uid=req.uid, repos=req.radix_current_reposition,
+                 nodes=[[node.uuid, node.ref_count, node.page_length,
+                         digest(node._key)] for node in nodes(self.prefix_cache)])
+        return result
+
+    CacheManager.cache_req = commit
+    original_idle = Scheduler.run_when_idle
+    pressure_done = False
+
+    @functools.wraps(original_idle)
+    def idle(self):
+        nonlocal pressure_done
+        original_idle(self)
+        if pressure_done or not (root / "pressure.request").exists():
+            return
+        pressure_done = True
+        cache = self.cache_manager
+        tree = cache.prefix_cache
+        before = nodes(tree)
+        assert before and all(node.ref_count == 0 for node in before)
+        from minisgl.kvcache.radix_cache import RadixCacheHandle
+
+        leaf = max((node for node in before if node.is_leaf()), key=lambda node: node.page_length)
+        protected = RadixCacheHandle(leaf.length, leaf)
+        tree.lock_handle(protected)
+        eligible = {node.uuid for node in before if node.ref_count == 0}
+        protected_ids = {node.uuid for node in before if node.ref_count > 0}
+        snapshot = {str(slot): sorted(node.uuid for node in owners)
+                    for slot, owners in tree._ordinary_slot_nodes.items()}
+        emit("pressure_before", nodes=[[node.uuid, node.ref_count, node.page_length] for node in before],
+             physical_owners=snapshot, free_pages=len(cache.free_slots), total_pages=cache.num_pages,
+             dfs_leaves=[node.uuid for node in tree._collect_leave_nodes_for_evict()])
+        held = None
+        try:
+            # Consume the genuine free list, then request every evictable physical
+            # page through the existing allocator -> DFS -> heap eviction path.
+            held = cache._allocate(cache.available_size)
+            after_ids = {node.uuid for node in nodes(tree)}
+            remaining = eligible & after_ids
+            emit("pressure_protected", remaining_eligible=sorted(remaining),
+                 protected_survive=protected_ids <= after_ids, free_pages=len(cache.free_slots),
+                 retained_owners={str(slot): sorted(node.uuid for node in owners)
+                                  for slot, owners in tree._ordinary_slot_nodes.items()})
+            assert len(cache.free_slots) == 0
+            assert protected_ids <= after_ids
+            # Zero-page virtual-only nodes may have no reclamation value; report
+            # them explicitly rather than treating them as leaked physical pages.
+            assert not any(node.uuid in remaining and node.page_length for node in nodes(tree))
+        finally:
+            if held is not None:
+                cache.free_occurrence_pages(held)
+            tree.lock_handle(protected, unlock=True)
+        all_pages = cache._allocate(cache.num_pages)
+        assert len(torch.unique(all_pages)) == cache.num_pages
+        assert not tree._ordinary_slot_nodes
+        assert len(cache.free_slots) == 0
+        cache.free_occurrence_pages(all_pages)
+        emit("pressure_complete", free_pages=len(cache.free_slots), total_pages=cache.num_pages,
+             residual_nodes=[[node.uuid, node.page_length] for node in nodes(tree)])
+
+    Scheduler.run_when_idle = idle
 
 
 def loopback_url(value: str) -> str:
@@ -65,10 +271,21 @@ def start_server(args) -> None:
     env.update(CUDA_VISIBLE_DEVICES=args.gpus, HF_HUB_OFFLINE="1",
                TRANSFORMERS_OFFLINE="1", PYTHONDONTWRITEBYTECODE="1",
                PYTHONPATH=str(args.repo.resolve() / "python"))
+    if args.observe:
+        env["MINISGL_R4_OBSERVE"] = str(root)
+        env["MINISGL_R4_OBSERVE_MODE"] = args.observe
+    if args.reference_shim:
+        if args.observe != "exact":
+            raise ValueError("Reference safety shim requires exact observation, never timing.")
+        baseline_core = (args.repo / "python/minisgl/core.py").read_text()
+        if "occurrence_external_storage" in baseline_core:
+            raise ValueError("Reference safety shim requires the unchanged baseline source.")
+        env["MINISGL_R4_REFERENCE_SHIM"] = "1"
+    runtime = args.runtime_root.resolve() if args.runtime_root else root
     for key in ("TORCH_EXTENSIONS_DIR", "TRITON_CACHE_DIR", "FLASHINFER_WORKSPACE_BASE",
                 "TVM_FFI_CACHE_DIR", "CUDA_CACHE_PATH", "TMPDIR"):
-        path = root / key.lower()
-        path.mkdir()
+        path = runtime / key.lower()
+        path.mkdir(parents=True, exist_ok=True)
         env[key] = str(path)
     binary = Path(sys.executable).parent
     for key, name in (("CC", "x86_64-conda-linux-gnu-gcc"),
@@ -84,6 +301,8 @@ def start_server(args) -> None:
             "--attention-backend", "fi", "--radix-drop-key-mode", "delta-marker",
             "--contextual-prefill-mode", "mask", "--reposition-execution-mode", "paged-occurrence",
             "--tool-call-parser", "gpt-oss", "--reasoning-parser", "gpt-oss"]
+    if args.observe:
+        argv[1:3] = [str(Path(__file__).resolve()), "worker"]
     with (root / "server.log").open("xb") as log:
         child = subprocess.Popen(argv, cwd=args.repo, env=env, stdin=subprocess.DEVNULL,
                                  stdout=log, stderr=log, start_new_session=True)
@@ -186,7 +405,46 @@ async def wave(args) -> None:
         raise RuntimeError("At least one concurrent request failed.")
 
 
+async def five(args) -> None:
+    import httpx
+
+    cases = ["781", "249", "806", "785", "827"]
+    with args.output.open("x") as log:
+        async with httpx.AsyncClient(timeout=args.timeout, trust_env=False,
+                                     limits=httpx.Limits(max_connections=4)) as client:
+            for group in (cases[:1], cases[1:]):
+                for turn in range(1, 21):
+                    payloads = []
+                    for case in group:
+                        with gzip.open(args.input / f"case-{case}/turn-{turn:03d}.request.json.gz", "rt") as stream:
+                            payload = json.load(stream)
+                        if args.mode == "no_drop":
+                            for key in ("drop_rule", "drop_message", "reposition"):
+                                payload.pop(key, None)
+                        payload.update(max_tokens=1, temperature=0, top_p=1, top_k=-1,
+                                       seed=17, stream=False)
+                        payload.pop("stream_options", None)
+                        payloads.append(payload)
+                    records = await asyncio.gather(*[
+                        send(client, args.url, payload, f"{case}:{turn}")
+                        for case, payload in zip(group, payloads)
+                    ])
+                    for record in records:
+                        record.update(mode=args.mode, http_concurrency=len(group))
+                        log.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    log.flush()
+                    print(json.dumps([{key: value for key, value in row.items() if key != "response"}
+                                      for row in records]), flush=True)
+                    if any(row.get("status_code") != 200 for row in records):
+                        raise RuntimeError(f"Five-case replay failed at turn {turn}.")
+
+
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "worker":
+        sys.argv.pop(1)
+        from minisgl.server.launch import launch_server
+        launch_server()
+        return
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     launch = commands.add_parser("start")
@@ -196,6 +454,9 @@ def main():
     launch.add_argument("--port", type=int, required=True)
     launch.add_argument("--chunk", type=int, default=32768)
     launch.add_argument("--memory-ratio", type=float, default=0.90)
+    launch.add_argument("--observe", choices=["timing", "exact", "pressure"])
+    launch.add_argument("--reference-shim", action="store_true")
+    launch.add_argument("--runtime-root", type=Path)
     stop = commands.add_parser("stop")
     replay_parser = commands.add_parser("replay")
     replay_parser.add_argument("--request", type=Path, required=True)
@@ -204,9 +465,12 @@ def main():
     wave_parser = commands.add_parser("wave")
     wave_parser.add_argument("--input", type=Path, required=True)
     wave_parser.add_argument("--bs", type=int, choices=[4, 8], required=True)
-    for command in (launch, stop, replay_parser, wave_parser):
+    five_parser = commands.add_parser("five")
+    five_parser.add_argument("--input", type=Path, required=True)
+    five_parser.add_argument("--mode", choices=["no_drop", "rolling_drop"], required=True)
+    for command in (launch, stop, replay_parser, wave_parser, five_parser):
         command.add_argument("--output", type=Path, required=True)
-    for command in (replay_parser, wave_parser):
+    for command in (replay_parser, wave_parser, five_parser):
         command.add_argument("--url", type=loopback_url, required=True)
         command.add_argument("--timeout", type=float, default=1800)
     args = parser.parse_args()
@@ -216,9 +480,14 @@ def main():
         stop_server(args)
     elif args.command == "replay":
         asyncio.run(replay(args))
-    else:
+    elif args.command == "wave":
         asyncio.run(wave(args))
+    else:
+        asyncio.run(five(args))
 
+
+if os.environ.get("MINISGL_R4_OBSERVE"):
+    install_observers()
 
 if __name__ == "__main__":
     main()

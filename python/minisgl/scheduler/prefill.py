@@ -1173,10 +1173,15 @@ class PrefillAdder:
             self.reserved_size += remain_len + pending_req.output_len
         # NOTE: update the tokens ids only; new pages will be allocated in the scheduler
         _slice = slice(cached_len, cached_len + chunk_size)
-        device_ids = self.table_manager.occurrence_tokens(table_idx)[_slice]
+        device_ids = (
+            self.table_manager.occurrence_tokens(table_idx)[_slice]
+            if is_occurrence else self.table_manager.token_pool[table_idx, _slice]
+        )
         device_ids.copy_(pending_req.input_ids[_slice].pin_memory(), non_blocking=True)
         return CLS(
-            occurrence_external_storage=self.table_manager.has_occurrence_storage(table_idx),
+            occurrence_external_storage=(
+                is_occurrence and self.table_manager.has_occurrence_storage(table_idx)
+            ),
             input_ids=pending_req.input_ids[: cached_len + chunk_size],
             true_positions=pending_req.true_positions[: cached_len + chunk_size],
             raw_positions=pending_req.raw_positions[: cached_len + chunk_size],

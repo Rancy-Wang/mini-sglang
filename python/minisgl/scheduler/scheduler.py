@@ -369,7 +369,12 @@ class Scheduler(SchedulerIOMixin):
         if not bool(torch.any(keep).item()):
             raise RuntimeError("Cannot Drop every prompt token before generation.")
 
-        pages = self.table_manager.occurrence_pages(req.table_idx)[:prompt_len].clone()
+        external_storage = req.occurrence_external_storage
+        page_row = (
+            self.table_manager.occurrence_pages(req.table_idx)
+            if external_storage else self.table_manager.page_table[req.table_idx]
+        )
+        pages = page_row[:prompt_len].clone()
         keep_device = keep.to(device=pages.device, non_blocking=True)
         active_slots = torch.arange(prompt_len, dtype=torch.int64, device="cpu")
         if req.occurrence_terminal_owned_mask is not None:
@@ -398,7 +403,10 @@ class Scheduler(SchedulerIOMixin):
         kept_count = int(torch.count_nonzero(keep).item())
         if kept_count + 1 > self.table_manager.page_table.shape[1]:
             raise RuntimeError("Active prompt and sampled token exceed the decode table.")
-        tokens = self.table_manager.occurrence_tokens(req.table_idx)
+        tokens = (
+            self.table_manager.occurrence_tokens(req.table_idx)
+            if external_storage else self.table_manager.token_pool[req.table_idx]
+        )
         self.table_manager.page_table[req.table_idx, :kept_count].copy_(pages[keep_device])
         self.table_manager.token_pool[req.table_idx, :kept_count].copy_(
             tokens[:prompt_len][keep_device]
@@ -406,7 +414,8 @@ class Scheduler(SchedulerIOMixin):
         self.table_manager.token_pool[req.table_idx, kept_count].copy_(
             tokens[prompt_len]
         )
-        self.table_manager.release_occurrence(req.table_idx)
+        if external_storage:
+            self.table_manager.release_occurrence(req.table_idx)
         req.occurrence_external_storage = False
 
         queued_true_position = req.true_positions[prompt_len:].clone()
@@ -811,7 +820,7 @@ class Scheduler(SchedulerIOMixin):
         forward_output = self.engine.forward_batch(batch, sample_args)
         self.token_pool[output_mapping] = forward_output.next_tokens_gpu
         for index, req in enumerate(batch.reqs):
-            if req.occurrence_external_storage and req.can_decode:
+            if req.occurrence_external_storage and not isinstance(req, ChunkedReq):
                 # Engine.forward_batch has already called Req.complete_one().
                 self.table_manager.occurrence_tokens(req.table_idx)[req.cached_len].copy_(
                     forward_output.next_tokens_gpu[index]

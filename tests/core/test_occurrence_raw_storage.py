@@ -70,6 +70,7 @@ def test_external_sample_write_uses_post_forward_cached_length():
     def forward(current_batch, args):
         assert current_batch.input_ids.tolist() == [7, 8]
         req.cached_len, req.device_len = 9, 10
+        req.can_decode = False  # max_tokens=1 still commits its sampled token.
         return SimpleNamespace(next_tokens_gpu=torch.tensor([999], dtype=torch.int32))
 
     scheduler = object.__new__(Scheduler)
