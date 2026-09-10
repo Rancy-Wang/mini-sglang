@@ -23,6 +23,7 @@ import statistics
 import subprocess
 import sys
 import time
+from types import SimpleNamespace
 from urllib.parse import urlsplit
 
 
@@ -668,6 +669,109 @@ def paired_noninferiority(baseline, candidate):
             "noninferior_2_percent": upper <= 1.02, "paired_runs": 5}
 
 
+async def benchmark(args) -> None:
+    """Five alternating paired runs, one server at a time on the same GPUs.
+
+    Warm up both workload modes, reset only idle unprotected KV before every
+    measured mode, and retain all measurements including outliers.
+    """
+    import httpx
+
+    args.output.mkdir(parents=True, exist_ok=False)
+    specification = {
+        "repetitions": 5, "order": [(["baseline", "candidate"] if i % 2 == 0 else
+                                     ["candidate", "baseline"]) for i in range(5)],
+        "gpus": args.gpus, "port": args.port, "chunk": args.chunk,
+        "modes": ["no_drop", "rolling_drop"], "cases": ["781", "249", "806", "785", "827"],
+        "turns": 20, "max_tokens": 8, "seed": 17, "warmup": "both complete modes before measurements",
+        "primary": "TTFT paired run arithmetic means, separately by mode and HTTP bs",
+        "gate": "one-sided 95% t interval on 5 paired log ratios <=1.02; no outlier removal",
+    }
+    (args.output / "specification.json").write_text(json.dumps(specification, indent=2))
+    for repetition, order in enumerate(specification["order"], 1):
+        for branch in order:
+            root = args.output / f"rep-{repetition:02d}-{branch}"
+            launch = SimpleNamespace(
+                repo=args.baseline if branch == "baseline" else args.repo,
+                model=args.model, gpus=args.gpus, port=args.port, chunk=args.chunk,
+                memory_ratio=args.memory_ratio, observe="timing", reference_shim=False,
+                runtime_root=args.baseline_cache if branch == "baseline" else args.candidate_cache,
+                output=root)
+            started = time.perf_counter_ns()
+            start_server(launch)
+            try:
+                deadline = time.monotonic() + 900
+                async with httpx.AsyncClient(timeout=2, trust_env=False) as client:
+                    while True:
+                        try:
+                            ready = await client.get(f"http://127.0.0.1:{args.port}/v1/models")
+                            if ready.status_code == 200:
+                                break
+                        except httpx.HTTPError:
+                            pass
+                        identity = json.loads((root / "launch.json").read_text())
+                        proc = Path(f"/proc/{identity['pid']}/stat")
+                        if not proc.exists() or proc.read_text().split()[2] == "Z":
+                            raise RuntimeError(f"Server exited during startup: {root}")
+                        if time.monotonic() > deadline:
+                            raise TimeoutError(f"Server startup timed out: {root}")
+                        await asyncio.sleep(2)
+                (root / "initialization.json").write_text(json.dumps({
+                    "startup_ns": time.perf_counter_ns() - started}))
+                for phase in ("warmup", "measured"):
+                    for mode in specification["modes"]:
+                        common = dict(url=f"http://127.0.0.1:{args.port}/v1/chat/completions", timeout=1800)
+                        await clear_cache(SimpleNamespace(
+                            **common, server_root=root, model=args.model, tp=len(args.gpus.split(",")),
+                            output=root / f"{phase}-{mode}-reset.json"))
+                        await five(SimpleNamespace(
+                            **common, input=args.input, mode=mode, max_tokens=8,
+                            output=root / f"{phase}-{mode}.jsonl"))
+                print(json.dumps({"finished": str(root)}), flush=True)
+            finally:
+                stop_server(launch)
+                deadline = time.monotonic() + 60
+                while True:
+                    memory = subprocess.check_output([
+                        "nvidia-smi", "--query-gpu=index,memory.used", "--format=csv,noheader,nounits"
+                    ], text=True)
+                    used = {int(row.split(",")[0]): int(row.split(",")[1]) for row in memory.splitlines()}
+                    if all(used[int(gpu)] <= 100 for gpu in args.gpus.split(",")):
+                        break
+                    if time.monotonic() > deadline:
+                        raise RuntimeError("Owned server did not release GPUs; refusing the next run.")
+                    await asyncio.sleep(1)
+    report = {"specification": specification, "strata": []}
+    for mode in specification["modes"]:
+        for bs in (1, 4):
+            metrics = {}
+            for metric in ("ttft_ms", "decode_e2e_ms_per_token"):
+                branch_values, branch_means = {}, {}
+                for branch in ("baseline", "candidate"):
+                    values, means = [], []
+                    for repetition in range(1, 6):
+                        path = args.output / f"rep-{repetition:02d}-{branch}" / f"measured-{mode}.jsonl"
+                        rows = [json.loads(line) for line in path.open()]
+                        selected = [row[metric] for row in rows
+                                    if row["http_concurrency"] == bs and metric in row]
+                        assert selected and all(row["status_code"] == 200 for row in rows)
+                        means.append(statistics.mean(selected))
+                        values.extend(selected)
+                    percentiles = statistics.quantiles(values, n=100, method="inclusive")
+                    branch_values[branch] = {"n": len(values), "mean": statistics.mean(values),
+                                             "p50": percentiles[49], "p90": percentiles[89],
+                                             "p99": percentiles[98], "paired_run_means": means}
+                    branch_means[branch] = means
+                metrics[metric] = {**branch_values,
+                                   **paired_noninferiority(branch_means["baseline"], branch_means["candidate"])}
+            report["strata"].append({"mode": mode, "http_bs": bs, "metrics": metrics})
+    report["ttft_noninferior"] = all(row["metrics"]["ttft_ms"]["noninferior_2_percent"]
+                                       for row in report["strata"])
+    report["remaining_review"] = "exact outputs, planner/mapping, tail and memory review are separate gates"
+    (args.output / "summary.json").write_text(json.dumps(report, indent=2))
+    print(json.dumps(report), flush=True)
+
+
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == "worker":
         sys.argv.pop(1)
@@ -706,7 +810,16 @@ def main():
     clear_parser.add_argument("--server-root", type=Path, required=True)
     clear_parser.add_argument("--model", required=True)
     clear_parser.add_argument("--tp", type=int, default=2)
-    for command in (launch, stop, replay_parser, wave_parser, five_parser, prepare_parser, clear_parser):
+    bench_parser = commands.add_parser("benchmark")
+    for name in ("repo", "baseline", "input", "baseline-cache", "candidate-cache"):
+        bench_parser.add_argument(f"--{name}", type=Path, required=True)
+    bench_parser.add_argument("--model", required=True)
+    bench_parser.add_argument("--gpus", required=True)
+    bench_parser.add_argument("--port", type=int, required=True)
+    bench_parser.add_argument("--chunk", type=int, default=32768)
+    bench_parser.add_argument("--memory-ratio", type=float, default=0.90)
+    for command in (launch, stop, replay_parser, wave_parser, five_parser, prepare_parser, clear_parser,
+                    bench_parser):
         command.add_argument("--output", type=Path, required=True)
     for command in (replay_parser, wave_parser, five_parser, clear_parser):
         command.add_argument("--url", type=loopback_url, required=True)
@@ -724,6 +837,8 @@ def main():
         prepare(args)
     elif args.command == "clear":
         asyncio.run(clear_cache(args))
+    elif args.command == "benchmark":
+        asyncio.run(benchmark(args))
     else:
         asyncio.run(five(args))
 
