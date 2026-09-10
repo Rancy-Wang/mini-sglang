@@ -1,5 +1,12 @@
 import threading
+import asyncio
+import importlib.util
+import json
+from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
+import torch
 
 from minisgl.server.launch import _start_worker_watchdog
 
@@ -29,3 +36,120 @@ def test_normal_shutdown_cancels_watchdog_before_workers_stop():
     cancel()
     worker.exitcode = 0
     assert calls == []
+
+
+@pytest.fixture
+def r4_harness(monkeypatch):
+    monkeypatch.delenv("MINISGL_R4_OBSERVE", raising=False)
+    monkeypatch.delenv("MINISGL_R4_REFERENCE_SHIM", raising=False)
+    path = Path(__file__).resolve().parents[2] / "scripts/validate_paged_occurrence_regression.py"
+    spec = importlib.util.spec_from_file_location("r4_validation_harness", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.parametrize("mode", ["timing", "exact", "pressure"])
+def test_r4_observers_preserve_forward_and_keyword_only_commit(
+    r4_harness, monkeypatch, tmp_path, mode,
+):
+    import minisgl.attention.base as attention
+    from minisgl.core import Req
+    from minisgl.engine.engine import Engine
+    from minisgl.engine.sample import Sampler
+    from minisgl.scheduler.cache import CacheManager
+    from minisgl.scheduler.scheduler import Scheduler
+
+    # Register every patched production attribute for restoration after this
+    # test. The harness itself exists only in an isolated serving process.
+    for owner, names in (
+        (attention, ("build_context_attention_batch", "build_occurrence_attention_batch",
+                     "compile_context_page_tables")),
+        (Engine, ("forward_batch",)), (Sampler, ("sample",)), (Req, ("append_host",)),
+        (CacheManager, ("_allocate", "cache_req")), (Scheduler, ("run_when_idle",)),
+    ):
+        for name in names:
+            monkeypatch.setattr(owner, name, getattr(owner, name))
+    # A pre-imported backend must not silently bypass the timing/CSR observer.
+    backend = SimpleNamespace(compile_context_page_tables=attention.compile_context_page_tables)
+    monkeypatch.setitem(r4_harness.sys.modules, "minisgl.attention.fi", backend)
+    monkeypatch.setitem(r4_harness.sys.modules, "minisgl.attention.fa", SimpleNamespace())
+    monkeypatch.setenv("MINISGL_R4_OBSERVE", str(tmp_path))
+    monkeypatch.setenv("MINISGL_R4_OBSERVE_MODE", mode)
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda: 0)
+    commits = []
+
+    def commit(self, req, *, finished):
+        commits.append((req.uid, finished))
+        return "committed"
+
+    monkeypatch.setattr(CacheManager, "cache_req", commit)
+    monkeypatch.setattr(Sampler, "sample", lambda self, logits, args: logits.argmax(-1))
+    monkeypatch.setattr(Req, "append_host", lambda self, token: token)
+
+    def forward(self, batch, args):
+        req = batch.reqs[0]
+        req.cached_len = req.device_len
+        req.device_len += 1
+        return Sampler.sample(None, torch.tensor([[0., 1.]]), args)
+
+    monkeypatch.setattr(Engine, "forward_batch", forward)
+    r4_harness.install_observers()
+    req = SimpleNamespace(uid="r4-smoke", cached_len=0, device_len=2, table_idx=0,
+                          input_ids=torch.tensor([10, 11]), true_positions=torch.tensor([0, 1, 2]),
+                          raw_positions=torch.tensor([0, 1, 2]), radix_current_reposition=1)
+    batch = SimpleNamespace(reqs=[req], size=1, phase="prefill", out_loc=torch.tensor([1, 0]),
+                            occurrence_destination_pages=torch.tensor([2]),
+                            occurrence_position_pairs=torch.tensor([[9, 1]]))
+    kv = torch.arange(12).reshape(3, 4).to(torch.bfloat16)
+    engine = SimpleNamespace(graph_runner=SimpleNamespace(can_use_cuda_graph=lambda _: False),
+                             kv_cache=SimpleNamespace(num_layers=1, k_cache=lambda _: kv,
+                                                      v_cache=lambda _: kv))
+    assert Engine.forward_batch(engine, batch, None).tolist() == [1]
+    assert Req.append_host(req, torch.tensor([12])).tolist() == [12]
+    manager = SimpleNamespace(prefix_cache=SimpleNamespace(root_node=SimpleNamespace(children={})))
+    assert CacheManager.cache_req(manager, req, finished=True) == "committed"
+    assert CacheManager.cache_req(manager, req, finished=False) == "committed"
+    assert commits == [(req.uid, True), (req.uid, False)]
+    plan = attention.ContextAttentionBatch(
+        cached_tokens=(0,), segment_table_indices=torch.tensor([0], dtype=torch.int32),
+        key_positions=torch.tensor([0, 1], dtype=torch.int32),
+        cu_seqlens_q=torch.tensor([0, 2], dtype=torch.int32),
+        cu_seqlens_k=torch.tensor([0, 2], dtype=torch.int32), max_seqlen_q=2, max_seqlen_k=2,
+    )
+    assert backend.compile_context_page_tables(torch.tensor([[7, 8]]), plan,
+                                                output_layout="flat").flat_indices.tolist() == [7, 8]
+    rows = [json.loads(line) for path in tmp_path.glob("observer-*.jsonl")
+            for line in path.read_text().splitlines()]
+    kinds = [row["kind"] for row in rows]
+    assert "forward" in kinds and "page_tables" in kinds
+    if mode == "pressure":
+        assert kinds.count("completed_tree") == 1
+    elif mode == "exact":
+        assert {"logits", "kv", "reposition_kv", "token"} <= set(kinds)
+        assert next(row for row in rows if row["kind"] == "kv")["pages"] == 2
+
+
+def test_r4_records_plaintext_server_failure(r4_harness):
+    class Client:
+        async def post(self, url, json):
+            class Response:
+                status_code = 500
+                text = "Internal Server Error"
+
+                def json(self):
+                    raise ValueError("not JSON")
+            return Response()
+
+    record = asyncio.run(r4_harness.send(Client(), "http://127.0.0.1:1", {"messages": []}, 1))
+    assert record["status_code"] == 500
+    assert record["response_text"] == "Internal Server Error"
+    assert "error" not in record  # Do not obscure a server error with a JSON parsing error.
+
+
+@pytest.mark.parametrize("url", ["https://127.0.0.1", "http://example.com", "http://192.0.2.1",
+                                 "http://user:password@127.0.0.1"])
+def test_r4_rejects_non_loopback_destinations(r4_harness, url):
+    with pytest.raises(ValueError):
+        r4_harness.loopback_url(url)

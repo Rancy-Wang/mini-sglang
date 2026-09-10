@@ -39,6 +39,16 @@ def install_observers() -> None:
     mode = os.environ["MINISGL_R4_OBSERVE_MODE"]
     batch_state = []
 
+    def observe_attention(name, replacement):
+        original = getattr(attention, name)
+        setattr(attention, name, replacement)
+        # Backends use `from .base import ...`; preserve observation even when a
+        # backend was already imported before this worker's test setup.
+        for module_name in ("minisgl.attention.fi", "minisgl.attention.fa"):
+            module = sys.modules.get(module_name)
+            if module is not None and getattr(module, name, None) is original:
+                setattr(module, name, replacement)
+
     if os.environ.get("MINISGL_R4_REFERENCE_SHIM") == "1":
         import inspect
         import textwrap
@@ -78,11 +88,14 @@ def install_observers() -> None:
         started = time.perf_counter_ns()
         result = original_forward(self, batch, args)
         if mode == "exact":
-            for req in batch.reqs:
-                if req.occurrence_pages is not None:
-                    pages = req.occurrence_pages[req.occurrence_pages >= 0].to(torch.int64)
-                else:
-                    pages = self.page_table[req.table_idx, :req.cached_len].to(torch.int64)
+            offset = 0
+            for req, (_, start, end) in zip(batch.reqs, queries):
+                # Hash every newly written KV in logical query order, not the
+                # entire growing history on each decode token. Reposition writes
+                # are observed separately below; reused pages were checked at
+                # their original write in the same replay history.
+                pages = batch.out_loc[offset:offset + end - start].to(torch.int64)
+                offset += end - start
                 layer_hashes = []
                 for layer in range(self.kv_cache.num_layers):
                     layer_hashes.append([
@@ -92,6 +105,13 @@ def install_observers() -> None:
                 emit("kv", uid=req.uid, cached_len=req.cached_len, pages=len(pages),
                      layers=layer_hashes, true_positions=digest(req.true_positions),
                      raw_positions=digest(req.raw_positions))
+            if batch.occurrence_destination_pages is not None:
+                pages = batch.occurrence_destination_pages.to(torch.int64)
+                emit("reposition_kv", uids=[req.uid for req in batch.reqs],
+                     positions=digest(batch.occurrence_position_pairs), pages=len(pages),
+                     layers=[[digest(self.kv_cache.k_cache(layer).index_select(0, pages)),
+                              digest(self.kv_cache.v_cache(layer).index_select(0, pages))]
+                             for layer in range(self.kv_cache.num_layers)])
         emit("forward", queries=queries, size=batch.size, phase=batch.phase, graph=graph,
              host_ns=time.perf_counter_ns() - started,
              allocated_bytes=torch.cuda.memory_allocated(), reserved_bytes=torch.cuda.memory_reserved())
@@ -129,13 +149,24 @@ def install_observers() -> None:
             emit(_name, uids=[req.uid for req in reqs], host_ns=time.perf_counter_ns() - started,
                  segments=result.num_segments, keys=len(result.key_positions))
             if mode == "exact":
-                emit("csr", uids=[req.uid for req in reqs],
-                     query_sha256=digest(result.cu_seqlens_q),
-                     offsets_sha256=digest(result.cu_seqlens_k),
-                     keys_sha256=digest(result.key_positions))
+                segment_offset = occurrence_base = 0
+                for req in reqs:
+                    count = int((result.segment_table_indices == req.table_idx).sum())
+                    end = segment_offset + count
+                    first_key, last_key = (int(result.cu_seqlens_k[index])
+                                           for index in (segment_offset, end))
+                    emit("csr", uid=req.uid, planner=_name, sliding_window=kwargs.get("sliding_window"),
+                         cached_len=req.cached_len, device_len=req.device_len,
+                         query_sha256=digest(result.cu_seqlens_q[segment_offset:end + 1] -
+                                             result.cu_seqlens_q[segment_offset]),
+                         offsets_sha256=digest(result.cu_seqlens_k[segment_offset:end + 1] - first_key),
+                         keys_sha256=digest(result.key_positions[first_key:last_key] - occurrence_base))
+                    segment_offset = end
+                    if _name == "build_occurrence_attention_batch":
+                        occurrence_base += len(req.occurrence_raw_tokens)
             return result
 
-        setattr(attention, name, timed)
+        observe_attention(name, timed)
 
     original_allocate = CacheManager._allocate
 
@@ -148,6 +179,18 @@ def install_observers() -> None:
         return result
 
     CacheManager._allocate = allocate
+
+    original_pages = attention.compile_context_page_tables
+
+    @functools.wraps(original_pages)
+    def page_tables(*args, **kwargs):
+        started = time.perf_counter_ns()
+        result = original_pages(*args, **kwargs)
+        emit("page_tables", host_ns=time.perf_counter_ns() - started,
+             layout=kwargs.get("output_layout", "both"))
+        return result
+
+    observe_attention("compile_context_page_tables", page_tables)
     if mode != "pressure":
         return
 
@@ -163,8 +206,8 @@ def install_observers() -> None:
     original_commit = CacheManager.cache_req
 
     @functools.wraps(original_commit)
-    def commit(self, req, finished):
-        result = original_commit(self, req, finished)
+    def commit(self, req, *, finished):
+        result = original_commit(self, req, finished=finished)
         if finished:
             emit("completed_tree", uid=req.uid, repos=req.radix_current_reposition,
                  nodes=[[node.uuid, node.ref_count, node.page_length,
@@ -337,11 +380,20 @@ async def send(client, url, payload, label):
     try:
         response = await client.post(url, json=payload)
         record["status_code"] = response.status_code
-        record["response"] = response.json()
-        metrics = record["response"].get("server_metrics")
+        try:
+            record["response"] = response.json()
+        except ValueError:
+            record["response_text"] = response.text
+        metrics = record.get("response", {}).get("server_metrics")
         if metrics:
             record["ttft_ms"] = (metrics["first_token_generated_ns"] -
                                  metrics["request_received_ns"]) / 1e6
+            if metrics["generated_tokens"] > 1:
+                # End-to-end post-first-token cost, including terminal handling;
+                # this is deliberately not labelled CUDA decode-kernel time.
+                record["decode_e2e_ms_per_token"] = (
+                    metrics["request_finished_ns"] - metrics["first_token_generated_ns"]
+                ) / 1e6 / (metrics["generated_tokens"] - 1)
     except Exception as exc:
         record["error"] = f"{type(exc).__name__}: {exc}"
     record["elapsed_ms"] = (time.perf_counter_ns() - started) / 1e6
@@ -421,7 +473,7 @@ async def five(args) -> None:
                         if args.mode == "no_drop":
                             for key in ("drop_rule", "drop_message", "reposition"):
                                 payload.pop(key, None)
-                        payload.update(max_tokens=1, temperature=0, top_p=1, top_k=-1,
+                        payload.update(max_tokens=args.max_tokens, temperature=0, top_p=1, top_k=-1,
                                        seed=17, stream=False)
                         payload.pop("stream_options", None)
                         payloads.append(payload)
@@ -468,6 +520,7 @@ def main():
     five_parser = commands.add_parser("five")
     five_parser.add_argument("--input", type=Path, required=True)
     five_parser.add_argument("--mode", choices=["no_drop", "rolling_drop"], required=True)
+    five_parser.add_argument("--max-tokens", type=int, default=8)
     for command in (launch, stop, replay_parser, wave_parser, five_parser):
         command.add_argument("--output", type=Path, required=True)
     for command in (replay_parser, wave_parser, five_parser):
