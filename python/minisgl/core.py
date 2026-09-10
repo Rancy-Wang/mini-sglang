@@ -64,6 +64,32 @@ class SamplingParams:
         return (self.temperature <= 0.0 or self.top_k == 1) and self.top_p == 1.0
 
 
+def validate_occurrence_positions(req, model_limit: int, rope_limit: int) -> int:
+    """Check execution positions once at admission, independently of raw length."""
+    positions = req.occurrence_positions
+    terminal = req.occurrence_terminal_indices
+    keep = req.full_keep_mask
+    if positions is None or terminal is None or keep is None:
+        raise ValueError("Occurrence position validation requires a complete plan.")
+    if not positions.is_cpu or positions.ndim != 1 or len(positions) == 0:
+        raise ValueError("Occurrence positions must be a nonempty CPU vector.")
+    if len(terminal) != len(req.input_ids) or len(keep) != len(terminal):
+        raise ValueError("Occurrence terminal and active maps must cover raw input.")
+    if int(terminal.min()) < 0 or int(terminal.max()) >= len(positions):
+        raise ValueError("Occurrence terminal references are out of range.")
+    if int(positions.min()) < 0 or int(positions.max()) >= min(model_limit, rope_limit):
+        raise ValueError("An occurrence execution position exceeds the model/RoPE limit.")
+    active = keep.to(torch.bool)
+    active_count = int(torch.count_nonzero(active))
+    if active_count == 0:
+        raise ValueError("Occurrence prompt must retain an active token.")
+    active_positions = positions[terminal[active].to(torch.int64)]
+    next_position = req.radix_next_position
+    if next_position is None or next_position <= int(active_positions.max()):
+        raise ValueError("Next position does not cover active terminal positions.")
+    return active_count
+
+
 @dataclass(eq=False)
 class Req:
     input_ids: torch.Tensor  # cpu tensor
@@ -136,6 +162,7 @@ class Req:
     occurrence_repositioned_cached_mask: torch.Tensor | None = None
     occurrence_inflight: bool = False
     occurrence_abort_deferred: bool = False
+    occurrence_external_storage: bool = False
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu
@@ -383,7 +410,15 @@ class Req:
                 terminal_positions, self.radix_positions.to(torch.int32)
             ):
                 raise ValueError("Occurrence terminal positions disagree with Radix positions.")
-            if self.true_seq_len < int(torch.max(terminal_positions).item()) + 1:
+            active_terminal_positions = terminal_positions
+            if self.context_post_prefill_keep_mask is not None:
+                final_keep = self.context_post_prefill_keep_mask
+                if len(final_keep) != plan_token_count:
+                    raise ValueError("Occurrence final keep mask must cover the raw prompt.")
+                active_terminal_positions = terminal_positions[final_keep.to(torch.bool)]
+            if len(active_terminal_positions) == 0:
+                raise ValueError("Occurrence prompt must retain an active token.")
+            if self.true_seq_len < int(torch.max(active_terminal_positions).item()) + 1:
                 raise ValueError("true_seq_len does not cover terminal occurrence positions.")
             if self.occurrence_terminal_owned_mask is not None and (
                 not self.occurrence_terminal_owned_mask.is_cpu

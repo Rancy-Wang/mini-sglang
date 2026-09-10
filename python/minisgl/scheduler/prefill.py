@@ -23,6 +23,12 @@ logger = init_logger(__name__)
 _sparse_kernel_failure_logged = False
 
 
+class OccurrenceInputError(ValueError):
+    def __init__(self, uid: int, detail: str) -> None:
+        super().__init__(detail)
+        self.uid = uid
+
+
 @dataclass
 class RepositionCapacityError(RuntimeError):
     uid: int
@@ -120,6 +126,7 @@ class PrefillAllocation:
     occurrence_terminal_owned_mask: torch.Tensor | None = None
     occurrence_initial_source_positions: torch.Tensor | None = None
     occurrence_repositioned_cached_mask: torch.Tensor | None = None
+    occurrence_allocated_pages: torch.Tensor | None = None
 
 
 def _mask_free_context_reason_reference(
@@ -418,6 +425,7 @@ class PrefillAdder:
                     self.cache_manager.lock(cache_handle)
                     cache_locked = True
                     table_idx = self.table_manager.allocate()
+                    self.table_manager.prepare_occurrence(table_idx, plan_token_count)
                     source_pages = match.full_match_indices[:cached_len].clone()
                     matched_virtual = (
                         cache_handle.get_matched_virtual_mask()[: cache_handle.cached_len]
@@ -455,11 +463,11 @@ class PrefillAdder:
                     radix_cached_tokens = cache_handle.physical_cached_len
                     full_prefix_len, _ = self.cache_manager.matchable_prefix_lens(req)
                     cache_reuse_ratio = _calculate_cache_reuse_ratio(cached_len, full_prefix_len)
-                    table = self.table_manager.page_table[table_idx]
+                    table = self.table_manager.occurrence_pages(table_idx)
                     table[:plan_token_count].fill_(-1)
                     if cached_len > 0:
                         table[:cached_len].copy_(source_pages)
-                        self.table_manager.token_pool[table_idx, :cached_len].copy_(
+                        self.table_manager.occurrence_tokens(table_idx)[:cached_len].copy_(
                             req.input_ids[:cached_len].pin_memory(), non_blocking=True
                         )
                 except Exception:
@@ -586,8 +594,8 @@ class PrefillAdder:
             if bool(torch.any(borrowed).item()):
                 canonical_pages[borrowed_device] = source_pages[prior_raw_device[borrowed_device]]
             if bool(torch.any(prior_owned).item()):
-                canonical_pages[owner_device] = self.table_manager.page_table[
-                    table_idx, prior_raw_device[owner_device]
+                canonical_pages[owner_device] = self.table_manager.occurrence_pages(table_idx)[
+                    prior_raw_device[owner_device]
                 ]
         prior_new = required_positions[prior] != canonical_positions
         new_mask = torch.zeros(len(required_ids), dtype=torch.bool, device="cpu")
@@ -694,7 +702,7 @@ class PrefillAdder:
                 persistent_raw_device = persistent_raw.pin_memory().to(
                     self.cache_manager.device, non_blocking=True
                 )
-                self.table_manager.page_table[table_idx].index_copy_(
+                self.table_manager.occurrence_pages(table_idx).index_copy_(
                     0, persistent_raw_device, persistent_pages
                 )
                 terminal_owned[persistent_raw] = True
@@ -729,6 +737,7 @@ class PrefillAdder:
             occurrence_terminal_owned_mask=terminal_owned,
             occurrence_initial_source_positions=source_positions,
             occurrence_repositioned_cached_mask=repositioned_cached,
+            occurrence_allocated_pages=allocated_pages,
         )
 
     def _validate_occurrence_rope_positions(self, position_pairs: torch.Tensor) -> None:
@@ -1092,7 +1101,32 @@ class PrefillAdder:
             inactive_cached_pages=retry_inactive_pages,
         )
 
-    def _add_one_req(
+    def _add_one_req(self, **kwargs) -> Req:
+        """Transfer an allocation to Req, or roll it back before propagating failure."""
+        allocated = kwargs.pop("occurrence_allocated_pages", None)
+        pending = kwargs["pending_req"]
+        budget, reserved = self.token_budget, self.reserved_size
+        try:
+            return self._construct_req(**kwargs)
+        except Exception as exc:
+            self.token_budget, self.reserved_size = budget, reserved
+            if allocated is not None:
+                slot = kwargs["table_idx"]
+                table = self.table_manager.occurrence_pages(slot)
+                owned = kwargs["occurrence_terminal_owned_mask"]
+                # Error-only rollback. Never release borrowed source pages.
+                newly_owned = torch.isin(table[:len(owned)], allocated).cpu()
+                owned[newly_owned] = False
+                table[:len(owned)][newly_owned.to(table.device)] = -1
+                self.cache_manager.free_occurrence_pages(allocated)
+                if pending.chunked_req is None:
+                    self.cache_manager.unlock(kwargs["cache_handle"])
+                    self.table_manager.free(slot)
+                if isinstance(exc, ValueError):
+                    raise OccurrenceInputError(pending.uid, str(exc)) from exc
+            raise
+
+    def _construct_req(
         self,
         pending_req: PendingReq,
         cache_handle: BaseCacheHandle,
@@ -1139,9 +1173,10 @@ class PrefillAdder:
             self.reserved_size += remain_len + pending_req.output_len
         # NOTE: update the tokens ids only; new pages will be allocated in the scheduler
         _slice = slice(cached_len, cached_len + chunk_size)
-        device_ids = self.table_manager.token_pool[table_idx, _slice]
+        device_ids = self.table_manager.occurrence_tokens(table_idx)[_slice]
         device_ids.copy_(pending_req.input_ids[_slice].pin_memory(), non_blocking=True)
         return CLS(
+            occurrence_external_storage=self.table_manager.has_occurrence_storage(table_idx),
             input_ids=pending_req.input_ids[: cached_len + chunk_size],
             true_positions=pending_req.true_positions[: cached_len + chunk_size],
             raw_positions=pending_req.raw_positions[: cached_len + chunk_size],
@@ -1277,6 +1312,7 @@ class PrefillAdder:
                     context_usage_cached_positions=resource.context_usage_cached_positions,
                     chunk_size_override=resource.chunk_size,
                     occurrence_reserved_pages=resource.reserved_pages,
+                    occurrence_allocated_pages=resource.occurrence_allocated_pages,
                 )
             result = self._add_one_req(
                 pending_req=pending_req,
@@ -1321,6 +1357,7 @@ class PrefillAdder:
                 context_usage_cached_positions=resource.context_usage_cached_positions,
                 chunk_size_override=resource.chunk_size,
                 occurrence_reserved_pages=resource.reserved_pages,
+                occurrence_allocated_pages=resource.occurrence_allocated_pages,
             )
             return result
 
@@ -1432,7 +1469,7 @@ class PrefillManager:
                 .pin_memory()
                 .to(self.cache_manager.device, non_blocking=True)
             )
-            table = self.table_manager.page_table[chunk.table_idx]
+            table = self.table_manager.occurrence_pages(chunk.table_idx)
             self.cache_manager.free_occurrence_pages(table[raw_device].clone())
             table[raw_device] = -1
             owned[releasable] = False
@@ -1485,7 +1522,7 @@ class PrefillManager:
                     break
             try:
                 req = adder.try_add_one(pending_req, context_plan)
-            except RepositionCapacityError:
+            except (RepositionCapacityError, OccurrenceInputError):
                 if not reqs:
                     raise
                 break

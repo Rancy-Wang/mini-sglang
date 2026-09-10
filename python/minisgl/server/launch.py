@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import logging
 import multiprocessing as mp
+import os
 import queue
 import signal
 import socket
 import sys
+import threading
 import time
 from dataclasses import replace
 from typing import TYPE_CHECKING, Callable, Sequence
@@ -43,6 +45,29 @@ def _find_available_internal_port(*, exclude: set[int] | None = None) -> int:
 
 def _exited_workers(processes: Sequence[mp.Process]) -> list[mp.Process]:
     return [process for process in processes if process.exitcode is not None]
+
+
+def _start_worker_watchdog(
+    processes: Sequence[mp.Process], on_failure: Callable[[], None], *, poll_interval_s: float = 0.2
+) -> Callable[[], None]:
+    """Detect runtime worker loss; cancellation must precede normal worker shutdown."""
+    cancelled = threading.Event()
+
+    def watch() -> None:
+        while not cancelled.wait(poll_interval_s):
+            if _exited_workers(processes):
+                on_failure()
+                return
+
+    thread = threading.Thread(target=watch, name="minisgl-worker-watchdog", daemon=True)
+    thread.start()
+
+    def cancel() -> None:
+        cancelled.set()
+        if threading.current_thread() is not thread:
+            thread.join(timeout=1.0)
+
+    return cancel
 
 
 def _wait_for_worker_acks(
@@ -236,7 +261,24 @@ def launch_server(run_shell: bool = False) -> None:
 
             # Only the primary scheduler sends an acknowledgment after all TP ranks sync.
             _wait_for_worker_acks(processes, ack_queue, num_tokenizers + 2)
-            return stop
+            stopping = threading.Event()
+
+            def failed() -> None:
+                logger.error("Backend worker exited; stopping this server instance.")
+                # Uvicorn's second SIGINT forces shutdown of requests waiting on
+                # the dead backend. Never continue serving a poisoned CUDA context.
+                os.kill(os.getpid(), signal.SIGINT)
+                if not stopping.wait(1.0):
+                    os.kill(os.getpid(), signal.SIGINT)
+
+            cancel_watchdog = _start_worker_watchdog(processes, failed)
+
+            def stop_monitored() -> None:
+                stopping.set()
+                cancel_watchdog()
+                stop()
+
+            return stop_monitored
         except BaseException:
             stop()
             raise

@@ -4,7 +4,7 @@ import time
 from typing import TYPE_CHECKING, Dict, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
 
 import torch
-from minisgl.core import Batch, Req
+from minisgl.core import Batch, Req, validate_occurrence_positions
 from minisgl.engine.tool_grammar import ToolGrammarManager
 from minisgl.env import ENV
 from minisgl.kernel.context_page_table import preload_context_page_table_kernel
@@ -34,6 +34,7 @@ from .prefill import (
     ChunkedReq,
     PrefillManager,
     RepositionCapacityError,
+    OccurrenceInputError,
 )
 from .radix_symbol import RadixSymbolRegistry, inject_radix_symbols
 from .table import TableManager
@@ -368,7 +369,7 @@ class Scheduler(SchedulerIOMixin):
         if not bool(torch.any(keep).item()):
             raise RuntimeError("Cannot Drop every prompt token before generation.")
 
-        pages = self.table_manager.page_table[req.table_idx, :prompt_len].clone()
+        pages = self.table_manager.occurrence_pages(req.table_idx)[:prompt_len].clone()
         keep_device = keep.to(device=pages.device, non_blocking=True)
         active_slots = torch.arange(prompt_len, dtype=torch.int64, device="cpu")
         if req.occurrence_terminal_owned_mask is not None:
@@ -395,13 +396,18 @@ class Scheduler(SchedulerIOMixin):
                 req.inactive_cached_pages = torch.cat((req.inactive_cached_pages, dropped_pages))
 
         kept_count = int(torch.count_nonzero(keep).item())
+        if kept_count + 1 > self.table_manager.page_table.shape[1]:
+            raise RuntimeError("Active prompt and sampled token exceed the decode table.")
+        tokens = self.table_manager.occurrence_tokens(req.table_idx)
         self.table_manager.page_table[req.table_idx, :kept_count].copy_(pages[keep_device])
         self.table_manager.token_pool[req.table_idx, :kept_count].copy_(
-            self.table_manager.token_pool[req.table_idx, :prompt_len][keep_device]
+            tokens[:prompt_len][keep_device]
         )
         self.table_manager.token_pool[req.table_idx, kept_count].copy_(
-            self.table_manager.token_pool[req.table_idx, prompt_len]
+            tokens[prompt_len]
         )
+        self.table_manager.release_occurrence(req.table_idx)
+        req.occurrence_external_storage = False
 
         queued_true_position = req.true_positions[prompt_len:].clone()
         queued_raw_position = req.raw_positions[prompt_len:].clone()
@@ -531,6 +537,20 @@ class Scheduler(SchedulerIOMixin):
             else:
                 true_input_len = 0
             max_seq_len = self.engine.max_seq_len
+            active_input_len = true_input_len
+            if msg.reposition_execution_mode == "paged-occurrence":
+                max_seq_len = self.engine.model_max_seq_len
+                try:
+                    active_input_len = validate_occurrence_positions(
+                        msg, max_seq_len, len(self.prefill_manager.retry_rope_cache)
+                    )
+                except ValueError as exc:
+                    self.send_result([RequestRejectMsg(
+                        uid=msg.uid, status_code=400,
+                        error_code="invalid_occurrence_positions", detail=str(exc),
+                    )])
+                    self._close_context_sequence(msg.uid)
+                    return
             if true_input_len > max_seq_len:
                 detail = (
                     f"A Reposition materialization step needs sequence length {true_input_len}, "
@@ -550,6 +570,10 @@ class Scheduler(SchedulerIOMixin):
                 self._close_context_sequence(msg.uid)
                 return
             max_output_len = max_seq_len - true_input_len
+            if msg.reposition_execution_mode == "paged-occurrence":
+                max_output_len = min(
+                    max_output_len, self.engine.max_seq_len - active_input_len
+                )
             if max_output_len <= 0:
                 detail = (
                     f"Input true sequence length {true_input_len} exceeds the usable "
@@ -681,7 +705,7 @@ class Scheduler(SchedulerIOMixin):
                     .pin_memory()
                     .to(self.cache_manager.device, non_blocking=True)
                 )
-                pages = self.table_manager.page_table[req.table_idx, owned_device].clone()
+                pages = self.table_manager.occurrence_pages(req.table_idx)[owned_device].clone()
                 self.cache_manager.free_occurrence_pages(pages)
             self.cache_manager.unlock(req.cache_handle)
         finally:
@@ -752,7 +776,7 @@ class Scheduler(SchedulerIOMixin):
         # TODO: support other policies: e.g. DECODE first
         try:
             batch = self.prefill_manager.schedule_next_batch(self.prefill_budget)
-        except RepositionCapacityError as exc:
+        except (RepositionCapacityError, OccurrenceInputError) as exc:
             aborted = self.prefill_manager.abort_req(exc.uid)
             if isinstance(aborted, ChunkedReq):
                 # A request may discover an intrinsically impossible later
@@ -765,8 +789,9 @@ class Scheduler(SchedulerIOMixin):
                 [
                     RequestRejectMsg(
                         uid=exc.uid,
-                        status_code=413,
-                        error_code="reposition_working_set_exceeded",
+                        status_code=400 if isinstance(exc, OccurrenceInputError) else 413,
+                        error_code=("invalid_occurrence_request" if isinstance(exc, OccurrenceInputError)
+                                    else "reposition_working_set_exceeded"),
                         detail=str(exc),
                     )
                 ]
@@ -778,8 +803,18 @@ class Scheduler(SchedulerIOMixin):
     def _forward(self, forward_input: ForwardInput) -> ForwardOutput:
         batch, sample_args, input_mapping, output_mapping = forward_input
         batch.input_ids = self.token_pool[input_mapping]
+        if any(req.occurrence_external_storage for req in batch.reqs):
+            batch.input_ids = torch.cat([
+                self.table_manager.occurrence_tokens(req.table_idx)[req.cached_len:req.device_len]
+                for req in batch.padded_reqs
+            ])
         forward_output = self.engine.forward_batch(batch, sample_args)
         self.token_pool[output_mapping] = forward_output.next_tokens_gpu
+        for index, req in enumerate(batch.reqs):
+            if req.occurrence_external_storage and req.can_decode:
+                self.table_manager.occurrence_tokens(req.table_idx)[req.device_len].copy_(
+                    forward_output.next_tokens_gpu[index]
+                )
         self.decode_manager.filter_reqs(forward_input.batch.reqs)
         return forward_output
 
@@ -804,11 +839,15 @@ def _make_input_tuple(batch: Batch, device: torch.device) -> Indice2D:
     for req in batch.padded_reqs:
         length = req.extend_len
         mapping_host[offset : offset + length].fill_(req.table_idx)
-        torch.arange(
-            req.cached_len,
-            req.device_len,
-            out=offsets_host[offset : offset + length],
-        )
+        if req.occurrence_external_storage:
+            # This row is replaced from request-owned raw storage before forward.
+            offsets_host[offset : offset + length].zero_()
+        else:
+            torch.arange(
+                req.cached_len,
+                req.device_len,
+                out=offsets_host[offset : offset + length],
+            )
         offset += length
     return mapping_host.to(device, non_blocking=True), offsets_host.to(device, non_blocking=True)
 
@@ -816,6 +855,9 @@ def _make_input_tuple(batch: Batch, device: torch.device) -> Indice2D:
 def _make_write_tuple(batch: Batch, device: torch.device) -> Indice2D:
     mapping_list = [req.table_idx for req in batch.reqs]
     mapping_host = torch.tensor(mapping_list, dtype=torch.int64, pin_memory=True)
-    write_list = [(req.device_len if req.can_decode else -1) for req in batch.reqs]
+    write_list = [
+        (req.device_len if req.can_decode and not req.occurrence_external_storage else -1)
+        for req in batch.reqs
+    ]
     write_host = torch.tensor(write_list, dtype=torch.int64, pin_memory=True)
     return mapping_host.to(device, non_blocking=True), write_host.to(device, non_blocking=True)

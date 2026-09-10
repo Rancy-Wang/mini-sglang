@@ -268,6 +268,7 @@ def test_occurrence_sliding_plan_matches_direct_reference() -> None:
             dtype=torch.int32,
         )
         query_start = rng.randrange(key_length)
+        query_end = rng.randint(query_start + 1, key_length)
         window_left = rng.randint(0, 12)
         occurrence_base = rng.randint(0, 1000)
         result = try_build_occurrence_sliding_plan(
@@ -277,9 +278,9 @@ def test_occurrence_sliding_plan_matches_direct_reference() -> None:
             torch.tensor([key_length], dtype=torch.int32),
             torch.tensor([0, key_length], dtype=torch.int32),
             raw,
-            positions,
+            positions[:query_end],
             cached_len=query_start,
-            device_len=key_length,
+            device_len=query_end,
             initial_cached_len=query_start,
             sliding_window=window_left,
             occurrence_base=occurrence_base,
@@ -290,7 +291,7 @@ def test_occurrence_sliding_plan_matches_direct_reference() -> None:
         expected_offsets = [0]
         expected_keys = []
         expected_cached = set()
-        for query in range(query_start, key_length):
+        for query in range(query_start, query_end):
             threshold = int(positions[query]) - window_left
             row = [key for key in range(query + 1) if int(positions[key]) >= threshold]
             expected_keys.extend(occurrence_base + key for key in row)

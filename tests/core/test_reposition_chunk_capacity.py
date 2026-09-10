@@ -11,7 +11,9 @@ from minisgl.core import SamplingParams
 from minisgl.kernel.radix_reposition import RadixRepositionLayout
 from minisgl.message import AbortBackendMsg, RequestRejectMsg
 from minisgl.scheduler.cache import CacheManager
-from minisgl.scheduler.prefill import ChunkedReq, PrefillManager, RepositionCapacityError
+from minisgl.scheduler.prefill import (
+    ChunkedReq, OccurrenceInputError, PrefillAdder, PrefillManager, RepositionCapacityError,
+)
 from minisgl.scheduler.scheduler import Scheduler
 from minisgl.scheduler.table import TableManager
 from minisgl.scheduler.utils import PendingReq
@@ -154,8 +156,8 @@ def _pending(uid: int) -> PendingReq:
     )
 
 
-def _manager(num_pages: int, table_count: int = 2):
-    page_table = torch.full((table_count, 32), -1, dtype=torch.int32)
+def _manager(num_pages: int, table_count: int = 2, table_width: int = 32):
+    page_table = torch.full((table_count, table_width), -1, dtype=torch.int32)
     cache = CacheManager(num_pages, 1, page_table, "radix")
     table = TableManager(table_count, page_table)
     kv_cache = _RecordingKVCache()
@@ -189,9 +191,61 @@ def _free_occurrence_request(req, cache: CacheManager, table: TableManager) -> N
     assert owned is not None
     owned_indices = torch.nonzero(owned, as_tuple=False).view(-1)
     if len(owned_indices) > 0:
-        cache.free_occurrence_pages(table.page_table[req.table_idx, owned_indices].clone())
+        cache.free_occurrence_pages(table.occurrence_pages(req.table_idx)[owned_indices].clone())
     cache.unlock(req.cache_handle)
     table.free(req.table_idx)
+
+
+@pytest.mark.parametrize("budget", [2, 8])
+def test_overflow_raw_storage_compacts_to_fixed_decode_table(budget: int) -> None:
+    manager, cache, table, _ = _manager(32, table_count=1, table_width=8)
+    pending = _pending(201)
+    pending.context_post_prefill_keep_mask = pending.full_keep_mask
+    manager.pending_list.append(pending)
+    pointer = table.page_table.data_ptr()
+    while True:
+        batch = manager.schedule_next_batch(prefill_budget=budget)
+        assert batch is not None
+        req = batch.reqs[0]
+        assert req.occurrence_external_storage
+        build_occurrence_attention_batch([req])
+        if not isinstance(req, ChunkedReq):
+            break
+        _complete_intermediate_chunk(manager, req)
+    keep = pending.full_keep_mask.to(torch.bool)
+    pages = table.occurrence_pages(req.table_idx)[keep].clone()
+    table.occurrence_tokens(req.table_idx)[8] = 999
+    req.complete_one()
+    scheduler = object.__new__(Scheduler)
+    scheduler.table_manager = table
+    scheduler._compact_context_after_prefill(req)
+    assert table.page_table.data_ptr() == pointer
+    assert not table.has_occurrence_storage(req.table_idx)
+    assert not req.occurrence_external_storage
+    assert torch.equal(table.page_table[req.table_idx, :6], pages)
+    assert torch.equal(table.token_pool[req.table_idx, :6], pending.input_ids[keep])
+    assert table.token_pool[req.table_idx, 6] == 999
+    assert req.true_positions.tolist() == [0, 1, 2, 3, 4, 5, 6]
+    _free_occurrence_request(req, cache, table)
+    if req.inactive_cached_pages is not None:
+        cache.free_occurrence_pages(req.inactive_cached_pages)
+    assert cache.available_size == cache.num_pages
+
+
+def test_occurrence_construction_failure_rolls_back_allocated_pages(monkeypatch) -> None:
+    manager, cache, table, _ = _manager(32, table_count=1, table_width=8)
+    manager.pending_list.append(_pending(202))
+
+    def fail_construction(*args, **kwargs):
+        raise ValueError("synthetic request construction failure")
+
+    monkeypatch.setattr(PrefillAdder, "_construct_req", fail_construction)
+    with pytest.raises(OccurrenceInputError, match="synthetic request construction"):
+        manager.schedule_next_batch(prefill_budget=8)
+    assert cache.available_size == cache.num_pages
+    assert table.available_size == 1
+    assert not table.has_occurrence_storage(0)
+    assert cache.prefix_cache.size_info.protected_size == 0
 
 
 def test_paged_occurrence_chunks_until_the_full_prompt_is_covered() -> None:

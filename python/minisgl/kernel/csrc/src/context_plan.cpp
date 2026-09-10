@@ -366,11 +366,13 @@ auto count_occurrence_sliding_keys(
   result_status[0] = 0;
   int64_t local_query = 0;
   int64_t expected_query = cached_len;
+  const int64_t full_raw_length = ends[query_ends.size(0) - 1];
   for (int64_t segment = 0; segment < query_starts.size(0); ++segment) {
     const int64_t raw_start = starts[segment];
     const int64_t raw_end = ends[segment];
     host::RuntimeCheck(raw_start >= 0 && raw_start < raw_end &&
-                           raw_end <= true_positions.size(0),
+                           raw_end <= full_raw_length &&
+                           (segment == 0 ? raw_start == 0 : raw_start == ends[segment - 1]),
                        "Occurrence segment bounds are invalid");
     const int64_t key_begin = offsets[segment];
     const int64_t key_end = offsets[segment + 1];
@@ -382,7 +384,7 @@ auto count_occurrence_sliding_keys(
                              keys[cursor] < occurrence_positions.size(0),
                          "Occurrence segment references an invalid occurrence");
       host::RuntimeCheck(raw[keys[cursor]] >= 0 &&
-                             raw[keys[cursor]] < true_positions.size(0),
+                             raw[keys[cursor]] < full_raw_length,
                          "Occurrence segment references an invalid raw token");
       if (cursor > key_begin && positions[keys[cursor - 1]] >= positions[keys[cursor]]) {
         result_status[0] = 1;
