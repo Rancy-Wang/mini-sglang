@@ -245,7 +245,7 @@ def test_context_full_plan_matches_direct_reference() -> None:
         expected_query_lengths = []
         expected_offsets = [0]
         expected_keys = []
-        for start, end in zip(ordered, ordered[1:], strict=True):
+        for start, end in zip(ordered, ordered[1:]):
             prefix = [
                 key for key in range(start) if int(visible_until[kept_raw[key]]) > kept_raw[start]
             ]
