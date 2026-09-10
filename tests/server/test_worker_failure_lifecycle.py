@@ -171,6 +171,19 @@ def test_r4_records_plaintext_server_failure(r4_harness):
     assert "error" not in record  # Do not obscure a server error with a JSON parsing error.
 
 
+def test_r4_rolling_interface_counts_tool_responses_not_assistant_turns(r4_harness):
+    messages = [{"role": "system"}, {"role": "user"}]
+    tools = []
+    for _ in range(14):
+        messages.extend([{"role": "assistant"}, {"role": "tool"}])
+        tools.append(len(messages) - 1)
+    assert r4_harness.rolling_interface(messages[:tools[11] + 1]) == {}
+    assert r4_harness.rolling_interface(messages) == {
+        "drop_message": {str(tools[12]): [tools[0]], str(tools[13]): [tools[1]]},
+        "reposition": [tools[12], tools[13]],
+    }
+
+
 @pytest.mark.parametrize("url", ["https://127.0.0.1", "http://example.com", "http://192.0.2.1",
                                  "http://user:password@127.0.0.1"])
 def test_r4_rejects_non_loopback_destinations(r4_harness, url):

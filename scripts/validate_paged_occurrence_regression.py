@@ -303,6 +303,101 @@ def effective_interface(payload: dict, length: int) -> None:
             payload.pop("reposition")
 
 
+def rolling_interface(messages: list[dict]) -> dict:
+    """K=12 complete tool responses; event IDs are public zero-based message IDs."""
+    tools = [i for i, message in enumerate(messages) if message.get("role") == "tool"]
+    drops = {str(event): [tools[n - 12]] for n, event in enumerate(tools) if n >= 12}
+    return {"drop_message": drops, "reposition": list(map(int, drops))} if drops else {}
+
+
+def prepare(args) -> None:
+    """Read existing rollout usage once; tokenize only selected stress histories."""
+    from transformers import AutoTokenizer
+    from minisgl.benchmark.reposition_bcp import browsecomp_plus_tools, load_rollout_prompt_token_hints
+    from minisgl.core import SamplingParams
+    from minisgl.message import TokenizeMsg
+    from minisgl.tokenizer.tokenize import TokenizeManager
+
+    roots = sorted(args.source.glob(
+        "rolling_tool_drop_k12_kv_full_document_100q_t1_tp8ret_c4_shard[0-3]"))
+    assert len(roots) == 4
+    hints = load_rollout_prompt_token_hints([root / "rollouts.jsonl" for root in roots])
+    ranked = sorted(hints.items(), key=lambda item: (-item[1], item[0]))
+    stress_ids = [case for case, _ in ranked[:8]]
+    five_ids = ["781", "249", "806", "785", "827"]
+    selected = set(stress_ids + five_ids)
+    rows = {}
+    for root in roots:
+        with (root / "trajectories.jsonl").open() as stream:
+            for line in stream:
+                row = json.loads(line)
+                case = str(row["case_id"])
+                if case in selected:
+                    assert case not in rows, f"Duplicate case {case}"
+                    rows[case] = (row["trajectory"], str(root / "trajectories.jsonl"))
+    assert set(rows) == selected
+    args.output.mkdir(parents=True, exist_ok=False)
+    for case in five_ids:
+        trajectory, provenance = rows[case]
+        ends = [i for i, message in enumerate(trajectory) if message.get("role") == "assistant"][:20]
+        assert len(ends) == 20
+        target = args.output / "five" / f"case-{case}"
+        target.mkdir(parents=True)
+        for turn, end in enumerate(ends, 1):
+            messages = trajectory[:end]
+            payload = {"model": args.model, "messages": messages, "tools": browsecomp_plus_tools(),
+                       **rolling_interface(messages)}
+            with gzip.open(target / f"turn-{turn:03d}.request.json.gz", "xt") as stream:
+                json.dump(payload, stream, ensure_ascii=False)
+        print(json.dumps({"case": case, "turns": len(ends), "provenance": provenance}), flush=True)
+    manager = TokenizeManager(AutoTokenizer.from_pretrained(args.model, local_files_only=True),
+                              radix_drop_key_mode="delta-marker")
+    report = {"ranking_from_existing_rollout_usage": ranked, "selected": [],
+              "five_ids": five_ids, "five_policy": "K12 drop and reposition at each new tool response",
+              "stress_policy": "K12 drop; reposition after >=8192 new raw tokens at next tool end"}
+    target = args.output / "stress"
+    target.mkdir()
+    for case in stress_ids:
+        trajectory, provenance = rows[case]
+        end = max(i for i, message in enumerate(trajectory) if message.get("role") == "assistant")
+        messages = trajectory[:end]
+        payload = {"model": args.model, "messages": messages, "tools": browsecomp_plus_tools(),
+                   "max_tokens": 1, "ignore_eos": True, "temperature": 0, "stream": False,
+                   **rolling_interface(messages)}
+        payload.pop("reposition", None)
+
+        def tokenize():
+            return manager.tokenize([TokenizeMsg(
+                uid=1, text=messages, sampling_params=SamplingParams(max_tokens=1),
+                target_msg_id=len(messages), drop_message=payload.get("drop_message"),
+                reposition=payload.get("reposition"), tools=payload["tools"],
+                use_context_mask=True)])[0]
+
+        tokenize()  # Initialize production Harmony renderer state.
+        _, owners, _ = manager._render_harmony_message_drop(
+            messages, enable_thinking=None, tools=payload["tools"])
+        ranges = manager._build_owner_position_ranges(owners)
+        previous, repos, boundaries = 0, [], []
+        for message_id, message in enumerate(messages):
+            if message.get("role") != "tool":
+                continue
+            boundary = max(end for _, end in ranges[message_id])
+            if boundary - previous >= 8192:
+                repos.append(message_id)
+                boundaries.append(boundary)
+                previous = boundary
+        payload["reposition"] = repos
+        result = tokenize()
+        item = {"case_id": case, "historical_prompt_token_hint": hints[case],
+                "raw_tokens": result.prompt_tokens, "active_tokens": len(result.input_ids),
+                "next_position": result.radix_next_position, "provenance": provenance,
+                "reposition_message_ids": repos, "reposition_raw_insert_offsets": boundaries}
+        report["selected"].append(item)
+        (target / f"case_{case}.json").write_text(json.dumps(payload, ensure_ascii=False))
+        print(json.dumps(item), flush=True)
+    (target / "preflight.json").write_text(json.dumps(report, indent=2))
+
+
 def start_server(args) -> None:
     gpus = [int(value) for value in args.gpus.split(",")]
     memory = subprocess.check_output([
@@ -526,7 +621,10 @@ def main():
     five_parser.add_argument("--input", type=Path, required=True)
     five_parser.add_argument("--mode", choices=["no_drop", "rolling_drop"], required=True)
     five_parser.add_argument("--max-tokens", type=int, default=8)
-    for command in (launch, stop, replay_parser, wave_parser, five_parser):
+    prepare_parser = commands.add_parser("prepare")
+    prepare_parser.add_argument("--source", type=Path, required=True)
+    prepare_parser.add_argument("--model", required=True)
+    for command in (launch, stop, replay_parser, wave_parser, five_parser, prepare_parser):
         command.add_argument("--output", type=Path, required=True)
     for command in (replay_parser, wave_parser, five_parser):
         command.add_argument("--url", type=loopback_url, required=True)
@@ -540,6 +638,8 @@ def main():
         asyncio.run(replay(args))
     elif args.command == "wave":
         asyncio.run(wave(args))
+    elif args.command == "prepare":
+        prepare(args)
     else:
         asyncio.run(five(args))
 
