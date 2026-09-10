@@ -23,10 +23,14 @@ def _is_cpu_int32_vector(tensor: torch.Tensor) -> bool:
     )
 
 
-def _checked_int32_offsets(key_lengths: torch.Tensor) -> torch.Tensor:
+def _checked_int32_offsets(
+    key_lengths: torch.Tensor,
+    *,
+    description: str = "Sliding attention keys",
+) -> torch.Tensor:
     total_keys = int(key_lengths.sum(dtype=torch.int64).item())
     if total_keys > torch.iinfo(torch.int32).max:
-        raise RuntimeError("Sliding attention keys exceed int32 CSR capacity.")
+        raise RuntimeError(f"{description} exceed int32 CSR capacity.")
     key_offsets = torch.empty(len(key_lengths) + 1, dtype=torch.int32, device="cpu")
     key_offsets[0] = 0
     torch.cumsum(key_lengths, dim=0, out=key_offsets[1:])
@@ -51,6 +55,60 @@ def _load_context_plan_module() -> Module:
 
 def preload_context_plan_kernel() -> None:
     _load_context_plan_module()
+
+
+def try_build_context_full_plan(
+    full_token_visible_until: torch.Tensor,
+    raw_positions: torch.Tensor,
+    *,
+    query_start: int,
+    query_length: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    """Build one request's full-attention Context CSR with two AOT passes."""
+
+    try:
+        module = _load_context_plan_module()
+    except Exception:
+        return None
+
+    if not all(
+        _is_cpu_int32_vector(tensor) for tensor in (full_token_visible_until, raw_positions)
+    ):
+        return None
+
+    query_count = int(query_length)
+    query_lengths_capacity = torch.empty(query_count, dtype=torch.int32, device="cpu")
+    key_lengths_capacity = torch.empty(query_count, dtype=torch.int32, device="cpu")
+    status = torch.zeros(1, dtype=torch.int64, device="cpu")
+    module.count_context_full_keys(
+        full_token_visible_until,
+        raw_positions,
+        int(query_start),
+        query_count,
+        query_lengths_capacity,
+        key_lengths_capacity,
+        status,
+    )
+    segment_count = int(status[0].item())
+    if segment_count < 1 or segment_count > query_count:
+        raise RuntimeError("The Context full-attention planner returned an invalid segment count.")
+    query_lengths = query_lengths_capacity[:segment_count]
+    key_lengths = key_lengths_capacity[:segment_count]
+    key_offsets = _checked_int32_offsets(
+        key_lengths,
+        description="Full attention keys",
+    )
+    key_positions = torch.empty(int(key_offsets[-1].item()), dtype=torch.int32, device="cpu")
+    module.fill_context_full_keys(
+        full_token_visible_until,
+        raw_positions,
+        int(query_start),
+        query_count,
+        query_lengths,
+        key_offsets,
+        key_positions,
+    )
+    return query_lengths, key_offsets, key_positions
 
 
 def try_build_context_sliding_plan(

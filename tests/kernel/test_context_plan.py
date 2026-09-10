@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import itertools
 import random
+from bisect import bisect_left
 
 import pytest
 import torch
@@ -11,6 +12,7 @@ pytest.importorskip("tvm_ffi")
 from minisgl.core import SamplingParams
 from minisgl.kernel.context_plan import (
     first_mask_free_conflict_event,
+    try_build_context_full_plan,
     try_build_context_sliding_plan,
     try_build_occurrence_sliding_plan,
 )
@@ -203,6 +205,55 @@ def test_context_sliding_plan_matches_direct_reference() -> None:
             row.append(query)
             expected_keys.extend(row)
             expected_offsets.append(len(expected_keys))
+        assert offsets.tolist() == expected_offsets
+        assert keys.tolist() == expected_keys
+
+
+def test_context_full_plan_matches_direct_reference() -> None:
+    rng = random.Random(20260912)
+    never = torch.iinfo(torch.int32).max
+    for _ in range(100):
+        full_token_count = rng.randint(8, 128)
+        kept_raw = [raw_position for raw_position in range(full_token_count) if rng.random() >= 0.2]
+        if len(kept_raw) < 2:
+            kept_raw = [0, full_token_count - 1]
+        raw = torch.tensor(kept_raw, dtype=torch.int32)
+        key_length = len(raw)
+        visible_until = torch.full((full_token_count,), never, dtype=torch.int32)
+        for raw_position in range(full_token_count - 1):
+            if rng.random() < 0.2:
+                visible_until[raw_position] = rng.randint(raw_position + 1, full_token_count)
+        query_start = rng.randrange(key_length)
+        query_count = key_length - query_start
+
+        result = try_build_context_full_plan(
+            visible_until,
+            raw,
+            query_start=query_start,
+            query_length=query_count,
+        )
+
+        assert result is not None
+        query_lengths, offsets, keys = result
+        boundaries = {query_start, key_length}
+        query_raw = kept_raw[query_start:key_length]
+        for expiry in {int(visible_until[position]) for position in kept_raw[:key_length]}:
+            local_boundary = bisect_left(query_raw, expiry)
+            if 0 < local_boundary < query_count:
+                boundaries.add(query_start + local_boundary)
+        ordered = sorted(boundaries)
+        expected_query_lengths = []
+        expected_offsets = [0]
+        expected_keys = []
+        for start, end in zip(ordered, ordered[1:], strict=True):
+            prefix = [
+                key for key in range(start) if int(visible_until[kept_raw[key]]) > kept_raw[start]
+            ]
+            row = prefix + list(range(start, end))
+            expected_query_lengths.append(end - start)
+            expected_keys.extend(row)
+            expected_offsets.append(len(expected_keys))
+        assert query_lengths.tolist() == expected_query_lengths
         assert offsets.tolist() == expected_offsets
         assert keys.tolist() == expected_keys
 

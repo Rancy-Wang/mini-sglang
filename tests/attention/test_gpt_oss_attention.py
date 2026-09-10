@@ -282,6 +282,21 @@ def test_context_sliding_aot_batch_matches_python_reference(monkeypatch):
     _assert_context_batches_equal(actual, expected)
 
 
+def test_context_full_aot_batch_matches_python_reference(monkeypatch):
+    requests = _context_batch_requests()
+    with monkeypatch.context() as fallback:
+        fallback.setattr(
+            attention_base,
+            "try_build_context_full_plan",
+            lambda *args, **kwargs: None,
+        )
+        expected = attention_base.build_context_attention_batch(requests)
+
+    actual = attention_base.build_context_attention_batch(requests)
+
+    _assert_context_batches_equal(actual, expected)
+
+
 def test_multi_request_context_batch_preserves_flattened_q_and_table_ownership():
     requests = _context_batch_requests()
     context_batch = build_context_attention_batch(requests)
@@ -325,7 +340,7 @@ def test_multi_request_context_batch_preserves_flattened_q_and_table_ownership()
         assert torch.equal(reconstructed[req.table_idx], expected_mask)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA Triton")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_context_page_table_gpu_kernel_matches_cpu_reference():
     context_batch = build_context_attention_batch(
         _context_batch_requests(), sliding_window=2

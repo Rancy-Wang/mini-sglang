@@ -180,6 +180,14 @@ def test_compiled_page_tables_preserve_segment_ownership_and_padding() -> None:
         [200, 201, 202, 203],
     ]
 
+    flat_only = compile_context_page_tables(page_table, metadata, output_layout="flat")
+    assert flat_only.padded_page_table is None
+    assert torch.equal(flat_only.flat_indices, compiled.flat_indices)
+
+    padded_only = compile_context_page_tables(page_table, metadata, output_layout="padded")
+    assert padded_only.flat_indices is None
+    assert torch.equal(padded_only.padded_page_table, compiled.padded_page_table)
+
 
 @pytest.mark.parametrize(
     ("positions", "device_len", "message"),

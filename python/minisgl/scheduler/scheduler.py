@@ -7,6 +7,7 @@ import torch
 from minisgl.core import Batch, Req
 from minisgl.engine.tool_grammar import ToolGrammarManager
 from minisgl.env import ENV
+from minisgl.kernel.context_page_table import preload_context_page_table_kernel
 from minisgl.kernel.context_plan import preload_context_plan_kernel
 from minisgl.layers import get_rope
 from minisgl.message import (
@@ -137,15 +138,20 @@ class Scheduler(SchedulerIOMixin):
             if config.page_size != 1:
                 raise ValueError("Context-mask Prefill currently requires --page-size 1.")
             self.engine.attn_backend.validate_context_mask_prefill(self.device)
-            if config.mask_free_context_prefill:
-                try:
-                    preload_context_plan_kernel()
-                except Exception:
-                    logger.warning(
-                        "Could not preload the sparse Context planner kernel; "
-                        "the O(N) reference remains available.",
-                        exc_info=True,
-                    )
+            try:
+                preload_context_plan_kernel()
+            except Exception:
+                logger.warning(
+                    "Could not preload the Context planner kernel; "
+                    "the Python reference remains available.",
+                    exc_info=True,
+                )
+            try:
+                preload_context_page_table_kernel()
+            except Exception as exc:
+                raise RuntimeError(
+                    "Could not preload the CUDA Context page-table compiler."
+                ) from exc
 
         # some alias for easy access
         self.finished_reqs: Set[Req] = set()

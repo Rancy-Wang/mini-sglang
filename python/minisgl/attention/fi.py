@@ -390,7 +390,13 @@ class FlashInferBackend(BaseAttnBackend):
         sliding_context_segments = None
 
         def _compile_fi_segments(context_batch, *, is_decode: bool):
-            compiled = compile_context_page_tables(page_table, context_batch)
+            compiled = compile_context_page_tables(
+                page_table,
+                context_batch,
+                output_layout="flat",
+            )
+            if compiled.flat_indices is None:
+                raise RuntimeError("FlashInfer Context compilation did not produce flat indices.")
             context_cu_q_cpu = context_batch.cu_seqlens_q.pin_memory()
             context_cu_k_cpu = context_batch.cu_seqlens_k.pin_memory()
             context_seq_lens_cpu = (

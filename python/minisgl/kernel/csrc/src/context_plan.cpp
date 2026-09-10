@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <limits>
+#include <vector>
 
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
@@ -29,6 +30,147 @@ auto is_cpu_bool_vector(const tvm::ffi::TensorView tensor) -> bool {
   return tensor.ndim() == 1 && tensor.is_contiguous() &&
          tensor.device().device_type == kDLCPU &&
          tensor.dtype().code == kDLBool && tensor.dtype().bits == 8;
+}
+
+auto validate_context_full_inputs(
+    const tvm::ffi::TensorView visible_until,
+    const tvm::ffi::TensorView raw_positions, int64_t query_start,
+    int64_t query_count) -> void {
+  host::RuntimeCheck(is_cpu_int32_vector(visible_until) &&
+                         is_cpu_int32_vector(raw_positions),
+                     "Context full-attention inputs must be contiguous CPU int32 vectors");
+  host::RuntimeCheck(query_start >= 0 && query_count > 0 &&
+                         query_start + query_count <= raw_positions.size(0),
+                     "Context full-attention query bounds are invalid");
+
+  const auto *raw = static_cast<const int32_t *>(raw_positions.data_ptr());
+  const auto *expiry = static_cast<const int32_t *>(visible_until.data_ptr());
+  for (int64_t i = 0; i < raw_positions.size(0); ++i) {
+    host::RuntimeCheck(raw[i] >= 0 && raw[i] < visible_until.size(0),
+                       "Context raw position is outside visibility metadata");
+    host::RuntimeCheck(expiry[raw[i]] > raw[i],
+                       "A Context token expires before it is computed");
+    if (i > 0) {
+      host::RuntimeCheck(raw[i - 1] < raw[i],
+                         "Context raw positions must be strictly increasing");
+    }
+  }
+}
+
+auto count_context_full_keys(
+    const tvm::ffi::TensorView visible_until,
+    const tvm::ffi::TensorView raw_positions, int64_t query_start,
+    int64_t query_count, const tvm::ffi::TensorView query_lengths,
+    const tvm::ffi::TensorView key_lengths,
+    const tvm::ffi::TensorView status) -> void {
+  validate_context_full_inputs(visible_until, raw_positions, query_start,
+                               query_count);
+  host::RuntimeCheck(is_cpu_int32_vector(query_lengths) &&
+                         query_lengths.size(0) == query_count &&
+                         is_cpu_int32_vector(key_lengths) &&
+                         key_lengths.size(0) == query_count &&
+                         is_cpu_int64_vector(status) && status.size(0) >= 1,
+                     "Context full-attention count outputs have invalid layouts");
+
+  const auto *raw = static_cast<const int32_t *>(raw_positions.data_ptr());
+  const auto *expiry = static_cast<const int32_t *>(visible_until.data_ptr());
+  auto *q_lengths = static_cast<int32_t *>(query_lengths.data_ptr());
+  auto *k_lengths = static_cast<int32_t *>(key_lengths.data_ptr());
+  auto *result_status = static_cast<int64_t *>(status.data_ptr());
+  std::fill(q_lengths, q_lengths + query_count, 0);
+  std::fill(k_lengths, k_lengths + query_count, 0);
+
+  // An expiry starts a new segment at the first query whose immutable raw
+  // position reaches it. A byte marker avoids Python sets and repeated tensor
+  // scalar extraction while preserving the reference's sorted boundaries.
+  std::vector<uint8_t> boundaries(query_count + 1, 0);
+  boundaries[0] = 1;
+  boundaries[query_count] = 1;
+  const int64_t query_end = query_start + query_count;
+  const auto *query_begin = raw + query_start;
+  const auto *query_limit = raw + query_end;
+  for (int64_t key = 0; key < query_end; ++key) {
+    const auto *boundary =
+        std::lower_bound(query_begin, query_limit, expiry[raw[key]]);
+    const int64_t local_boundary = boundary - query_begin;
+    if (local_boundary > 0 && local_boundary < query_count) {
+      boundaries[local_boundary] = 1;
+    }
+  }
+
+  int64_t segment_count = 0;
+  int64_t local_start = 0;
+  for (int64_t local_end = 1; local_end <= query_count; ++local_end) {
+    if (!boundaries[local_end]) continue;
+    const int64_t compact_start = query_start + local_start;
+    const int64_t compact_end = query_start + local_end;
+    int64_t prefix_count = 0;
+    for (int64_t key = 0; key < compact_start; ++key) {
+      if (expiry[raw[key]] > raw[compact_start]) ++prefix_count;
+    }
+    const int64_t key_count = prefix_count + compact_end - compact_start;
+    host::RuntimeCheck(key_count <= std::numeric_limits<int32_t>::max(),
+                       "Context full-attention segment exceeds int32 capacity");
+    q_lengths[segment_count] =
+        static_cast<int32_t>(compact_end - compact_start);
+    k_lengths[segment_count] = static_cast<int32_t>(key_count);
+    ++segment_count;
+    local_start = local_end;
+  }
+  host::RuntimeCheck(local_start == query_count && segment_count > 0,
+                     "Context full-attention boundaries do not cover all queries");
+  result_status[0] = segment_count;
+}
+
+auto fill_context_full_keys(
+    const tvm::ffi::TensorView visible_until,
+    const tvm::ffi::TensorView raw_positions, int64_t query_start,
+    int64_t query_count, const tvm::ffi::TensorView query_lengths,
+    const tvm::ffi::TensorView key_offsets,
+    const tvm::ffi::TensorView key_positions) -> void {
+  validate_context_full_inputs(visible_until, raw_positions, query_start,
+                               query_count);
+  host::RuntimeCheck(is_cpu_int32_vector(query_lengths) &&
+                         query_lengths.size(0) > 0 &&
+                         is_cpu_int32_vector(key_offsets) &&
+                         key_offsets.size(0) == query_lengths.size(0) + 1 &&
+                         is_cpu_int32_vector(key_positions),
+                     "Context full-attention fill outputs have invalid layouts");
+
+  const auto *raw = static_cast<const int32_t *>(raw_positions.data_ptr());
+  const auto *expiry = static_cast<const int32_t *>(visible_until.data_ptr());
+  const auto *q_lengths =
+      static_cast<const int32_t *>(query_lengths.data_ptr());
+  const auto *offsets = static_cast<const int32_t *>(key_offsets.data_ptr());
+  auto *output = static_cast<int32_t *>(key_positions.data_ptr());
+  const int64_t segment_count = query_lengths.size(0);
+  host::RuntimeCheck(offsets[0] == 0 &&
+                         offsets[segment_count] == key_positions.size(0),
+                     "Context full-attention offsets do not cover output keys");
+
+  int64_t local_start = 0;
+  for (int64_t segment = 0; segment < segment_count; ++segment) {
+    const int64_t query_length = q_lengths[segment];
+    host::RuntimeCheck(query_length > 0 &&
+                           local_start + query_length <= query_count,
+                       "Context full-attention query lengths are invalid");
+    const int64_t compact_start = query_start + local_start;
+    const int64_t compact_end = compact_start + query_length;
+    int64_t cursor = offsets[segment];
+    for (int64_t key = 0; key < compact_start; ++key) {
+      if (expiry[raw[key]] > raw[compact_start]) {
+        output[cursor++] = static_cast<int32_t>(key);
+      }
+    }
+    for (int64_t query = compact_start; query < compact_end; ++query) {
+      output[cursor++] = static_cast<int32_t>(query);
+    }
+    host::RuntimeCheck(cursor == offsets[segment + 1],
+                       "Context full-attention count/fill passes disagree");
+    local_start += query_length;
+  }
+  host::RuntimeCheck(local_start == query_count,
+                     "Context full-attention fill did not cover all queries");
 }
 
 auto validate_context_sliding_inputs(
@@ -434,6 +576,10 @@ auto first_mask_free_conflict_event(
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(first_mask_free_conflict_event,
                               first_mask_free_conflict_event);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(count_context_full_keys,
+                              count_context_full_keys);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(fill_context_full_keys,
+                              fill_context_full_keys);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(count_context_sliding_keys,
                               count_context_sliding_keys);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fill_context_sliding_keys,
