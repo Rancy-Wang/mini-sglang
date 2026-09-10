@@ -2,6 +2,9 @@ import threading
 import asyncio
 import importlib.util
 import json
+import subprocess
+import sys
+import textwrap
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -9,6 +12,53 @@ import pytest
 import torch
 
 from minisgl.server.launch import _start_worker_watchdog
+
+
+def test_backend_failure_interrupt_cancels_real_pending_http_and_unwinds():
+    # Real Uvicorn/asyncio teardown, not a mocked SIGINT handler. The HTTP task
+    # deliberately never responds, as when its scheduler has actually exited.
+    code = textwrap.dedent('''
+        import asyncio, socket, threading, time
+        import uvicorn
+        from minisgl.server.launch import _backend_failure_interrupt
+
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+        listener.listen()
+        worker = type("Worker", (), {"exitcode": None})()
+
+        async def app(scope, receive, send):
+            assert scope["type"] == "http"
+            print("REQUEST_PENDING", flush=True)
+            worker.exitcode = 1
+            try:
+                await asyncio.Event().wait()
+            finally:
+                print("REQUEST_CANCELLED", flush=True)
+
+        def client():
+            with socket.create_connection(("127.0.0.1", port), timeout=10) as conn:
+                conn.sendall(b"GET / HTTP/1.1\\r\\nHost: 127.0.0.1\\r\\n\\r\\n")
+                conn.recv(1024)
+
+        from minisgl.server.launch import _start_worker_watchdog
+        with _backend_failure_interrupt() as notify:
+            cancel = _start_worker_watchdog([worker], notify, poll_interval_s=.01)
+            try:
+                threading.Thread(target=client, daemon=True).start()
+                config = uvicorn.Config(app, lifespan="off", log_level="error")
+                uvicorn.Server(config).run(sockets=[listener])
+            finally:
+                cancel()
+                listener.close()
+                print("BACKEND_CLEANUP_REACHED", flush=True)
+    ''')
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=25)
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "REQUEST_PENDING" in result.stdout
+    assert "REQUEST_CANCELLED" in result.stdout
+    assert "BACKEND_CLEANUP_REACHED" in result.stdout
 
 
 def test_runtime_worker_loss_notifies_once():
@@ -47,6 +97,23 @@ def r4_harness(monkeypatch):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def test_r4_idle_controls_are_broadcast_not_read_independently(r4_harness, monkeypatch, tmp_path):
+    import torch.distributed as dist
+
+    group = object()
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "get_rank", lambda g: 1 if g is group else -1)
+    (tmp_path / "pressure.request").touch()
+    (tmp_path / "reset-late.request").touch()
+
+    def broadcast(command, *, src, group):
+        assert src == 0 and command == [None]
+        command[0] = {"resets": [], "pressure": False}
+
+    monkeypatch.setattr(dist, "broadcast_object_list", broadcast)
+    assert r4_harness.idle_control(tmp_path, group) == {"resets": [], "pressure": False}
 
 
 @pytest.mark.parametrize("mode", ["timing", "exact", "pressure"])

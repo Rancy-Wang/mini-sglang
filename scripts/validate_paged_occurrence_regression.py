@@ -48,6 +48,26 @@ def request_segment_ranges(cumulative_queries, query_lengths):
         raise ValueError("Query segments contain an unassigned request suffix.")
 
 
+def idle_control(root, group=None):
+    """All TP ranks must mutate test caches at the same idle boundary.
+
+    A file can appear between two ranks' idle callbacks. Independent reads can
+    otherwise reset one rank before a wakeup inference and another after it.
+    """
+    import torch.distributed as dist
+
+    distributed = dist.is_initialized()
+    command = [None]
+    if not distributed or dist.get_rank(group) == 0:
+        command[0] = {
+            "resets": [p.name for p in sorted(root.glob("reset-*.request"))],
+            "pressure": (root / "pressure.request").exists(),
+        }
+    if distributed:
+        dist.broadcast_object_list(command, src=0, group=group)
+    return command[0]
+
+
 def install_observers() -> None:
     """Test-only observers installed in each spawned worker, never in production imports."""
     import torch
@@ -228,11 +248,14 @@ def install_observers() -> None:
         setattr(scheduler_module, name, mapping)
     original_reset_idle = Scheduler.run_when_idle
     reset_seen = set()
+    control_state = {}
 
     @functools.wraps(original_reset_idle)
     def reset_idle(self):
         original_reset_idle(self)
-        for marker in sorted(root.glob("reset-*.request")):
+        control_state.update(idle_control(root, getattr(self, "tp_cpu_group", None)))
+        for name in control_state["resets"]:
+            marker = root / name
             if marker.name in reset_seen:
                 continue
             cache = self.cache_manager
@@ -282,7 +305,7 @@ def install_observers() -> None:
     def idle(self):
         nonlocal pressure_done
         original_idle(self)
-        if pressure_done or not (root / "pressure.request").exists():
+        if pressure_done or not control_state["pressure"]:
             return
         pressure_done = True
         cache = self.cache_manager

@@ -9,6 +9,7 @@ import socket
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import replace
 from typing import TYPE_CHECKING, Callable, Sequence
 
@@ -20,6 +21,28 @@ if TYPE_CHECKING:
 
 
 logger = init_logger(__name__, "initializer")
+
+
+@contextmanager
+def _backend_failure_interrupt():
+    """Unwind the API even when a dead backend leaves an HTTP request pending.
+
+    Uvicorn owns SIGINT/SIGTERM and may wait indefinitely for open transports
+    even after its second SIGINT. A separate, scoped signal interrupts its event
+    loop instead: asyncio cancels requests, then run_api_server's finally closes
+    frontend resources and stops this instance's remaining worker processes.
+    This is only for actual worker exit, never a request timeout or normal stop.
+    """
+    previous = signal.getsignal(signal.SIGUSR1)
+
+    def interrupt(_signum, _frame):
+        raise SystemExit(1)
+
+    signal.signal(signal.SIGUSR1, interrupt)
+    try:
+        yield lambda: os.kill(os.getpid(), signal.SIGUSR1)
+    finally:
+        signal.signal(signal.SIGUSR1, previous)
 
 
 def _check_public_port(host: str, port: int) -> None:
@@ -261,20 +284,13 @@ def launch_server(run_shell: bool = False) -> None:
 
             # Only the primary scheduler sends an acknowledgment after all TP ranks sync.
             _wait_for_worker_acks(processes, ack_queue, num_tokenizers + 2)
-            stopping = threading.Event()
-
             def failed() -> None:
                 logger.error("Backend worker exited; stopping this server instance.")
-                # Uvicorn's second SIGINT forces shutdown of requests waiting on
-                # the dead backend. Never continue serving a poisoned CUDA context.
-                os.kill(os.getpid(), signal.SIGINT)
-                if not stopping.wait(1.0):
-                    os.kill(os.getpid(), signal.SIGINT)
+                interrupt_backend_failure()
 
             cancel_watchdog = _start_worker_watchdog(processes, failed)
 
             def stop_monitored() -> None:
-                stopping.set()
                 cancel_watchdog()
                 stop()
 
@@ -290,7 +306,8 @@ def launch_server(run_shell: bool = False) -> None:
 
     signal.signal(signal.SIGTERM, interrupt_startup)
     try:
-        run_api_server(server_args, start_subprocess, run_shell=run_shell)
+        with _backend_failure_interrupt() as interrupt_backend_failure:
+            run_api_server(server_args, start_subprocess, run_shell=run_shell)
     finally:
         signal.signal(signal.SIGTERM, previous_sigterm)
 
