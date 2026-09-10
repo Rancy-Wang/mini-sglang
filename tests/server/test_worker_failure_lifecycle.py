@@ -87,6 +87,7 @@ def test_r4_observers_preserve_forward_and_keyword_only_commit(
     monkeypatch.setattr(CacheManager, "cache_req", commit)
     monkeypatch.setattr(Sampler, "sample", lambda self, logits, args: logits.argmax(-1))
     monkeypatch.setattr(Req, "append_host", lambda self, token: token)
+    monkeypatch.setattr(Scheduler, "run_when_idle", lambda self: None)
 
     def forward(self, batch, args):
         req = batch.reqs[0]
@@ -126,6 +127,28 @@ def test_r4_observers_preserve_forward_and_keyword_only_commit(
     assert "forward" in kinds and "page_tables" in kinds
     if mode == "pressure":
         assert kinds.count("completed_tree") == 1
+        # Exercise the genuine allocator/DFS with a tiny CPU pool as a harness
+        # regression only. This does NOT satisfy R4's real model/GPU-pool gate.
+        import minisgl.core as core
+
+        monkeypatch.setattr(core, "_GLOBAL_CTX", core.Context(page_size=1))
+        cache = CacheManager(8, 1, torch.empty((1,)), type="radix")
+        pages = cache._allocate(4)
+        cache.prefix_cache.insert_prefix(torch.tensor([1, 2]), pages[:2])
+        cache.prefix_cache.insert_prefix(torch.tensor([3, 4]), pages[2:])
+        # This newer branch shares the protected branch's physical pages; after
+        # reclaiming all EXCLUSIVE evictable memory it can legitimately remain.
+        cache.prefix_cache.insert_prefix(torch.tensor([5, 6]), pages[:2])
+        (tmp_path / "pressure.request").touch()
+        scheduler = SimpleNamespace(cache_manager=cache)
+        Scheduler.run_when_idle(scheduler)
+        Scheduler.run_when_idle(scheduler)  # The trigger is consumed only once.
+        assert len(cache.free_slots) == cache.num_pages == 8
+        pressure_rows = [json.loads(line) for path in tmp_path.glob("observer-*.jsonl")
+                         for line in path.read_text().splitlines()]
+        protected = next(row for row in pressure_rows if row["kind"] == "pressure_protected")
+        assert protected["protected_survive"] and protected["remaining_eligible"]
+        assert sum(row["kind"] == "pressure_complete" for row in pressure_rows) == 1
     elif mode == "exact":
         assert {"logits", "kv", "reposition_kv", "token"} <= set(kinds)
         assert next(row for row in rows if row["kind"] == "kv")["pages"] == 2

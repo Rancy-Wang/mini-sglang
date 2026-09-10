@@ -254,9 +254,13 @@ def install_observers() -> None:
                                   for slot, owners in tree._ordinary_slot_nodes.items()})
             assert len(cache.free_slots) == 0
             assert protected_ids <= after_ids
-            # Zero-page virtual-only nodes may have no reclamation value; report
-            # them explicitly rather than treating them as leaked physical pages.
-            assert not any(node.uuid in remaining and node.page_length for node in nodes(tree))
+            # Eviction stops once the requested physical capacity is reclaimed.
+            # A zero-ref branch sharing ONLY protected pages may therefore stay:
+            # deleting it cannot return memory until the live owner is unlocked.
+            # Require every retained page to have a protected owner, then test
+            # complete branch removal in the fully unlocked phase below.
+            assert all(any(owner.ref_count > 0 for owner in owners)
+                       for owners in tree._ordinary_slot_nodes.values())
         finally:
             if held is not None:
                 cache.free_occurrence_pages(held)
@@ -264,6 +268,7 @@ def install_observers() -> None:
         all_pages = cache._allocate(cache.num_pages)
         assert len(torch.unique(all_pages)) == cache.num_pages
         assert not tree._ordinary_slot_nodes
+        assert not any(node.page_length for node in nodes(tree))
         assert len(cache.free_slots) == 0
         cache.free_occurrence_pages(all_pages)
         emit("pressure_complete", free_pages=len(cache.free_slots), total_pages=cache.num_pages,
