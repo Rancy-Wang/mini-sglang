@@ -19,6 +19,7 @@ import os
 from pathlib import Path
 import signal
 import socket
+import statistics
 import subprocess
 import sys
 import time
@@ -211,6 +212,25 @@ def install_observers() -> None:
         return result
 
     observe_attention("compile_context_page_tables", page_tables)
+    original_reset_idle = Scheduler.run_when_idle
+    reset_seen = set()
+
+    @functools.wraps(original_reset_idle)
+    def reset_idle(self):
+        original_reset_idle(self)
+        for marker in sorted(root.glob("reset-*.request")):
+            if marker.name in reset_seen:
+                continue
+            cache = self.cache_manager
+            assert cache.available_size == cache.num_pages, "Cannot reset a protected cache"
+            pages = cache._allocate(cache.num_pages)
+            assert not cache.prefix_cache._ordinary_slot_nodes
+            cache.free_occurrence_pages(pages)
+            reset_seen.add(marker.name)
+            emit("cache_reset", marker=marker.name, free_pages=len(cache.free_slots))
+            (root / f"{marker.stem}.ack-{os.getpid()}").touch(exist_ok=False)
+
+    Scheduler.run_when_idle = reset_idle
     if mode != "pressure":
         return
 
@@ -541,6 +561,8 @@ async def replay(args) -> None:
                 if not (args.original_terminal and length == len(messages)):
                     payload.update(max_tokens=1, ignore_eos=True)
                 payload["stream"] = False
+                if args.seed is not None:
+                    payload["seed"] = args.seed
                 payload.pop("stream_options", None)
                 effective_interface(payload, length)
                 record = await send(client, args.url, payload, turn)
@@ -611,6 +633,41 @@ async def five(args) -> None:
                         raise RuntimeError(f"Five-case replay failed at turn {turn}.")
 
 
+async def clear_cache(args) -> None:
+    """Idle-only test reset. The identical health prefix remains in every cache."""
+    import httpx
+
+    marker = args.server_root / f"reset-{time.time_ns()}.request"
+    marker.touch(exist_ok=False)
+    async with httpx.AsyncClient(timeout=args.timeout, trust_env=False) as client:
+        record = await send(client, args.url, {
+            "model": args.model, "messages": [{"role": "user", "content": "Say OK."}],
+            "temperature": 0, "max_tokens": 1, "stream": False}, "cache_reset_health")
+    acknowledgments = list(args.server_root.glob(f"{marker.stem}.ack-*"))
+    if record.get("status_code") != 200 or len(acknowledgments) != args.tp:
+        raise RuntimeError(f"Incomplete cache reset: {record}; acknowledgments={acknowledgments}")
+    with args.output.open("x") as stream:
+        json.dump({"health": record, "acknowledgments": [str(p) for p in acknowledgments]}, stream)
+    print(json.dumps({"status": "cache_reset_complete", "tp": args.tp}), flush=True)
+
+
+def paired_noninferiority(baseline, candidate):
+    """One-sided Student-t interval over independent paired run log-ratios.
+
+    Exactly five paired repetitions are preregistered. Turns within one replay
+    are correlated observations, never counted as independent repetitions.
+    """
+    import math
+
+    if len(baseline) != 5 or len(candidate) != 5 or min(baseline + candidate) <= 0:
+        raise ValueError("The preregistered gate requires five positive paired run means.")
+    ratios = [math.log(c / b) for b, c in zip(baseline, candidate, strict=True)]
+    mean = statistics.mean(ratios)
+    upper = math.exp(mean + 2.131846786 * statistics.stdev(ratios) / math.sqrt(5))
+    return {"paired_ratio": math.exp(mean), "upper_one_sided_95": upper,
+            "noninferior_2_percent": upper <= 1.02, "paired_runs": 5}
+
+
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == "worker":
         sys.argv.pop(1)
@@ -634,6 +691,7 @@ def main():
     replay_parser.add_argument("--request", type=Path, required=True)
     replay_parser.add_argument("--original-terminal", action="store_true")
     replay_parser.add_argument("--terminal-only", action="store_true")
+    replay_parser.add_argument("--seed", type=int)
     wave_parser = commands.add_parser("wave")
     wave_parser.add_argument("--input", type=Path, required=True)
     wave_parser.add_argument("--bs", type=int, choices=[4, 8], required=True)
@@ -644,9 +702,13 @@ def main():
     prepare_parser = commands.add_parser("prepare")
     prepare_parser.add_argument("--source", type=Path, required=True)
     prepare_parser.add_argument("--model", required=True)
-    for command in (launch, stop, replay_parser, wave_parser, five_parser, prepare_parser):
+    clear_parser = commands.add_parser("clear")
+    clear_parser.add_argument("--server-root", type=Path, required=True)
+    clear_parser.add_argument("--model", required=True)
+    clear_parser.add_argument("--tp", type=int, default=2)
+    for command in (launch, stop, replay_parser, wave_parser, five_parser, prepare_parser, clear_parser):
         command.add_argument("--output", type=Path, required=True)
-    for command in (replay_parser, wave_parser, five_parser):
+    for command in (replay_parser, wave_parser, five_parser, clear_parser):
         command.add_argument("--url", type=loopback_url, required=True)
         command.add_argument("--timeout", type=float, default=1800)
     args = parser.parse_args()
@@ -660,6 +722,8 @@ def main():
         asyncio.run(wave(args))
     elif args.command == "prepare":
         prepare(args)
+    elif args.command == "clear":
+        asyncio.run(clear_cache(args))
     else:
         asyncio.run(five(args))
 

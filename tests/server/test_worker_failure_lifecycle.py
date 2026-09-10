@@ -193,6 +193,15 @@ def test_r4_csr_partition_uses_query_boundaries_for_shared_direct_table(r4_harne
         list(r4_harness.request_segment_ranges(torch.tensor([0, 2, 3]), [2]))
 
 
+def test_r4_paired_gate_does_not_treat_turns_as_independent_samples(r4_harness):
+    assert r4_harness.paired_noninferiority([100.] * 5, [101.] * 5)["noninferior_2_percent"]
+    assert not r4_harness.paired_noninferiority([100.] * 5, [103.] * 5)["noninferior_2_percent"]
+    assert not r4_harness.paired_noninferiority([100.] * 5, [90., 110., 90., 110., 100.])[
+        "noninferior_2_percent"]
+    with pytest.raises(ValueError, match="five"):
+        r4_harness.paired_noninferiority([100.] * 100, [100.] * 100)
+
+
 @pytest.mark.parametrize("url", ["https://127.0.0.1", "http://example.com", "http://192.0.2.1",
                                  "http://user:password@127.0.0.1"])
 def test_r4_rejects_non_loopback_destinations(r4_harness, url):
