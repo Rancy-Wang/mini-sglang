@@ -4,6 +4,7 @@ import pytest
 import torch
 from minisgl.core import validate_occurrence_positions
 from minisgl.scheduler.table import TableManager
+from minisgl.scheduler.scheduler import ForwardInput, Scheduler
 
 
 @pytest.mark.parametrize("raw_length", [7, 8, 9, 131443])
@@ -53,3 +54,31 @@ def test_drop_without_reposition_allows_position_holes():
     req.radix_next_position = 9
     with pytest.raises(ValueError, match="active terminal"):
         validate_occurrence_positions(req, 128, 128)
+
+
+def test_external_sample_write_uses_post_forward_cached_length():
+    table = TableManager(1, torch.zeros((2, 8), dtype=torch.int32))
+    slot = table.allocate()
+    table.prepare_occurrence(slot, 9)
+    table.occurrence_tokens(slot)[:9] = torch.arange(9)
+    req = SimpleNamespace(
+        occurrence_external_storage=True, table_idx=slot, cached_len=7,
+        device_len=9, can_decode=True,
+    )
+    batch = SimpleNamespace(reqs=[req], padded_reqs=[req])
+
+    def forward(current_batch, args):
+        assert current_batch.input_ids.tolist() == [7, 8]
+        req.cached_len, req.device_len = 9, 10
+        return SimpleNamespace(next_tokens_gpu=torch.tensor([999], dtype=torch.int32))
+
+    scheduler = object.__new__(Scheduler)
+    scheduler.table_manager = table
+    scheduler.token_pool = table.token_pool
+    scheduler.engine = SimpleNamespace(forward_batch=forward)
+    scheduler.decode_manager = SimpleNamespace(filter_reqs=lambda _: None)
+    scheduler._forward(ForwardInput(
+        batch, None, (torch.tensor([slot, slot]), torch.tensor([0, 0])),
+        (torch.tensor([slot]), torch.tensor([-1])),
+    ))
+    assert table.occurrence_tokens(slot)[9] == 999

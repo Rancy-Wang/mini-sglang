@@ -812,7 +812,8 @@ class Scheduler(SchedulerIOMixin):
         self.token_pool[output_mapping] = forward_output.next_tokens_gpu
         for index, req in enumerate(batch.reqs):
             if req.occurrence_external_storage and req.can_decode:
-                self.table_manager.occurrence_tokens(req.table_idx)[req.device_len].copy_(
+                # Engine.forward_batch has already called Req.complete_one().
+                self.table_manager.occurrence_tokens(req.table_idx)[req.cached_len].copy_(
                     forward_output.next_tokens_gpu[index]
                 )
         self.decode_manager.filter_reqs(forward_input.batch.reqs)
