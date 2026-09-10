@@ -641,12 +641,18 @@ async def clear_cache(args) -> None:
     marker = args.server_root / f"reset-{time.time_ns()}.request"
     marker.touch(exist_ok=False)
     async with httpx.AsyncClient(timeout=args.timeout, trust_env=False) as client:
-        record = await send(client, args.url, {
+        probe = {
             "model": args.model, "messages": [{"role": "user", "content": "Say OK."}],
-            "temperature": 0, "max_tokens": 1, "stream": False}, "cache_reset_health")
-    acknowledgments = list(args.server_root.glob(f"{marker.stem}.ack-*"))
-    if record.get("status_code") != 200 or len(acknowledgments) != args.tp:
-        raise RuntimeError(f"Incomplete cache reset: {record}; acknowledgments={acknowledgments}")
+            "temperature": 0, "max_tokens": 1, "stream": False}
+        wake = await send(client, args.url, probe, "cache_reset_wakeup")
+        deadline = time.monotonic() + 30
+        while len(acknowledgments := list(args.server_root.glob(f"{marker.stem}.ack-*"))) != args.tp:
+            if wake.get("status_code") != 200 or time.monotonic() > deadline:
+                raise RuntimeError(f"Incomplete cache reset: {wake}; acknowledgments={acknowledgments}")
+            await asyncio.sleep(0.05)
+        record = await send(client, args.url, probe, "cache_reset_health")
+        if record.get("status_code") != 200:
+            raise RuntimeError(f"Inference after cache reset failed: {record}")
     with args.output.open("x") as stream:
         json.dump({"health": record, "acknowledgments": [str(p) for p in acknowledgments]}, stream)
     print(json.dumps({"status": "cache_reset_complete", "tp": args.tp}), flush=True)
