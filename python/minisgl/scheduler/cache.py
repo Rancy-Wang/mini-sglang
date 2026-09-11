@@ -430,7 +430,26 @@ class CacheManager:
             )
 
             old_full_cached_len = old_handle.physical_cached_len
-            if old_full_cached_len > 0:
+            occurrence_birth_pages = getattr(req, "occurrence_birth_pages", None)
+            occurrence_birth_owned = getattr(req, "occurrence_birth_owned_mask", None)
+            birth_prefix_len = 0
+            if occurrence_birth_pages is not None:
+                if occurrence_birth_owned is None:
+                    raise RuntimeError("Occurrence birth page ownership is missing.")
+                birth_prefix_len = min(len(occurrence_birth_pages), full_token_prefix_len)
+                canonical_birth_pages = occurrence_birth_pages[:birth_prefix_len]
+                if bool(torch.any(canonical_birth_pages < 0).item()):
+                    raise RuntimeError("Occurrence canonical birth cache contains a page hole.")
+                full_indices[:birth_prefix_len] = canonical_birth_pages
+                filled[:birth_prefix_len] = True
+                if old_full_cached_len > birth_prefix_len:
+                    raise RuntimeError("Matched occurrence prefix exceeds canonical birth pages.")
+                if old_full_cached_len > 0 and not torch.equal(
+                    canonical_birth_pages[:old_full_cached_len],
+                    req.initial_full_match_indices[:old_full_cached_len],
+                ):
+                    raise RuntimeError("Matched occurrence pages disagree with canonical births.")
+            elif old_full_cached_len > 0:
                 if len(req.initial_full_match_indices) < old_full_cached_len:
                     raise RuntimeError(
                         "Initial full-token match indices are shorter than the cache handle."
@@ -446,6 +465,7 @@ class CacheManager:
                 device=active_indices.device, non_blocking=True
             )
             overlap = active_positions < old_full_cached_len
+            birth_backed = active_positions < birth_prefix_len
             if bool(torch.any(overlap).item()):
                 transformed = torch.zeros(len(active_indices), dtype=torch.bool, device="cpu")
                 if req.retry_transformed_mask is not None:
@@ -458,7 +478,7 @@ class CacheManager:
                             "Occurrence-owned mask exceeds the active cache candidate prefix."
                         )
                     transformed[:occurrence_owned_len] |= occurrence_owned
-                ordinary_overlap = overlap & (~transformed)
+                ordinary_overlap = overlap & (~transformed) & (~birth_backed)
                 ordinary_device = ordinary_overlap.to(
                     device=active_indices.device, non_blocking=True
                 )
@@ -467,8 +487,14 @@ class CacheManager:
                     active_indices[ordinary_device],
                 ):
                     raise RuntimeError("Matched delta-marker tokens use different KV slots.")
-            full_indices[active_positions_device] = active_indices
-            filled[active_positions_device] = True
+            active_write = ~birth_backed
+            active_write_device = active_write.to(
+                device=active_indices.device, dtype=torch.bool, non_blocking=True
+            )
+            full_indices[active_positions_device[active_write_device]] = active_indices[
+                active_write_device
+            ]
+            filled[active_positions_device[active_write_device]] = True
 
             inactive_positions = req.inactive_cached_positions
             inactive_pages = req.inactive_cached_pages
@@ -480,8 +506,14 @@ class CacheManager:
                 inactive_device = inactive_positions.to(
                     device=active_indices.device, dtype=torch.int64, non_blocking=True
                 )
-                full_indices[inactive_device] = inactive_pages
-                filled[inactive_device] = True
+                inactive_write = inactive_positions >= birth_prefix_len
+                inactive_write_device = inactive_write.to(
+                    device=inactive_pages.device, dtype=torch.bool, non_blocking=True
+                )
+                full_indices[inactive_device[inactive_write_device]] = inactive_pages[
+                    inactive_write_device
+                ]
+                filled[inactive_device[inactive_write_device]] = True
 
             missing_positions = torch.nonzero(~filled, as_tuple=False).view(-1)
             cacheable_full_len = (
@@ -519,12 +551,28 @@ class CacheManager:
                 commit_virtual_mask,
             )
             active_key_positions = req.radix_token_to_key[active_positions]
+            extra_owned_pages = None
+            extra_owned_key_positions = None
+            if occurrence_birth_pages is not None and occurrence_birth_owned is not None:
+                owned_raw = torch.nonzero(occurrence_birth_owned, as_tuple=False).view(-1)
+                extra_owned_pages = occurrence_birth_pages[
+                    owned_raw.pin_memory().to(occurrence_birth_pages.device, non_blocking=True)
+                ]
+                extra_owned_key_positions = torch.full(
+                    (len(owned_raw),), -1, dtype=torch.int64, device="cpu"
+                )
+                committed_birth = owned_raw < cacheable_full_len
+                extra_owned_key_positions[committed_birth] = req.radix_token_to_key[
+                    owned_raw[committed_birth]
+                ]
             self._free_finished_candidates(
                 req,
                 active_indices,
                 active_key_positions,
                 insert_result,
                 excluded_indices,
+                extra_owned_pages=extra_owned_pages,
+                extra_owned_key_positions=extra_owned_key_positions,
             )
         finally:
             self.unlock(old_handle)
@@ -561,6 +609,9 @@ class CacheManager:
         candidate_key_positions: torch.Tensor,
         insert_result: InsertResult,
         excluded: torch.Tensor | None = None,
+        *,
+        extra_owned_pages: torch.Tensor | None = None,
+        extra_owned_key_positions: torch.Tensor | None = None,
     ) -> None:
         """Apply main's three cache regions after mapping active tokens to Radix keys."""
 
@@ -622,7 +673,12 @@ class CacheManager:
             released = torch.cat([released, inactive_pages[~inactive_adopted]])
         if excluded is not None:
             released = torch.cat([released, excluded])
-        self._free(released)
+        if (extra_owned_pages is None) != (extra_owned_key_positions is None):
+            raise RuntimeError("Extra owned page metadata must be complete.")
+        if extra_owned_pages is not None and extra_owned_key_positions is not None:
+            extra_adopted = adopted_pages(extra_owned_pages, extra_owned_key_positions)
+            released = torch.cat([released, extra_owned_pages[~extra_adopted]])
+        self._free(torch.unique(released))
 
     def _cache_finished_sparse_req(self, req: Req) -> None:
         if self.page_size != 1:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import minisgl.core as core
@@ -22,6 +23,7 @@ from minisgl.scheduler.scheduler import Scheduler
 from minisgl.scheduler.table import TableManager
 from minisgl.scheduler.utils import PendingReq
 from minisgl.tokenizer.reposition_occurrence import compile_reposition_occurrence_plan
+from minisgl.tokenizer.server import _build_occurrence_radix_records
 
 
 @pytest.fixture(autouse=True)
@@ -122,6 +124,12 @@ def _layout() -> RadixRepositionLayout:
 
 def _pending(uid: int) -> PendingReq:
     layout = _layout()
+    radix_records = _build_occurrence_radix_records(
+        SimpleNamespace(
+            reposition_layout=layout,
+            reposition_raw_boundaries=torch.tensor([3, 6], dtype=torch.int32),
+        )
+    )
     visible_until = torch.tensor([4, 9, 7, 9, 9, 9, 9, 9], dtype=torch.int32)
     plan = compile_reposition_occurrence_plan(layout, visible_until)
     input_ids = layout.records[:, 1].clone()
@@ -131,8 +139,8 @@ def _pending(uid: int) -> PendingReq:
         input_ids=input_ids,
         true_positions=layout.birth_positions,
         raw_positions=raw_positions,
-        radix_input_ids=layout.records,
-        radix_match_ids=layout.records,
+        radix_input_ids=radix_records,
+        radix_match_ids=radix_records,
         sampling_params=SamplingParams(max_tokens=1),
         prompt_tokens=len(input_ids),
         is_warmup=True,
@@ -189,15 +197,60 @@ def _complete_intermediate_chunk(manager: PrefillManager, req: ChunkedReq) -> No
 
 
 def _free_occurrence_request(req, cache: CacheManager, table: TableManager) -> None:
+    released = []
     if req.occurrence_transient_pages is not None:
-        cache.free_occurrence_pages(req.occurrence_transient_pages)
+        released.append(req.occurrence_transient_pages)
     owned = req.occurrence_terminal_owned_mask
     assert owned is not None
     owned_indices = torch.nonzero(owned, as_tuple=False).view(-1)
     if len(owned_indices) > 0:
-        cache.free_occurrence_pages(table.occurrence_pages(req.table_idx)[owned_indices].clone())
+        released.append(table.occurrence_pages(req.table_idx)[owned_indices].clone())
+    birth_pages = req.occurrence_birth_pages
+    birth_owned = req.occurrence_birth_owned_mask
+    assert birth_pages is not None and birth_owned is not None
+    if bool(torch.any(birth_owned).item()):
+        released.append(birth_pages[birth_owned])
+    if req.inactive_cached_pages is not None:
+        released.append(req.inactive_cached_pages)
+        req.inactive_cached_pages = None
+        req.inactive_cached_positions = None
+    if released:
+        cache.free_occurrence_pages(torch.unique(torch.cat(released)))
     cache.unlock(req.cache_handle)
     table.free(req.table_idx)
+
+
+def _owned_occurrence_pages(req, table: TableManager) -> torch.Tensor:
+    terminal_owned = req.occurrence_terminal_owned_mask
+    birth_pages = req.occurrence_birth_pages
+    birth_owned = req.occurrence_birth_owned_mask
+    assert terminal_owned is not None
+    assert birth_pages is not None and birth_owned is not None
+    parts = [
+        table.occurrence_pages(req.table_idx)[: len(terminal_owned)][terminal_owned],
+        birth_pages[birth_owned],
+    ]
+    return torch.unique(torch.cat([part[part >= 0] for part in parts]))
+
+
+def test_occurrence_radix_records_freeze_token_rows_at_birth_state() -> None:
+    layout = _layout()
+    altered_records = layout.records.clone()
+    altered_records[layout.token_to_key, 2] += 100
+    altered_records[layout.token_to_key, 3] += 200
+    altered = replace(layout, records=altered_records)
+    boundaries = torch.tensor([3, 6], dtype=torch.int32)
+
+    original = _build_occurrence_radix_records(
+        SimpleNamespace(reposition_layout=layout, reposition_raw_boundaries=boundaries)
+    )
+    later_terminal = _build_occurrence_radix_records(
+        SimpleNamespace(reposition_layout=altered, reposition_raw_boundaries=boundaries)
+    )
+
+    assert torch.equal(original, later_terminal)
+    assert original[:, 2].tolist() == [-1, -1, -1, -1, 3, 3, 3, 6]
+    assert torch.equal(original[:, 3], layout.birth_positions)
 
 
 @pytest.mark.parametrize("budget", [2, 8])
@@ -231,8 +284,6 @@ def test_overflow_raw_storage_compacts_to_fixed_decode_table(budget: int) -> Non
     assert table.token_pool[req.table_idx, 6] == 999
     assert req.true_positions.tolist() == [0, 1, 2, 3, 4, 5, 6]
     _free_occurrence_request(req, cache, table)
-    if req.inactive_cached_pages is not None:
-        cache.free_occurrence_pages(req.inactive_cached_pages)
     assert cache.available_size == cache.num_pages
 
 
@@ -253,16 +304,16 @@ def test_occurrence_construction_failure_rolls_back_allocated_pages(monkeypatch)
 
 
 def test_paged_occurrence_chunks_until_the_full_prompt_is_covered() -> None:
-    # The unchunked plan has 15 occurrence pages, while the actual peak
-    # working set for this plan is 10 pages (retained terminal pages plus one
-    # chunk's temporary occurrences).
-    manager, cache, table, kv_cache = _manager(num_pages=10, table_count=1)
+    # Birth and terminal pages remain live through Decode, so this plan's
+    # persistent set plus one output page needs 15 pages. A small token budget
+    # still chunks the prompt without overcommitting that fixed KV capacity.
+    manager, cache, table, kv_cache = _manager(num_pages=15, table_count=1)
     manager.pending_list.append(_pending(uid=101))
     query_ranges: list[tuple[int, int]] = []
     saw_layer_transform = False
 
     while True:
-        batch = manager.schedule_next_batch(prefill_budget=8)
+        batch = manager.schedule_next_batch(prefill_budget=2)
         assert batch is not None
         assert len(batch.reqs) == 1
         req = batch.reqs[0]
@@ -279,10 +330,7 @@ def test_paged_occurrence_chunks_until_the_full_prompt_is_covered() -> None:
         available_before = cache.available_size
         _complete_intermediate_chunk(manager, req)
         assert cache.available_size >= available_before + transient_count
-        owned_mask = req.occurrence_terminal_owned_mask
-        owned_pages = table.page_table[req.table_idx, : len(owned_mask)][owned_mask]
-        owned_pages = owned_pages[owned_pages >= 0]
-        assert len(torch.unique(owned_pages)) == len(owned_pages)
+        owned_pages = _owned_occurrence_pages(req, table)
         assert cache.available_size + len(owned_pages) == cache.num_pages
 
     assert len(query_ranges) > 1
@@ -299,8 +347,8 @@ def test_paged_occurrence_chunks_until_the_full_prompt_is_covered() -> None:
     cache.check_integrity()
 
 
-def test_paged_occurrence_unlocks_a_pinned_prefix_and_recomputes_when_needed() -> None:
-    manager, cache, table, _ = _manager(num_pages=8, table_count=1)
+def test_paged_occurrence_reuses_a_canonical_birth_prefix() -> None:
+    manager, cache, table, _ = _manager(num_pages=14, table_count=1)
     pending = _pending(uid=102)
     cached_pages = cache._allocate(6)
     cache.prefix_cache.insert_prefix(pending.radix_match_ids[:6], cached_pages)
@@ -311,10 +359,66 @@ def test_paged_occurrence_unlocks_a_pinned_prefix_and_recomputes_when_needed() -
     assert batch is not None
     req = batch.reqs[0]
     assert isinstance(req, ChunkedReq)
-    assert req.initial_active_cached_len == 0
-    assert req.cached_len == 0
-    assert cache.prefix_cache.size_info.protected_size == 0
+    assert req.initial_active_cached_len == 6
+    assert req.cached_len == 6
+    assert cache.prefix_cache.size_info.protected_size == 6
+    assert torch.equal(req.occurrence_birth_pages[:6], cached_pages)
+    assert not bool(torch.any(req.occurrence_birth_owned_mask[:6]).item())
     _free_occurrence_request(req, cache, table)
+    cache.check_integrity()
+
+
+def test_finished_occurrence_caches_birth_pages_and_releases_terminal_copies() -> None:
+    manager, cache, table, _ = _manager(num_pages=32, table_count=1)
+    pending = _pending(uid=114)
+    pending.context_post_prefill_keep_mask = pending.full_keep_mask
+    manager.pending_list.append(pending)
+
+    batch = manager.schedule_next_batch(prefill_budget=8)
+
+    assert batch is not None and len(batch.reqs) == 1
+    req = batch.reqs[0]
+    assert not isinstance(req, ChunkedReq)
+    assert req.occurrence_birth_pages is not None
+    assert req.occurrence_birth_owned_mask is not None
+    assert req.occurrence_terminal_owned_mask is not None
+    birth_pages = req.occurrence_birth_pages.clone()
+    terminal_pages = table.occurrence_pages(req.table_idx)[: len(birth_pages)].clone()
+    terminal_only = terminal_pages[~torch.isin(terminal_pages, birth_pages)]
+    assert len(terminal_only) > 0
+
+    req.complete_one()
+    scheduler = object.__new__(Scheduler)
+    scheduler.cache_manager = cache
+    scheduler.table_manager = table
+    scheduler._release_occurrence_transients(req)
+    scheduler._compact_context_after_prefill(req)
+    cache.cache_req(req, finished=True)
+    table.free(req.table_idx)
+
+    later = _pending(uid=115)
+    next_record = torch.tensor([[0, 999, 6, 6]], dtype=torch.int32)
+    later.input_ids = torch.cat((later.input_ids, torch.tensor([999], dtype=torch.int32)))
+    later.true_positions = torch.cat((later.true_positions, torch.tensor([6], dtype=torch.int32)))
+    later.raw_positions = torch.cat((later.raw_positions, torch.tensor([8], dtype=torch.int32)))
+    later.radix_input_ids = torch.cat((later.radix_input_ids, next_record))
+    later.radix_match_ids = torch.cat((later.radix_match_ids, next_record))
+    later.radix_key_virtual_mask = torch.cat((later.radix_key_virtual_mask, torch.tensor([False])))
+    later.radix_key_to_token = torch.cat(
+        (later.radix_key_to_token, torch.tensor([8], dtype=torch.int64))
+    )
+    later.radix_token_to_key = torch.cat(
+        (later.radix_token_to_key, torch.tensor([8], dtype=torch.int64))
+    )
+    match = cache.match_occurrence_req(later)
+
+    assert match is not None
+    assert match.full_cached_len == 8
+    assert torch.equal(match.full_match_indices, birth_pages)
+    assert match.retry_plan is None
+    assert match.retry_plan_ns == 0
+    free_pages = set(cache.free_slots.tolist())
+    assert set(terminal_only.tolist()).issubset(free_pages)
     cache.check_integrity()
 
 
@@ -345,13 +449,13 @@ def test_paged_occurrence_rejects_only_an_impossible_minimum_working_set() -> No
         manager.schedule_next_batch(prefill_budget=8)
 
     assert raised.value.uid == 105
-    assert raised.value.required_pages == 8
+    assert raised.value.required_pages == 14
     assert raised.value.available_pages == 7
     cache.check_integrity()
 
 
 def test_paged_occurrence_waits_for_pages_protected_by_another_request() -> None:
-    manager, cache, table, _ = _manager(num_pages=10, table_count=1)
+    manager, cache, table, _ = _manager(num_pages=16, table_count=1)
     pending = _pending(uid=106)
     blocker_keys = pending.radix_match_ids[:3].clone()
     blocker_keys[:, 1] += 1_000
@@ -401,12 +505,12 @@ def test_staged_reposition_waits_for_pages_protected_by_another_request() -> Non
 
 
 def test_capacity_chunked_occurrence_request_runs_alone_until_completed() -> None:
-    manager, cache, table, _ = _manager(num_pages=10, table_count=2)
+    manager, cache, table, _ = _manager(num_pages=15, table_count=2)
     first = _pending(uid=108)
     second = _pending(uid=109)
     manager.pending_list.extend([first, second])
 
-    batch = manager.schedule_next_batch(prefill_budget=16)
+    batch = manager.schedule_next_batch(prefill_budget=2)
 
     assert batch is not None and len(batch.reqs) == 1
     assert isinstance(batch.reqs[0], ChunkedReq)
@@ -475,10 +579,10 @@ def test_scheduler_rejection_releases_a_partial_occurrence_request() -> None:
 def test_abort_releases_a_completed_partial_occurrence_request(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    manager, cache, table, _ = _manager(num_pages=10, table_count=1)
+    manager, cache, table, _ = _manager(num_pages=15, table_count=1)
     pending = _pending(uid=112)
     manager.pending_list.append(pending)
-    batch = manager.schedule_next_batch(prefill_budget=8)
+    batch = manager.schedule_next_batch(prefill_budget=2)
     assert batch is not None and len(batch.reqs) == 1
     req = batch.reqs[0]
     assert isinstance(req, ChunkedReq)

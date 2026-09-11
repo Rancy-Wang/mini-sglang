@@ -154,6 +154,8 @@ class Req:
     occurrence_segment_key_indices: torch.Tensor | None = None
     occurrence_pages: torch.Tensor | None = None
     occurrence_transient_pages: torch.Tensor | None = None
+    occurrence_birth_pages: torch.Tensor | None = None
+    occurrence_birth_owned_mask: torch.Tensor | None = None
     occurrence_transform_source_pages: torch.Tensor | None = None
     occurrence_transform_destination_pages: torch.Tensor | None = None
     occurrence_transform_position_pairs: torch.Tensor | None = None
@@ -429,6 +431,20 @@ class Req:
                 raise ValueError(
                     "Occurrence-owned mask must be a CPU bool vector covering the prompt."
                 )
+            if self.occurrence_birth_pages is None or self.occurrence_birth_owned_mask is None:
+                raise ValueError("Paged-occurrence requires canonical birth page ownership.")
+            if (
+                self.occurrence_birth_pages.ndim != 1
+                or len(self.occurrence_birth_pages) != plan_token_count
+            ):
+                raise ValueError("Occurrence birth pages must cover the full prompt.")
+            if (
+                not self.occurrence_birth_owned_mask.is_cpu
+                or self.occurrence_birth_owned_mask.dtype != torch.bool
+                or self.occurrence_birth_owned_mask.ndim != 1
+                or len(self.occurrence_birth_owned_mask) != plan_token_count
+            ):
+                raise ValueError("Occurrence birth ownership must cover the full prompt.")
             if self.occurrence_initial_source_positions is not None and (
                 not self.occurrence_initial_source_positions.is_cpu
                 or self.occurrence_initial_source_positions.dtype != torch.int32

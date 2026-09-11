@@ -746,9 +746,10 @@ class Scheduler(SchedulerIOMixin):
 
     def _free_aborted_occurrence_resources(self, req: Req) -> None:
         try:
+            released = []
             transient = req.occurrence_transient_pages
             if transient is not None:
-                self.cache_manager.free_occurrence_pages(transient)
+                released.append(transient)
             owned = req.occurrence_terminal_owned_mask
             if owned is not None and bool(torch.any(owned).item()):
                 owned_device = (
@@ -758,7 +759,21 @@ class Scheduler(SchedulerIOMixin):
                     .to(self.cache_manager.device, non_blocking=True)
                 )
                 pages = self.table_manager.occurrence_pages(req.table_idx)[owned_device].clone()
-                self.cache_manager.free_occurrence_pages(pages)
+                released.append(pages)
+            birth_pages = req.occurrence_birth_pages
+            birth_owned = req.occurrence_birth_owned_mask
+            if (
+                birth_pages is not None
+                and birth_owned is not None
+                and bool(torch.any(birth_owned).item())
+            ):
+                released.append(
+                    birth_pages[
+                        birth_owned.pin_memory().to(self.cache_manager.device, non_blocking=True)
+                    ]
+                )
+            if released:
+                self.cache_manager.free_occurrence_pages(torch.unique(torch.cat(released)))
             self.cache_manager.unlock(req.cache_handle)
         finally:
             try:
@@ -766,6 +781,8 @@ class Scheduler(SchedulerIOMixin):
             finally:
                 req.occurrence_pages = None
                 req.occurrence_transient_pages = None
+                req.occurrence_birth_pages = None
+                req.occurrence_birth_owned_mask = None
                 req.occurrence_inflight = False
                 req.occurrence_abort_deferred = False
                 self._close_context_sequence(req.uid)

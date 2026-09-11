@@ -106,6 +106,40 @@ def _build_user_msg(msg: TokenizeMsg, t: Any) -> UserMsg:
     )
 
 
+def _build_occurrence_radix_records(t: Any) -> torch.Tensor:
+    """Freeze real-token Radix rows at the KV position where each token was born."""
+
+    layout = t.reposition_layout
+    raw_boundaries = t.reposition_raw_boundaries
+    if layout is None or raw_boundaries is None:
+        raise ValueError("Paged-occurrence Reposition requires compiled event boundaries.")
+    if len(raw_boundaries) != len(layout.effective_reposition_stages):
+        raise ValueError("Reposition boundaries and effective stages have different lengths.")
+
+    stage_boundaries = torch.full(
+        (len(layout.transition_offsets),), -1, dtype=torch.int32, device="cpu"
+    )
+    effective_stages = layout.effective_reposition_stages.to(torch.int64)
+    effective = effective_stages > 0
+    if bool(torch.any(effective).item()):
+        stage_boundaries[effective_stages[effective]] = raw_boundaries[effective]
+
+    birth_stages = layout.birth_stages.to(torch.int64)
+    if bool(torch.any(birth_stages < 0).item()) or bool(
+        torch.any(birth_stages >= len(stage_boundaries)).item()
+    ):
+        raise ValueError("Paged-occurrence token birth stage is outside the compiled layout.")
+    token_boundaries = stage_boundaries[birth_stages]
+    if bool(torch.any((birth_stages > 0) & (token_boundaries < 0)).item()):
+        raise ValueError("Paged-occurrence token birth stage has no Reposition boundary.")
+
+    records = layout.records.clone()
+    token_rows = layout.token_to_key
+    records[token_rows, 2] = token_boundaries
+    records[token_rows, 3] = layout.birth_positions
+    return records
+
+
 def _build_occurrence_user_msg(msg: TokenizeMsg, t: Any) -> UserMsg:
     from .reposition_occurrence import compile_reposition_occurrence_plan
 
@@ -121,13 +155,14 @@ def _build_occurrence_user_msg(msg: TokenizeMsg, t: Any) -> UserMsg:
         visible_until = torch.full((token_count,), token_count + 1, dtype=torch.int32, device="cpu")
     keep_mask = t.reposition_layout.keep_mask.to(dtype=torch.int32).contiguous()
     raw_positions = torch.arange(token_count, dtype=torch.int32, device="cpu")
+    radix_records = _build_occurrence_radix_records(t)
     message = UserMsg(
         uid=msg.uid,
         input_ids=t.reposition_input_ids,
         true_positions=t.reposition_layout.birth_positions,
         raw_positions=raw_positions,
-        radix_input_ids=t.reposition_layout.records[t.reposition_layout.token_to_key].contiguous(),
-        radix_match_ids=t.reposition_layout.records,
+        radix_input_ids=radix_records[t.reposition_layout.token_to_key].contiguous(),
+        radix_match_ids=radix_records,
         sampling_params=msg.sampling_params,
         prompt_tokens=t.prompt_tokens,
         radix_key_virtual_mask=t.reposition_layout.virtual_mask,
