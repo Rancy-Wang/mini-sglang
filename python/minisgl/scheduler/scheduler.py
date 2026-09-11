@@ -39,6 +39,7 @@ from .prefill import (
     RepositionCapacityError,
 )
 from .radix_symbol import RadixSymbolRegistry, inject_radix_symbols
+from .reposition_occurrence import prewarm_occurrence_window_compiler
 from .reposition_sequence import SchedulerRepositionSequence
 from .table import TableManager
 from .utils import PendingReq
@@ -131,6 +132,7 @@ class Scheduler(SchedulerIOMixin):
             retry_rope_cache=retry_rope.cos_sin_cache,
         )
         startup_prewarm_started_ns = time.perf_counter_ns()
+        prewarm_occurrence_window_compiler()
         kv_cache_shape = self.engine.kv_cache.k_cache(0).shape
         prewarm_reposition_kv_with_rope_delta(
             device=self.device,

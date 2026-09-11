@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 from minisgl.core import SamplingParams
 from minisgl.message import TokenizeMsg
+from minisgl.tokenizer.server import _build_occurrence_user_msg
 from minisgl.tokenizer.tokenize import TokenizeManager
 
 
@@ -96,19 +97,18 @@ def test_ordinary_chat_renders_and_encodes_exactly_once(monkeypatch) -> None:
 def test_structured_drop_and_reposition_render_and_encode_exactly_once() -> None:
     tokenizer = _SinglePassTokenizer()
     manager = TokenizeManager(tokenizer)
-    result = manager._chat_tokenize(
-        TokenizeMsg(
-            uid=31,
-            text=[
-                {"role": "user", "content": "old"},
-                {"role": "assistant", "content": "answer"},
-                {"role": "user", "content": "new"},
-            ],
-            sampling_params=SamplingParams(max_tokens=1),
-            drop_message={1: [0]},
-            reposition=[1],
-        )
+    msg = TokenizeMsg(
+        uid=31,
+        text=[
+            {"role": "user", "content": "old"},
+            {"role": "assistant", "content": "answer"},
+            {"role": "user", "content": "new"},
+        ],
+        sampling_params=SamplingParams(max_tokens=1),
+        drop_message={1: [0]},
+        reposition=[1],
     )
+    result = manager._chat_tokenize(msg)
 
     expected = "<user>old<assistant>answer<user>new<assistant>"
     assert result.reposition_input_ids is not None
@@ -119,6 +119,13 @@ def test_structured_drop_and_reposition_render_and_encode_exactly_once() -> None
     assert tokenizer.apply_calls == 0
     assert result.message_meta["gen_prompt_start"] == len(expected) - len("<assistant>")
     assert torch.any(result.reposition_layout.records[:, 0] == 1)
+    backend = _build_occurrence_user_msg(msg, result)
+    assert torch.equal(
+        backend.occurrence_layout_transition_raw_tokens,
+        result.reposition_layout.transition_raw_tokens,
+    )
+    assert backend.occurrence_raw_tokens is None
+    assert backend.occurrence_segment_key_indices is None
 
 
 def test_empty_and_future_drop_use_ordinary_path(monkeypatch) -> None:

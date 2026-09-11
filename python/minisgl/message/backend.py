@@ -136,6 +136,16 @@ class UserMsg(BaseBackendMsg):
     reposition_d2h_bytes: int = 0
     reposition_ipc_tensor_bytes: int = 0
     reposition_execution_mode: str | None = None
+    # Compact paged-occurrence wire program.  The scheduler performs exact
+    # Radix matching before expanding only the query window that missed cache.
+    occurrence_layout_birth_positions: torch.Tensor | None = None
+    occurrence_layout_birth_stages: torch.Tensor | None = None
+    occurrence_layout_transition_offsets: torch.Tensor | None = None
+    occurrence_layout_transition_raw_tokens: torch.Tensor | None = None
+    occurrence_layout_transition_old_positions: torch.Tensor | None = None
+    occurrence_layout_transition_new_positions: torch.Tensor | None = None
+    # Expanded runtime plan.  Retained for scheduler-local compatibility and
+    # tests; production tokenizer messages leave these fields empty.
     occurrence_raw_tokens: torch.Tensor | None = None
     occurrence_positions: torch.Tensor | None = None
     occurrence_birth_indices: torch.Tensor | None = None

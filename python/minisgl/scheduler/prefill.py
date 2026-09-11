@@ -9,6 +9,12 @@ from minisgl.core import Batch, Req, get_global_ctx
 from minisgl.kernel.context_plan import first_mask_free_conflict_event
 from minisgl.utils import init_logger
 
+from .reposition_occurrence import (
+    compile_occurrence_window,
+    install_occurrence_plan,
+    pack_compact_occurrence_pending_fields,
+    unpack_compact_occurrence_pending_fields,
+)
 from .utils import PendingReq
 
 if TYPE_CHECKING:
@@ -381,26 +387,51 @@ class PrefillAdder:
             return None
         if self.kv_cache is None or self.retry_rope_cache is None:
             raise RuntimeError("Paged-occurrence KV materialization is not configured.")
-        plan = (
-            req.occurrence_raw_tokens,
-            req.occurrence_positions,
-            req.occurrence_birth_indices,
-            req.occurrence_terminal_indices,
-            req.occurrence_segment_query_starts,
-            req.occurrence_segment_query_ends,
-            req.occurrence_segment_key_offsets,
-            req.occurrence_segment_key_indices,
-        )
-        if not all(tensor is not None for tensor in plan):
-            raise RuntimeError("Paged-occurrence request is missing its occurrence plan.")
-        occurrence_raw, occurrence_positions, birth_ids, terminal_ids = plan[:4]
-        assert occurrence_raw is not None
-        assert occurrence_positions is not None
-        assert birth_ids is not None
-        assert terminal_ids is not None
-        occurrence_count = len(occurrence_raw)
-        plan_token_count = len(birth_ids)
         initial_allocation = chunked_req is None
+        compact_layout = (
+            unpack_compact_occurrence_pending_fields(req) if initial_allocation else None
+        )
+        if compact_layout is not None:
+            # PendingReq intentionally reuses its legacy occurrence slots for the
+            # compact wire program.  Preserve the immutable source program after
+            # installing a runtime plan so a later scheduling attempt can adapt
+            # to a changed exact-prefix match.
+            setattr(req, "_compact_occurrence_layout", compact_layout)
+        elif initial_allocation:
+            compact_layout = getattr(req, "_compact_occurrence_layout", None)
+
+        occurrence_raw = None
+        occurrence_positions = None
+        birth_ids = None
+        terminal_ids = None
+        occurrence_count = 0
+        plan_token_count = 0
+
+        def refresh_occurrence_plan() -> None:
+            nonlocal occurrence_count, occurrence_positions, occurrence_raw
+            nonlocal birth_ids, plan_token_count, terminal_ids
+            plan = (
+                req.occurrence_raw_tokens,
+                req.occurrence_positions,
+                req.occurrence_birth_indices,
+                req.occurrence_terminal_indices,
+                req.occurrence_segment_query_starts,
+                req.occurrence_segment_query_ends,
+                req.occurrence_segment_key_offsets,
+                req.occurrence_segment_key_indices,
+            )
+            if not all(tensor is not None for tensor in plan):
+                raise RuntimeError("Paged-occurrence request is missing its occurrence plan.")
+            occurrence_raw, occurrence_positions, birth_ids, terminal_ids = plan[:4]
+            assert occurrence_raw is not None
+            assert occurrence_positions is not None
+            assert birth_ids is not None
+            assert terminal_ids is not None
+            occurrence_count = len(occurrence_raw)
+            plan_token_count = len(birth_ids)
+
+        if compact_layout is None:
+            refresh_occurrence_plan()
         initial_resources_live = False
         match = None
         fallback_to_empty = False
@@ -429,6 +460,22 @@ class PrefillAdder:
                     raise RuntimeError(
                         "Prefix matching must leave at least one occurrence query token."
                     )
+                if compact_layout is not None:
+                    if req.full_token_visible_until is None or req.radix_positions is None:
+                        raise RuntimeError(
+                            "Compact occurrence compilation requires visibility and terminal positions."
+                        )
+                    install_occurrence_plan(
+                        req,
+                        compile_occurrence_window(
+                            compact_layout,
+                            req.full_token_visible_until,
+                            req.radix_positions,
+                            query_start=cached_len,
+                            query_end=req.input_len,
+                        ),
+                    )
+                    refresh_occurrence_plan()
                 cache_handle = match.handle
                 table_idx: int | None = None
                 cache_locked = False
@@ -1476,6 +1523,25 @@ class PrefillManager:
                 raise ValueError(
                     "Context-mask Prefill requires a full token stream and Radix keys."
                 )
+        occurrence_fields = pack_compact_occurrence_pending_fields(
+            birth_positions=req.occurrence_layout_birth_positions,
+            birth_stages=req.occurrence_layout_birth_stages,
+            transition_offsets=req.occurrence_layout_transition_offsets,
+            transition_raw_tokens=req.occurrence_layout_transition_raw_tokens,
+            transition_old_positions=req.occurrence_layout_transition_old_positions,
+            transition_new_positions=req.occurrence_layout_transition_new_positions,
+        )
+        if not occurrence_fields:
+            occurrence_fields = {
+                "occurrence_raw_tokens": req.occurrence_raw_tokens,
+                "occurrence_positions": req.occurrence_positions,
+                "occurrence_birth_indices": req.occurrence_birth_indices,
+                "occurrence_terminal_indices": req.occurrence_terminal_indices,
+                "occurrence_segment_query_starts": req.occurrence_segment_query_starts,
+                "occurrence_segment_query_ends": req.occurrence_segment_query_ends,
+                "occurrence_segment_key_offsets": req.occurrence_segment_key_offsets,
+                "occurrence_segment_key_indices": req.occurrence_segment_key_indices,
+            }
         self.pending_list.append(
             PendingReq(
                 uid=req.uid,
@@ -1517,14 +1583,7 @@ class PrefillManager:
                 reposition_h2d_bytes=req.reposition_h2d_bytes,
                 reposition_d2h_bytes=req.reposition_d2h_bytes,
                 reposition_execution_mode=req.reposition_execution_mode,
-                occurrence_raw_tokens=req.occurrence_raw_tokens,
-                occurrence_positions=req.occurrence_positions,
-                occurrence_birth_indices=req.occurrence_birth_indices,
-                occurrence_terminal_indices=req.occurrence_terminal_indices,
-                occurrence_segment_query_starts=req.occurrence_segment_query_starts,
-                occurrence_segment_query_ends=req.occurrence_segment_query_ends,
-                occurrence_segment_key_offsets=req.occurrence_segment_key_offsets,
-                occurrence_segment_key_indices=req.occurrence_segment_key_indices,
+                **occurrence_fields,
             )
         )
 

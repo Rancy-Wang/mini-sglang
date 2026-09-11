@@ -5,6 +5,7 @@ import time
 from typing import Any, List
 
 import torch
+from minisgl.core import SamplingParams
 from minisgl.message import (
     AbortBackendMsg,
     AbortMsg,
@@ -141,14 +142,8 @@ def _build_occurrence_radix_records(t: Any) -> torch.Tensor:
 
 
 def _build_occurrence_user_msg(msg: TokenizeMsg, t: Any) -> UserMsg:
-    from .reposition_occurrence import compile_reposition_occurrence_plan
-
     if t.reposition_layout is None or t.reposition_input_ids is None:
         raise ValueError("Paged-occurrence Reposition requires a precompiled layout.")
-    plan = compile_reposition_occurrence_plan(
-        t.reposition_layout,
-        t.full_token_visible_until,
-    )
     token_count = len(t.reposition_input_ids)
     visible_until = t.full_token_visible_until
     if visible_until is None:
@@ -197,14 +192,16 @@ def _build_occurrence_user_msg(msg: TokenizeMsg, t: Any) -> UserMsg:
         radix_compile_ns=t.reposition_layout.compile_ns,
         reposition_transition_count=len(t.reposition_layout.transition_raw_tokens),
         reposition_execution_mode="paged-occurrence",
-        occurrence_raw_tokens=plan.occurrence_raw_tokens,
-        occurrence_positions=plan.occurrence_positions,
-        occurrence_birth_indices=plan.birth_occurrences,
-        occurrence_terminal_indices=plan.terminal_occurrences,
-        occurrence_segment_query_starts=plan.segment_query_starts,
-        occurrence_segment_query_ends=plan.segment_query_ends,
-        occurrence_segment_key_offsets=plan.segment_key_offsets,
-        occurrence_segment_key_indices=plan.segment_key_occurrences,
+        occurrence_layout_birth_positions=t.reposition_layout.birth_positions,
+        occurrence_layout_birth_stages=t.reposition_layout.birth_stages,
+        occurrence_layout_transition_offsets=t.reposition_layout.transition_offsets,
+        occurrence_layout_transition_raw_tokens=t.reposition_layout.transition_raw_tokens,
+        occurrence_layout_transition_old_positions=(
+            t.reposition_layout.transition_old_positions
+        ),
+        occurrence_layout_transition_new_positions=(
+            t.reposition_layout.transition_new_positions
+        ),
     )
     message.reposition_ipc_tensor_bytes = sum(
         value.numel() * value.element_size()
@@ -214,15 +211,43 @@ def _build_occurrence_user_msg(msg: TokenizeMsg, t: Any) -> UserMsg:
     return message
 
 
-def _prewarm_tokenizer_worker(tokenizer: Any, *, radix_drop_key_mode: str) -> None:
-    """Pay tokenizer and structured Radix first-use costs before ready."""
+def _prewarm_tokenizer_worker(
+    tokenizer: Any,
+    tokenize_manager: Any,
+    *,
+    radix_drop_key_mode: str,
+    reposition_execution_mode: str,
+) -> None:
+    """Pay production tokenizer and structured Radix first-use costs before ready."""
 
     tokenizer.encode("")
     tokenizer.decode([])
+    if tokenize_manager.is_gpt_oss:
+        ordinary = TokenizeMsg(
+            uid=-1,
+            text=[{"role": "user", "content": "Tokenizer startup warmup."}],
+            sampling_params=SamplingParams(max_tokens=1),
+        )
+        tokenize_manager.tokenize([ordinary])
     if radix_drop_key_mode == "delta-marker":
         from minisgl.kernel.radix_reposition import prewarm_radix_reposition_layout_kernel
 
         prewarm_radix_reposition_layout_kernel()
+        if tokenize_manager.is_gpt_oss:
+            structured = TokenizeMsg(
+                uid=-2,
+                text=[
+                    {"role": "user", "content": "old"},
+                    {"role": "assistant", "content": "answer"},
+                    {"role": "user", "content": "new"},
+                ],
+                sampling_params=SamplingParams(max_tokens=1),
+                drop_message={1: [0]},
+                reposition=[1],
+            )
+            tokenized = tokenize_manager.tokenize([structured])[0]
+            if reposition_execution_mode == "paged-occurrence":
+                _build_occurrence_user_msg(structured, tokenized)
 
 
 @torch.inference_mode()
@@ -257,7 +282,12 @@ def tokenize_worker(
     detokenize_manager = DetokenizeManager(tokenizer)
     reposition_sequences: dict[int, RepositionSequenceState] = {}
     prewarm_started_ns = time.perf_counter_ns()
-    _prewarm_tokenizer_worker(tokenizer, radix_drop_key_mode=radix_drop_key_mode)
+    _prewarm_tokenizer_worker(
+        tokenizer,
+        tokenize_manager,
+        radix_drop_key_mode=radix_drop_key_mode,
+        reposition_execution_mode=reposition_execution_mode,
+    )
     logger.info(
         "Tokenizer/Radix prewarm completed in %.2f ms.",
         (time.perf_counter_ns() - prewarm_started_ns) / 1e6,

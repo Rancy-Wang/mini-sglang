@@ -69,21 +69,79 @@ def validate_occurrence_positions(req, model_limit: int, rope_limit: int) -> int
     positions = req.occurrence_positions
     terminal = req.occurrence_terminal_indices
     keep = req.full_keep_mask
-    if positions is None or terminal is None or keep is None:
-        raise ValueError("Occurrence position validation requires a complete plan.")
-    if not positions.is_cpu or positions.ndim != 1 or len(positions) == 0:
-        raise ValueError("Occurrence positions must be a nonempty CPU vector.")
-    if len(terminal) != len(req.input_ids) or len(keep) != len(terminal):
-        raise ValueError("Occurrence terminal and active maps must cover raw input.")
-    if int(terminal.min()) < 0 or int(terminal.max()) >= len(positions):
-        raise ValueError("Occurrence terminal references are out of range.")
-    if int(positions.min()) < 0 or int(positions.max()) >= min(model_limit, rope_limit):
+    if keep is None:
+        raise ValueError("Occurrence position validation requires a final active mask.")
+    execution_positions: torch.Tensor
+    if positions is not None and terminal is not None:
+        if not positions.is_cpu or positions.ndim != 1 or len(positions) == 0:
+            raise ValueError("Occurrence positions must be a nonempty CPU vector.")
+        if len(terminal) != len(req.input_ids) or len(keep) != len(terminal):
+            raise ValueError("Occurrence terminal and active maps must cover raw input.")
+        if int(terminal.min()) < 0 or int(terminal.max()) >= len(positions):
+            raise ValueError("Occurrence terminal references are out of range.")
+        terminal_positions = positions[terminal.to(torch.int64)]
+        execution_positions = positions
+    else:
+        compact = (
+            getattr(req, "occurrence_layout_birth_positions", None),
+            getattr(req, "occurrence_layout_birth_stages", None),
+            getattr(req, "occurrence_layout_transition_offsets", None),
+            getattr(req, "occurrence_layout_transition_raw_tokens", None),
+            getattr(req, "occurrence_layout_transition_old_positions", None),
+            getattr(req, "occurrence_layout_transition_new_positions", None),
+        )
+        if not all(tensor is not None for tensor in compact):
+            raise ValueError("Occurrence position validation requires a complete compact layout.")
+        for tensor in compact:
+            assert tensor is not None
+            if not tensor.is_cpu or tensor.dtype != torch.int32 or tensor.ndim != 1:
+                raise ValueError("Compact occurrence layout tensors must be CPU int32 vectors.")
+        birth_positions, birth_stages, offsets, raw_tokens, old_positions, new_positions = compact
+        assert birth_positions is not None
+        assert birth_stages is not None
+        assert offsets is not None
+        assert raw_tokens is not None
+        assert old_positions is not None
+        assert new_positions is not None
+        token_count = len(req.input_ids)
+        if len(birth_positions) != token_count or len(birth_stages) != token_count:
+            raise ValueError("Compact occurrence birth metadata must cover raw input.")
+        if len(keep) != token_count:
+            raise ValueError("Occurrence active mask must cover raw input.")
+        if len(offsets) < 2 or int(offsets[0]) != 0 or bool(
+            torch.any(offsets[1:] < offsets[:-1]).item()
+        ):
+            raise ValueError("Compact occurrence transition offsets are invalid.")
+        transition_count = int(offsets[-1])
+        if not transition_count == len(raw_tokens) == len(old_positions) == len(new_positions):
+            raise ValueError("Compact occurrence transition arrays have different lengths.")
+        if bool(torch.any(raw_tokens < 0).item()) or bool(
+            torch.any(raw_tokens >= token_count).item()
+        ):
+            raise ValueError("Compact occurrence transitions reference invalid raw tokens.")
+        terminal_positions = req.radix_positions
+        if (
+            terminal_positions is None
+            or not terminal_positions.is_cpu
+            or terminal_positions.dtype != torch.int32
+            or terminal_positions.ndim != 1
+            or len(terminal_positions) != token_count
+        ):
+            raise ValueError("Compact occurrence layout requires terminal Radix positions.")
+        execution_positions = torch.cat(
+            (birth_positions, old_positions, new_positions, terminal_positions)
+        )
+        if len(execution_positions) == 0:
+            raise ValueError("Compact occurrence layout has no execution positions.")
+    if int(execution_positions.min()) < 0 or int(execution_positions.max()) >= min(
+        model_limit, rope_limit
+    ):
         raise ValueError("An occurrence execution position exceeds the model/RoPE limit.")
     active = keep.to(torch.bool)
     active_count = int(torch.count_nonzero(active))
     if active_count == 0:
         raise ValueError("Occurrence prompt must retain an active token.")
-    active_positions = positions[terminal[active].to(torch.int64)]
+    active_positions = terminal_positions[active]
     next_position = req.radix_next_position
     if next_position is None or next_position <= int(active_positions.max()):
         raise ValueError("Next position does not cover active terminal positions.")
@@ -365,8 +423,10 @@ class Req:
             if len(self.occurrence_segment_query_starts) == 0:
                 raise ValueError("Occurrence plan must contain at least one query segment.")
             if (
-                int(self.occurrence_segment_query_starts[0]) != 0
-                or int(self.occurrence_segment_query_ends[-1]) != plan_token_count
+                int(self.occurrence_segment_query_starts[0]) > self.cached_len
+                or int(self.occurrence_segment_query_ends[-1]) < self.device_len
+                or int(self.occurrence_segment_query_starts[0]) < 0
+                or int(self.occurrence_segment_query_ends[-1]) > plan_token_count
                 or bool(
                     torch.any(
                         self.occurrence_segment_query_starts[1:]
@@ -379,7 +439,9 @@ class Req:
                     ).item()
                 )
             ):
-                raise ValueError("Occurrence query segments must contiguously cover the prompt.")
+                raise ValueError(
+                    "Occurrence query segments must contiguously cover the request extension."
+                )
             if bool(torch.any(self.occurrence_raw_tokens < 0).item()) or bool(
                 torch.any(self.occurrence_raw_tokens >= plan_token_count).item()
             ):

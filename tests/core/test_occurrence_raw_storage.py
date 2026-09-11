@@ -3,8 +3,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 from minisgl.core import validate_occurrence_positions
-from minisgl.scheduler.table import TableManager
 from minisgl.scheduler.scheduler import ForwardInput, Scheduler
+from minisgl.scheduler.table import TableManager
 
 
 @pytest.mark.parametrize("raw_length", [7, 8, 9, 131443])
@@ -53,6 +53,28 @@ def test_drop_without_reposition_allows_position_holes():
     assert validate_occurrence_positions(req, 128, 128) == 3
     req.radix_next_position = 9
     with pytest.raises(ValueError, match="active terminal"):
+        validate_occurrence_positions(req, 128, 128)
+
+
+def test_compact_occurrence_layout_validates_without_expanded_plan():
+    req = SimpleNamespace(
+        input_ids=torch.arange(4),
+        occurrence_positions=None,
+        occurrence_terminal_indices=None,
+        occurrence_layout_birth_positions=torch.tensor([0, 1, 1, 2], dtype=torch.int32),
+        occurrence_layout_birth_stages=torch.tensor([0, 0, 1, 1], dtype=torch.int32),
+        occurrence_layout_transition_offsets=torch.tensor([0, 1], dtype=torch.int32),
+        occurrence_layout_transition_raw_tokens=torch.tensor([1], dtype=torch.int32),
+        occurrence_layout_transition_old_positions=torch.tensor([1], dtype=torch.int32),
+        occurrence_layout_transition_new_positions=torch.tensor([0], dtype=torch.int32),
+        full_keep_mask=torch.tensor([1, 0, 1, 1], dtype=torch.int32),
+        radix_positions=torch.tensor([0, 0, 1, 2], dtype=torch.int32),
+        radix_next_position=3,
+    )
+
+    assert validate_occurrence_positions(req, 128, 128) == 3
+    req.occurrence_layout_transition_old_positions[0] = 128
+    with pytest.raises(ValueError, match="model/RoPE"):
         validate_occurrence_positions(req, 128, 128)
 
 

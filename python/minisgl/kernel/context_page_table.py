@@ -48,9 +48,15 @@ def prewarm_context_page_table_variants(
     """Launch normal/direct and flat/padded CUDA variants before serving."""
 
     preload_context_page_table_kernel()
-    key_positions = torch.tensor([0, 1], dtype=torch.int32, device=device)
-    key_offsets = torch.tensor([0, 2], dtype=torch.int32, device=device)
-    table_indices = torch.tensor([0], dtype=torch.int32, device=device)
+    key_positions = torch.tensor([0, 1], dtype=torch.int32).pin_memory().to(
+        device, non_blocking=True
+    )
+    key_offsets = torch.tensor([0, 2], dtype=torch.int32).pin_memory().to(
+        device, non_blocking=True
+    )
+    table_indices = torch.tensor([0], dtype=torch.int32).pin_memory().to(
+        device, non_blocking=True
+    )
     normal_source = torch.arange(2, dtype=dtype, device=device).view(1, 2)
     direct_source = torch.arange(2, dtype=dtype, device=device)
     for direct, source, owners in (
@@ -76,6 +82,7 @@ def prewarm_context_page_table_variants(
                 padded_page_table=padded_page_table,
                 direct=direct,
             )
+    torch.cuda.synchronize(device)
 
 
 def compile_context_page_table_aot(

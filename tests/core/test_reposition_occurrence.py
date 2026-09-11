@@ -17,6 +17,12 @@ from minisgl.kernel.radix_reposition import RadixRepositionLayout
 from minisgl.scheduler.cache import CacheManager
 from minisgl.scheduler.config import SchedulerConfig
 from minisgl.scheduler.prefill import PrefillManager, RepositionCapacityError
+from minisgl.scheduler.reposition_occurrence import (
+    CompactRepositionOccurrenceLayout,
+    compile_occurrence_window,
+    pack_compact_occurrence_pending_fields,
+    unpack_compact_occurrence_pending_fields,
+)
 from minisgl.tokenizer.reposition_occurrence import compile_reposition_occurrence_plan
 
 
@@ -138,6 +144,100 @@ def test_occurrence_expansion_rejects_stale_transition_source_position() -> None
             replace(layout, transition_old_positions=stale),
             torch.tensor([4, 9, 7, 9, 9, 9, 9, 9], dtype=torch.int32),
         )
+
+
+def _compact_layout(layout: RadixRepositionLayout) -> CompactRepositionOccurrenceLayout:
+    return CompactRepositionOccurrenceLayout(
+        birth_positions=layout.birth_positions,
+        birth_stages=layout.birth_stages,
+        transition_offsets=layout.transition_offsets,
+        transition_raw_tokens=layout.transition_raw_tokens,
+        transition_old_positions=layout.transition_old_positions,
+        transition_new_positions=layout.transition_new_positions,
+    )
+
+
+def _semantic_window(plan, query_start: int, query_end: int):
+    semantic = []
+    for index, (segment_start, segment_end) in enumerate(
+        zip(plan.segment_query_starts.tolist(), plan.segment_query_ends.tolist(), strict=True)
+    ):
+        local_start = max(query_start, segment_start)
+        local_end = min(query_end, segment_end)
+        if local_start >= local_end:
+            continue
+        key_start = int(plan.segment_key_offsets[index])
+        key_end = int(plan.segment_key_offsets[index + 1])
+        keys = plan.segment_key_occurrences[key_start:key_end]
+        prefix_length = len(keys) - (segment_end - segment_start)
+        keys = keys[: prefix_length + local_end - segment_start].to(torch.int64)
+        semantic.append(
+            (
+                local_start,
+                local_end,
+                list(
+                    zip(
+                        plan.occurrence_raw_tokens[keys].tolist(),
+                        plan.occurrence_positions[keys].tolist(),
+                        strict=True,
+                    )
+                ),
+            )
+        )
+    return semantic
+
+
+def test_compact_occurrence_pending_adapter_round_trips_without_expansion() -> None:
+    compact = _compact_layout(_layout())
+    packed = pack_compact_occurrence_pending_fields(
+        birth_positions=compact.birth_positions,
+        birth_stages=compact.birth_stages,
+        transition_offsets=compact.transition_offsets,
+        transition_raw_tokens=compact.transition_raw_tokens,
+        transition_old_positions=compact.transition_old_positions,
+        transition_new_positions=compact.transition_new_positions,
+    )
+
+    restored = unpack_compact_occurrence_pending_fields(SimpleNamespace(**packed))
+
+    assert restored is not None
+    for name in (
+        "birth_positions",
+        "birth_stages",
+        "transition_offsets",
+        "transition_raw_tokens",
+        "transition_old_positions",
+        "transition_new_positions",
+    ):
+        assert torch.equal(getattr(restored, name), getattr(compact, name))
+    assert packed["occurrence_segment_key_offsets"].tolist() == [-1]
+    assert packed["occurrence_segment_key_indices"].numel() == 0
+
+
+@pytest.mark.parametrize("query_start", [0, 2, 4, 7])
+def test_lazy_occurrence_window_matches_full_plan_semantics(query_start: int) -> None:
+    layout = _layout()
+    visibility = torch.tensor([4, 9, 7, 9, 9, 9, 9, 9], dtype=torch.int32)
+    full = compile_reposition_occurrence_plan(layout, visibility)
+    lazy = compile_occurrence_window(
+        _compact_layout(layout),
+        visibility,
+        layout.positions,
+        query_start=query_start,
+        query_end=8,
+    )
+
+    assert _semantic_window(lazy, query_start, 8) == _semantic_window(full, query_start, 8)
+    assert torch.equal(
+        lazy.occurrence_positions[lazy.birth_occurrences.to(torch.int64)],
+        full.occurrence_positions[full.birth_occurrences.to(torch.int64)],
+    )
+    assert torch.equal(
+        lazy.occurrence_positions[lazy.terminal_occurrences.to(torch.int64)],
+        full.occurrence_positions[full.terminal_occurrences.to(torch.int64)],
+    )
+    if query_start == 7:
+        assert lazy.occurrence_count < full.occurrence_count
 
 
 def _runtime_req(plan, *, cached_len: int, page_base: int, table_idx: int):
