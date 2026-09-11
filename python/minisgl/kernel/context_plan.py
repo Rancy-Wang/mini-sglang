@@ -82,7 +82,7 @@ def prewarm_context_plan_variants() -> None:
     occurrence = try_build_occurrence_sliding_plan(
         raw_positions,
         true_positions,
-        torch.tensor([0], dtype=torch.int32, device="cpu"),
+        torch.tensor([1], dtype=torch.int32, device="cpu"),
         torch.tensor([2], dtype=torch.int32, device="cpu"),
         torch.tensor([0, 2], dtype=torch.int32, device="cpu"),
         raw_positions,

@@ -314,10 +314,22 @@ auto validate_occurrence_sliding_inputs(
   host::RuntimeCheck(offsets[0] == 0 &&
                          offsets[query_starts.size(0)] == flat_keys.size(0),
                      "Occurrence key offsets do not cover flat keys");
+  const auto *starts = static_cast<const int32_t *>(query_starts.data_ptr());
+  const auto *ends = static_cast<const int32_t *>(query_ends.data_ptr());
+  const int64_t full_raw_length = ends[query_ends.size(0) - 1];
+  host::RuntimeCheck(full_raw_length >= device_len,
+                     "Occurrence segments do not reach the request device length");
   for (int64_t segment = 0; segment < query_starts.size(0); ++segment) {
     host::RuntimeCheck(offsets[segment] >= 0 &&
                            offsets[segment] <= offsets[segment + 1],
                        "Occurrence key offsets must be monotonic");
+    const int64_t raw_start = starts[segment];
+    const int64_t raw_end = ends[segment];
+    host::RuntimeCheck(
+        raw_start >= 0 && raw_start < raw_end && raw_end <= full_raw_length &&
+            (segment == 0 ? raw_start <= cached_len
+                          : raw_start == ends[segment - 1]),
+        "Occurrence segment bounds are invalid");
   }
 }
 
@@ -370,10 +382,6 @@ auto count_occurrence_sliding_keys(
   for (int64_t segment = 0; segment < query_starts.size(0); ++segment) {
     const int64_t raw_start = starts[segment];
     const int64_t raw_end = ends[segment];
-    host::RuntimeCheck(raw_start >= 0 && raw_start < raw_end &&
-                           raw_end <= full_raw_length &&
-                           (segment == 0 ? raw_start == 0 : raw_start == ends[segment - 1]),
-                       "Occurrence segment bounds are invalid");
     const int64_t key_begin = offsets[segment];
     const int64_t key_end = offsets[segment + 1];
     const int64_t prefix_length = key_end - key_begin - (raw_end - raw_start);

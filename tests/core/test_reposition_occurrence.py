@@ -325,6 +325,48 @@ def test_occurrence_sliding_aot_batch_matches_python_reference(
         assert torch.equal(getattr(actual, name), getattr(expected, name))
 
 
+def test_lazy_occurrence_sliding_aot_batch_matches_python_reference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    layout = _layout()
+    plan = compile_occurrence_window(
+        _compact_layout(layout),
+        torch.tensor([4, 9, 7, 9, 9, 9, 9, 9], dtype=torch.int32),
+        layout.positions,
+        query_start=4,
+        query_end=8,
+    )
+    reqs = [_runtime_req(plan, cached_len=4, page_base=100, table_idx=3)]
+    reqs[0].initial_active_cached_len = reqs[0].cached_len
+
+    with monkeypatch.context() as fallback:
+        fallback.setattr(
+            attention_base,
+            "try_build_occurrence_sliding_plan",
+            lambda *args, **kwargs: None,
+        )
+        expected = attention_base.build_occurrence_attention_batch(reqs, sliding_window=2)
+
+    actual = attention_base.build_occurrence_attention_batch(reqs, sliding_window=2)
+
+    assert actual.cached_tokens == expected.cached_tokens
+    assert actual.max_seqlen_q == expected.max_seqlen_q
+    assert actual.max_seqlen_k == expected.max_seqlen_k
+    assert len(actual.cached_positions) == len(expected.cached_positions)
+    for actual_positions, expected_positions in zip(
+        actual.cached_positions, expected.cached_positions, strict=True
+    ):
+        assert torch.equal(actual_positions, expected_positions)
+    for name in (
+        "segment_table_indices",
+        "key_positions",
+        "cu_seqlens_q",
+        "cu_seqlens_k",
+        "direct_pages",
+    ):
+        assert torch.equal(getattr(actual, name), getattr(expected, name))
+
+
 def test_occurrence_owned_prompt_prefix_allows_generated_cache_candidates() -> None:
     page_table = torch.full((1, 8), -1, dtype=torch.int32)
     manager = CacheManager(16, 1, page_table, "radix")

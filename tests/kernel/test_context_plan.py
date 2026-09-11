@@ -300,3 +300,29 @@ def test_occurrence_sliding_plan_matches_direct_reference() -> None:
         assert offsets.tolist() == expected_offsets
         assert keys.tolist() == expected_keys
         assert cached_positions.tolist() == sorted(expected_cached)
+
+
+def test_occurrence_sliding_plan_accepts_window_starting_at_cached_len() -> None:
+    raw = torch.arange(4, dtype=torch.int32)
+    positions = raw.clone()
+
+    result = try_build_occurrence_sliding_plan(
+        raw,
+        positions,
+        torch.tensor([2], dtype=torch.int32),
+        torch.tensor([4], dtype=torch.int32),
+        torch.tensor([0, 4], dtype=torch.int32),
+        raw,
+        positions,
+        cached_len=2,
+        device_len=4,
+        initial_cached_len=2,
+        sliding_window=2,
+        occurrence_base=7,
+    )
+
+    assert result is not None
+    offsets, keys, cached_positions = result
+    assert offsets.tolist() == [0, 3, 6]
+    assert keys.tolist() == [7, 8, 9, 8, 9, 10]
+    assert cached_positions.tolist() == [0, 1]
