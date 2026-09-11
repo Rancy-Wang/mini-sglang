@@ -62,6 +62,7 @@ def idle_control(root, group=None):
         command[0] = {
             "resets": [p.name for p in sorted(root.glob("reset-*.request"))],
             "pressure": (root / "pressure.request").exists(),
+            "inflight_finalize": (root / "inflight-finalize.request").exists(),
         }
     if distributed:
         dist.broadcast_object_list(command, src=0, group=group)
@@ -280,6 +281,90 @@ def install_observers() -> None:
             pending.extend(node.children.values())
         return found
 
+    original_scheduler_forward = Scheduler._forward
+    inflight_pressure_done = False
+
+    @functools.wraps(original_scheduler_forward)
+    def pressure_forward(self, forward_input):
+        """Exhaust allocatable pages while a real occurrence request owns its lock."""
+        nonlocal inflight_pressure_done
+        batch = forward_input.batch
+        marker = root / "inflight-pressure.request"
+        candidates = [
+            req for req in batch.reqs
+            if (
+                req.reposition_execution_mode == "paged-occurrence"
+                and req.cache_handle.cached_len > 0
+                and batch.occurrence_source_pages is not None
+                and len(batch.occurrence_source_pages) > 0
+            )
+        ]
+        if not inflight_pressure_done and marker.exists() and candidates:
+            inflight_pressure_done = True
+            cache = self.cache_manager
+            if cache.page_size != 1:
+                raise RuntimeError("R4 in-flight pressure requires page_size=1.")
+            tree = cache.prefix_cache
+            before = nodes(tree)
+            protected_ids = {node.uuid for node in before if node.ref_count > 0}
+            if not protected_ids:
+                raise RuntimeError("The in-flight request did not protect a Radix branch.")
+
+            page_tensors = [
+                batch.out_loc,
+                batch.occurrence_source_pages,
+                batch.occurrence_destination_pages,
+            ]
+            for req in batch.reqs:
+                if req.cache_handle.cached_len > 0:
+                    page_tensors.append(req.cache_handle.get_matched_indices())
+                page_tensors.append(req.initial_full_match_indices)
+                if req.occurrence_transient_pages is not None:
+                    page_tensors.append(req.occurrence_transient_pages)
+            valid_pages = []
+            for value in page_tensors:
+                if value is None or len(value) == 0:
+                    continue
+                flat = value.detach().reshape(-1).to(
+                    device=cache.device, dtype=torch.int64, non_blocking=True
+                )
+                valid_pages.append(flat[(flat >= 0) & (flat < cache.num_pages)])
+            critical = torch.unique(torch.cat(valid_pages))
+            available_before = cache.available_size
+            free_before = len(cache.free_slots)
+            held = None
+            try:
+                held = cache._allocate(available_before)
+                allocated = torch.zeros(cache.num_pages, dtype=torch.bool, device=cache.device)
+                allocated[held.to(torch.int64)] = True
+                overlap = critical[allocated[critical]]
+                after_ids = {node.uuid for node in nodes(tree)}
+                emit(
+                    "inflight_pressure_protected",
+                    uid=candidates[0].uid,
+                    handle_cached_len=candidates[0].cache_handle.cached_len,
+                    protected_nodes=len(protected_ids),
+                    protected_survive=protected_ids <= after_ids,
+                    critical_pages=len(critical),
+                    allocated_pages=len(held),
+                    overlap_pages=len(overlap),
+                    free_before=free_before,
+                    available_before=available_before,
+                    free_pages=len(cache.free_slots),
+                    available_pages=cache.available_size,
+                    total_pages=cache.num_pages,
+                )
+                assert len(cache.free_slots) == 0
+                assert cache.available_size == 0
+                assert protected_ids <= after_ids
+                assert len(overlap) == 0
+            finally:
+                if held is not None:
+                    cache.free_occurrence_pages(held)
+        return original_scheduler_forward(self, forward_input)
+
+    Scheduler._forward = pressure_forward
+
     original_commit = CacheManager.cache_req
 
     @functools.wraps(original_commit)
@@ -300,11 +385,36 @@ def install_observers() -> None:
     CacheManager.cache_req = commit
     original_idle = Scheduler.run_when_idle
     pressure_done = False
+    inflight_finalize_done = False
 
     @functools.wraps(original_idle)
     def idle(self):
-        nonlocal pressure_done
+        nonlocal inflight_finalize_done, pressure_done
         original_idle(self)
+        if (
+            not inflight_finalize_done
+            and inflight_pressure_done
+            and control_state["inflight_finalize"]
+        ):
+            inflight_finalize_done = True
+            cache = self.cache_manager
+            tree = cache.prefix_cache
+            before = nodes(tree)
+            assert all(node.ref_count == 0 for node in before)
+            assert cache.available_size == cache.num_pages
+            all_pages = cache._allocate(cache.num_pages)
+            assert len(torch.unique(all_pages)) == cache.num_pages
+            assert len(cache.free_slots) == 0
+            assert not tree._ordinary_slot_nodes
+            assert not any(node.page_length for node in nodes(tree))
+            cache.free_occurrence_pages(all_pages)
+            emit(
+                "inflight_pressure_complete",
+                free_pages=len(cache.free_slots),
+                total_pages=cache.num_pages,
+                residual_nodes=[[node.uuid, node.page_length] for node in nodes(tree)],
+            )
+            (root / f"inflight-finalize.ack-{os.getpid()}").touch(exist_ok=False)
         if pressure_done or not control_state["pressure"]:
             return
         pressure_done = True
@@ -710,6 +820,118 @@ async def clear_cache(args) -> None:
     print(json.dumps({"status": "cache_reset_complete", "tp": args.tp}), flush=True)
 
 
+def safe_record(record):
+    """Keep status/timing evidence without copying generated response content."""
+    return {key: value for key, value in record.items() if key not in {"response", "response_text"}}
+
+
+async def inflight_pressure(args) -> None:
+    """Drive the opt-in pressure hook with a real cached HTTP request."""
+    import httpx
+
+    def load(turn):
+        path = args.input / f"case-{args.case}/turn-{turn:03d}.request.json.gz"
+        with gzip.open(path, "rt") as stream:
+            payload = json.load(stream)
+        payload.update(
+            max_tokens=args.max_tokens,
+            temperature=0,
+            top_p=1,
+            top_k=-1,
+            seed=17,
+            stream=False,
+        )
+        payload.pop("stream_options", None)
+        return payload
+
+    warm_payload = load(args.warm_turn)
+    trigger_payload = load(args.trigger_turn)
+    if args.trigger_turn <= args.warm_turn:
+        raise ValueError("The pressure trigger turn must follow the cache-warm turn.")
+    if not trigger_payload.get("reposition") or not trigger_payload.get("drop_message"):
+        raise ValueError("The pressure trigger must contain a real Drop/Reposition event.")
+    pressure_marker = args.server_root / "inflight-pressure.request"
+    finalize_marker = args.server_root / "inflight-finalize.request"
+    if pressure_marker.exists() or finalize_marker.exists():
+        raise FileExistsError("In-flight pressure markers already exist in this server root.")
+
+    async with httpx.AsyncClient(timeout=args.timeout, trust_env=False) as client:
+        warm = await send(client, args.url, warm_payload, f"{args.case}:{args.warm_turn}:warm")
+        if warm.get("status_code") != 200:
+            raise RuntimeError(f"Cache warm request failed: {safe_record(warm)}")
+        pressure_marker.touch(exist_ok=False)
+        trigger = await send(
+            client,
+            args.url,
+            trigger_payload,
+            f"{args.case}:{args.trigger_turn}:inflight-pressure",
+        )
+        if trigger.get("status_code") != 200:
+            raise RuntimeError(f"In-flight pressure request failed: {safe_record(trigger)}")
+        finalize_marker.touch(exist_ok=False)
+        probe = {
+            "model": args.model,
+            "messages": [{"role": "user", "content": "Say OK."}],
+            "max_tokens": 1,
+            "temperature": 0,
+            "stream": False,
+        }
+        wake = await send(client, args.url, probe, "inflight-finalize-wakeup")
+        deadline = time.monotonic() + 30
+        while len(acks := list(args.server_root.glob("inflight-finalize.ack-*"))) != args.tp:
+            if wake.get("status_code") != 200 or time.monotonic() > deadline:
+                raise RuntimeError(
+                    f"Incomplete in-flight finalization: {safe_record(wake)}; acknowledgments={acks}"
+                )
+            await asyncio.sleep(0.05)
+        health = await send(client, args.url, probe, "post-inflight-pressure-health")
+        if health.get("status_code") != 200:
+            raise RuntimeError(f"Post-pressure health request failed: {safe_record(health)}")
+
+    rows = [
+        json.loads(line)
+        for path in args.server_root.glob("observer-*.jsonl")
+        for line in path.read_text().splitlines()
+    ]
+    protected = [row for row in rows if row["kind"] == "inflight_pressure_protected"]
+    completed = [row for row in rows if row["kind"] == "inflight_pressure_complete"]
+    if len(protected) != args.tp or len(completed) != args.tp:
+        raise RuntimeError(
+            f"Expected {args.tp} pressure/finalization records, got {len(protected)}/{len(completed)}."
+        )
+    trigger_uids = {row["uid"] for row in protected}
+    actual_forward = any(
+        row["kind"] == "forward"
+        and any(query[0] in trigger_uids for query in row["queries"])
+        for row in rows
+    )
+    summary = {
+        "case": args.case,
+        "warm_turn": args.warm_turn,
+        "trigger_turn": args.trigger_turn,
+        "warm": safe_record(warm),
+        "trigger": safe_record(trigger),
+        "finalize_wakeup": safe_record(wake),
+        "post_pressure_health": safe_record(health),
+        "actual_forward_observed": actual_forward,
+        "ranks": protected,
+        "finalization": completed,
+        "pass": (
+            actual_forward
+            and all(row["protected_survive"] and row["overlap_pages"] == 0 for row in protected)
+            and all(
+                row["free_pages"] == row["total_pages"] and not row["residual_nodes"]
+                for row in completed
+            )
+        ),
+    }
+    if not summary["pass"]:
+        raise RuntimeError(f"In-flight pressure checks failed: {summary}")
+    with args.output.open("x") as stream:
+        json.dump(summary, stream, indent=2)
+    print(json.dumps({"pass": True, "ranks": len(protected), "output": str(args.output)}))
+
+
 def paired_noninferiority(baseline, candidate):
     """One-sided Student-t interval over independent paired run log-ratios.
 
@@ -870,6 +1092,15 @@ def main():
     clear_parser.add_argument("--server-root", type=Path, required=True)
     clear_parser.add_argument("--model", required=True)
     clear_parser.add_argument("--tp", type=int, default=2)
+    pressure_parser = commands.add_parser("inflight-pressure")
+    pressure_parser.add_argument("--input", type=Path, required=True)
+    pressure_parser.add_argument("--server-root", type=Path, required=True)
+    pressure_parser.add_argument("--model", required=True)
+    pressure_parser.add_argument("--case", default="806")
+    pressure_parser.add_argument("--warm-turn", type=int, default=13)
+    pressure_parser.add_argument("--trigger-turn", type=int, default=14)
+    pressure_parser.add_argument("--max-tokens", type=int, default=8)
+    pressure_parser.add_argument("--tp", type=int, default=2)
     bench_parser = commands.add_parser("benchmark")
     for name in ("repo", "baseline", "input", "baseline-cache", "candidate-cache"):
         bench_parser.add_argument(f"--{name}", type=Path, required=True)
@@ -879,9 +1110,9 @@ def main():
     bench_parser.add_argument("--chunk", type=int, default=32768)
     bench_parser.add_argument("--memory-ratio", type=float, default=0.90)
     for command in (launch, stop, replay_parser, wave_parser, five_parser, prepare_parser, clear_parser,
-                    bench_parser):
+                    pressure_parser, bench_parser):
         command.add_argument("--output", type=Path, required=True)
-    for command in (replay_parser, wave_parser, five_parser, clear_parser):
+    for command in (replay_parser, wave_parser, five_parser, clear_parser, pressure_parser):
         command.add_argument("--url", type=loopback_url, required=True)
         command.add_argument("--timeout", type=float, default=1800)
     args = parser.parse_args()
@@ -897,6 +1128,8 @@ def main():
         prepare(args)
     elif args.command == "clear":
         asyncio.run(clear_cache(args))
+    elif args.command == "inflight-pressure":
+        asyncio.run(inflight_pressure(args))
     elif args.command == "benchmark":
         asyncio.run(benchmark(args))
     else:

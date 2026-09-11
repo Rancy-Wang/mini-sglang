@@ -110,10 +110,12 @@ def test_r4_idle_controls_are_broadcast_not_read_independently(r4_harness, monke
 
     def broadcast(command, *, src, group):
         assert src == 0 and command == [None]
-        command[0] = {"resets": [], "pressure": False}
+        command[0] = {"resets": [], "pressure": False, "inflight_finalize": False}
 
     monkeypatch.setattr(dist, "broadcast_object_list", broadcast)
-    assert r4_harness.idle_control(tmp_path, group) == {"resets": [], "pressure": False}
+    assert r4_harness.idle_control(tmp_path, group) == {
+        "resets": [], "pressure": False, "inflight_finalize": False,
+    }
 
 
 @pytest.mark.parametrize("mode", ["timing", "exact", "pressure"])
@@ -133,7 +135,8 @@ def test_r4_observers_preserve_forward_and_keyword_only_commit(
         (attention, ("build_context_attention_batch", "build_occurrence_attention_batch",
                      "compile_context_page_tables")),
         (Engine, ("forward_batch",)), (Sampler, ("sample",)), (Req, ("append_host",)),
-        (CacheManager, ("_allocate", "cache_req")), (Scheduler, ("run_when_idle",)),
+        (CacheManager, ("_allocate", "cache_req")),
+        (Scheduler, ("run_when_idle", "_forward")),
     ):
         for name in names:
             monkeypatch.setattr(owner, name, getattr(owner, name))
@@ -155,6 +158,7 @@ def test_r4_observers_preserve_forward_and_keyword_only_commit(
     monkeypatch.setattr(Sampler, "sample", lambda self, logits, args: logits.argmax(-1))
     monkeypatch.setattr(Req, "append_host", lambda self, token: token)
     monkeypatch.setattr(Scheduler, "run_when_idle", lambda self: None)
+    monkeypatch.setattr(Scheduler, "_forward", lambda self, forward_input: "forwarded")
     import minisgl.scheduler.scheduler as scheduler_module
     for name in ("_make_input_tuple", "_make_write_tuple"):
         monkeypatch.setattr(scheduler_module, name, lambda batch, device: ("mapping", device))
@@ -227,6 +231,47 @@ def test_r4_observers_preserve_forward_and_keyword_only_commit(
         protected = next(row for row in pressure_rows if row["kind"] == "pressure_protected")
         assert protected["protected_survive"] and protected["remaining_eligible"]
         assert sum(row["kind"] == "pressure_complete" for row in pressure_rows) == 1
+
+        # The in-flight hook must use a request's existing Radix lock, protect
+        # every page it can read/write, then permit natural unlock and recovery.
+        pages = cache._allocate(5)
+        handle = cache.prefix_cache.insert_prefix(
+            torch.tensor([10, 11, 12]), pages[:3]
+        ).handle
+        cache.prefix_cache.insert_prefix(torch.tensor([20, 21]), pages[3:])
+        cache.lock(handle)
+        transient = cache.allocate_occurrence_pages(1)
+        inflight_req = SimpleNamespace(
+            uid="real-http-request",
+            reposition_execution_mode="paged-occurrence",
+            cache_handle=handle,
+            initial_full_match_indices=pages[:3],
+            occurrence_transient_pages=transient,
+        )
+        inflight_batch = SimpleNamespace(
+            reqs=[inflight_req],
+            out_loc=transient,
+            occurrence_source_pages=pages[:1],
+            occurrence_destination_pages=transient,
+        )
+        (tmp_path / "inflight-pressure.request").touch()
+        assert Scheduler._forward(
+            scheduler, SimpleNamespace(batch=inflight_batch)
+        ) == "forwarded"
+        cache.free_occurrence_pages(transient)
+        cache.unlock(handle)
+        (tmp_path / "inflight-finalize.request").touch()
+        Scheduler.run_when_idle(scheduler)
+        final_rows = [
+            json.loads(line)
+            for path in tmp_path.glob("observer-*.jsonl")
+            for line in path.read_text().splitlines()
+        ]
+        inflight = next(row for row in final_rows if row["kind"] == "inflight_pressure_protected")
+        assert inflight["protected_survive"] and inflight["overlap_pages"] == 0
+        complete = next(row for row in final_rows if row["kind"] == "inflight_pressure_complete")
+        assert complete["free_pages"] == complete["total_pages"] == 8
+        assert not complete["residual_nodes"]
     elif mode == "exact":
         assert {"logits", "kv", "reposition_kv", "token"} <= set(kinds)
         assert next(row for row in rows if row["kind"] == "kv")["pages"] == 2
