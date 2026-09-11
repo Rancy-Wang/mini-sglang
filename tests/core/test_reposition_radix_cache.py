@@ -115,6 +115,25 @@ def test_structured_exact_index_survives_edge_split() -> None:
     cache.check_integrity()
 
 
+def test_radix_insert_owns_staged_key_after_sender_mutates_working_records() -> None:
+    cache = _cache()
+    working = _records(
+        [
+            [TOKEN_KIND, 10, -1, 0],
+            [TOKEN_KIND, 11, -1, 1],
+        ]
+    )
+    committed = working.clone()
+    cache.insert_prefix(working, torch.tensor([0, 1], dtype=torch.int32), _mask(2))
+
+    working[:, 2] = 7
+    working[:, 3] = torch.tensor([4, 5], dtype=torch.int32)
+
+    assert cache.match_prefix(committed, _mask(2)).cuda_handle.cached_len == 2
+    assert cache.match_prefix(working, _mask(2)).cuda_handle.cached_len == 0
+    cache.check_integrity()
+
+
 def test_radix_integrity_check_does_not_traverse_the_tree() -> None:
     class NoTraversalDict(dict):
         def values(self):
@@ -302,6 +321,51 @@ def test_retry_position_plan_keeps_changed_pages_that_are_dropped_later() -> Non
     assert match.full_cached_len == 2
     assert match.active_cached_len == 0
     assert match.retry_plan.tolist() == [[1, 1, 1, 0]]
+
+
+def test_occurrence_match_never_walks_a_structured_retry_branch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page_table = torch.zeros((1, 8), dtype=torch.int32, device="cpu")
+    manager = CacheManager(8, 1, page_table, "radix")
+    source = _records(
+        [
+            [TOKEN_KIND, 10, -1, 0],
+            [TOKEN_KIND, 11, -1, 1],
+        ]
+    )
+    manager.prefix_cache.insert_prefix(
+        source,
+        torch.tensor([0, 1], dtype=torch.int32),
+        _mask(2),
+    )
+    target = _records(
+        [
+            [TOKEN_KIND, 10, -1, 0],
+            [TOKEN_KIND, 11, 1, 0],
+        ]
+    )
+    req = SimpleNamespace(
+        input_len=2,
+        radix_match_ids=target,
+        radix_token_to_key=torch.tensor([0, 1], dtype=torch.int64),
+        radix_key_to_token=torch.tensor([0, 1], dtype=torch.int64),
+        radix_key_virtual_mask=_mask(2),
+        radix_commit_key_len=None,
+        raw_positions=torch.tensor([0, 1], dtype=torch.int32),
+        prefix_keep_mask=torch.ones(2, dtype=torch.int32),
+    )
+
+    def fail_retry(*_args, **_kwargs):
+        raise AssertionError("paged-occurrence attempted structured Retry")
+
+    monkeypatch.setattr(manager.prefix_cache, "match_retry_prefix", fail_retry)
+    match = manager.match_occurrence_req(req)
+
+    assert match is not None
+    assert match.full_cached_len == 1
+    assert match.retry_plan is None
+    assert match.retry_plan_ns == 0
 
 
 def test_concurrent_commit_adopts_inactive_retry_page_and_frees_duplicate() -> None:

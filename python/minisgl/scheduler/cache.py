@@ -109,14 +109,35 @@ class CacheManager:
         )
         return full_token_prefix_len, active_token_prefix_len
 
+    def match_occurrence_req(self, req: PendingReq) -> ContextMatchResult | None:
+        """Match only the exact Radix prefix for paged-occurrence execution.
+
+        Paged-occurrence materializes position changes directly from the exact
+        reusable KV prefix.  It must never walk a structured Retry branch or
+        compile a staged Retry plan.
+        """
+
+        return self._match_req(req, allow_structured_retry=False)
+
     def match_req(self, req: PendingReq) -> ContextMatchResult | None:
+        """Match a request, including the legacy staged structured-Retry path."""
+
+        return self._match_req(req, allow_structured_retry=True)
+
+    def _match_req(
+        self,
+        req: PendingReq,
+        *,
+        allow_structured_retry: bool,
+    ) -> ContextMatchResult | None:
         assert req.input_len > 0, "Input length must be greater than 0."
         radix_query, query_virtual_mask = self._radix_query_prefix(req)
         matched = self._match_prefix(radix_query, query_virtual_mask)
         handle, key_match_indices, matched_virtual_mask = matched
         used_retry = False
         if (
-            req.radix_match_ids is not None
+            allow_structured_retry
+            and req.radix_match_ids is not None
             and req.radix_match_ids.ndim == 2
             and req.radix_key_to_token is not None
         ):

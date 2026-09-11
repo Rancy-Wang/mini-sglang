@@ -34,7 +34,7 @@ class BaseKVCachePool(ABC):
     ) -> None: ...
 
     @abstractmethod
-    def reposition_layer(
+    def materialize_occurrence_layer(
         self,
         source_slots: torch.Tensor,
         destination_slots: torch.Tensor,

@@ -100,13 +100,27 @@ def test_bootstrap_is_task_local_and_covers_both_framework_maps(tmp_path: Path) 
     assert "bootstrap" in env["PYTHONPATH"]
     assert {target.stage for target in targets_for_framework("minisgl")} >= {
         "tokenize",
+        "reposition_sequence",
+        "serialization",
         "scheduler",
+        "scheduler_loop",
+        "scheduler_prepare",
+        "scheduler_forward",
+        "scheduler_result",
+        "scheduler_receive",
+        "scheduler_reply",
+        "scheduler_host",
+        "scheduler_metrics",
+        "scheduler_ipc",
         "prefill_extend",
         "decode",
         "radix_match",
         "free_and_cache",
         "evict",
     }
+    minisgl_names = {target.qualname for target in targets_for_framework("minisgl")}
+    assert "CacheManager.match_occurrence_req" in minisgl_names
+    assert "CacheManager._match_req" in minisgl_names
     assert {target.stage for target in targets_for_framework("sglang")} >= {
         "tokenize",
         "scheduler",

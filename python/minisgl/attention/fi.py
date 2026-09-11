@@ -279,7 +279,7 @@ class FlashInferBackend(BaseAttnBackend):
                 or batch.occurrence_rope_cache is None
             ):
                 raise RuntimeError("Occurrence layer transform metadata is incomplete.")
-            self.kvcache.reposition_layer(
+            self.kvcache.materialize_occurrence_layer(
                 batch.occurrence_source_pages,
                 batch.occurrence_destination_pages,
                 batch.occurrence_position_pairs,

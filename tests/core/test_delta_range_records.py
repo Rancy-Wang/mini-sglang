@@ -13,7 +13,7 @@ from minisgl.kernel.radix_reposition import (
     RadixRepositionInput,
     compile_radix_reposition_layout,
 )
-from minisgl.message import RepositionOpenMsg, UserMsg
+from minisgl.message import RepositionOpenMsg, StagedRepositionInit, UserMsg
 from minisgl.message.tokenizer import RepositionOpenAckMsg
 from minisgl.scheduler.radix_delta import decode_delta_record, validate_delta_records
 from minisgl.scheduler.utils import PendingReq
@@ -74,6 +74,7 @@ def test_protocol_and_request_state_have_no_allocated_delta_id_field() -> None:
     classes = (
         RadixRepositionInput,
         RepositionOpenMsg,
+        StagedRepositionInit,
         RepositionOpenAckMsg,
         UserMsg,
         PendingReq,
@@ -83,7 +84,7 @@ def test_protocol_and_request_state_have_no_allocated_delta_id_field() -> None:
         assert "radix_marker_ids" not in {field.name for field in fields(cls)}
         assert "delta_marker_ids" not in {field.name for field in fields(cls)}
 
-    assert {field.name for field in fields(RepositionOpenMsg)} == {"uid"}
+    assert {field.name for field in fields(RepositionOpenMsg)} == {"uid", "init"}
     assert {field.name for field in fields(RepositionOpenAckMsg)} == {
         "uid",
         "step_token_budget",

@@ -416,7 +416,11 @@ class RadixPrefixCache(BasePrefixCache):
                     continue
                 new_node = RadixTreeNode(self.key_fn)
                 new_node.set_key_value(
-                    input_ids[prefix_len:segment_end],
+                    # The scheduler may advance a staged Reposition program by
+                    # updating its working records in place after this request
+                    # finishes.  A Radix node must therefore own the external
+                    # key segment it retains beyond this insertion call.
+                    input_ids[prefix_len:segment_end].clone(),
                     indices[prefix_len:segment_end].clone(),
                     virtual_mask[prefix_len:segment_end].clone(),
                 )

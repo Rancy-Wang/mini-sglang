@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import multiprocessing as mp
+import time
 from typing import Any, List
 
 import torch
@@ -178,6 +179,17 @@ def _build_occurrence_user_msg(msg: TokenizeMsg, t: Any) -> UserMsg:
     return message
 
 
+def _prewarm_tokenizer_worker(tokenizer: Any, *, radix_drop_key_mode: str) -> None:
+    """Pay tokenizer and structured Radix first-use costs before ready."""
+
+    tokenizer.encode("")
+    tokenizer.decode([])
+    if radix_drop_key_mode == "delta-marker":
+        from minisgl.kernel.radix_reposition import prewarm_radix_reposition_layout_kernel
+
+        prewarm_radix_reposition_layout_kernel()
+
+
 @torch.inference_mode()
 def tokenize_worker(
     *,
@@ -209,6 +221,12 @@ def tokenize_worker(
     tokenize_manager = TokenizeManager(tokenizer, radix_drop_key_mode=radix_drop_key_mode)
     detokenize_manager = DetokenizeManager(tokenizer)
     reposition_sequences: dict[int, RepositionSequenceState] = {}
+    prewarm_started_ns = time.perf_counter_ns()
+    _prewarm_tokenizer_worker(tokenizer, radix_drop_key_mode=radix_drop_key_mode)
+    logger.info(
+        "Tokenizer/Radix prewarm completed in %.2f ms.",
+        (time.perf_counter_ns() - prewarm_started_ns) / 1e6,
+    )
 
     if ack_queue is not None:
         ack_queue.put(f"Tokenize server {tokenizer_id} is ready")

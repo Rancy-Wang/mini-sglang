@@ -64,9 +64,9 @@ class MHAKVCache(BaseKVCachePool):
     ) -> None:
         if self._kv_buffer.shape[3] != 1:
             raise RuntimeError("Retry Reposition requires page_size=1.")
-        from minisgl.kernel import retry_reposition_kv
+        from minisgl.kernel import reposition_kv_with_rope_delta
 
-        retry_reposition_kv(
+        reposition_kv_with_rope_delta(
             self._k_buffer[:, :, 0],
             self._v_buffer[:, :, 0],
             source_slots,
@@ -75,7 +75,7 @@ class MHAKVCache(BaseKVCachePool):
             cos_sin_cache,
         )
 
-    def reposition_layer(
+    def materialize_occurrence_layer(
         self,
         source_slots: torch.Tensor,
         destination_slots: torch.Tensor,
@@ -87,9 +87,9 @@ class MHAKVCache(BaseKVCachePool):
             raise RuntimeError("Paged-occurrence Reposition requires page_size=1.")
         if not 0 <= layer_id < self._num_layers:
             raise ValueError(f"Invalid KV cache layer: {layer_id}.")
-        from minisgl.kernel import retry_reposition_kv
+        from minisgl.kernel import reposition_kv_with_rope_delta
 
-        retry_reposition_kv(
+        reposition_kv_with_rope_delta(
             self._k_buffer[layer_id : layer_id + 1, :, 0],
             self._v_buffer[layer_id : layer_id + 1, :, 0],
             source_slots,

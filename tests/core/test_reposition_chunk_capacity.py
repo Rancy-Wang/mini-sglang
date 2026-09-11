@@ -12,7 +12,11 @@ from minisgl.kernel.radix_reposition import RadixRepositionLayout
 from minisgl.message import AbortBackendMsg, RequestRejectMsg
 from minisgl.scheduler.cache import CacheManager
 from minisgl.scheduler.prefill import (
-    ChunkedReq, OccurrenceInputError, PrefillAdder, PrefillManager, RepositionCapacityError,
+    ChunkedReq,
+    OccurrenceInputError,
+    PrefillAdder,
+    PrefillManager,
+    RepositionCapacityError,
 )
 from minisgl.scheduler.scheduler import Scheduler
 from minisgl.scheduler.table import TableManager
@@ -255,6 +259,7 @@ def test_paged_occurrence_chunks_until_the_full_prompt_is_covered() -> None:
     manager, cache, table, kv_cache = _manager(num_pages=10, table_count=1)
     manager.pending_list.append(_pending(uid=101))
     query_ranges: list[tuple[int, int]] = []
+    saw_layer_transform = False
 
     while True:
         batch = manager.schedule_next_batch(prefill_budget=8)
@@ -262,6 +267,8 @@ def test_paged_occurrence_chunks_until_the_full_prompt_is_covered() -> None:
         assert len(batch.reqs) == 1
         req = batch.reqs[0]
         query_ranges.append((req.cached_len, req.device_len))
+        assert req.occurrence_transform_source_pages is not None
+        saw_layer_transform |= len(req.occurrence_transform_source_pages) > 0
         metadata = build_occurrence_attention_batch([req])
         assert metadata.num_queries == req.extend_len
         assert bool(torch.all(metadata.direct_pages[metadata.key_positions] >= 0).item())
@@ -286,7 +293,8 @@ def test_paged_occurrence_chunks_until_the_full_prompt_is_covered() -> None:
         for (_, left_end), (right_start, _) in zip(query_ranges, query_ranges[1:])
     )
     assert req.usage_cached_tokens == 0
-    assert kv_cache.calls
+    assert kv_cache.calls == []
+    assert saw_layer_transform
     _free_occurrence_request(req, cache, table)
     cache.check_integrity()
 

@@ -57,6 +57,46 @@ def preload_context_plan_kernel() -> None:
     _load_context_plan_module()
 
 
+def prewarm_context_plan_variants() -> None:
+    """Execute representative full, sliding, and occurrence planner calls."""
+
+    preload_context_plan_kernel()
+    never = torch.iinfo(torch.int32).max
+    visible_until = torch.full((2,), never, dtype=torch.int32, device="cpu")
+    raw_positions = torch.tensor([0, 1], dtype=torch.int32, device="cpu")
+    true_positions = raw_positions.clone()
+    full = try_build_context_full_plan(
+        visible_until,
+        raw_positions,
+        query_start=1,
+        query_length=1,
+    )
+    sliding = try_build_context_sliding_plan(
+        visible_until,
+        raw_positions,
+        true_positions,
+        query_start=1,
+        query_length=1,
+        sliding_window=1,
+    )
+    occurrence = try_build_occurrence_sliding_plan(
+        raw_positions,
+        true_positions,
+        torch.tensor([0], dtype=torch.int32, device="cpu"),
+        torch.tensor([2], dtype=torch.int32, device="cpu"),
+        torch.tensor([0, 2], dtype=torch.int32, device="cpu"),
+        raw_positions,
+        true_positions,
+        cached_len=1,
+        device_len=2,
+        initial_cached_len=1,
+        sliding_window=1,
+        occurrence_base=0,
+    )
+    if full is None or sliding is None or occurrence is None:
+        raise RuntimeError("Context planner warmup did not execute every serving variant.")
+
+
 def try_build_context_full_plan(
     full_token_visible_until: torch.Tensor,
     raw_positions: torch.Tensor,

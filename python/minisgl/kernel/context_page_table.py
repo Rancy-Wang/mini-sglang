@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import torch
+
 from .utils import load_aot
 
 if TYPE_CHECKING:
-    import torch
     from tvm_ffi import Module
 
 
@@ -37,6 +38,44 @@ def preload_context_page_table_kernel() -> None:
     """Compile/load the fixed CUDA extension before the server becomes ready."""
 
     _load_context_page_table_module()
+
+
+def prewarm_context_page_table_variants(
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> None:
+    """Launch normal/direct and flat/padded CUDA variants before serving."""
+
+    preload_context_page_table_kernel()
+    key_positions = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    key_offsets = torch.tensor([0, 2], dtype=torch.int32, device=device)
+    table_indices = torch.tensor([0], dtype=torch.int32, device=device)
+    normal_source = torch.arange(2, dtype=dtype, device=device).view(1, 2)
+    direct_source = torch.arange(2, dtype=dtype, device=device)
+    for direct, source, owners in (
+        (False, normal_source, table_indices),
+        (True, direct_source, None),
+    ):
+        for layout in ("flat", "padded", "both"):
+            flat_indices = (
+                torch.empty(2, dtype=dtype, device=device) if layout in {"flat", "both"} else None
+            )
+            padded_page_table = (
+                torch.empty((1, 2), dtype=dtype, device=device)
+                if layout in {"padded", "both"}
+                else None
+            )
+            compile_context_page_table_aot(
+                source,
+                owners,
+                key_positions,
+                key_offsets,
+                max_seqlen_k=2,
+                flat_indices=flat_indices,
+                padded_page_table=padded_page_table,
+                direct=direct,
+            )
 
 
 def compile_context_page_table_aot(

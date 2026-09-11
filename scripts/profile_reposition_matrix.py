@@ -28,9 +28,81 @@ class ProfileTarget:
 
 MINISGL_TARGETS = (
     ProfileTarget("tokenize", "minisgl/tokenizer/tokenize.py", "TokenizeManager.tokenize"),
+    ProfileTarget(
+        "reposition_sequence",
+        "minisgl/tokenizer/reposition_sequence.py",
+        "RepositionSequenceState.open_msg",
+    ),
+    ProfileTarget(
+        "reposition_sequence",
+        "minisgl/tokenizer/reposition_sequence.py",
+        "RepositionSequenceState.activate",
+    ),
+    ProfileTarget(
+        "reposition_sequence",
+        "minisgl/tokenizer/reposition_sequence.py",
+        "RepositionSequenceState.build_next_msg",
+    ),
+    ProfileTarget(
+        "reposition_sequence",
+        "minisgl/tokenizer/reposition_sequence.py",
+        "RepositionSequenceState.accept_ack",
+    ),
+    ProfileTarget(
+        "reposition_sequence",
+        "minisgl/scheduler/reposition_sequence.py",
+        "SchedulerRepositionSequence.from_open",
+    ),
+    ProfileTarget(
+        "reposition_sequence",
+        "minisgl/scheduler/reposition_sequence.py",
+        "SchedulerRepositionSequence.materialize",
+    ),
+    ProfileTarget("serialization", "minisgl/message/backend.py", "BaseBackendMsg.encoder"),
+    ProfileTarget("serialization", "minisgl/message/backend.py", "BaseBackendMsg.decoder"),
+    ProfileTarget("scheduler_loop", "minisgl/scheduler/scheduler.py", "Scheduler.overlap_loop"),
+    ProfileTarget("scheduler_loop", "minisgl/scheduler/scheduler.py", "Scheduler.normal_loop"),
     ProfileTarget("scheduler", "minisgl/scheduler/scheduler.py", "Scheduler._process_one_msg"),
     ProfileTarget("scheduler", "minisgl/scheduler/scheduler.py", "Scheduler._schedule_next_batch"),
+    ProfileTarget(
+        "scheduler_result",
+        "minisgl/scheduler/scheduler.py",
+        "Scheduler._process_last_data",
+    ),
+    ProfileTarget(
+        "scheduler_prepare", "minisgl/scheduler/scheduler.py", "Scheduler._prepare_batch"
+    ),
+    ProfileTarget("scheduler_forward", "minisgl/scheduler/scheduler.py", "Scheduler._forward"),
+    ProfileTarget("scheduler_prepare", "minisgl/scheduler/scheduler.py", "_make_positions"),
+    ProfileTarget("scheduler_prepare", "minisgl/scheduler/scheduler.py", "_make_input_tuple"),
+    ProfileTarget("scheduler_prepare", "minisgl/scheduler/scheduler.py", "_make_write_tuple"),
     ProfileTarget("scheduler_idle", "minisgl/scheduler/scheduler.py", "Scheduler.run_when_idle"),
+    ProfileTarget(
+        "scheduler_receive", "minisgl/scheduler/io.py", "SchedulerIOMixin._recv_msg_single_rank"
+    ),
+    ProfileTarget(
+        "scheduler_receive", "minisgl/scheduler/io.py", "SchedulerIOMixin._recv_msg_multi_rank0"
+    ),
+    ProfileTarget(
+        "scheduler_receive", "minisgl/scheduler/io.py", "SchedulerIOMixin._recv_msg_multi_rank1"
+    ),
+    ProfileTarget(
+        "scheduler_reply", "minisgl/scheduler/io.py", "SchedulerIOMixin._reply_tokenizer_rank0"
+    ),
+    ProfileTarget("scheduler_host", "minisgl/core.py", "Req.append_host"),
+    ProfileTarget("scheduler_host", "minisgl/core.py", "Req.match_stop"),
+    ProfileTarget(
+        "scheduler_metrics",
+        "minisgl/message/metrics.py",
+        "RequestMetricsState.observe_token",
+    ),
+    ProfileTarget("scheduler_metrics", "minisgl/message/metrics.py", "RequestMetricsState.finish"),
+    ProfileTarget("scheduler_ipc", "minisgl/utils/mp.py", "ZmqPushQueue.put"),
+    ProfileTarget("scheduler_ipc", "minisgl/utils/mp.py", "ZmqPullQueue.get"),
+    ProfileTarget("scheduler_ipc", "minisgl/utils/mp.py", "ZmqPullQueue.get_raw"),
+    ProfileTarget("scheduler_ipc", "minisgl/utils/mp.py", "ZmqPullQueue.decode"),
+    ProfileTarget("scheduler_ipc", "minisgl/utils/mp.py", "ZmqPubQueue.put_raw"),
+    ProfileTarget("scheduler_ipc", "minisgl/utils/mp.py", "ZmqSubQueue.get"),
     ProfileTarget("prefill_extend", "minisgl/scheduler/prefill.py", "PrefillAdder.try_add_one"),
     ProfileTarget(
         "prefill_extend",
@@ -43,6 +115,12 @@ MINISGL_TARGETS = (
     ProfileTarget("decode", "minisgl/engine/engine.py", "Engine.forward_batch", phase="decode"),
     ProfileTarget("decode", "minisgl/scheduler/decode.py", "DecodeManager.schedule_next_batch"),
     ProfileTarget("radix_match", "minisgl/scheduler/cache.py", "CacheManager.match_req"),
+    ProfileTarget(
+        "radix_match",
+        "minisgl/scheduler/cache.py",
+        "CacheManager.match_occurrence_req",
+    ),
+    ProfileTarget("radix_match", "minisgl/scheduler/cache.py", "CacheManager._match_req"),
     ProfileTarget("radix_match", "minisgl/scheduler/cache.py", "CacheManager._derive_active_match"),
     ProfileTarget("radix_match", "minisgl/kvcache/radix_cache.py", "RadixPrefixCache.match_prefix"),
     ProfileTarget("radix_match", "minisgl/kvcache/radix_cache.py", "RadixPrefixCache._tree_walk"),

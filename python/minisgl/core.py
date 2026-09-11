@@ -154,9 +154,9 @@ class Req:
     occurrence_segment_key_indices: torch.Tensor | None = None
     occurrence_pages: torch.Tensor | None = None
     occurrence_transient_pages: torch.Tensor | None = None
-    occurrence_fresh_source_pages: torch.Tensor | None = None
-    occurrence_fresh_destination_pages: torch.Tensor | None = None
-    occurrence_fresh_position_pairs: torch.Tensor | None = None
+    occurrence_transform_source_pages: torch.Tensor | None = None
+    occurrence_transform_destination_pages: torch.Tensor | None = None
+    occurrence_transform_position_pairs: torch.Tensor | None = None
     occurrence_terminal_owned_mask: torch.Tensor | None = None
     occurrence_initial_source_positions: torch.Tensor | None = None
     occurrence_repositioned_cached_mask: torch.Tensor | None = None
@@ -445,6 +445,30 @@ class Req:
                 raise ValueError(
                     "Occurrence repositioned-cache mask must cover the initial cache hits."
                 )
+            transforms = (
+                self.occurrence_transform_source_pages,
+                self.occurrence_transform_destination_pages,
+                self.occurrence_transform_position_pairs,
+            )
+            if any(tensor is not None for tensor in transforms):
+                if not all(tensor is not None for tensor in transforms):
+                    raise ValueError("Occurrence layer transform metadata must be complete.")
+                source_pages, destination_pages, position_pairs = transforms
+                assert source_pages is not None
+                assert destination_pages is not None
+                assert position_pairs is not None
+                if (
+                    source_pages.dtype != torch.int32
+                    or destination_pages.dtype != torch.int32
+                    or position_pairs.dtype != torch.int32
+                    or source_pages.ndim != 1
+                    or destination_pages.ndim != 1
+                    or position_pairs.ndim != 2
+                    or position_pairs.shape[1] != 2
+                    or len(source_pages) != len(destination_pages)
+                    or len(source_pages) != len(position_pairs)
+                ):
+                    raise ValueError("Occurrence layer transform metadata has invalid shape/dtype.")
         elif any(tensor is not None for tensor in occurrence_plan):
             raise ValueError("Occurrence metadata requires paged-occurrence execution mode.")
         else:

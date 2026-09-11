@@ -3,7 +3,7 @@ import triton.language as tl
 
 
 @triton.jit
-def retry_reposition_kv_kernel(
+def reposition_kv_with_rope_delta_kernel(
     k_buffer,
     v_buffer,
     source_slots,
@@ -23,7 +23,7 @@ def retry_reposition_kv_kernel(
     BLOCK_HALF: tl.constexpr,
 ):
     # Production KV buffers can exceed 2**31 elements even when every individual
-    # stride fits in int32.  Promote the grid coordinates before multiplying by
+    # stride fits in int32. Promote the grid coordinates before multiplying by
     # those strides so high-layer addresses cannot wrap around.
     token = tl.program_id(0).to(tl.int64)
     layer = tl.program_id(1).to(tl.int64)

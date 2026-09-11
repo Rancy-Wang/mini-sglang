@@ -10,6 +10,8 @@ from minisgl.message import (
     BaseFrontendMsg,
     BatchBackendMsg,
     RepositionOpenMsg,
+    RepositionStepMsg,
+    StagedRepositionInit,
     UserMsg,
     UserReply,
     WarmupAckMsg,
@@ -102,9 +104,39 @@ def test_serialize_deserialize():
     assert torch.equal(restored_structured.radix_match_ids, records)
     assert restored_structured.radix_key_virtual_mask.tolist() == [False, True, False]
 
-    open_msg = RepositionOpenMsg(uid=2)
+    open_msg = RepositionOpenMsg(
+        uid=2,
+        init=StagedRepositionInit(
+            input_ids=t,
+            radix_records=records,
+            radix_key_virtual_mask=torch.tensor([False, True, False]),
+            radix_key_to_token=torch.tensor([0, -1, 1], dtype=torch.int64),
+            radix_token_to_key=torch.tensor([0, 2, 2], dtype=torch.int64),
+            initial_positions=torch.arange(3, dtype=torch.int32),
+            initial_repos=torch.full((3,), -1, dtype=torch.int32),
+            drop_event_positions=torch.empty(0, dtype=torch.int32),
+            drop_range_offsets=torch.zeros(1, dtype=torch.int32),
+            drop_position_ranges=torch.empty(0, dtype=torch.int32),
+            full_token_visible_until=None,
+            sampling_params=SamplingParams(),
+            prompt_tokens=3,
+            radix_next_position=3,
+            radix_final_reposition=-1,
+        ),
+    )
     restored_open = BaseBackendMsg.decoder(open_msg.encoder())
-    assert vars(restored_open) == {"uid": 2}
+    assert restored_open.uid == 2
+    assert torch.equal(restored_open.init.radix_records, records)
+
+    step = RepositionStepMsg(
+        uid=2,
+        end=3,
+        is_final=True,
+        radix_commit_key_len=None,
+        radix_current_reposition=-1,
+    )
+    restored_step = BaseBackendMsg.decoder(step.encoder())
+    assert vars(restored_step) == vars(step)
 
     warmup = WarmupAckMsg(
         uid=3,

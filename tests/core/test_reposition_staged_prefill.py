@@ -14,6 +14,7 @@ from minisgl.kernel.radix_reposition import compile_radix_reposition_layout
 from minisgl.message import BaseBackendMsg, RequestRejectMsg, TokenizeMsg, WarmupAckMsg
 from minisgl.scheduler.cache import CacheManager
 from minisgl.scheduler.prefill import PrefillManager, RepositionCapacityError
+from minisgl.scheduler.reposition_sequence import SchedulerRepositionSequence
 from minisgl.scheduler.scheduler import Scheduler
 from minisgl.scheduler.table import TableManager
 from minisgl.scheduler.utils import PendingReq
@@ -128,6 +129,21 @@ def _ack(uid: int, *, drop_skipped_tokens: int = 0, **metrics: int) -> WarmupAck
     )
 
 
+def _open_scheduler_sequence(
+    state: RepositionSequenceState,
+) -> tuple[object, SchedulerRepositionSequence]:
+    open_msg = BaseBackendMsg.decoder(state.open_msg().encoder())
+    return open_msg, SchedulerRepositionSequence.from_open(open_msg)
+
+
+def _materialize_step(
+    state: RepositionSequenceState,
+    scheduler_state: SchedulerRepositionSequence,
+):
+    step = BaseBackendMsg.decoder(state.build_next_msg().encoder())
+    return step, scheduler_state.materialize(step)
+
+
 def test_sequence_rejects_layout_without_an_effective_reposition() -> None:
     token_ids = torch.arange(5, dtype=torch.int32)
     request = TokenizeMsg(
@@ -169,31 +185,32 @@ def test_sequence_rejects_layout_without_an_effective_reposition() -> None:
 def test_tokenizer_sequence_reuses_one_precompiled_layout_between_scheduler_turns() -> None:
     state = _sequence()
     original_layout = state.layout
-    open_msg = state.open_msg()
+    open_msg, scheduler_state = _open_scheduler_sequence(state)
     assert open_msg.uid == 7
-    assert tuple(vars(open_msg)) == ("uid",)
+    assert tuple(vars(open_msg)) == ("uid", "init")
+    with pytest.raises(RuntimeError, match="already dispatched"):
+        state.open_msg()
     state.activate(step_token_budget=64)
     assert state.layout is original_layout
 
     # Scheduler acknowledgements carry cumulative snapshots seeded by the
     # previous Tokenizer turn; accepting one must not count that seed twice.
     state.radix_match_ns = 5
-    first = state.build_next_msg()
+    first_step, first = _materialize_step(state, scheduler_state)
     assert first.raw_positions.tolist() == [0, 1, 2, 3, 4]
     assert first.use_context_mask
     assert first.is_warmup
     assert first.radix_match_ns == 5
-    first_radix_key = first.radix_match_ids.clone()
+    assert first.reposition_ipc_tensor_bytes == first_step.reposition_ipc_tensor_bytes
     with pytest.raises(RuntimeError, match="awaiting Scheduler"):
         state.build_next_msg()
     state.accept_ack(_ack(7, radix_match_ns=11, drop_skipped_tokens=3))
-    assert torch.equal(first.radix_match_ids, first_radix_key)
     assert not torch.equal(
         first.radix_match_ids,
         state.current_records[: len(first.radix_match_ids)],
     )
 
-    final = state.build_next_msg()
+    _, final = _materialize_step(state, scheduler_state)
     assert final.raw_positions.tolist() == [1, 2, 3, 4, 5, 6, 7, 8]
     assert final.use_context_mask
     assert not final.is_warmup
@@ -213,13 +230,14 @@ def test_tokenizer_sequence_reuses_one_precompiled_layout_between_scheduler_turn
 
 def test_context_stage_count_tracks_actual_scheduler_dispatches() -> None:
     state = _sequence()
+    state.open_msg()
     state.activate(step_token_budget=2)
 
     messages = []
     while True:
         message = state.build_next_msg()
         messages.append(message)
-        if not message.is_warmup:
+        if message.is_final:
             break
         state.accept_ack(_ack(7))
 
@@ -274,6 +292,7 @@ def test_each_scheduler_turn_reuses_the_previous_partial_radix_prefix(
         drop_positions=drop_positions,
         drop_ranges=drop_ranges,
     )
+    _, scheduler_state = _open_scheduler_sequence(state)
     state.activate(step_token_budget=64)
     page_table = torch.full((2, 64), -1, dtype=torch.int32)
     cache = CacheManager(64, 1, page_table, "radix")
@@ -294,7 +313,7 @@ def test_each_scheduler_turn_reuses_the_previous_partial_radix_prefix(
     for turn in range(2):
         # Exercise the real Tokenizer -> Scheduler ownership boundary.  Without
         # the wire copy, later state transitions could mutate this test's key.
-        message = BaseBackendMsg.decoder(state.build_next_msg().encoder())
+        _, message = _materialize_step(state, scheduler_state)
         manager.add_one_req(message)
         batch = manager.schedule_next_batch(prefill_budget=64)
         assert batch is not None and len(batch.reqs) == 1
@@ -429,15 +448,16 @@ def test_scheduler_rejects_terminal_reposition_capacity_failure() -> None:
 
 def test_terminal_reposition_dispatches_final_generation_without_new_raw_tokens() -> None:
     state = _sequence(max_tokens=1, reposition_boundary=8)
+    _, scheduler_state = _open_scheduler_sequence(state)
     state.activate(step_token_budget=64)
 
-    materialize = state.build_next_msg()
+    _, materialize = _materialize_step(state, scheduler_state)
     assert materialize.raw_positions.tolist() == list(range(9))
     assert materialize.is_warmup
     assert not torch.any(materialize.radix_match_ids[:, 0] == 2)
 
     state.accept_ack(_ack(7))
-    final = state.build_next_msg()
+    _, final = _materialize_step(state, scheduler_state)
 
     assert final.raw_positions.tolist() == [1, 2, 4, 5, 6, 7, 8]
     assert not final.is_warmup

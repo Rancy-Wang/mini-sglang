@@ -143,9 +143,7 @@ def _python_reference_records(request: RadixRepositionInput) -> list[list[int]]:
     reposition_event = 0
     for insertion, token_id in enumerate(token_ids + [None]):
         if drop_event < len(insertions) and insertions[drop_event] == insertion:
-            for start, end in ranges[
-                range_offsets[drop_event] : range_offsets[drop_event + 1]
-            ]:
+            for start, end in ranges[range_offsets[drop_event] : range_offsets[drop_event + 1]]:
                 records.append([DELTA_KIND, -start - 1, -end - 1, -1])
             drop_event += 1
         if (
@@ -237,10 +235,11 @@ def _measure_scheduler_dispatch(
         ),
         tokenized,
     )
+    state.open_msg()
     state.activate(step_token_budget=len(token_ids))
     while True:
         message = state.build_next_msg()
-        if not message.is_warmup:
+        if message.is_final:
             return message.context_stage_count, message.reposition_ipc_tensor_bytes
         state.accept_ack(
             WarmupAckMsg(

@@ -8,8 +8,9 @@ pytest.importorskip("tvm_ffi")
 
 from minisgl.core import Req, SamplingParams
 from minisgl.kernel.radix_reposition import TOKEN_KIND, compile_radix_reposition_layout
-from minisgl.message import TokenizeMsg, WarmupAckMsg
+from minisgl.message import BaseBackendMsg, TokenizeMsg, WarmupAckMsg
 from minisgl.scheduler.cache import CacheManager
+from minisgl.scheduler.reposition_sequence import SchedulerRepositionSequence
 from minisgl.tokenizer.reposition_sequence import RepositionSequenceState
 from minisgl.tokenizer.tokenize import TokenizedResult
 
@@ -65,8 +66,11 @@ def _final_message():
         chat_template_invocations=1,
     )
     state = RepositionSequenceState.pending(request, tokenized)
+    open_msg = BaseBackendMsg.decoder(state.open_msg().encoder())
+    scheduler_state = SchedulerRepositionSequence.from_open(open_msg)
     state.activate(step_token_budget=32)
-    first = state.build_next_msg()
+    first_step = BaseBackendMsg.decoder(state.build_next_msg().encoder())
+    first = scheduler_state.materialize(first_step)
     assert first.is_warmup
     state.accept_ack(
         WarmupAckMsg(
@@ -77,7 +81,8 @@ def _final_message():
             finished=True,
         )
     )
-    final = state.build_next_msg()
+    final_step = BaseBackendMsg.decoder(state.build_next_msg().encoder())
+    final = scheduler_state.materialize(final_step)
     assert not final.is_warmup
     assert final.radix_commit_key_len is None
     return final

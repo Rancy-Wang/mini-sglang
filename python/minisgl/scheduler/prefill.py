@@ -120,9 +120,9 @@ class PrefillAllocation:
     context_usage_cached_positions: torch.Tensor | None = None
     occurrence_pages: torch.Tensor | None = None
     occurrence_transient_pages: torch.Tensor | None = None
-    occurrence_fresh_source_pages: torch.Tensor | None = None
-    occurrence_fresh_destination_pages: torch.Tensor | None = None
-    occurrence_fresh_position_pairs: torch.Tensor | None = None
+    occurrence_transform_source_pages: torch.Tensor | None = None
+    occurrence_transform_destination_pages: torch.Tensor | None = None
+    occurrence_transform_position_pairs: torch.Tensor | None = None
     occurrence_terminal_owned_mask: torch.Tensor | None = None
     occurrence_initial_source_positions: torch.Tensor | None = None
     occurrence_repositioned_cached_mask: torch.Tensor | None = None
@@ -401,13 +401,15 @@ class PrefillAdder:
                 match = (
                     self.cache_manager.match_empty_req(req)
                     if fallback_to_empty
-                    else self.cache_manager.match_req(req)
+                    else self.cache_manager.match_occurrence_req(req)
                 )
                 match_elapsed_ns = time.perf_counter_ns() - match_started_ns
                 match_retry_plan_ns = 0 if match is None else match.retry_plan_ns
                 req.radix_match_ns += max(0, match_elapsed_ns - match_retry_plan_ns)
                 if match is None:
                     return None
+                if match.retry_plan is not None or match.retry_plan_ns != 0:
+                    raise RuntimeError("Paged-occurrence matching produced a staged Retry plan.")
                 req.retry_plan_ns += match.retry_plan_ns
                 cached_len = match.full_cached_len
                 if match.active_cached_len != cached_len:
@@ -446,15 +448,6 @@ class PrefillAdder:
                         raise RuntimeError(
                             "Matched source positions do not cover the cached prefix."
                         )
-                    if match.retry_plan is not None and len(match.retry_plan) > 0:
-                        retry_source = match.retry_plan[:, 0].to(torch.int64)
-                        retry_target = match.retry_plan[:, 1].to(torch.int64)
-                        source_pages[retry_target.to(source_pages.device)] = (
-                            match.full_match_indices[
-                                retry_source.to(match.full_match_indices.device)
-                            ]
-                        )
-                        source_positions[retry_target] = match.retry_plan[:, 2].to(torch.int32)
                     terminal_owned = torch.zeros(plan_token_count, dtype=torch.bool, device="cpu")
                     repositioned_cached = torch.zeros(cached_len, dtype=torch.bool, device="cpu")
                     usage_positions = None
@@ -641,25 +634,29 @@ class PrefillAdder:
             cached_transform = prior_new
             cached_ids = required_ids[prior][cached_transform]
             cached_raw = prior_raw[cached_transform]
+            cached_source_pages = torch.empty(
+                0, dtype=torch.int32, device=self.cache_manager.device
+            )
+            cached_destination_pages = torch.empty(
+                0, dtype=torch.int32, device=self.cache_manager.device
+            )
+            cached_position_pairs = torch.empty(
+                (0, 2), dtype=torch.int32, device=self.cache_manager.device
+            )
             if len(cached_ids) > 0:
                 cached_reuse_device = cached_transform.pin_memory().to(
                     self.cache_manager.device, non_blocking=True
                 )
-                cached_destination = runtime_pages[
+                cached_source_pages = canonical_pages[cached_reuse_device]
+                cached_destination_pages = runtime_pages[
                     cached_ids.pin_memory().to(self.cache_manager.device, non_blocking=True)
                 ]
                 cached_pairs_cpu = torch.column_stack(
                     (canonical_positions[cached_transform], occurrence_positions[cached_ids])
                 ).to(torch.int32)
                 self._validate_occurrence_rope_positions(cached_pairs_cpu)
-                cached_pairs = cached_pairs_cpu.pin_memory().to(
+                cached_position_pairs = cached_pairs_cpu.pin_memory().to(
                     self.cache_manager.device, non_blocking=True
-                )
-                self.kv_cache.retry_reposition(
-                    canonical_pages[cached_reuse_device],
-                    cached_destination,
-                    cached_pairs,
-                    self.retry_rope_cache,
                 )
                 req.reposition_h2d_bytes += (
                     cached_pairs_cpu.numel() * cached_pairs_cpu.element_size()
@@ -690,6 +687,11 @@ class PrefillAdder:
                 self.cache_manager.device, non_blocking=True
             )
             req.reposition_h2d_bytes += fresh_pairs_cpu.numel() * fresh_pairs_cpu.element_size()
+            transform_source_pages = torch.cat((cached_source_pages, fresh_source_pages))
+            transform_destination_pages = torch.cat(
+                (cached_destination_pages, fresh_destination_pages)
+            )
+            transform_position_pairs = torch.cat((cached_position_pairs, fresh_position_pairs))
 
             transient_ids = allocated_ids[~persistent_allocated]
             transient_pages = runtime_pages[
@@ -731,9 +733,9 @@ class PrefillAdder:
             context_usage_cached_positions=usage_positions,
             occurrence_pages=runtime_pages,
             occurrence_transient_pages=transient_pages,
-            occurrence_fresh_source_pages=fresh_source_pages,
-            occurrence_fresh_destination_pages=fresh_destination_pages,
-            occurrence_fresh_position_pairs=fresh_position_pairs,
+            occurrence_transform_source_pages=transform_source_pages,
+            occurrence_transform_destination_pages=transform_destination_pages,
+            occurrence_transform_position_pairs=transform_position_pairs,
             occurrence_terminal_owned_mask=terminal_owned,
             occurrence_initial_source_positions=source_positions,
             occurrence_repositioned_cached_mask=repositioned_cached,
@@ -1115,9 +1117,9 @@ class PrefillAdder:
                 table = self.table_manager.occurrence_pages(slot)
                 owned = kwargs["occurrence_terminal_owned_mask"]
                 # Error-only rollback. Never release borrowed source pages.
-                newly_owned = torch.isin(table[:len(owned)], allocated).cpu()
+                newly_owned = torch.isin(table[: len(owned)], allocated).cpu()
                 owned[newly_owned] = False
-                table[:len(owned)][newly_owned.to(table.device)] = -1
+                table[: len(owned)][newly_owned.to(table.device)] = -1
                 self.cache_manager.free_occurrence_pages(allocated)
                 if pending.chunked_req is None:
                     self.cache_manager.unlock(kwargs["cache_handle"])
@@ -1143,9 +1145,9 @@ class PrefillAdder:
         usage_repos_tokens: int | None = None,
         occurrence_pages: torch.Tensor | None = None,
         occurrence_transient_pages: torch.Tensor | None = None,
-        occurrence_fresh_source_pages: torch.Tensor | None = None,
-        occurrence_fresh_destination_pages: torch.Tensor | None = None,
-        occurrence_fresh_position_pairs: torch.Tensor | None = None,
+        occurrence_transform_source_pages: torch.Tensor | None = None,
+        occurrence_transform_destination_pages: torch.Tensor | None = None,
+        occurrence_transform_position_pairs: torch.Tensor | None = None,
         occurrence_terminal_owned_mask: torch.Tensor | None = None,
         occurrence_initial_source_positions: torch.Tensor | None = None,
         occurrence_repositioned_cached_mask: torch.Tensor | None = None,
@@ -1175,7 +1177,8 @@ class PrefillAdder:
         _slice = slice(cached_len, cached_len + chunk_size)
         device_ids = (
             self.table_manager.occurrence_tokens(table_idx)[_slice]
-            if is_occurrence else self.table_manager.token_pool[table_idx, _slice]
+            if is_occurrence
+            else self.table_manager.token_pool[table_idx, _slice]
         )
         device_ids.copy_(pending_req.input_ids[_slice].pin_memory(), non_blocking=True)
         return CLS(
@@ -1264,9 +1267,9 @@ class PrefillAdder:
             occurrence_segment_key_indices=pending_req.occurrence_segment_key_indices,
             occurrence_pages=occurrence_pages,
             occurrence_transient_pages=occurrence_transient_pages,
-            occurrence_fresh_source_pages=occurrence_fresh_source_pages,
-            occurrence_fresh_destination_pages=occurrence_fresh_destination_pages,
-            occurrence_fresh_position_pairs=occurrence_fresh_position_pairs,
+            occurrence_transform_source_pages=occurrence_transform_source_pages,
+            occurrence_transform_destination_pages=occurrence_transform_destination_pages,
+            occurrence_transform_position_pairs=occurrence_transform_position_pairs,
             occurrence_terminal_owned_mask=occurrence_terminal_owned_mask,
             occurrence_initial_source_positions=occurrence_initial_source_positions,
             occurrence_repositioned_cached_mask=occurrence_repositioned_cached_mask,
@@ -1306,9 +1309,13 @@ class PrefillAdder:
                     usage_repos_tokens=resource.usage_repos_tokens,
                     occurrence_pages=resource.occurrence_pages,
                     occurrence_transient_pages=resource.occurrence_transient_pages,
-                    occurrence_fresh_source_pages=resource.occurrence_fresh_source_pages,
-                    occurrence_fresh_destination_pages=resource.occurrence_fresh_destination_pages,
-                    occurrence_fresh_position_pairs=resource.occurrence_fresh_position_pairs,
+                    occurrence_transform_source_pages=(resource.occurrence_transform_source_pages),
+                    occurrence_transform_destination_pages=(
+                        resource.occurrence_transform_destination_pages
+                    ),
+                    occurrence_transform_position_pairs=(
+                        resource.occurrence_transform_position_pairs
+                    ),
                     occurrence_terminal_owned_mask=resource.occurrence_terminal_owned_mask,
                     occurrence_initial_source_positions=resource.occurrence_initial_source_positions,
                     occurrence_repositioned_cached_mask=(
@@ -1353,9 +1360,11 @@ class PrefillAdder:
                 usage_repos_tokens=resource.usage_repos_tokens,
                 occurrence_pages=resource.occurrence_pages,
                 occurrence_transient_pages=resource.occurrence_transient_pages,
-                occurrence_fresh_source_pages=resource.occurrence_fresh_source_pages,
-                occurrence_fresh_destination_pages=resource.occurrence_fresh_destination_pages,
-                occurrence_fresh_position_pairs=resource.occurrence_fresh_position_pairs,
+                occurrence_transform_source_pages=resource.occurrence_transform_source_pages,
+                occurrence_transform_destination_pages=(
+                    resource.occurrence_transform_destination_pages
+                ),
+                occurrence_transform_position_pairs=resource.occurrence_transform_position_pairs,
                 occurrence_terminal_owned_mask=resource.occurrence_terminal_owned_mask,
                 occurrence_initial_source_positions=resource.occurrence_initial_source_positions,
                 occurrence_repositioned_cached_mask=(resource.occurrence_repositioned_cached_mask),
@@ -1450,9 +1459,9 @@ class PrefillManager:
         self.cache_manager.free_occurrence_pages(chunk.occurrence_transient_pages)
         chunk.occurrence_transient_pages = None
         chunk.occurrence_pages = None
-        chunk.occurrence_fresh_source_pages = None
-        chunk.occurrence_fresh_destination_pages = None
-        chunk.occurrence_fresh_position_pairs = None
+        chunk.occurrence_transform_source_pages = None
+        chunk.occurrence_transform_destination_pages = None
+        chunk.occurrence_transform_position_pairs = None
         chunk.occurrence_inflight = False
 
         owned = chunk.occurrence_terminal_owned_mask

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-from minisgl.kernel.retry_reposition import retry_reposition_kv
+from minisgl.kernel.reposition_kv import reposition_kv_with_rope_delta
 
 
 def _rotate(vector: torch.Tensor, cache: torch.Tensor, position: int) -> torch.Tensor:
@@ -21,7 +21,7 @@ def _rotate(vector: torch.Tensor, cache: torch.Tensor, position: int) -> torch.T
     ("dtype", "atol"),
     [(torch.float32, 3e-5), (torch.bfloat16, 3e-2)],
 )
-def test_retry_reposition_rotates_k_and_copies_v(dtype: torch.dtype, atol: float) -> None:
+def test_reposition_kv_rotates_k_and_copies_v(dtype: torch.dtype, atol: float) -> None:
     pytest.importorskip("triton")
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA Triton")
@@ -68,7 +68,7 @@ def test_retry_reposition_rotates_k_and_copies_v(dtype: torch.dtype, atol: float
         v_buffer[:, int(source_slots[token])] = source_values[token]
         expected_k.append(_rotate(unrotated[token], rope_cache, new_position).to(dtype))
 
-    retry_reposition_kv(
+    reposition_kv_with_rope_delta(
         k_buffer,
         v_buffer,
         source_slots,
