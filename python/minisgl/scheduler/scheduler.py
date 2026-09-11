@@ -9,6 +9,7 @@ from minisgl.engine.tool_grammar import ToolGrammarManager
 from minisgl.env import ENV
 from minisgl.kernel.context_page_table import prewarm_context_page_table_variants
 from minisgl.kernel.context_plan import prewarm_context_plan_variants
+from minisgl.kernel.radix import radix_record_edge_hash
 from minisgl.kernel.reposition_kv import prewarm_reposition_kv_with_rope_delta
 from minisgl.layers import get_rope
 from minisgl.message import (
@@ -132,6 +133,10 @@ class Scheduler(SchedulerIOMixin):
             retry_rope_cache=retry_rope.cos_sin_cache,
         )
         startup_prewarm_started_ns = time.perf_counter_ns()
+        if config.radix_drop_key_mode == "delta-marker":
+            # Delta-marker Radix queries are structured [N, 4] records.  Load
+            # their CPU AOT comparator before the first real prefix lookup.
+            radix_record_edge_hash(torch.zeros((1, 4), dtype=torch.int32, device="cpu"))
         prewarm_occurrence_window_compiler()
         kv_cache_shape = self.engine.kv_cache.k_cache(0).shape
         prewarm_reposition_kv_with_rope_delta(
