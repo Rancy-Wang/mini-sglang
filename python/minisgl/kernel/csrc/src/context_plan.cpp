@@ -504,6 +504,240 @@ auto fill_occurrence_sliding_keys(
                      "Occurrence sliding fill did not cover all queries");
 }
 
+auto build_occurrence_capacity_index(
+    const tvm::ffi::TensorView occurrence_raw_tokens,
+    const tvm::ffi::TensorView occurrence_positions,
+    const tvm::ffi::TensorView birth_occurrences,
+    const tvm::ffi::TensorView terminal_occurrences,
+    const tvm::ffi::TensorView segment_query_starts,
+    const tvm::ffi::TensorView segment_query_ends,
+    const tvm::ffi::TensorView segment_key_offsets,
+    const tvm::ffi::TensorView segment_key_occurrences,
+    const tvm::ffi::TensorView terminal_owned,
+    const tvm::ffi::TensorView final_keep, int64_t chunk_start,
+    int64_t max_chunk_end, int64_t output_len,
+    const tvm::ffi::TensorView first_required_end,
+    const tvm::ffi::TensorView current_allocations,
+    const tvm::ffi::TensorView persistent_allocations,
+    const tvm::ffi::TensorView future_reserve) -> void {
+  host::RuntimeCheck(
+      is_cpu_int32_vector(occurrence_raw_tokens) &&
+          is_cpu_int32_vector(occurrence_positions) &&
+          is_cpu_int32_vector(birth_occurrences) &&
+          is_cpu_int32_vector(terminal_occurrences) &&
+          is_cpu_int32_vector(segment_query_starts) &&
+          is_cpu_int32_vector(segment_query_ends) &&
+          is_cpu_int32_vector(segment_key_offsets) &&
+          is_cpu_int32_vector(segment_key_occurrences),
+      "Occurrence capacity metadata must be contiguous CPU int32 vectors");
+  host::RuntimeCheck(is_cpu_bool_vector(terminal_owned) &&
+                         is_cpu_bool_vector(final_keep),
+                     "Occurrence ownership metadata must be contiguous CPU bool vectors");
+
+  const int64_t occurrence_count = occurrence_raw_tokens.size(0);
+  const int64_t raw_count = birth_occurrences.size(0);
+  const int64_t segment_count = segment_query_starts.size(0);
+  const int64_t endpoint_count = max_chunk_end - chunk_start;
+  host::RuntimeCheck(
+      occurrence_count > 0 && occurrence_positions.size(0) == occurrence_count &&
+          terminal_occurrences.size(0) == raw_count &&
+          terminal_owned.size(0) == raw_count && final_keep.size(0) == raw_count,
+      "Occurrence capacity token metadata lengths disagree");
+  host::RuntimeCheck(
+      chunk_start >= 0 && max_chunk_end > chunk_start &&
+          max_chunk_end <= raw_count &&
+          max_chunk_end < std::numeric_limits<int32_t>::max() && output_len >= 0,
+      "Occurrence capacity chunk bounds are invalid");
+  host::RuntimeCheck(
+      segment_query_ends.size(0) == segment_count &&
+          segment_key_offsets.size(0) == segment_count + 1,
+      "Occurrence capacity segment metadata lengths disagree");
+  host::RuntimeCheck(
+      is_cpu_int32_vector(first_required_end) &&
+          first_required_end.size(0) == occurrence_count &&
+          is_cpu_int64_vector(current_allocations) &&
+          current_allocations.size(0) == endpoint_count &&
+          is_cpu_int64_vector(persistent_allocations) &&
+          persistent_allocations.size(0) == endpoint_count &&
+          is_cpu_int64_vector(future_reserve) &&
+          future_reserve.size(0) == endpoint_count,
+      "Occurrence capacity outputs have invalid layouts");
+
+  const auto *raw =
+      static_cast<const int32_t *>(occurrence_raw_tokens.data_ptr());
+  const auto *positions =
+      static_cast<const int32_t *>(occurrence_positions.data_ptr());
+  const auto *birth =
+      static_cast<const int32_t *>(birth_occurrences.data_ptr());
+  const auto *terminal =
+      static_cast<const int32_t *>(terminal_occurrences.data_ptr());
+  const auto *starts =
+      static_cast<const int32_t *>(segment_query_starts.data_ptr());
+  const auto *ends =
+      static_cast<const int32_t *>(segment_query_ends.data_ptr());
+  const auto *offsets =
+      static_cast<const int32_t *>(segment_key_offsets.data_ptr());
+  const auto *keys =
+      static_cast<const int32_t *>(segment_key_occurrences.data_ptr());
+  const auto *initial_owned =
+      static_cast<const bool *>(terminal_owned.data_ptr());
+  const auto *keep = static_cast<const bool *>(final_keep.data_ptr());
+  auto *activation_output =
+      static_cast<int32_t *>(first_required_end.data_ptr());
+  auto *current_output =
+      static_cast<int64_t *>(current_allocations.data_ptr());
+  auto *persistent_output =
+      static_cast<int64_t *>(persistent_allocations.data_ptr());
+  auto *future_output = static_cast<int64_t *>(future_reserve.data_ptr());
+
+  for (int64_t occurrence = 0; occurrence < occurrence_count; ++occurrence) {
+    host::RuntimeCheck(raw[occurrence] >= 0 && raw[occurrence] < raw_count,
+                       "Occurrence capacity references an invalid raw token");
+  }
+  for (int64_t raw_token = 0; raw_token < raw_count; ++raw_token) {
+    host::RuntimeCheck(
+        birth[raw_token] >= 0 && birth[raw_token] < occurrence_count &&
+            terminal[raw_token] >= 0 && terminal[raw_token] < occurrence_count &&
+            raw[birth[raw_token]] == raw_token &&
+            raw[terminal[raw_token]] == raw_token,
+        "Occurrence birth or terminal mapping is invalid");
+  }
+  host::RuntimeCheck(offsets[0] == 0 &&
+                         offsets[segment_count] == segment_key_occurrences.size(0),
+                     "Occurrence capacity offsets do not cover segment keys");
+
+  const int32_t never_required = static_cast<int32_t>(max_chunk_end + 1);
+  std::fill(activation_output, activation_output + occurrence_count,
+            never_required);
+  auto mark_required = [&](int32_t occurrence, int64_t endpoint) {
+    host::RuntimeCheck(occurrence >= 0 && occurrence < occurrence_count,
+                       "Occurrence capacity segment references an invalid occurrence");
+    host::RuntimeCheck(endpoint > chunk_start && endpoint <= max_chunk_end,
+                       "Occurrence capacity activation endpoint is invalid");
+    activation_output[occurrence] = std::min<int32_t>(
+        activation_output[occurrence], static_cast<int32_t>(endpoint));
+  };
+
+  for (int64_t raw_token = chunk_start; raw_token < max_chunk_end;
+       ++raw_token) {
+    mark_required(birth[raw_token], raw_token + 1);
+    mark_required(terminal[raw_token], raw_token + 1);
+  }
+  for (int64_t segment = 0; segment < segment_count; ++segment) {
+    host::RuntimeCheck(offsets[segment] >= 0 &&
+                           offsets[segment] <= offsets[segment + 1],
+                       "Occurrence capacity offsets must be monotonic");
+    const int64_t raw_start = starts[segment];
+    const int64_t raw_end = ends[segment];
+    const int64_t key_begin = offsets[segment];
+    const int64_t key_end = offsets[segment + 1];
+    const int64_t prefix_length = key_end - key_begin - (raw_end - raw_start);
+    host::RuntimeCheck(raw_start >= 0 && raw_start < raw_end &&
+                           raw_end <= raw_count && prefix_length >= 0,
+                       "Occurrence capacity segment bounds are invalid");
+    for (int64_t cursor = key_begin; cursor < key_end; ++cursor) {
+      host::RuntimeCheck(keys[cursor] >= 0 && keys[cursor] < occurrence_count,
+                         "Occurrence capacity segment references an invalid occurrence");
+    }
+
+    const int64_t query_start = std::max<int64_t>(chunk_start, raw_start);
+    const int64_t query_end = std::min<int64_t>(max_chunk_end, raw_end);
+    if (query_start >= query_end) continue;
+    const int64_t included_keys =
+        prefix_length + query_end - raw_start;
+    for (int64_t local_key = 0; local_key < included_keys; ++local_key) {
+      const int64_t endpoint =
+          local_key < prefix_length
+              ? query_start + 1
+              : std::max<int64_t>(
+                    query_start, raw_start + local_key - prefix_length) +
+                    1;
+      mark_required(keys[key_begin + local_key], endpoint);
+    }
+  }
+
+  std::vector<int64_t> current_delta(endpoint_count, 0);
+  std::vector<int64_t> persistent_delta(endpoint_count, 0);
+  std::vector<int32_t> terminal_acquire_end(raw_count, never_required);
+  for (int64_t occurrence = 0; occurrence < occurrence_count; ++occurrence) {
+    const int64_t endpoint = activation_output[occurrence];
+    if (endpoint > max_chunk_end) continue;
+    host::RuntimeCheck(raw[occurrence] < endpoint,
+                       "Occurrence chunk references an uncomputed future token");
+    const int64_t endpoint_index = endpoint - chunk_start - 1;
+    const int64_t raw_token = raw[occurrence];
+    if (raw_token < chunk_start) {
+      const int32_t canonical_position =
+          initial_owned[raw_token] &&
+                  positions[occurrence] == positions[terminal[raw_token]]
+              ? positions[terminal[raw_token]]
+              : positions[birth[raw_token]];
+      const bool prior_new = positions[occurrence] != canonical_position;
+      if (prior_new) ++current_delta[endpoint_index];
+      if (prior_new && occurrence == terminal[raw_token]) {
+        ++persistent_delta[endpoint_index];
+        terminal_acquire_end[raw_token] = std::min<int32_t>(
+            terminal_acquire_end[raw_token], static_cast<int32_t>(endpoint));
+      }
+    } else {
+      ++current_delta[endpoint_index];
+    }
+  }
+
+  int64_t needs_terminal = 0;
+  int64_t recyclable_terminal_pages = 0;
+  std::vector<int64_t> needs_terminal_delta(endpoint_count, 0);
+  std::vector<int64_t> recyclable_delta(endpoint_count, 0);
+  for (int64_t raw_token = 0; raw_token < raw_count; ++raw_token) {
+    const bool distinct_terminal =
+        positions[terminal[raw_token]] != positions[birth[raw_token]];
+    if (distinct_terminal && !initial_owned[raw_token] && keep[raw_token]) {
+      ++needs_terminal;
+    }
+    if (distinct_terminal && initial_owned[raw_token] && !keep[raw_token]) {
+      ++recyclable_terminal_pages;
+    }
+    if (initial_owned[raw_token]) continue;
+    int32_t acquire_end = terminal_acquire_end[raw_token];
+    if (raw_token >= chunk_start && raw_token < max_chunk_end) {
+      acquire_end = std::min<int32_t>(
+          acquire_end, static_cast<int32_t>(raw_token + 1));
+    }
+    if (distinct_terminal && acquire_end <= max_chunk_end) {
+      const int64_t endpoint_index = acquire_end - chunk_start - 1;
+      if (keep[raw_token]) {
+        --needs_terminal_delta[endpoint_index];
+      } else {
+        ++recyclable_delta[endpoint_index];
+      }
+    }
+  }
+
+  int64_t current = 0;
+  int64_t persistent = 0;
+  for (int64_t local_endpoint = 0; local_endpoint < endpoint_count;
+       ++local_endpoint) {
+    const int64_t endpoint = chunk_start + local_endpoint + 1;
+    current += current_delta[local_endpoint];
+    persistent += persistent_delta[local_endpoint];
+    needs_terminal += needs_terminal_delta[local_endpoint];
+    recyclable_terminal_pages += recyclable_delta[local_endpoint];
+    host::RuntimeCheck(needs_terminal >= 0,
+                       "Occurrence terminal reserve accounting underflowed");
+
+    const int64_t fresh_raw = endpoint - 1;
+    ++persistent;
+    if (birth[fresh_raw] != terminal[fresh_raw]) ++persistent;
+
+    current_output[local_endpoint] = current;
+    persistent_output[local_endpoint] = persistent;
+    const int64_t output_reserve =
+        std::max<int64_t>(0, output_len - recyclable_terminal_pages);
+    future_output[local_endpoint] =
+        raw_count - endpoint + needs_terminal + output_reserve;
+  }
+}
+
 auto first_mask_free_conflict_event(
     const tvm::ffi::TensorView active_positions,
     const tvm::ffi::TensorView event_positions,
@@ -598,3 +832,5 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(count_occurrence_sliding_keys,
                               count_occurrence_sliding_keys);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fill_occurrence_sliding_keys,
                               fill_occurrence_sliding_keys);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(build_occurrence_capacity_index,
+                              build_occurrence_capacity_index);

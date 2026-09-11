@@ -170,7 +170,13 @@ def _pending(uid: int) -> PendingReq:
 
 def _manager(num_pages: int, table_count: int = 2, table_width: int = 32):
     page_table = torch.full((table_count, table_width), -1, dtype=torch.int32)
-    cache = CacheManager(num_pages, 1, page_table, "radix")
+    cache = CacheManager(
+        num_pages,
+        1,
+        page_table,
+        "radix",
+        track_shared_page_owners=False,
+    )
     table = TableManager(table_count, page_table)
     kv_cache = _RecordingKVCache()
     manager = PrefillManager(
@@ -345,6 +351,61 @@ def test_paged_occurrence_chunks_until_the_full_prompt_is_covered() -> None:
     assert saw_layer_transform
     _free_occurrence_request(req, cache, table)
     cache.check_integrity()
+
+
+def test_paged_occurrence_max_endpoint_uses_precomputed_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, cache, table, _ = _manager(num_pages=32, table_count=1)
+    pending = _pending(uid=116)
+    terminal_owned = torch.zeros(len(pending.input_ids), dtype=torch.bool)
+    first_required_end = torch.full(
+        (len(pending.occurrence_raw_tokens),),
+        len(pending.input_ids) + 1,
+        dtype=torch.int32,
+    )
+    capacities = []
+    for endpoint in range(1, len(pending.input_ids) + 1):
+        required, current, persistent, future = PrefillAdder._occurrence_capacity_for_chunk(
+            pending,
+            start=0,
+            end=endpoint,
+            terminal_owned=terminal_owned,
+        )
+        first_required_end[required] = torch.minimum(
+            first_required_end[required],
+            torch.full_like(required, endpoint, dtype=torch.int32),
+        )
+        capacities.append((current, persistent, future))
+    current_curve, persistent_curve, future_curve = (
+        torch.tensor(values, dtype=torch.int64) for values in zip(*capacities, strict=True)
+    )
+    monkeypatch.setattr(
+        "minisgl.scheduler.prefill.try_build_occurrence_capacity_index",
+        lambda *_args, **_kwargs: (
+            first_required_end,
+            current_curve,
+            persistent_curve,
+            future_curve,
+        ),
+    )
+    manager.pending_list.append(pending)
+
+    def fail_reference_capacity(*_args, **_kwargs):
+        raise AssertionError("maximum endpoint fell back to repeated Python capacity scans")
+
+    monkeypatch.setattr(
+        PrefillAdder,
+        "_occurrence_capacity_for_chunk",
+        fail_reference_capacity,
+    )
+    batch = manager.schedule_next_batch(prefill_budget=8)
+
+    assert batch is not None and len(batch.reqs) == 1
+    req = batch.reqs[0]
+    assert req.cached_len == 0
+    assert req.device_len == 8
+    _free_occurrence_request(req, cache, table)
 
 
 def test_paged_occurrence_reuses_a_canonical_birth_prefix() -> None:

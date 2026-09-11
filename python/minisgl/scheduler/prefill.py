@@ -6,7 +6,10 @@ from typing import TYPE_CHECKING, List
 
 import torch
 from minisgl.core import Batch, Req, get_global_ctx
-from minisgl.kernel.context_plan import first_mask_free_conflict_event
+from minisgl.kernel.context_plan import (
+    first_mask_free_conflict_event,
+    try_build_occurrence_capacity_index,
+)
 from minisgl.utils import init_logger
 
 from .reposition_occurrence import (
@@ -580,25 +583,148 @@ class PrefillAdder:
                 max_end = min(req.input_len, cached_len + self.token_budget)
                 best: tuple[torch.Tensor, int, int, int] | None = None
                 best_end: int | None = None
-                low = cached_len + 1
-                high = max_end
                 available_pages = self.cache_manager.available_size
-                while low <= high:
-                    candidate = (low + high) // 2
-                    capacity = self._occurrence_capacity_for_chunk(
-                        req,
-                        start=cached_len,
-                        end=candidate,
-                        terminal_owned=terminal_owned,
+                if max_end > cached_len:
+                    assert occurrence_raw is not None
+                    assert occurrence_positions is not None
+                    assert birth_ids is not None
+                    assert terminal_ids is not None
+                    assert req.occurrence_segment_query_starts is not None
+                    assert req.occurrence_segment_query_ends is not None
+                    assert req.occurrence_segment_key_offsets is not None
+                    assert req.occurrence_segment_key_indices is not None
+                    final_keep = (
+                        req.full_keep_mask.to(dtype=torch.bool, device="cpu").contiguous()
+                        if req.full_keep_mask is not None
+                        else torch.ones(
+                            plan_token_count,
+                            dtype=torch.bool,
+                            device="cpu",
+                        )
                     )
-                    _, current_pages, persistent_pages, future_pages = capacity
-                    required_pages = max(current_pages, persistent_pages + future_pages)
-                    if required_pages + self.reserved_size <= available_pages:
-                        best = capacity
-                        best_end = candidate
-                        low = candidate + 1
+                    capacity_index = try_build_occurrence_capacity_index(
+                        occurrence_raw,
+                        occurrence_positions,
+                        birth_ids,
+                        terminal_ids,
+                        req.occurrence_segment_query_starts,
+                        req.occurrence_segment_query_ends,
+                        req.occurrence_segment_key_offsets,
+                        req.occurrence_segment_key_indices,
+                        terminal_owned.contiguous(),
+                        final_keep,
+                        chunk_start=cached_len,
+                        max_chunk_end=max_end,
+                        output_len=req.output_len,
+                    )
+
+                    if capacity_index is not None:
+                        first_required_end, current_curve, persistent_curve, future_curve = (
+                            capacity_index
+                        )
+
+                        def indexed_capacity(end: int) -> tuple[int, int, int]:
+                            index = end - cached_len - 1
+                            return (
+                                int(current_curve[index]),
+                                int(persistent_curve[index]),
+                                int(future_curve[index]),
+                            )
+
+                        # Most scheduling attempts can consume the whole token-budget
+                        # window. Test that endpoint first and only search when it does
+                        # not fit; every later predicate lookup is O(1).
+                        current_pages, persistent_pages, future_pages = indexed_capacity(max_end)
+                        required_pages = max(
+                            current_pages,
+                            persistent_pages + future_pages,
+                        )
+                        if required_pages + self.reserved_size <= available_pages:
+                            best_end = max_end
+                        else:
+                            low = cached_len + 1
+                            high = max_end - 1
+                            while low <= high:
+                                candidate = (low + high) // 2
+                                current_pages, persistent_pages, future_pages = indexed_capacity(
+                                    candidate
+                                )
+                                required_pages = max(
+                                    current_pages,
+                                    persistent_pages + future_pages,
+                                )
+                                if required_pages + self.reserved_size <= available_pages:
+                                    best_end = candidate
+                                    low = candidate + 1
+                                else:
+                                    high = candidate - 1
+                        if best_end is not None:
+                            current_pages, persistent_pages, future_pages = indexed_capacity(
+                                best_end
+                            )
+                            required = (
+                                torch.nonzero(
+                                    first_required_end <= best_end,
+                                    as_tuple=False,
+                                )
+                                .view(-1)
+                                .to(torch.int64)
+                            )
+                            if len(required) == 0:
+                                raise RuntimeError(
+                                    "Occurrence chunk has no physical page requirements."
+                                )
+                            best = (
+                                required,
+                                current_pages,
+                                persistent_pages,
+                                future_pages,
+                            )
                     else:
-                        high = candidate - 1
+                        # Keep a semantics-identical reference fallback for platforms
+                        # where the CPU AOT planner cannot be loaded.
+                        capacity_cache: dict[int, tuple[torch.Tensor, int, int, int]] = {}
+
+                        def reference_capacity(
+                            end: int,
+                        ) -> tuple[torch.Tensor, int, int, int]:
+                            capacity = capacity_cache.get(end)
+                            if capacity is None:
+                                capacity = self._occurrence_capacity_for_chunk(
+                                    req,
+                                    start=cached_len,
+                                    end=end,
+                                    terminal_owned=terminal_owned,
+                                )
+                                capacity_cache[end] = capacity
+                            return capacity
+
+                        capacity = reference_capacity(max_end)
+                        _, current_pages, persistent_pages, future_pages = capacity
+                        required_pages = max(
+                            current_pages,
+                            persistent_pages + future_pages,
+                        )
+                        if required_pages + self.reserved_size <= available_pages:
+                            best = capacity
+                            best_end = max_end
+                        else:
+                            low = cached_len + 1
+                            high = max_end - 1
+                            while low <= high:
+                                candidate = (low + high) // 2
+                                capacity = reference_capacity(candidate)
+                                _, current_pages, persistent_pages, future_pages = capacity
+                                required_pages = max(
+                                    current_pages,
+                                    persistent_pages + future_pages,
+                                )
+                                if required_pages + self.reserved_size <= available_pages:
+                                    best = capacity
+                                    best_end = candidate
+                                    low = candidate + 1
+                                else:
+                                    high = candidate - 1
             except Exception:
                 if initial_resources_live:
                     self.table_manager.free(table_idx)

@@ -26,6 +26,13 @@ def _cache() -> RadixPrefixCache:
     return RadixPrefixCache(torch.device("cpu"))
 
 
+def _paged_cache() -> RadixPrefixCache:
+    return RadixPrefixCache(
+        torch.device("cpu"),
+        track_shared_page_owners=False,
+    )
+
+
 def _records(rows: list[list[int]]) -> torch.Tensor:
     return torch.tensor(rows, dtype=torch.int32, device="cpu")
 
@@ -224,6 +231,32 @@ def test_ordinary_radix_index_survives_edge_split() -> None:
     cache.check_integrity()
 
 
+def test_paged_occurrence_lock_uses_node_page_counts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache = _paged_cache()
+    keys = torch.tensor([10, 11, 12], dtype=torch.int32)
+    pages = torch.tensor([0, -1, 1], dtype=torch.int32)
+    virtual = torch.tensor([False, True, False], dtype=torch.bool)
+    inserted = cache.insert_prefix(keys, pages, virtual)
+
+    def fail_shared_owner_scan(*_args, **_kwargs):
+        raise AssertionError("paged-occurrence used shared-slot ownership tracking")
+
+    monkeypatch.setattr(cache, "_ordinary_node_became_protected", fail_shared_owner_scan)
+    monkeypatch.setattr(cache, "_ordinary_node_became_evictable", fail_shared_owner_scan)
+
+    assert cache.size_info.evictable_size == 2
+    assert cache.size_info.protected_size == 0
+    cache.lock_handle(inserted.handle)
+    assert cache.size_info.evictable_size == 0
+    assert cache.size_info.protected_size == 2
+    cache.lock_handle(inserted.handle, unlock=True)
+    assert cache.size_info.evictable_size == 2
+    assert cache.size_info.protected_size == 0
+    assert set(cache.evict(2).tolist()) == {0, 1}
+
+
 def test_shared_retry_pages_are_counted_and_normally_evicted_once() -> None:
     cache = _cache()
     source = _records(
@@ -327,7 +360,13 @@ def test_occurrence_match_never_walks_a_structured_retry_branch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     page_table = torch.zeros((1, 8), dtype=torch.int32, device="cpu")
-    manager = CacheManager(8, 1, page_table, "radix")
+    manager = CacheManager(
+        8,
+        1,
+        page_table,
+        "radix",
+        track_shared_page_owners=False,
+    )
     source = _records(
         [
             [TOKEN_KIND, 10, -1, 0],

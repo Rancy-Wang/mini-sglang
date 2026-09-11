@@ -113,6 +113,7 @@ class Scheduler(SchedulerIOMixin):
             config.page_size,
             self.engine.page_table,
             config.cache_type,
+            track_shared_page_owners=(self.reposition_execution_mode == "staged"),
         )
         self.decode_manager = DecodeManager(config.page_size)
         rotary_config = config.model_config.rotary_config

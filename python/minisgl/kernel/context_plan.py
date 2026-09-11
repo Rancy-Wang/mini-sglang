@@ -23,6 +23,15 @@ def _is_cpu_int32_vector(tensor: torch.Tensor) -> bool:
     )
 
 
+def _is_cpu_bool_vector(tensor: torch.Tensor) -> bool:
+    return (
+        tensor.device.type == "cpu"
+        and tensor.dtype == torch.bool
+        and tensor.ndim == 1
+        and tensor.is_contiguous()
+    )
+
+
 def _checked_int32_offsets(
     key_lengths: torch.Tensor,
     *,
@@ -93,7 +102,22 @@ def prewarm_context_plan_variants() -> None:
         sliding_window=1,
         occurrence_base=0,
     )
-    if full is None or sliding is None or occurrence is None:
+    capacity = try_build_occurrence_capacity_index(
+        raw_positions,
+        true_positions,
+        raw_positions,
+        raw_positions,
+        torch.tensor([1], dtype=torch.int32, device="cpu"),
+        torch.tensor([2], dtype=torch.int32, device="cpu"),
+        torch.tensor([0, 2], dtype=torch.int32, device="cpu"),
+        raw_positions,
+        torch.zeros(2, dtype=torch.bool, device="cpu"),
+        torch.ones(2, dtype=torch.bool, device="cpu"),
+        chunk_start=1,
+        max_chunk_end=2,
+        output_len=1,
+    )
+    if full is None or sliding is None or occurrence is None or capacity is None:
         raise RuntimeError("Context planner warmup did not execute every serving variant.")
 
 
@@ -276,6 +300,71 @@ def try_build_occurrence_sliding_plan(
     )
     cached_positions = torch.nonzero(cached_mask, as_tuple=False).view(-1).to(torch.int64)
     return key_offsets, key_positions, cached_positions
+
+
+def try_build_occurrence_capacity_index(
+    occurrence_raw_tokens: torch.Tensor,
+    occurrence_positions: torch.Tensor,
+    birth_occurrences: torch.Tensor,
+    terminal_occurrences: torch.Tensor,
+    segment_query_starts: torch.Tensor,
+    segment_query_ends: torch.Tensor,
+    segment_key_offsets: torch.Tensor,
+    segment_key_occurrences: torch.Tensor,
+    terminal_owned: torch.Tensor,
+    final_keep: torch.Tensor,
+    *,
+    chunk_start: int,
+    max_chunk_end: int,
+    output_len: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    """Precompute exact occurrence capacity for every candidate chunk endpoint."""
+
+    try:
+        module = _load_context_plan_module()
+    except Exception:
+        return None
+
+    int32_inputs = (
+        occurrence_raw_tokens,
+        occurrence_positions,
+        birth_occurrences,
+        terminal_occurrences,
+        segment_query_starts,
+        segment_query_ends,
+        segment_key_offsets,
+        segment_key_occurrences,
+    )
+    if not all(_is_cpu_int32_vector(tensor) for tensor in int32_inputs):
+        return None
+    if not _is_cpu_bool_vector(terminal_owned) or not _is_cpu_bool_vector(final_keep):
+        return None
+
+    endpoint_count = int(max_chunk_end) - int(chunk_start)
+    if endpoint_count <= 0:
+        raise ValueError("Occurrence capacity index requires at least one endpoint.")
+    first_required_end = torch.empty(len(occurrence_raw_tokens), dtype=torch.int32, device="cpu")
+    current_allocations = torch.empty(endpoint_count, dtype=torch.int64, device="cpu")
+    persistent_allocations = torch.empty(endpoint_count, dtype=torch.int64, device="cpu")
+    future_reserve = torch.empty(endpoint_count, dtype=torch.int64, device="cpu")
+    module.build_occurrence_capacity_index(
+        *int32_inputs,
+        terminal_owned,
+        final_keep,
+        int(chunk_start),
+        int(max_chunk_end),
+        int(output_len),
+        first_required_end,
+        current_allocations,
+        persistent_allocations,
+        future_reserve,
+    )
+    return (
+        first_required_end,
+        current_allocations,
+        persistent_allocations,
+        future_reserve,
+    )
 
 
 def first_mask_free_conflict_event(

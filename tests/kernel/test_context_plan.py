@@ -14,9 +14,10 @@ from minisgl.kernel.context_plan import (
     first_mask_free_conflict_event,
     try_build_context_full_plan,
     try_build_context_sliding_plan,
+    try_build_occurrence_capacity_index,
     try_build_occurrence_sliding_plan,
 )
-from minisgl.scheduler.prefill import _mask_free_context_reason_reference
+from minisgl.scheduler.prefill import PrefillAdder, _mask_free_context_reason_reference
 from minisgl.scheduler.utils import PendingReq
 
 
@@ -326,3 +327,86 @@ def test_occurrence_sliding_plan_accepts_window_starting_at_cached_len() -> None
     assert offsets.tolist() == [0, 3, 6]
     assert keys.tolist() == [7, 8, 9, 8, 9, 10]
     assert cached_positions.tolist() == [0, 1]
+
+
+@pytest.mark.parametrize(
+    ("chunk_start", "terminal_owned"),
+    [
+        (0, [False, False, False, False, False]),
+        (2, [True, False, False, False, False]),
+    ],
+)
+def test_occurrence_capacity_index_matches_reference_for_every_endpoint(
+    chunk_start: int,
+    terminal_owned: list[bool],
+) -> None:
+    occurrence_raw = torch.tensor([0, 1, 2, 3, 4, 0, 1, 2], dtype=torch.int32)
+    occurrence_positions = torch.tensor([0, 1, 2, 3, 4, -1, 0, 1], dtype=torch.int32)
+    birth = torch.tensor([0, 1, 2, 3, 4], dtype=torch.int32)
+    terminal = torch.tensor([5, 6, 7, 3, 4], dtype=torch.int32)
+    segment_starts = torch.tensor([0, 2], dtype=torch.int32)
+    segment_ends = torch.tensor([2, 5], dtype=torch.int32)
+    segment_offsets = torch.tensor([0, 2, 7], dtype=torch.int32)
+    segment_keys = torch.tensor([0, 1, 5, 6, 2, 3, 4], dtype=torch.int32)
+    owned = torch.tensor(terminal_owned, dtype=torch.bool)
+    final_keep = torch.tensor([False, True, True, False, True], dtype=torch.bool)
+    req = PendingReq(
+        uid=7,
+        input_ids=torch.arange(5, dtype=torch.int32),
+        true_positions=torch.arange(5, dtype=torch.int32),
+        raw_positions=torch.arange(5, dtype=torch.int32),
+        radix_input_ids=torch.arange(5, dtype=torch.int32),
+        radix_match_ids=torch.arange(5, dtype=torch.int32),
+        sampling_params=SamplingParams(max_tokens=2),
+        prompt_tokens=5,
+        full_keep_mask=final_keep.to(torch.int32),
+        occurrence_raw_tokens=occurrence_raw,
+        occurrence_positions=occurrence_positions,
+        occurrence_birth_indices=birth,
+        occurrence_terminal_indices=terminal,
+        occurrence_segment_query_starts=segment_starts,
+        occurrence_segment_query_ends=segment_ends,
+        occurrence_segment_key_offsets=segment_offsets,
+        occurrence_segment_key_indices=segment_keys,
+    )
+
+    result = try_build_occurrence_capacity_index(
+        occurrence_raw,
+        occurrence_positions,
+        birth,
+        terminal,
+        segment_starts,
+        segment_ends,
+        segment_offsets,
+        segment_keys,
+        owned,
+        final_keep,
+        chunk_start=chunk_start,
+        max_chunk_end=5,
+        output_len=req.output_len,
+    )
+
+    assert result is not None
+    first_required_end, current, persistent, future = result
+    for endpoint in range(chunk_start + 1, 6):
+        expected_required, expected_current, expected_persistent, expected_future = (
+            PrefillAdder._occurrence_capacity_for_chunk(
+                req,
+                start=chunk_start,
+                end=endpoint,
+                terminal_owned=owned,
+            )
+        )
+        actual_required = (
+            torch.nonzero(
+                first_required_end <= endpoint,
+                as_tuple=False,
+            )
+            .view(-1)
+            .to(torch.int64)
+        )
+        index = endpoint - chunk_start - 1
+        assert torch.equal(actual_required, expected_required)
+        assert int(current[index]) == expected_current
+        assert int(persistent[index]) == expected_persistent
+        assert int(future[index]) == expected_future
