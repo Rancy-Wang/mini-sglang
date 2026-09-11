@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from pathlib import Path
 
 from scripts.profile_reposition_matrix import (
@@ -20,6 +21,10 @@ def _profile_probe(profiler: EventProfiler) -> None:
     profiler.callback(frame, "call", None)
     sum(range(100))
     profiler.callback(frame, "return", None)
+
+
+def _automatic_profile_probe() -> None:
+    sum(range(100))
 
 
 def _profile_child(profiler: EventProfiler) -> None:
@@ -67,6 +72,65 @@ def test_event_profiler_records_only_exact_mapped_function(tmp_path: Path) -> No
     assert rows[0]["samples_ns"] == [rows[0]["total_ns"]]
 
 
+def test_event_profiler_ignores_calls_until_explicit_activation(tmp_path: Path) -> None:
+    profiler = EventProfiler(
+        [
+            ProfileTarget(
+                "scheduler",
+                "tests/scripts/test_profile_reposition_matrix.py",
+                "_profile_probe",
+            )
+        ],
+        tmp_path / "profile-{pid}.jsonl",
+        nvtx=False,
+        activation_file=tmp_path / "ready.marker",
+    )
+
+    _profile_probe(profiler)
+    profiler.activate()
+    _profile_probe(profiler)
+    profiler.flush()
+
+    row = json.loads(next(tmp_path.glob("profile-*.jsonl")).read_text())
+    assert row["calls"] == 1
+    assert row["activated_ns"] is not None
+
+
+def test_event_profiler_marker_activation_writes_periodic_snapshot(tmp_path: Path) -> None:
+    activation_file = tmp_path / "ready.marker"
+    profiler = EventProfiler(
+        [
+            ProfileTarget(
+                "scheduler",
+                "tests/scripts/test_profile_reposition_matrix.py",
+                "_automatic_profile_probe",
+            )
+        ],
+        tmp_path / "profile-{pid}.jsonl",
+        nvtx=False,
+        activation_file=activation_file,
+        snapshot_interval_s=0.01,
+    )
+    profiler.install()
+    try:
+        _automatic_profile_probe()
+        activation_file.touch()
+        deadline = time.monotonic() + 1
+        while not profiler._enabled and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert profiler._enabled
+        _automatic_profile_probe()
+        output = tmp_path / f"profile-{__import__('os').getpid()}.jsonl"
+        while not output.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert output.exists()
+    finally:
+        profiler.flush()
+
+    row = json.loads(output.read_text())
+    assert row["calls"] == 1
+
+
 def test_event_profiler_separates_nested_inclusive_and_self_time(tmp_path: Path) -> None:
     profiler = EventProfiler(
         [
@@ -93,11 +157,21 @@ def test_event_profiler_separates_nested_inclusive_and_self_time(tmp_path: Path)
 
 
 def test_bootstrap_is_task_local_and_covers_both_framework_maps(tmp_path: Path) -> None:
-    env = create_profile_bootstrap(tmp_path / "profile", framework="minisgl", nvtx=False)
+    activation_file = tmp_path / "ready.marker"
+    env = create_profile_bootstrap(
+        tmp_path / "profile",
+        framework="minisgl",
+        nvtx=False,
+        activation_file=activation_file,
+        snapshot_interval_s=0.25,
+    )
 
     assert Path(env[PROFILE_CONFIG_ENV]).is_file()
     assert (tmp_path / "profile" / "bootstrap" / "sitecustomize.py").is_file()
     assert "bootstrap" in env["PYTHONPATH"]
+    config = json.loads(Path(env[PROFILE_CONFIG_ENV]).read_text())
+    assert config["activation_file"] == str(activation_file.resolve())
+    assert config["snapshot_interval_s"] == 0.25
     assert {target.stage for target in targets_for_framework("minisgl")} >= {
         "tokenize",
         "reposition_sequence",

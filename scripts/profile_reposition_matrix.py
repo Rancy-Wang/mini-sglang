@@ -16,6 +16,7 @@ from types import FrameType
 from typing import Any, Iterable, Sequence
 
 PROFILE_CONFIG_ENV = "MINISGL_R10_PROFILE_CONFIG"
+DEFAULT_SNAPSHOT_INTERVAL_S = 5.0
 
 
 @dataclass(frozen=True)
@@ -222,13 +223,24 @@ class EventProfiler:
         *,
         nvtx: bool,
         sample_limit: int = 4096,
+        activation_file: Path | None = None,
+        snapshot_interval_s: float = DEFAULT_SNAPSHOT_INTERVAL_S,
     ) -> None:
         if sample_limit < 1:
             raise ValueError("sample_limit must be positive")
+        if snapshot_interval_s <= 0:
+            raise ValueError("snapshot_interval_s must be positive")
         self.targets = tuple(targets)
         self.output = output
         self.nvtx = nvtx
         self.sample_limit = sample_limit
+        self.activation_file = activation_file
+        self.snapshot_interval_s = snapshot_interval_s
+        self._enabled = activation_file is None
+        self._activated_ns = time.perf_counter_ns() if self._enabled else None
+        self._stop = threading.Event()
+        self._snapshot_write_lock = threading.Lock()
+        self._monitor: threading.Thread | None = None
         self._local = threading.local()
         self._lock = threading.Lock()
         self._targets_by_name: dict[str, list[ProfileTarget]] = defaultdict(list)
@@ -271,6 +283,8 @@ class EventProfiler:
         return self._nvtx_module
 
     def callback(self, frame: FrameType, event: str, _: Any) -> None:
+        if not self._enabled:
+            return
         active = getattr(self._local, "active", None)
         if active is None:
             active = self._local.active = []
@@ -320,28 +334,55 @@ class EventProfiler:
     def install(self) -> None:
         sys.setprofile(self.callback)
         threading.setprofile(self.callback)
+        self._monitor = threading.Thread(
+            target=self._monitor_activation_and_snapshot,
+            name="minisgl-profile-snapshot",
+            daemon=True,
+        )
+        self._monitor.start()
         atexit.register(self.flush)
 
-    def flush(self) -> None:
-        sys.setprofile(None)
-        threading.setprofile(None)
-        rows = [
-            {
-                "pid": os.getpid(),
-                "stage": stage,
-                "filename_suffix": filename,
-                "qualname": qualname,
-                **value.to_dict(),
-            }
-            for (stage, filename, qualname), value in sorted(self._aggregates.items())
-        ]
+    def activate(self) -> None:
+        if not self._enabled:
+            self._activated_ns = time.perf_counter_ns()
+            self._enabled = True
+
+    def _monitor_activation_and_snapshot(self) -> None:
+        while not self._stop.wait(0.05 if not self._enabled else self.snapshot_interval_s):
+            if not self._enabled:
+                if self.activation_file is not None and self.activation_file.exists():
+                    self.activate()
+                continue
+            self.snapshot()
+
+    def snapshot(self) -> None:
+        with self._lock:
+            rows = [
+                {
+                    "pid": os.getpid(),
+                    "activated_ns": self._activated_ns,
+                    "stage": stage,
+                    "filename_suffix": filename,
+                    "qualname": qualname,
+                    **value.to_dict(),
+                }
+                for (stage, filename, qualname), value in sorted(self._aggregates.items())
+            ]
         if not rows:
             return
         output = Path(str(self.output).format(pid=os.getpid()))
         output.parent.mkdir(parents=True, exist_ok=True)
-        with output.open("a", encoding="utf-8", newline="\n") as stream:
-            for row in rows:
-                stream.write(json.dumps(row, sort_keys=True) + "\n")
+        temporary = output.with_name(f".{output.name}.tmp")
+        payload = "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows)
+        with self._snapshot_write_lock:
+            temporary.write_text(payload, encoding="utf-8", newline="\n")
+            temporary.replace(output)
+
+    def flush(self) -> None:
+        sys.setprofile(None)
+        threading.setprofile(None)
+        self._stop.set()
+        self.snapshot()
 
 
 @dataclass
@@ -407,7 +448,14 @@ def install_from_env() -> EventProfiler | None:
         return _ACTIVE_PROFILER
     config = json.loads(Path(config_path).read_text(encoding="utf-8"))
     targets = tuple(ProfileTarget(**item) for item in config["targets"])
-    profiler = EventProfiler(targets, Path(config["output"]), nvtx=bool(config.get("nvtx", True)))
+    activation_file = config.get("activation_file")
+    profiler = EventProfiler(
+        targets,
+        Path(config["output"]),
+        nvtx=bool(config.get("nvtx", True)),
+        activation_file=Path(activation_file) if activation_file else None,
+        snapshot_interval_s=float(config.get("snapshot_interval_s", DEFAULT_SNAPSHOT_INTERVAL_S)),
+    )
     profiler.install()
     _ACTIVE_PROFILER = profiler
     return profiler
@@ -418,6 +466,8 @@ def create_profile_bootstrap(
     *,
     framework: str,
     nvtx: bool = True,
+    activation_file: Path | None = None,
+    snapshot_interval_s: float = DEFAULT_SNAPSHOT_INTERVAL_S,
 ) -> dict[str, str]:
     """Create a task-local sitecustomize and return env additions for every server child."""
 
@@ -428,6 +478,8 @@ def create_profile_bootstrap(
         "targets": [asdict(target) for target in targets_for_framework(framework)],
         "output": str((output_dir / "profile-{pid}.jsonl").resolve()),
         "nvtx": nvtx,
+        "activation_file": str(activation_file.resolve()) if activation_file else None,
+        "snapshot_interval_s": snapshot_interval_s,
     }
     config_path.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     bootstrap = output_dir / "bootstrap"
@@ -591,6 +643,8 @@ def build_parser() -> argparse.ArgumentParser:
     install.add_argument("--output-dir", type=Path, required=True)
     install.add_argument("--framework", choices=("minisgl", "sglang"), required=True)
     install.add_argument("--no-nvtx", action="store_true")
+    install.add_argument("--activation-file", type=Path)
+    install.add_argument("--snapshot-interval-s", type=float, default=DEFAULT_SNAPSHOT_INTERVAL_S)
 
     summarize = subparsers.add_parser("summarize")
     summarize.add_argument("--inputs", type=Path, nargs="+", required=True)
@@ -607,7 +661,11 @@ def main(argv: Iterable[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "create-bootstrap":
         additions = create_profile_bootstrap(
-            args.output_dir, framework=args.framework, nvtx=not args.no_nvtx
+            args.output_dir,
+            framework=args.framework,
+            nvtx=not args.no_nvtx,
+            activation_file=args.activation_file,
+            snapshot_interval_s=args.snapshot_interval_s,
         )
         print(json.dumps(additions, sort_keys=True))
         return 0
