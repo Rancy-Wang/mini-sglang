@@ -947,7 +947,9 @@ class Scheduler(SchedulerIOMixin):
                 )
         transitioned = False
         for req in batch.reqs:
-            if not isinstance(req, ChunkedReq) and req.context_post_prefill_keep_mask is not None:
+            if not isinstance(req, ChunkedReq) and getattr(
+                req, "context_post_prefill_keep_mask", None
+            ) is not None:
                 self._compact_context_after_prefill(req)
                 transitioned = True
         if transitioned:
