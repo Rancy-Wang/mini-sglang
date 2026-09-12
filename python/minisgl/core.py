@@ -183,6 +183,9 @@ class Req:
     use_context_mask: bool = False
     context_compact_stream: bool = False
     context_post_prefill_keep_mask: torch.Tensor | None = None
+    context_decode_keep_mask: torch.Tensor | None = None
+    context_decode_keep_indices: torch.Tensor | None = None
+    context_decode_dropped_owned_indices: torch.Tensor | None = None
     radix_key_virtual_mask: torch.Tensor | None = None
     radix_key_to_token: torch.Tensor | None = None
     radix_token_to_key: torch.Tensor | None = None
@@ -223,6 +226,9 @@ class Req:
     occurrence_inflight: bool = False
     occurrence_abort_deferred: bool = False
     occurrence_external_storage: bool = False
+    _host_append_buffers: dict[str, torch.Tensor] = field(
+        default_factory=dict, init=False, repr=False
+    )
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu
@@ -668,6 +674,34 @@ class Req:
     def extend_len(self) -> int:
         return self.device_len - self.cached_len
 
+    def _append_host_tensor(self, name: str, value: torch.Tensor) -> None:
+        """Append to a CPU tensor without copying its full prefix every token."""
+
+        current = getattr(self, name)
+        assert current is not None and current.is_cpu and value.is_cpu
+        if value.ndim != current.ndim or value.shape[1:] != current.shape[1:]:
+            raise ValueError(f"{name} append has incompatible shape.")
+        length = len(current)
+        required = length + len(value)
+        dtype = torch.promote_types(current.dtype, value.dtype)
+        buffer = self._host_append_buffers.get(name)
+        if (
+            buffer is None
+            or buffer.data_ptr() != current.data_ptr()
+            or buffer.dtype != dtype
+            or required > len(buffer)
+        ):
+            capacity = length + max(self.output_len + 1, len(value), 2)
+            if buffer is not None and buffer.data_ptr() == current.data_ptr():
+                capacity = max(capacity, len(buffer) * 2)
+            buffer = torch.empty(
+                (capacity, *current.shape[1:]), dtype=dtype, device="cpu"
+            )
+            buffer[:length].copy_(current)
+            self._host_append_buffers[name] = buffer
+        buffer[length:required].copy_(value)
+        setattr(self, name, buffer[:required])
+
     def complete_one(self) -> None:
         # `complete_one` is called immediately after forward.
         # Update position metadata here so both overlap and normal loops
@@ -678,7 +712,7 @@ class Req:
             self.radix_next_position if self.radix_next_position is not None else self.true_seq_len
         )
         next_pos = torch.tensor([position], dtype=torch.int32, device="cpu")
-        self.true_positions = torch.cat([self.true_positions, next_pos])
+        self._append_host_tensor("true_positions", next_pos)
         self.true_seq_len = max(self.true_seq_len, position + 1)
         if self.radix_next_position is not None:
             self.radix_next_position += 1
@@ -689,11 +723,8 @@ class Req:
             raw_position = len(self.radix_token_to_key) + pending_host_tokens
         else:
             raw_position = int(self.raw_positions[-1]) + 1
-        self.raw_positions = torch.cat(
-            [
-                self.raw_positions,
-                torch.tensor([raw_position], dtype=torch.int32, device="cpu"),
-            ]
+        self._append_host_tensor(
+            "raw_positions", torch.tensor([raw_position], dtype=torch.int32, device="cpu")
         )
 
     @property
@@ -719,7 +750,7 @@ class Req:
             self.radix_token_to_key
         ):
             raise RuntimeError("Generated-token raw positions are not contiguous.")
-        self.input_ids = torch.cat([self.input_ids, next_token])
+        self._append_host_tensor("input_ids", next_token)
         if self.radix_match_ids.ndim == 2:
             next_token_key = torch.tensor(
                 [
@@ -735,44 +766,34 @@ class Req:
             )
         else:
             next_token_key = next_token.to(dtype=torch.int64, device="cpu")
-        self.radix_input_ids = torch.cat([self.radix_input_ids, next_token_key])
-        self.radix_match_ids = torch.cat([self.radix_match_ids, next_token_key])
+        self._append_host_tensor("radix_input_ids", next_token_key)
+        self._append_host_tensor("radix_match_ids", next_token_key)
         if self.radix_positions is not None:
-            self.radix_positions = torch.cat(
-                [
-                    self.radix_positions,
-                    torch.tensor([host_true_position], dtype=torch.int32, device="cpu"),
-                ]
+            self._append_host_tensor(
+                "radix_positions",
+                torch.tensor([host_true_position], dtype=torch.int32, device="cpu"),
             )
         if self.radix_repos_info is not None:
-            self.radix_repos_info = torch.cat(
-                [
-                    self.radix_repos_info,
-                    torch.tensor([self.radix_current_reposition], dtype=torch.int32, device="cpu"),
-                ]
+            self._append_host_tensor(
+                "radix_repos_info",
+                torch.tensor([self.radix_current_reposition], dtype=torch.int32, device="cpu"),
             )
         if self.radix_key_virtual_mask is not None:
             assert self.radix_key_to_token is not None
             assert self.radix_token_to_key is not None
             token_pos = len(self.radix_token_to_key)
             key_pos = len(self.radix_match_ids) - 1
-            self.radix_key_virtual_mask = torch.cat(
-                [
-                    self.radix_key_virtual_mask,
-                    torch.tensor([False], dtype=torch.bool, device="cpu"),
-                ]
+            self._append_host_tensor(
+                "radix_key_virtual_mask",
+                torch.tensor([False], dtype=torch.bool, device="cpu"),
             )
-            self.radix_key_to_token = torch.cat(
-                [
-                    self.radix_key_to_token,
-                    torch.tensor([token_pos], dtype=torch.int64, device="cpu"),
-                ]
+            self._append_host_tensor(
+                "radix_key_to_token",
+                torch.tensor([token_pos], dtype=torch.int64, device="cpu"),
             )
-            self.radix_token_to_key = torch.cat(
-                [
-                    self.radix_token_to_key,
-                    torch.tensor([key_pos], dtype=torch.int64, device="cpu"),
-                ]
+            self._append_host_tensor(
+                "radix_token_to_key",
+                torch.tensor([key_pos], dtype=torch.int64, device="cpu"),
             )
 
     @property
@@ -787,11 +808,17 @@ class Req:
     def match_stop(self) -> tuple[bool, str | None]:
         if not self.stop_token_seqs:
             return False, None
-        input_ids = self.input_ids.tolist()
+        max_stop_len = max(
+            (len(seq) for seq in self.stop_token_seqs if 0 < len(seq) <= len(self.input_ids)),
+            default=0,
+        )
+        if max_stop_len == 0:
+            return False, None
+        suffix = self.input_ids[-max_stop_len:].tolist()
         for idx, stop_seq in enumerate(self.stop_token_seqs):
-            if len(stop_seq) == 0 or len(stop_seq) > len(input_ids):
+            if len(stop_seq) == 0 or len(stop_seq) > len(self.input_ids):
                 continue
-            if input_ids[-len(stop_seq) :] == stop_seq:
+            if suffix[-len(stop_seq) :] == stop_seq:
                 if self.stop is not None and idx < len(self.stop):
                     return True, self.stop[idx]
                 return True, None

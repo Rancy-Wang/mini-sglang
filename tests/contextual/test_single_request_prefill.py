@@ -22,7 +22,7 @@ from minisgl.message import TokenizeMsg, WarmupAckMsg
 from minisgl.scheduler.cache import CacheManager
 from minisgl.scheduler.decode import DecodeManager
 from minisgl.scheduler.prefill import ChunkedReq, PrefillManager
-from minisgl.scheduler.scheduler import Scheduler
+from minisgl.scheduler.scheduler import ForwardInput, Scheduler
 from minisgl.scheduler.table import TableManager
 from minisgl.tokenizer.server import _build_user_msg
 from minisgl.tokenizer.tokenize import TokenizedResult, TokenizeManager
@@ -295,6 +295,65 @@ def test_overlap_finishes_compaction_before_scheduling_decode(runtime):
     )
     assert scheduler.overlap_loop(data) is None
     assert len(replies) == 1
+    scheduler._free_req_resources(req)
+    scheduler.cache_manager.check_integrity()
+
+
+def test_forward_queues_final_compaction_before_overlapped_decode(runtime, monkeypatch):
+    scheduler, replies = runtime
+    scheduler.prefill_manager.add_one_req(_tokens())
+    batch = scheduler.prefill_manager.schedule_next_batch(32)
+    assert batch is not None
+    req = batch.reqs[0]
+    scheduler.cache_manager.allocate_paged(batch.reqs)
+    metadata = build_context_attention_batch([req])
+    req.record_context_cache_usage(metadata.cached_tokens[0], metadata.cached_positions[0])
+    table = scheduler.table_manager
+    table.token_pool[req.table_idx, : req.device_len].copy_(req.input_ids)
+    scheduler.token_pool = table.token_pool
+    seen = []
+
+    class Event:
+        def record(self, stream):
+            seen.append(("record", stream))
+
+    engine_stream = object()
+
+    def forward_batch(_batch, _args):
+        req.complete_one()
+        return SimpleNamespace(next_tokens_gpu=torch.tensor([42], dtype=torch.int32))
+
+    scheduler.engine = SimpleNamespace(
+        stream=engine_stream,
+        forward_batch=forward_batch,
+        sampler=SimpleNamespace(discard=lambda _req: None),
+    )
+    scheduler.stream = SimpleNamespace(wait_event=lambda event: seen.append(("wait", event)))
+    monkeypatch.setattr(torch.cuda, "Event", Event)
+    input_tuple = (
+        torch.tensor([req.table_idx]),
+        torch.tensor([0]),
+    )
+    output_tuple = (
+        torch.tensor([req.table_idx]),
+        torch.tensor([req.device_len]),
+    )
+    scheduler._forward(ForwardInput(batch, None, input_tuple, output_tuple))
+
+    assert req.context_post_prefill_keep_mask is None
+    assert req.input_ids.tolist() == [105, 106, 107, 108, 109]
+    assert req.true_positions.tolist() == [5, 6, 7, 8, 9, 10]
+    assert table.token_pool[req.table_idx, :6].tolist() == [105, 106, 107, 108, 109, 42]
+    assert seen[0] == ("record", engine_stream)
+    assert seen[1][0] == "wait" and seen[1][1] is not None
+
+    scheduler._process_last_data(
+        (
+            SimpleNamespace(batch=batch),
+            (None, torch.tensor([42], dtype=torch.int32), SimpleNamespace(synchronize=lambda: None)),
+        )
+    )
+    assert len(replies) == 1 and replies[0].next_token == 42
     scheduler._free_req_resources(req)
     scheduler.cache_manager.check_integrity()
 
