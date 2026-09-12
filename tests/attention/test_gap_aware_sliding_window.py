@@ -116,6 +116,29 @@ def test_historical_gap_keeps_fast_path_when_recent_window_is_contiguous() -> No
     )
 
 
+@pytest.mark.parametrize("sliding_window", [1, 2, 4, 8, 64])
+@pytest.mark.parametrize("cached_len", [0, 2, 5])
+def test_prefill_gap_check_matches_per_query_oracle(
+    sliding_window: int, cached_len: int
+) -> None:
+    for positions in (
+        [0, 1, 2, 3, 4, 5],
+        [0, 1, 2, 10, 11, 12],
+        [0, 1, 2, 3, 10, 11],
+        [0, 8, 9, 10, 11, 12],
+    ):
+        req = _req(positions, cached_len=cached_len)
+        expected = any(
+            positions[query_idx]
+            - positions[max(0, query_idx - sliding_window + 1)]
+            != min(sliding_window, query_idx + 1) - 1
+            for query_idx in range(cached_len, len(positions))
+        )
+        assert batch_needs_gap_aware_sliding_window(
+            [req], sliding_window=sliding_window
+        ) is expected
+
+
 def test_decode_graph_eligibility_recovers_at_128_contiguous_tokens() -> None:
     positions = torch.cat(
         [

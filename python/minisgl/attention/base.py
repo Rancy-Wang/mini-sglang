@@ -136,11 +136,17 @@ def batch_needs_gap_aware_sliding_window(
         query_start = req.cached_len
         if not 0 <= query_start < req.device_len:
             raise ValueError("Sliding-window queries must satisfy 0 <= query_start < device_len.")
-        for query_idx in range(query_start, req.device_len):
-            token_count = min(sliding_window, query_idx + 1)
-            first_idx = query_idx + 1 - token_count
-            if int(active_positions[query_idx] - active_positions[first_idx]) + 1 != token_count:
-                return True
+        if sliding_window == 1:
+            continue
+        # Every query window is an interval of strictly increasing positions.
+        # Their union contains precisely the edges from the first query's
+        # window through the final token, so one endpoint comparison detects
+        # every gap without scanning the queries individually.
+        first_idx = max(0, query_start - sliding_window + 1)
+        if int(active_positions[-1] - active_positions[first_idx]) != (
+            req.device_len - 1 - first_idx
+        ):
+            return True
     return False
 
 

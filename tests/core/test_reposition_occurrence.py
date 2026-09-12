@@ -240,6 +240,59 @@ def test_lazy_occurrence_window_matches_full_plan_semantics(query_start: int) ->
         assert lazy.occurrence_count < full.occurrence_count
 
 
+def test_lazy_occurrence_window_preserves_empty_stage_and_partial_window() -> None:
+    layout = _layout()
+    layout = replace(
+        layout,
+        birth_stages=torch.tensor([0, 0, 0, 0, 1, 1, 1, 3], dtype=torch.int32),
+        transition_offsets=torch.tensor([0, 3, 3, 7], dtype=torch.int32),
+    )
+    visibility = torch.tensor([4, 9, 7, 9, 9, 9, 9, 9], dtype=torch.int32)
+    full = compile_reposition_occurrence_plan(layout, visibility)
+    lazy = compile_occurrence_window(
+        _compact_layout(layout),
+        visibility,
+        layout.positions,
+        query_start=5,
+        query_end=8,
+    )
+
+    assert _semantic_window(lazy, 5, 8) == _semantic_window(full, 5, 8)
+
+
+def test_lazy_occurrence_window_accepts_unsorted_unique_transitions() -> None:
+    layout = _layout()
+    order = torch.tensor([1, 0, 2, 3, 4, 5, 6])
+    layout = replace(
+        layout,
+        transition_raw_tokens=layout.transition_raw_tokens[order],
+        transition_old_positions=layout.transition_old_positions[order],
+        transition_new_positions=layout.transition_new_positions[order],
+    )
+    visibility = torch.tensor([4, 9, 7, 9, 9, 9, 9, 9], dtype=torch.int32)
+    full = compile_reposition_occurrence_plan(layout, visibility)
+    lazy = compile_occurrence_window(
+        _compact_layout(layout), visibility, layout.positions, query_start=4, query_end=8
+    )
+
+    assert _semantic_window(lazy, 4, 8) == _semantic_window(full, 4, 8)
+
+
+def test_lazy_occurrence_window_rejects_duplicate_stage_transition() -> None:
+    layout = _layout()
+    duplicate = layout.transition_raw_tokens.clone()
+    duplicate[1] = duplicate[0]
+
+    with pytest.raises(ValueError, match="cannot transition a raw token twice"):
+        compile_occurrence_window(
+            _compact_layout(replace(layout, transition_raw_tokens=duplicate)),
+            torch.tensor([4, 9, 7, 9, 9, 9, 9, 9], dtype=torch.int32),
+            layout.positions,
+            query_start=4,
+            query_end=8,
+        )
+
+
 def _runtime_req(plan, *, cached_len: int, page_base: int, table_idx: int):
     return SimpleNamespace(
         reposition_execution_mode="paged-occurrence",

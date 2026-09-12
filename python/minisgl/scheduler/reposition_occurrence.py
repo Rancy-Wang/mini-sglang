@@ -156,13 +156,17 @@ def compile_occurrence_window(
         raise ValueError("Occurrence positions must be non-negative.")
 
     stage_count = len(layout.transition_offsets) - 1
-    birth_stages = layout.birth_stages.to(torch.int64)
+    birth_stages = layout.birth_stages
     if bool(torch.any(birth_stages < 0).item()) or bool(
         torch.any(birth_stages > stage_count).item()
     ):
         raise ValueError("Occurrence birth stages are outside the Reposition program.")
     if len(birth_stages) > 1 and bool(torch.any(birth_stages[1:] < birth_stages[:-1]).item()):
         raise ValueError("Occurrence birth stages must preserve raw-token order.")
+    stage_boundaries = torch.searchsorted(
+        birth_stages,
+        torch.arange(stage_count + 2, dtype=torch.int32, device="cpu"),
+    ).tolist()
 
     raw = torch.arange(token_count, dtype=torch.int64, device="cpu")
     visible_until = full_token_visible_until.to(torch.int64)
@@ -207,26 +211,29 @@ def compile_occurrence_window(
         if stage > 0:
             begin = int(layout.transition_offsets[stage - 1])
             end = int(layout.transition_offsets[stage])
-            transition_raw = layout.transition_raw_tokens[begin:end].to(torch.int64)
+            transition_raw = layout.transition_raw_tokens[begin:end]
             transition_old = layout.transition_old_positions[begin:end]
             transition_new = layout.transition_new_positions[begin:end]
             if bool(torch.any(transition_raw < 0).item()) or bool(
                 torch.any(transition_raw >= token_count).item()
             ):
                 raise ValueError("Reposition transition references an invalid raw token.")
-            if len(torch.unique(transition_raw)) != len(transition_raw):
-                raise ValueError("One Reposition stage cannot transition a raw token twice.")
+            if len(transition_raw) > 1 and bool(
+                torch.any(transition_raw[1:] <= transition_raw[:-1]).item()
+            ):
+                # The tokenizer emits sorted raw IDs. Keep accepting valid
+                # unsorted external layouts, while avoiding a sort per stage
+                # on the common path.
+                if len(torch.unique(transition_raw)) != len(transition_raw):
+                    raise ValueError("One Reposition stage cannot transition a raw token twice.")
             if not torch.equal(current_positions[transition_raw], transition_old):
                 raise ValueError("Reposition transition old positions do not match current state.")
             current_positions[transition_raw] = transition_new
 
-        stage_queries = torch.nonzero(birth_stages == stage, as_tuple=False).view(-1)
-        if len(stage_queries) == 0:
+        stage_start = stage_boundaries[stage]
+        stage_end = stage_boundaries[stage + 1]
+        if stage_start == stage_end:
             continue
-        stage_start = int(stage_queries[0])
-        stage_end = int(stage_queries[-1]) + 1
-        if stage_end - stage_start != len(stage_queries):
-            raise ValueError("One Reposition stage must own a contiguous raw-query interval.")
         local_query_start = max(query_start, stage_start)
         local_query_end = min(query_end, stage_end)
         if local_query_start >= local_query_end:
@@ -240,7 +247,6 @@ def compile_occurrence_window(
         if len(internal_expiries) > 0:
             boundaries.extend(int(value) for value in torch.unique(internal_expiries).tolist())
         boundaries.append(local_query_end)
-        boundaries = sorted(set(boundaries))
         for local_start, local_end in zip(boundaries, boundaries[1:]):
             prefix_raw = raw[:local_start]
             active_prefix = prefix_raw[visible_until[:local_start] > local_start]
