@@ -1047,23 +1047,29 @@ class TokenizeManager:
 
     @staticmethod
     def _build_owner_position_ranges(
-        owners: List[int],
+        owners: List[int] | torch.Tensor,
     ) -> dict[int, List[tuple[int, int]]]:
         """Return exact full-token ranges for every provenance owner."""
 
         ranges: dict[int, List[tuple[int, int]]] = {}
-        if not owners:
+        owner_tensor = torch.as_tensor(owners, dtype=torch.int32, device="cpu")
+        if owner_tensor.ndim != 1:
+            raise ValueError("Token provenance owners must be a one-dimensional vector.")
+        if len(owner_tensor) == 0:
             return ranges
-        start = 0
-        owner = int(owners[0])
-        for pos in range(1, len(owners) + 1):
-            next_owner = int(owners[pos]) if pos < len(owners) else None
-            if next_owner == owner:
-                continue
-            ranges.setdefault(owner, []).append((start, pos))
-            if pos < len(owners):
-                start = pos
-                owner = int(next_owner)
+        changes = torch.nonzero(owner_tensor[1:] != owner_tensor[:-1], as_tuple=False).view(-1) + 1
+        starts = torch.cat((torch.zeros(1, dtype=torch.int64), changes.to(torch.int64)))
+        ends = torch.cat(
+            (changes.to(torch.int64), torch.tensor([len(owner_tensor)], dtype=torch.int64))
+        )
+        range_owners = owner_tensor[starts].tolist()
+        for owner, start, end in zip(
+            range_owners,
+            starts.tolist(),
+            ends.tolist(),
+            strict=True,
+        ):
+            ranges.setdefault(owner, []).append((start, end))
         return ranges
 
     @staticmethod
@@ -1397,18 +1403,18 @@ class TokenizeManager:
         )
 
     @staticmethod
-    def _query_epochs_from_owners(owners: List[int], message_count: int) -> List[int]:
-        epochs: List[int] = []
-        previous = 0
-        for owner in owners:
-            epoch = 0 if owner < 0 else min(owner, message_count)
-            if epoch < previous:
-                raise RuntimeError(
-                    "Chat template reordered messages; cannot construct monotonic Drop events."
-                )
-            epochs.append(epoch)
-            previous = epoch
-        return epochs
+    def _query_epochs_from_owners(
+        owners: List[int] | torch.Tensor, message_count: int
+    ) -> List[int]:
+        owner_tensor = torch.as_tensor(owners, dtype=torch.int32, device="cpu")
+        if owner_tensor.ndim != 1:
+            raise ValueError("Token provenance owners must be a one-dimensional vector.")
+        epochs = torch.clamp(owner_tensor, min=0, max=message_count)
+        if len(epochs) > 1 and bool(torch.any(epochs[1:] < epochs[:-1]).item()):
+            raise RuntimeError(
+                "Chat template reordered messages; cannot construct monotonic Drop events."
+            )
+        return epochs.tolist()
 
     def _chat_tokenize(self, msg: TokenizeMsg) -> TokenizedResult:
         assert isinstance(msg.text, list)
@@ -1597,10 +1603,11 @@ class TokenizeManager:
                     gen_prompt_start = len(full_with_gen)
 
         full_no_gen = full_with_gen[:gen_prompt_start]
-        query_epoch_with_gen = self._query_epochs_from_owners(owner_with_gen, len(messages))
+        owner_tensor = torch.as_tensor(owner_with_gen, dtype=torch.int32, device="cpu")
+        query_epoch_with_gen = self._query_epochs_from_owners(owner_tensor, len(messages))
         full_with_gen_tensor = torch.tensor(full_with_gen, dtype=torch.int32, device="cpu")
 
-        owner_ranges = self._build_owner_position_ranges(owner_with_gen)
+        owner_ranges = self._build_owner_position_ranges(owner_tensor)
         target_msg_id = self._resolve_target_msg_id(
             msg,
             len(messages),

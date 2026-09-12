@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
 import torch
 from minisgl.kernel.radix_reposition import (
@@ -9,7 +9,13 @@ from minisgl.kernel.radix_reposition import (
     TOKEN_KIND,
     RadixRepositionLayout,
 )
-from minisgl.message import RepositionOpenMsg, TokenizeMsg, UserMsg, WarmupAckMsg
+from minisgl.message import (
+    RepositionOpenMsg,
+    RepositionStepMsg,
+    StagedRepositionInit,
+    TokenizeMsg,
+    WarmupAckMsg,
+)
 
 from .tokenize import TokenizedResult
 
@@ -41,6 +47,10 @@ class RepositionSequenceState:
     in_flight_end: int = 0
     in_flight_final: bool = False
     transition_dispatch_pending: bool = False
+    pending_transition_raw_tokens: torch.Tensor | None = None
+    pending_transition_new_positions: torch.Tensor | None = None
+    pending_transition_boundary: int | None = None
+    open_ipc_counted: bool = False
     radix_match_ns: int = 0
     retry_plan_ns: int = 0
     transition_count: int = 0
@@ -72,17 +82,54 @@ class RepositionSequenceState:
         )
 
     def open_msg(self) -> RepositionOpenMsg:
-        return RepositionOpenMsg(uid=self.request.uid)
-
-    def activate(self, *, step_token_budget: int) -> None:
-        if step_token_budget <= 0:
-            raise ValueError("Reposition step token budget must be positive.")
-        assert self.tokenized.reposition_input_ids is not None
-        assert self.tokenized.reposition_raw_boundaries is not None
-        assert self.tokenized.reposition_insert_offsets is not None
+        self._initialize_current_state()
         assert self.layout is not None
-        self.step_token_budget = step_token_budget
-        self.active_raw = torch.empty(0, dtype=torch.int32, device="cpu")
+        assert self.tokenized.reposition_input_ids is not None
+        assert self.current_records is not None
+        assert self.current_positions is not None
+        assert self.current_repos is not None
+        init = StagedRepositionInit(
+            input_ids=self.tokenized.reposition_input_ids,
+            radix_records=self.current_records,
+            radix_key_virtual_mask=self.layout.virtual_mask,
+            radix_key_to_token=self.layout.key_to_token,
+            radix_token_to_key=self.layout.token_to_key,
+            initial_positions=self.current_positions,
+            initial_repos=self.current_repos,
+            drop_event_positions=self.drop_event_positions,
+            drop_range_offsets=self.drop_range_offsets,
+            drop_position_ranges=self.drop_position_ranges,
+            full_token_visible_until=self.tokenized.full_token_visible_until,
+            sampling_params=self.request.sampling_params,
+            prompt_tokens=self.tokenized.prompt_tokens,
+            radix_next_position=self.layout.next_position,
+            radix_final_reposition=self.layout.current_reposition,
+            enable_thinking=self.request.enable_thinking,
+            stop=self.request.stop,
+            stop_token_seqs=self.tokenized.stop_token_seqs,
+            message_meta=self.tokenized.message_meta,
+            request_is_warmup=self.request.is_warmup,
+            internal_uid=self.request.internal_uid,
+            request_received_ns=self.request.request_received_ns,
+            tokenize_invocations=self.tokenized.tokenize_invocations,
+            chat_template_invocations=self.tokenized.chat_template_invocations,
+            radix_compile_ns=self.layout.compile_ns,
+        )
+        if self.open_ipc_counted:
+            raise RuntimeError("Reposition sequence initialization was already dispatched.")
+        self.ipc_tensor_bytes += sum(
+            value.numel() * value.element_size()
+            for value in vars(init).values()
+            if isinstance(value, torch.Tensor)
+        )
+        self.open_ipc_counted = True
+        return RepositionOpenMsg(uid=self.request.uid, init=init)
+
+    def _initialize_current_state(self) -> None:
+        if self.current_records is not None:
+            return
+        assert self.tokenized.reposition_raw_boundaries is not None
+        assert self.layout is not None
         self.current_positions = self.layout.birth_positions.clone()
 
         stage_boundaries = torch.full(
@@ -98,6 +145,17 @@ class RepositionSequenceState:
         self.current_records[token_rows, 0] = TOKEN_KIND
         self.current_records[token_rows, 2] = self.current_repos
         self.current_records[token_rows, 3] = self.current_positions
+
+    def activate(self, *, step_token_budget: int) -> None:
+        if step_token_budget <= 0:
+            raise ValueError("Reposition step token budget must be positive.")
+        assert self.tokenized.reposition_input_ids is not None
+        assert self.tokenized.reposition_raw_boundaries is not None
+        assert self.tokenized.reposition_insert_offsets is not None
+        assert self.layout is not None
+        self.step_token_budget = step_token_budget
+        self.active_raw = torch.empty(0, dtype=torch.int32, device="cpu")
+        self._initialize_current_state()
 
     @property
     def is_compiled(self) -> bool:
@@ -177,7 +235,7 @@ class RepositionSequenceState:
             count,
         )
 
-    def build_next_msg(self) -> UserMsg:
+    def build_next_msg(self) -> RepositionStepMsg:
         if self.layout is None or self.current_records is None:
             raise RuntimeError("Reposition sequence must be compiled before dispatch.")
         if self.in_flight_end != 0 or self.in_flight_final:
@@ -196,90 +254,33 @@ class RepositionSequenceState:
         if end < self.raw_cursor or (end == self.raw_cursor and not transition_only):
             raise RuntimeError("Reposition sequence did not make raw-token progress.")
 
-        new_raw = torch.arange(self.raw_cursor, end, dtype=torch.int32, device="cpu")
-        execution_raw = torch.cat((self.active_raw, new_raw))
-        execution_raw = torch.unique(execution_raw, sorted=True)
-        raw_index = execution_raw.to(torch.int64)
         is_final = end == raw_count and next_reposition is None
         commit_key_len = len(self.layout.records) if is_final else self._commit_key_len(end)
-        # The Radix cache can retain this key after the Scheduler acknowledges
-        # the stage.  ``current_records`` is then updated in place for the next
-        # Reposition, so the dispatched key must own independent storage.
-        records = self.current_records[:commit_key_len].clone()
-        virtual_mask = self.layout.virtual_mask[:commit_key_len].contiguous()
-        key_to_token = self.layout.key_to_token[:commit_key_len].contiguous()
-        token_to_key = self.layout.token_to_key[:end].contiguous()
-        use_context_mask = self._drop_inside(end)
-        execution_mask = torch.zeros(end, dtype=torch.bool, device="cpu")
-        execution_mask[raw_index] = True
-        drop_positions, drop_offsets, drop_ranges, drop_count = self._drop_wire_before(end)
-        post_prefill_keep = None
-        if is_final and use_context_mask:
-            post_prefill_keep = self._active_after_events(end)
-
-        sampling_params = (
-            self.request.sampling_params
-            if is_final
-            else replace(self.request.sampling_params, max_tokens=1, ignore_eos=True)
-        )
         self.in_flight_end = end
         self.in_flight_final = is_final
         self.transition_dispatch_pending = False
         self.dispatch_count += 1
-        message = UserMsg(
+        message = RepositionStepMsg(
             uid=self.request.uid,
-            input_ids=self.tokenized.reposition_input_ids[raw_index].contiguous(),
-            true_positions=self.current_positions[raw_index].contiguous(),
-            raw_positions=execution_raw,
-            radix_input_ids=records[token_to_key[raw_index]].contiguous(),
-            radix_match_ids=records,
-            sampling_params=sampling_params,
-            prompt_tokens=self.tokenized.prompt_tokens,
-            radix_key_virtual_mask=virtual_mask,
-            radix_key_to_token=key_to_token,
-            radix_token_to_key=token_to_key,
+            end=end,
+            is_final=is_final,
             radix_commit_key_len=None if is_final else commit_key_len,
-            drop_event_positions=drop_positions,
-            drop_range_offsets=drop_offsets,
-            drop_position_ranges=drop_ranges,
-            drop_effective_event_count=drop_count,
-            radix_positions=self.current_positions[:end].contiguous(),
-            radix_repos_info=self.current_repos[:end].contiguous(),
-            radix_next_position=self.layout.next_position if is_final else None,
             radix_current_reposition=(
                 self.layout.current_reposition if is_final else self.current_reposition
             ),
-            enable_thinking=self.request.enable_thinking,
-            stop=self.request.stop,
-            stop_token_seqs=self.tokenized.stop_token_seqs,
-            message_meta=self.tokenized.message_meta,
-            is_warmup=not is_final or self.request.is_warmup,
-            internal_uid=self.request.internal_uid,
-            prefix_keep_mask=execution_mask.to(torch.int32),
-            full_input_ids=(
-                self.tokenized.reposition_input_ids[:end].contiguous() if use_context_mask else None
-            ),
-            full_token_visible_until=(
-                self.tokenized.full_token_visible_until[:end].contiguous()
-                if use_context_mask and self.tokenized.full_token_visible_until is not None
-                else None
-            ),
-            full_keep_mask=(execution_mask.to(torch.int32) if use_context_mask else None),
-            use_context_mask=use_context_mask,
-            context_compact_stream=use_context_mask,
-            context_post_prefill_keep_mask=post_prefill_keep,
-            request_received_ns=self.request.request_received_ns,
-            tokenize_invocations=self.tokenized.tokenize_invocations,
-            chat_template_invocations=self.tokenized.chat_template_invocations,
+            transition_raw_tokens=self.pending_transition_raw_tokens,
+            transition_new_positions=self.pending_transition_new_positions,
+            transition_boundary=self.pending_transition_boundary,
             context_stage_count=self.dispatch_count,
-            radix_compile_ns=self.layout.compile_ns,
             radix_match_ns=self.radix_match_ns,
             retry_plan_ns=self.retry_plan_ns,
             reposition_transition_count=self.transition_count,
             reposition_h2d_bytes=self.h2d_bytes,
             reposition_d2h_bytes=self.d2h_bytes,
-            reposition_ipc_tensor_bytes=self.ipc_tensor_bytes,
         )
+        self.pending_transition_raw_tokens = None
+        self.pending_transition_new_positions = None
+        self.pending_transition_boundary = None
         self.ipc_tensor_bytes += sum(
             value.numel() * value.element_size()
             for value in vars(message).values()
@@ -326,9 +327,7 @@ class RepositionSequenceState:
         # second time.
         self.radix_match_ns = max(self.radix_match_ns, ack.radix_match_ns)
         self.retry_plan_ns = max(self.retry_plan_ns, ack.retry_plan_ns)
-        self.transition_count = max(
-            self.transition_count, ack.reposition_transition_count
-        )
+        self.transition_count = max(self.transition_count, ack.reposition_transition_count)
         self.h2d_bytes = max(self.h2d_bytes, ack.reposition_h2d_bytes)
         self.d2h_bytes = max(self.d2h_bytes, ack.reposition_d2h_bytes)
 
@@ -367,6 +366,9 @@ class RepositionSequenceState:
             self.current_stage = stage
             self.current_reposition = boundary
             self.transition_dispatch_pending = True
+            self.pending_transition_raw_tokens = raw_tokens.to(torch.int32)
+            self.pending_transition_new_positions = new_positions
+            self.pending_transition_boundary = boundary
         self.raw_cursor = self.in_flight_end
         self.in_flight_end = 0
         self.in_flight_final = False

@@ -2,16 +2,16 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Sequence
+from typing import TYPE_CHECKING, List, Literal, Sequence
 
 import torch
 
-try:
-    import triton
-    import triton.language as tl
-except ImportError:  # Triton is only installed for the Linux CUDA runtime.
-    triton = None
-    tl = None
+from minisgl.kernel.context_plan import (
+    try_build_context_full_plan,
+    try_build_context_sliding_plan,
+    try_build_occurrence_sliding_plan,
+)
+from minisgl.kernel.context_page_table import compile_context_page_table_aot
 
 if TYPE_CHECKING:
     from minisgl.core import Batch
@@ -51,10 +51,10 @@ class ContextAttentionBatch:
 
 @dataclass(frozen=True)
 class CompiledContextPageTables:
-    """Backend layouts emitted together by the Context page-table compiler."""
+    """Backend-specific layouts emitted by the Context page-table compiler."""
 
-    flat_indices: torch.Tensor
-    padded_page_table: torch.Tensor
+    flat_indices: torch.Tensor | None
+    padded_page_table: torch.Tensor | None
 
 
 def validate_active_true_positions(
@@ -202,83 +202,6 @@ def build_sliding_window_attention_batch(
     )
 
 
-if triton is not None:
-
-    @triton.jit
-    def _compile_context_page_tables_kernel(
-        page_table_ptr,
-        segment_table_indices_ptr,
-        key_positions_ptr,
-        key_offsets_ptr,
-        flat_indices_ptr,
-        padded_page_table_ptr,
-        page_table_stride,
-        padded_stride,
-        max_seqlen_k,
-        BLOCK_SIZE: tl.constexpr,
-    ):
-        segment_idx = tl.program_id(0)
-        key_block_idx = tl.program_id(1)
-        local_key_idx = key_block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-        key_start = tl.load(key_offsets_ptr + segment_idx)
-        key_end = tl.load(key_offsets_ptr + segment_idx + 1)
-        key_count = key_end - key_start
-        valid = local_key_idx < key_count
-        key_position = tl.load(
-            key_positions_ptr + key_start + local_key_idx,
-            mask=valid,
-            other=0,
-        )
-        table_idx = tl.load(segment_table_indices_ptr + segment_idx)
-        page = tl.load(
-            page_table_ptr + table_idx * page_table_stride + key_position,
-            mask=valid,
-            other=0,
-        )
-        tl.store(flat_indices_ptr + key_start + local_key_idx, page, mask=valid)
-        padded_offset = segment_idx * padded_stride + local_key_idx
-        tl.store(
-            padded_page_table_ptr + padded_offset,
-            page,
-            mask=local_key_idx < max_seqlen_k,
-        )
-
-    @triton.jit
-    def _compile_direct_page_tables_kernel(
-        direct_pages_ptr,
-        key_positions_ptr,
-        key_offsets_ptr,
-        flat_indices_ptr,
-        padded_page_table_ptr,
-        padded_stride,
-        max_seqlen_k,
-        BLOCK_SIZE: tl.constexpr,
-    ):
-        segment_idx = tl.program_id(0)
-        key_block_idx = tl.program_id(1)
-        local_key_idx = key_block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-        key_start = tl.load(key_offsets_ptr + segment_idx)
-        key_end = tl.load(key_offsets_ptr + segment_idx + 1)
-        key_count = key_end - key_start
-        valid = local_key_idx < key_count
-        key_position = tl.load(
-            key_positions_ptr + key_start + local_key_idx,
-            mask=valid,
-            other=0,
-        )
-        page = tl.load(direct_pages_ptr + key_position, mask=valid, other=0)
-        tl.store(flat_indices_ptr + key_start + local_key_idx, page, mask=valid)
-        tl.store(
-            padded_page_table_ptr + segment_idx * padded_stride + local_key_idx,
-            page,
-            mask=local_key_idx < max_seqlen_k,
-        )
-
-else:
-    _compile_context_page_tables_kernel = None
-    _compile_direct_page_tables_kernel = None
-
-
 def build_context_attention_segments(
     full_token_visible_until: torch.Tensor,
     *,
@@ -407,6 +330,18 @@ def build_context_attention_batch(
     if not reqs:
         raise ValueError("Context attention batching requires at least one request.")
 
+    if sliding_window is None:
+        fast_batch = _try_build_context_full_attention_batch(reqs)
+        if fast_batch is not None:
+            return fast_batch
+    else:
+        fast_batch = _try_build_context_sliding_attention_batch(
+            reqs,
+            sliding_window=sliding_window,
+        )
+        if fast_batch is not None:
+            return fast_batch
+
     segment_table_indices = []
     key_positions = []
     query_lengths = []
@@ -471,6 +406,175 @@ def build_context_attention_batch(
     )
 
 
+def _try_build_context_full_attention_batch(
+    reqs: Sequence,
+) -> ContextAttentionBatch | None:
+    """Pack full-attention segments without constructing Python segment objects."""
+
+    request_query_parts = []
+    request_key_parts = []
+    request_offset_parts = []
+    segment_table_parts = []
+    cached_tokens = []
+    cached_positions = []
+    query_count = 0
+    key_count = 0
+    max_query_length = 0
+    max_key_length = 0
+    for req in reqs:
+        if req.full_token_visible_until is None:
+            raise RuntimeError("Context-mask Prefill request is missing visibility metadata.")
+        raw_positions = (
+            req.raw_positions[: req.device_len]
+            if getattr(req, "raw_positions", None) is not None
+            else torch.arange(req.device_len, dtype=torch.int32, device="cpu")
+        )
+        plan = try_build_context_full_plan(
+            req.full_token_visible_until,
+            raw_positions,
+            query_start=req.cached_len,
+            query_length=req.extend_len,
+        )
+        if plan is None:
+            return None
+        local_query_lengths, local_offsets, local_keys = plan
+        local_key_lengths = local_offsets[1:] - local_offsets[:-1]
+        if int(local_query_lengths.sum(dtype=torch.int64).item()) != req.extend_len:
+            return None
+        first_keys = local_keys[: int(local_offsets[1].item())]
+        initial_cached_len = getattr(req, "initial_active_cached_len", req.cached_len)
+        used_initial = first_keys[first_keys < initial_cached_len].to(torch.int64)
+        cached_tokens.append(len(used_initial))
+        cached_positions.append(used_initial)
+        request_query_parts.append(local_query_lengths)
+        request_key_parts.append(local_keys)
+        request_offset_parts.append(local_offsets[1:] + key_count)
+        segment_table_parts.append(
+            torch.full(
+                (len(local_query_lengths),),
+                req.table_idx,
+                dtype=torch.int32,
+                device="cpu",
+            )
+        )
+        query_count += req.extend_len
+        key_count += len(local_keys)
+        max_query_length = max(
+            max_query_length,
+            int(torch.max(local_query_lengths).item()),
+        )
+        max_key_length = max(
+            max_key_length,
+            int(torch.max(local_key_lengths).item()),
+        )
+
+    query_lengths = torch.cat(request_query_parts)
+    cu_seqlens_q = torch.cat(
+        (
+            torch.zeros(1, dtype=torch.int32, device="cpu"),
+            query_lengths,
+        )
+    ).cumsum_(dim=0)
+    if int(cu_seqlens_q[-1].item()) != query_count:
+        return None
+    return ContextAttentionBatch(
+        cached_tokens=tuple(cached_tokens),
+        cached_positions=tuple(cached_positions),
+        segment_table_indices=torch.cat(segment_table_parts),
+        key_positions=torch.cat(request_key_parts),
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=torch.cat(
+            (
+                torch.zeros(1, dtype=torch.int32, device="cpu"),
+                *request_offset_parts,
+            )
+        ),
+        max_seqlen_q=max_query_length,
+        max_seqlen_k=max_key_length,
+    )
+
+
+def _try_build_context_sliding_attention_batch(
+    reqs: Sequence,
+    *,
+    sliding_window: int,
+) -> ContextAttentionBatch | None:
+    """Pack exact sliding rows without constructing one Python segment per query."""
+
+    request_key_parts = []
+    request_offset_parts = []
+    segment_table_parts = []
+    cached_tokens = []
+    cached_positions = []
+    query_count = 0
+    key_count = 0
+    max_key_length = 0
+    for req in reqs:
+        if req.full_token_visible_until is None:
+            raise RuntimeError("Context-mask Prefill request is missing visibility metadata.")
+        raw_positions = (
+            req.raw_positions[: req.device_len]
+            if getattr(req, "raw_positions", None) is not None
+            else torch.arange(req.device_len, dtype=torch.int32, device="cpu")
+        )
+        true_positions = (
+            req.true_positions[: req.device_len]
+            if getattr(req, "true_positions", None) is not None
+            else raw_positions
+        )
+        plan = try_build_context_sliding_plan(
+            req.full_token_visible_until,
+            raw_positions,
+            true_positions,
+            query_start=req.cached_len,
+            query_length=req.extend_len,
+            sliding_window=sliding_window,
+        )
+        if plan is None:
+            return None
+        local_offsets, local_keys = plan
+        local_lengths = local_offsets[1:] - local_offsets[:-1]
+        if len(local_lengths) != req.extend_len:
+            return None
+        first_keys = local_keys[: int(local_offsets[1].item())]
+        initial_cached_len = getattr(req, "initial_active_cached_len", req.cached_len)
+        used_initial = first_keys[first_keys < initial_cached_len].to(torch.int64)
+        cached_tokens.append(len(used_initial))
+        cached_positions.append(used_initial)
+        request_key_parts.append(local_keys)
+        request_offset_parts.append(local_offsets[1:] + key_count)
+        segment_table_parts.append(
+            torch.full(
+                (req.extend_len,),
+                req.table_idx,
+                dtype=torch.int32,
+                device="cpu",
+            )
+        )
+        query_count += req.extend_len
+        key_count += len(local_keys)
+        max_key_length = max(
+            max_key_length,
+            int(torch.max(local_lengths).item()),
+        )
+
+    return ContextAttentionBatch(
+        cached_tokens=tuple(cached_tokens),
+        cached_positions=tuple(cached_positions),
+        segment_table_indices=torch.cat(segment_table_parts),
+        key_positions=torch.cat(request_key_parts),
+        cu_seqlens_q=torch.arange(query_count + 1, dtype=torch.int32, device="cpu"),
+        cu_seqlens_k=torch.cat(
+            (
+                torch.zeros(1, dtype=torch.int32, device="cpu"),
+                *request_offset_parts,
+            )
+        ),
+        max_seqlen_q=1,
+        max_seqlen_k=max_key_length,
+    )
+
+
 def build_occurrence_attention_batch(
     reqs: Sequence,
     *,
@@ -482,6 +586,14 @@ def build_occurrence_attention_batch(
         raise ValueError("Occurrence attention batching requires at least one request.")
     if sliding_window is not None and sliding_window < 0:
         raise ValueError("sliding_window must be non-negative when provided.")
+
+    if sliding_window is not None:
+        fast_batch = _try_build_occurrence_sliding_attention_batch(
+            reqs,
+            sliding_window=sliding_window,
+        )
+        if fast_batch is not None:
+            return fast_batch
 
     direct_page_parts = []
     segment_table_indices = []
@@ -597,60 +709,169 @@ def build_occurrence_attention_batch(
     )
 
 
+def _try_build_occurrence_sliding_attention_batch(
+    reqs: Sequence,
+    *,
+    sliding_window: int,
+) -> ContextAttentionBatch | None:
+    """Pack ordered occurrence windows with one AOT planner call per request."""
+
+    direct_page_parts = []
+    request_key_parts = []
+    request_offset_parts = []
+    cached_tokens = []
+    cached_positions = []
+    query_count = 0
+    key_count = 0
+    occurrence_base = 0
+    max_key_length = 0
+    for req in reqs:
+        if req.reposition_execution_mode != "paged-occurrence":
+            raise RuntimeError("Occurrence attention cannot mix execution modes.")
+        cpu_plan = (
+            req.occurrence_raw_tokens,
+            req.occurrence_positions,
+            req.occurrence_segment_query_starts,
+            req.occurrence_segment_query_ends,
+            req.occurrence_segment_key_offsets,
+            req.occurrence_segment_key_indices,
+        )
+        if not all(tensor is not None for tensor in cpu_plan) or req.occurrence_pages is None:
+            raise RuntimeError("Paged-occurrence request is missing runtime occurrence metadata.")
+        (
+            occurrence_raw,
+            occurrence_positions,
+            query_starts,
+            query_ends,
+            offsets,
+            flat_keys,
+        ) = cpu_plan
+        assert occurrence_raw is not None
+        assert occurrence_positions is not None
+        assert query_starts is not None
+        assert query_ends is not None
+        assert offsets is not None
+        assert flat_keys is not None
+        if len(req.occurrence_pages) != len(occurrence_raw):
+            raise RuntimeError("Occurrence page allocation does not cover all occurrences.")
+        if req.extend_len != req.device_len - req.cached_len:
+            return None
+        initial_cached_len = getattr(req, "initial_active_cached_len", req.cached_len)
+        plan = try_build_occurrence_sliding_plan(
+            occurrence_raw,
+            occurrence_positions,
+            query_starts,
+            query_ends,
+            offsets,
+            flat_keys,
+            req.true_positions,
+            cached_len=req.cached_len,
+            device_len=req.device_len,
+            initial_cached_len=initial_cached_len,
+            sliding_window=sliding_window,
+            occurrence_base=occurrence_base,
+        )
+        if plan is None:
+            return None
+        local_offsets, local_keys, used_cached_positions = plan
+        local_lengths = local_offsets[1:] - local_offsets[:-1]
+        if len(local_lengths) != req.extend_len:
+            return None
+        request_key_parts.append(local_keys)
+        request_offset_parts.append(local_offsets[1:] + key_count)
+        direct_page_parts.append(req.occurrence_pages)
+        cached_tokens.append(len(used_cached_positions))
+        cached_positions.append(used_cached_positions)
+        query_count += req.extend_len
+        key_count += len(local_keys)
+        occurrence_base += len(occurrence_raw)
+        max_key_length = max(
+            max_key_length,
+            int(torch.max(local_lengths).item()),
+        )
+
+    return ContextAttentionBatch(
+        cached_tokens=tuple(cached_tokens),
+        cached_positions=tuple(cached_positions),
+        segment_table_indices=torch.zeros(query_count, dtype=torch.int32, device="cpu"),
+        key_positions=torch.cat(request_key_parts),
+        cu_seqlens_q=torch.arange(query_count + 1, dtype=torch.int32, device="cpu"),
+        cu_seqlens_k=torch.cat(
+            (
+                torch.zeros(1, dtype=torch.int32, device="cpu"),
+                *request_offset_parts,
+            )
+        ),
+        max_seqlen_q=1,
+        max_seqlen_k=max_key_length,
+        direct_pages=torch.cat(direct_page_parts),
+    )
+
+
 def compile_context_page_tables(
     page_table: torch.Tensor,
     context_batch: ContextAttentionBatch,
+    *,
+    output_layout: Literal["flat", "padded", "both"] = "both",
 ) -> CompiledContextPageTables:
-    """Resolve compact Context keys into FA/FI page layouts in one GPU kernel."""
+    """Resolve compact Context keys into only the page layouts a backend consumes."""
+
+    if output_layout not in {"flat", "padded", "both"}:
+        raise ValueError(f"Unknown Context page-table output layout: {output_layout!r}.")
 
     num_segments = context_batch.num_segments
     total_keys = len(context_batch.key_positions)
-    flat_indices = torch.empty(total_keys, dtype=page_table.dtype, device=page_table.device)
-    padded_page_table = torch.empty(
-        (num_segments, context_batch.max_seqlen_k),
-        dtype=page_table.dtype,
-        device=page_table.device,
+    flat_indices = (
+        torch.empty(total_keys, dtype=page_table.dtype, device=page_table.device)
+        if output_layout in {"flat", "both"}
+        else None
+    )
+    padded_page_table = (
+        torch.empty(
+            (num_segments, context_batch.max_seqlen_k),
+            dtype=page_table.dtype,
+            device=page_table.device,
+        )
+        if output_layout in {"padded", "both"}
+        else None
     )
 
     if page_table.is_cuda:
-        if _compile_context_page_tables_kernel is None or triton is None:
-            raise RuntimeError("CUDA Context mask compilation requires Triton.")
         key_positions = context_batch.key_positions.pin_memory().to(
             page_table.device, non_blocking=True
         )
         key_offsets = context_batch.cu_seqlens_k.pin_memory().to(
             page_table.device, non_blocking=True
         )
-        block_size = 256
-        grid = (num_segments, triton.cdiv(context_batch.max_seqlen_k, block_size))
         if context_batch.direct_pages is not None:
-            if _compile_direct_page_tables_kernel is None:
-                raise RuntimeError("CUDA occurrence page compilation requires Triton.")
-            _compile_direct_page_tables_kernel[grid](
-                context_batch.direct_pages,
+            direct_pages = context_batch.direct_pages
+            if not direct_pages.is_cuda or direct_pages.device != page_table.device:
+                raise RuntimeError(
+                    "CUDA occurrence page compilation requires direct pages on the page-table device."
+                )
+            compile_context_page_table_aot(
+                direct_pages,
+                None,
                 key_positions,
                 key_offsets,
-                flat_indices,
-                padded_page_table,
-                padded_page_table.stride(0),
-                context_batch.max_seqlen_k,
-                BLOCK_SIZE=block_size,
+                max_seqlen_k=context_batch.max_seqlen_k,
+                flat_indices=flat_indices,
+                padded_page_table=padded_page_table,
+                direct=True,
             )
         else:
             table_indices = context_batch.segment_table_indices.pin_memory().to(
                 page_table.device, non_blocking=True
             )
-            _compile_context_page_tables_kernel[grid](
+            compile_context_page_table_aot(
                 page_table,
                 table_indices,
                 key_positions,
                 key_offsets,
-                flat_indices,
-                padded_page_table,
-                page_table.stride(0),
-                padded_page_table.stride(0),
-                context_batch.max_seqlen_k,
-                BLOCK_SIZE=block_size,
+                max_seqlen_k=context_batch.max_seqlen_k,
+                flat_indices=flat_indices,
+                padded_page_table=padded_page_table,
+                direct=False,
             )
     else:
         for segment_idx, table_idx in enumerate(context_batch.segment_table_indices.tolist()):
@@ -663,9 +884,11 @@ def compile_context_page_tables(
                 if source is not None
                 else page_table[table_idx].index_select(0, positions)
             )
-            flat_indices[key_start:key_end] = pages
-            padded_page_table[segment_idx, : len(pages)] = pages
-            padded_page_table[segment_idx, len(pages) :] = 0
+            if flat_indices is not None:
+                flat_indices[key_start:key_end] = pages
+            if padded_page_table is not None:
+                padded_page_table[segment_idx, : len(pages)] = pages
+                padded_page_table[segment_idx, len(pages) :] = 0
 
     return CompiledContextPageTables(
         flat_indices=flat_indices,

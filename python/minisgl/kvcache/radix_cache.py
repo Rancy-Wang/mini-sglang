@@ -231,11 +231,17 @@ class RadixCacheHandle(BaseCacheHandle):
 
 
 class RadixPrefixCache(BasePrefixCache):
-    def __init__(self, device: torch.device):
+    def __init__(
+        self,
+        device: torch.device,
+        *,
+        track_shared_page_owners: bool = True,
+    ):
         super().__init__()
         self.device = device
         self.page_size = get_global_ctx().page_size
         self.key_fn = _get_key_fn(self.page_size)
+        self.track_shared_page_owners = track_shared_page_owners
         self.empty_tensor = torch.empty(0, dtype=torch.int32, device=device)
         self.evictable_size = 0
         self.protected_size = 0
@@ -248,7 +254,11 @@ class RadixPrefixCache(BasePrefixCache):
         return [int(slot) for slot in node.value[real_mask].tolist()]
 
     def _split_node(self, node: RadixTreeNode, pos: int) -> RadixTreeNode:
-        prefix_slots = self._real_slots_from_slice(node, slice(0, pos))
+        prefix_slots = (
+            self._real_slots_from_slice(node, slice(0, pos))
+            if self.track_shared_page_owners
+            else ()
+        )
         new_node = node.split_at(pos)
         for slot in prefix_slots:
             owners = self._ordinary_slot_nodes.get(slot)
@@ -266,6 +276,12 @@ class RadixPrefixCache(BasePrefixCache):
         return [int(slot) for slot in values[real_mask].tolist()]
 
     def _register_ordinary_node(self, node: RadixTreeNode) -> None:
+        if not self.track_shared_page_owners:
+            if node.ref_count > 0:
+                self.protected_size += node.page_length
+            else:
+                self.evictable_size += node.page_length
+            return
         for slot in self._real_slots(node):
             owners = self._ordinary_slot_nodes.setdefault(slot, set())
             if node in owners:
@@ -282,6 +298,12 @@ class RadixPrefixCache(BasePrefixCache):
                 self.protected_size += 1
 
     def _unregister_ordinary_node(self, node: RadixTreeNode) -> torch.Tensor:
+        if not self.track_shared_page_owners:
+            if node.ref_count > 0:
+                self.protected_size -= node.page_length
+            else:
+                self.evictable_size -= node.page_length
+            return node.value[~node.virtual_mask.to(device=node.value.device)]
         released: list[int] = []
         for slot in self._real_slots(node):
             owners = self._ordinary_slot_nodes.get(slot)
@@ -325,14 +347,22 @@ class RadixPrefixCache(BasePrefixCache):
         if unlock:
             while not node.is_root():
                 if node.ref_count == 1:
-                    self._ordinary_node_became_evictable(node)
+                    if self.track_shared_page_owners:
+                        self._ordinary_node_became_evictable(node)
+                    else:
+                        self.protected_size -= node.page_length
+                        self.evictable_size += node.page_length
                 node.ref_count -= 1
                 assert node.ref_count >= 0
                 node = node.parent
         else:
             while not node.is_root():
                 if node.ref_count == 0:
-                    self._ordinary_node_became_protected(node)
+                    if self.track_shared_page_owners:
+                        self._ordinary_node_became_protected(node)
+                    else:
+                        self.evictable_size -= node.page_length
+                        self.protected_size += node.page_length
                 node.ref_count += 1
                 node = node.parent
 
@@ -416,7 +446,11 @@ class RadixPrefixCache(BasePrefixCache):
                     continue
                 new_node = RadixTreeNode(self.key_fn)
                 new_node.set_key_value(
-                    input_ids[prefix_len:segment_end],
+                    # The scheduler may advance a staged Reposition program by
+                    # updating its working records in place after this request
+                    # finishes.  A Radix node must therefore own the external
+                    # key segment it retains beyond this insertion call.
+                    input_ids[prefix_len:segment_end].clone(),
                     indices[prefix_len:segment_end].clone(),
                     virtual_mask[prefix_len:segment_end].clone(),
                 )

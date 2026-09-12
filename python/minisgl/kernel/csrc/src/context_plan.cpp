@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
+#include <vector>
 
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
@@ -16,6 +18,724 @@ auto is_cpu_int32_vector(const tvm::ffi::TensorView tensor) -> bool {
   return tensor.ndim() == 1 && tensor.is_contiguous() &&
          tensor.device().device_type == kDLCPU &&
          tensor.dtype().code == kDLInt && tensor.dtype().bits == 32;
+}
+
+auto is_cpu_int64_vector(const tvm::ffi::TensorView tensor) -> bool {
+  return tensor.ndim() == 1 && tensor.is_contiguous() &&
+         tensor.device().device_type == kDLCPU &&
+         tensor.dtype().code == kDLInt && tensor.dtype().bits == 64;
+}
+
+auto is_cpu_bool_vector(const tvm::ffi::TensorView tensor) -> bool {
+  return tensor.ndim() == 1 && tensor.is_contiguous() &&
+         tensor.device().device_type == kDLCPU &&
+         tensor.dtype().code == kDLBool && tensor.dtype().bits == 8;
+}
+
+auto validate_context_full_inputs(
+    const tvm::ffi::TensorView visible_until,
+    const tvm::ffi::TensorView raw_positions, int64_t query_start,
+    int64_t query_count) -> void {
+  host::RuntimeCheck(is_cpu_int32_vector(visible_until) &&
+                         is_cpu_int32_vector(raw_positions),
+                     "Context full-attention inputs must be contiguous CPU int32 vectors");
+  host::RuntimeCheck(query_start >= 0 && query_count > 0 &&
+                         query_start + query_count <= raw_positions.size(0),
+                     "Context full-attention query bounds are invalid");
+
+  const auto *raw = static_cast<const int32_t *>(raw_positions.data_ptr());
+  const auto *expiry = static_cast<const int32_t *>(visible_until.data_ptr());
+  for (int64_t i = 0; i < raw_positions.size(0); ++i) {
+    host::RuntimeCheck(raw[i] >= 0 && raw[i] < visible_until.size(0),
+                       "Context raw position is outside visibility metadata");
+    host::RuntimeCheck(expiry[raw[i]] > raw[i],
+                       "A Context token expires before it is computed");
+    if (i > 0) {
+      host::RuntimeCheck(raw[i - 1] < raw[i],
+                         "Context raw positions must be strictly increasing");
+    }
+  }
+}
+
+auto count_context_full_keys(
+    const tvm::ffi::TensorView visible_until,
+    const tvm::ffi::TensorView raw_positions, int64_t query_start,
+    int64_t query_count, const tvm::ffi::TensorView query_lengths,
+    const tvm::ffi::TensorView key_lengths,
+    const tvm::ffi::TensorView status) -> void {
+  validate_context_full_inputs(visible_until, raw_positions, query_start,
+                               query_count);
+  host::RuntimeCheck(is_cpu_int32_vector(query_lengths) &&
+                         query_lengths.size(0) == query_count &&
+                         is_cpu_int32_vector(key_lengths) &&
+                         key_lengths.size(0) == query_count &&
+                         is_cpu_int64_vector(status) && status.size(0) >= 1,
+                     "Context full-attention count outputs have invalid layouts");
+
+  const auto *raw = static_cast<const int32_t *>(raw_positions.data_ptr());
+  const auto *expiry = static_cast<const int32_t *>(visible_until.data_ptr());
+  auto *q_lengths = static_cast<int32_t *>(query_lengths.data_ptr());
+  auto *k_lengths = static_cast<int32_t *>(key_lengths.data_ptr());
+  auto *result_status = static_cast<int64_t *>(status.data_ptr());
+  std::fill(q_lengths, q_lengths + query_count, 0);
+  std::fill(k_lengths, k_lengths + query_count, 0);
+
+  // An expiry starts a new segment at the first query whose immutable raw
+  // position reaches it. A byte marker avoids Python sets and repeated tensor
+  // scalar extraction while preserving the reference's sorted boundaries.
+  std::vector<uint8_t> boundaries(query_count + 1, 0);
+  boundaries[0] = 1;
+  boundaries[query_count] = 1;
+  const int64_t query_end = query_start + query_count;
+  const auto *query_begin = raw + query_start;
+  const auto *query_limit = raw + query_end;
+  for (int64_t key = 0; key < query_end; ++key) {
+    const auto *boundary =
+        std::lower_bound(query_begin, query_limit, expiry[raw[key]]);
+    const int64_t local_boundary = boundary - query_begin;
+    if (local_boundary > 0 && local_boundary < query_count) {
+      boundaries[local_boundary] = 1;
+    }
+  }
+
+  int64_t segment_count = 0;
+  int64_t local_start = 0;
+  for (int64_t local_end = 1; local_end <= query_count; ++local_end) {
+    if (!boundaries[local_end]) continue;
+    const int64_t compact_start = query_start + local_start;
+    const int64_t compact_end = query_start + local_end;
+    int64_t prefix_count = 0;
+    for (int64_t key = 0; key < compact_start; ++key) {
+      if (expiry[raw[key]] > raw[compact_start]) ++prefix_count;
+    }
+    const int64_t key_count = prefix_count + compact_end - compact_start;
+    host::RuntimeCheck(key_count <= std::numeric_limits<int32_t>::max(),
+                       "Context full-attention segment exceeds int32 capacity");
+    q_lengths[segment_count] =
+        static_cast<int32_t>(compact_end - compact_start);
+    k_lengths[segment_count] = static_cast<int32_t>(key_count);
+    ++segment_count;
+    local_start = local_end;
+  }
+  host::RuntimeCheck(local_start == query_count && segment_count > 0,
+                     "Context full-attention boundaries do not cover all queries");
+  result_status[0] = segment_count;
+}
+
+auto fill_context_full_keys(
+    const tvm::ffi::TensorView visible_until,
+    const tvm::ffi::TensorView raw_positions, int64_t query_start,
+    int64_t query_count, const tvm::ffi::TensorView query_lengths,
+    const tvm::ffi::TensorView key_offsets,
+    const tvm::ffi::TensorView key_positions) -> void {
+  validate_context_full_inputs(visible_until, raw_positions, query_start,
+                               query_count);
+  host::RuntimeCheck(is_cpu_int32_vector(query_lengths) &&
+                         query_lengths.size(0) > 0 &&
+                         is_cpu_int32_vector(key_offsets) &&
+                         key_offsets.size(0) == query_lengths.size(0) + 1 &&
+                         is_cpu_int32_vector(key_positions),
+                     "Context full-attention fill outputs have invalid layouts");
+
+  const auto *raw = static_cast<const int32_t *>(raw_positions.data_ptr());
+  const auto *expiry = static_cast<const int32_t *>(visible_until.data_ptr());
+  const auto *q_lengths =
+      static_cast<const int32_t *>(query_lengths.data_ptr());
+  const auto *offsets = static_cast<const int32_t *>(key_offsets.data_ptr());
+  auto *output = static_cast<int32_t *>(key_positions.data_ptr());
+  const int64_t segment_count = query_lengths.size(0);
+  host::RuntimeCheck(offsets[0] == 0 &&
+                         offsets[segment_count] == key_positions.size(0),
+                     "Context full-attention offsets do not cover output keys");
+
+  int64_t local_start = 0;
+  for (int64_t segment = 0; segment < segment_count; ++segment) {
+    const int64_t query_length = q_lengths[segment];
+    host::RuntimeCheck(query_length > 0 &&
+                           local_start + query_length <= query_count,
+                       "Context full-attention query lengths are invalid");
+    const int64_t compact_start = query_start + local_start;
+    const int64_t compact_end = compact_start + query_length;
+    int64_t cursor = offsets[segment];
+    for (int64_t key = 0; key < compact_start; ++key) {
+      if (expiry[raw[key]] > raw[compact_start]) {
+        output[cursor++] = static_cast<int32_t>(key);
+      }
+    }
+    for (int64_t query = compact_start; query < compact_end; ++query) {
+      output[cursor++] = static_cast<int32_t>(query);
+    }
+    host::RuntimeCheck(cursor == offsets[segment + 1],
+                       "Context full-attention count/fill passes disagree");
+    local_start += query_length;
+  }
+  host::RuntimeCheck(local_start == query_count,
+                     "Context full-attention fill did not cover all queries");
+}
+
+auto validate_context_sliding_inputs(
+    const tvm::ffi::TensorView visible_until,
+    const tvm::ffi::TensorView raw_positions,
+    const tvm::ffi::TensorView true_positions, int64_t query_start,
+    int64_t query_count, int64_t sliding_window) -> void {
+  host::RuntimeCheck(is_cpu_int32_vector(visible_until) &&
+                         is_cpu_int32_vector(raw_positions) &&
+                         is_cpu_int32_vector(true_positions),
+                     "Context sliding inputs must be contiguous CPU int32 vectors");
+  host::RuntimeCheck(raw_positions.size(0) == true_positions.size(0),
+                     "Context raw and true positions must have equal lengths");
+  host::RuntimeCheck(query_start >= 0 && query_count > 0 &&
+                         query_start + query_count <= raw_positions.size(0),
+                     "Context sliding query bounds are invalid");
+  host::RuntimeCheck(sliding_window >= 0,
+                     "Context sliding window must be non-negative");
+
+  const auto *raw = static_cast<const int32_t *>(raw_positions.data_ptr());
+  const auto *position =
+      static_cast<const int32_t *>(true_positions.data_ptr());
+  const auto *expiry = static_cast<const int32_t *>(visible_until.data_ptr());
+  for (int64_t i = 0; i < raw_positions.size(0); ++i) {
+    host::RuntimeCheck(raw[i] >= 0 && raw[i] < visible_until.size(0),
+                       "Context raw position is outside visibility metadata");
+    host::RuntimeCheck(expiry[raw[i]] > raw[i],
+                       "A Context token expires before it is computed");
+    if (i > 0) {
+      host::RuntimeCheck(raw[i - 1] < raw[i],
+                         "Context raw positions must be strictly increasing");
+      host::RuntimeCheck(position[i - 1] < position[i],
+                         "Context true positions must be strictly increasing");
+    }
+  }
+}
+
+auto count_context_sliding_keys(
+    const tvm::ffi::TensorView visible_until,
+    const tvm::ffi::TensorView raw_positions,
+    const tvm::ffi::TensorView true_positions, int64_t query_start,
+    int64_t query_count, int64_t sliding_window,
+    const tvm::ffi::TensorView key_lengths) -> void {
+  validate_context_sliding_inputs(visible_until, raw_positions, true_positions,
+                                  query_start, query_count, sliding_window);
+  host::RuntimeCheck(is_cpu_int32_vector(key_lengths) &&
+                         key_lengths.size(0) == query_count,
+                     "Context key lengths must be a CPU int32 query vector");
+
+  const auto *raw = static_cast<const int32_t *>(raw_positions.data_ptr());
+  const auto *position =
+      static_cast<const int32_t *>(true_positions.data_ptr());
+  const auto *expiry = static_cast<const int32_t *>(visible_until.data_ptr());
+  auto *lengths = static_cast<int32_t *>(key_lengths.data_ptr());
+  int64_t left = 0;
+  for (int64_t local_query = 0; local_query < query_count; ++local_query) {
+    const int64_t query = query_start + local_query;
+    const int64_t threshold =
+        static_cast<int64_t>(position[query]) - sliding_window;
+    while (left < query && static_cast<int64_t>(position[left]) < threshold) {
+      ++left;
+    }
+    int64_t count = 1;
+    for (int64_t key = left; key < query; ++key) {
+      if (expiry[raw[key]] > raw[query]) ++count;
+    }
+    host::RuntimeCheck(count <= std::numeric_limits<int32_t>::max(),
+                       "Context sliding row exceeds int32 capacity");
+    lengths[local_query] = static_cast<int32_t>(count);
+  }
+}
+
+auto fill_context_sliding_keys(
+    const tvm::ffi::TensorView visible_until,
+    const tvm::ffi::TensorView raw_positions,
+    const tvm::ffi::TensorView true_positions, int64_t query_start,
+    int64_t query_count, int64_t sliding_window,
+    const tvm::ffi::TensorView key_offsets,
+    const tvm::ffi::TensorView key_positions) -> void {
+  validate_context_sliding_inputs(visible_until, raw_positions, true_positions,
+                                  query_start, query_count, sliding_window);
+  host::RuntimeCheck(is_cpu_int32_vector(key_offsets) &&
+                         key_offsets.size(0) == query_count + 1 &&
+                         is_cpu_int32_vector(key_positions),
+                     "Context sliding outputs must be contiguous CPU int32 vectors");
+  const auto *offsets = static_cast<const int32_t *>(key_offsets.data_ptr());
+  host::RuntimeCheck(offsets[0] == 0 && offsets[query_count] == key_positions.size(0),
+                     "Context sliding offsets do not cover output keys");
+
+  const auto *raw = static_cast<const int32_t *>(raw_positions.data_ptr());
+  const auto *position =
+      static_cast<const int32_t *>(true_positions.data_ptr());
+  const auto *expiry = static_cast<const int32_t *>(visible_until.data_ptr());
+  auto *output = static_cast<int32_t *>(key_positions.data_ptr());
+  int64_t left = 0;
+  for (int64_t local_query = 0; local_query < query_count; ++local_query) {
+    const int64_t query = query_start + local_query;
+    const int64_t threshold =
+        static_cast<int64_t>(position[query]) - sliding_window;
+    while (left < query && static_cast<int64_t>(position[left]) < threshold) {
+      ++left;
+    }
+    int64_t cursor = offsets[local_query];
+    for (int64_t key = left; key < query; ++key) {
+      if (expiry[raw[key]] > raw[query]) output[cursor++] = key;
+    }
+    output[cursor++] = query;
+    host::RuntimeCheck(cursor == offsets[local_query + 1],
+                       "Context sliding count/fill passes disagree");
+  }
+}
+
+auto validate_occurrence_sliding_inputs(
+    const tvm::ffi::TensorView occurrence_positions,
+    const tvm::ffi::TensorView query_starts,
+    const tvm::ffi::TensorView query_ends,
+    const tvm::ffi::TensorView key_offsets,
+    const tvm::ffi::TensorView flat_keys,
+    const tvm::ffi::TensorView true_positions, int64_t cached_len,
+    int64_t device_len, int64_t sliding_window) -> void {
+  host::RuntimeCheck(is_cpu_int32_vector(occurrence_positions) &&
+                         is_cpu_int32_vector(query_starts) &&
+                         is_cpu_int32_vector(query_ends) &&
+                         is_cpu_int32_vector(key_offsets) &&
+                         is_cpu_int32_vector(flat_keys) &&
+                         is_cpu_int32_vector(true_positions),
+                     "Occurrence sliding inputs must be contiguous CPU int32 vectors");
+  host::RuntimeCheck(query_starts.size(0) == query_ends.size(0) &&
+                         key_offsets.size(0) == query_starts.size(0) + 1,
+                     "Occurrence segment metadata lengths disagree");
+  host::RuntimeCheck(key_offsets.size(0) > 1 &&
+                         key_offsets.size(0) <=
+                             std::numeric_limits<int32_t>::max(),
+                     "Occurrence segment metadata is invalid");
+  host::RuntimeCheck(cached_len >= 0 && cached_len < device_len &&
+                         device_len <= true_positions.size(0),
+                     "Occurrence sliding query bounds are invalid");
+  host::RuntimeCheck(sliding_window >= 0,
+                     "Occurrence sliding window must be non-negative");
+  const auto *offsets = static_cast<const int32_t *>(key_offsets.data_ptr());
+  host::RuntimeCheck(offsets[0] == 0 &&
+                         offsets[query_starts.size(0)] == flat_keys.size(0),
+                     "Occurrence key offsets do not cover flat keys");
+  const auto *starts = static_cast<const int32_t *>(query_starts.data_ptr());
+  const auto *ends = static_cast<const int32_t *>(query_ends.data_ptr());
+  const int64_t full_raw_length = ends[query_ends.size(0) - 1];
+  host::RuntimeCheck(full_raw_length >= device_len,
+                     "Occurrence segments do not reach the request device length");
+  for (int64_t segment = 0; segment < query_starts.size(0); ++segment) {
+    host::RuntimeCheck(offsets[segment] >= 0 &&
+                           offsets[segment] <= offsets[segment + 1],
+                       "Occurrence key offsets must be monotonic");
+    const int64_t raw_start = starts[segment];
+    const int64_t raw_end = ends[segment];
+    host::RuntimeCheck(
+        raw_start >= 0 && raw_start < raw_end && raw_end <= full_raw_length &&
+            (segment == 0 ? raw_start <= cached_len
+                          : raw_start == ends[segment - 1]),
+        "Occurrence segment bounds are invalid");
+  }
+}
+
+auto count_occurrence_sliding_keys(
+    const tvm::ffi::TensorView occurrence_raw_tokens,
+    const tvm::ffi::TensorView occurrence_positions,
+    const tvm::ffi::TensorView query_starts,
+    const tvm::ffi::TensorView query_ends,
+    const tvm::ffi::TensorView key_offsets,
+    const tvm::ffi::TensorView flat_keys,
+    const tvm::ffi::TensorView true_positions, int64_t cached_len,
+    int64_t device_len, int64_t initial_cached_len, int64_t sliding_window,
+    const tvm::ffi::TensorView key_lengths,
+    const tvm::ffi::TensorView cached_mask,
+    const tvm::ffi::TensorView status) -> void {
+  validate_occurrence_sliding_inputs(
+      occurrence_positions, query_starts, query_ends, key_offsets, flat_keys,
+      true_positions, cached_len, device_len, sliding_window);
+  host::RuntimeCheck(is_cpu_int32_vector(occurrence_raw_tokens) &&
+                         occurrence_raw_tokens.size(0) == occurrence_positions.size(0),
+                     "Occurrence raw tokens must align with occurrence positions");
+  const int64_t query_count = device_len - cached_len;
+  host::RuntimeCheck(initial_cached_len >= 0 &&
+                         initial_cached_len <= true_positions.size(0),
+                     "Occurrence initial cached length is invalid");
+  host::RuntimeCheck(is_cpu_int32_vector(key_lengths) &&
+                         key_lengths.size(0) == query_count &&
+                         is_cpu_bool_vector(cached_mask) &&
+                         cached_mask.size(0) == initial_cached_len &&
+                         is_cpu_int64_vector(status) && status.size(0) >= 1,
+                     "Occurrence sliding count outputs have invalid layouts");
+
+  const auto *raw =
+      static_cast<const int32_t *>(occurrence_raw_tokens.data_ptr());
+  const auto *positions =
+      static_cast<const int32_t *>(occurrence_positions.data_ptr());
+  const auto *starts = static_cast<const int32_t *>(query_starts.data_ptr());
+  const auto *ends = static_cast<const int32_t *>(query_ends.data_ptr());
+  const auto *offsets = static_cast<const int32_t *>(key_offsets.data_ptr());
+  const auto *keys = static_cast<const int32_t *>(flat_keys.data_ptr());
+  const auto *query_positions =
+      static_cast<const int32_t *>(true_positions.data_ptr());
+  auto *lengths = static_cast<int32_t *>(key_lengths.data_ptr());
+  auto *used_cached = static_cast<bool *>(cached_mask.data_ptr());
+  auto *result_status = static_cast<int64_t *>(status.data_ptr());
+  result_status[0] = 0;
+  int64_t local_query = 0;
+  int64_t expected_query = cached_len;
+  const int64_t full_raw_length = ends[query_ends.size(0) - 1];
+  for (int64_t segment = 0; segment < query_starts.size(0); ++segment) {
+    const int64_t raw_start = starts[segment];
+    const int64_t raw_end = ends[segment];
+    const int64_t key_begin = offsets[segment];
+    const int64_t key_end = offsets[segment + 1];
+    const int64_t prefix_length = key_end - key_begin - (raw_end - raw_start);
+    host::RuntimeCheck(prefix_length >= 0,
+                       "Occurrence segment has fewer keys than local queries");
+    for (int64_t cursor = key_begin; cursor < key_end; ++cursor) {
+      host::RuntimeCheck(keys[cursor] >= 0 &&
+                             keys[cursor] < occurrence_positions.size(0),
+                         "Occurrence segment references an invalid occurrence");
+      host::RuntimeCheck(raw[keys[cursor]] >= 0 &&
+                             raw[keys[cursor]] < full_raw_length,
+                         "Occurrence segment references an invalid raw token");
+      if (cursor > key_begin && positions[keys[cursor - 1]] >= positions[keys[cursor]]) {
+        result_status[0] = 1;
+        return;
+      }
+    }
+
+    const int64_t query_begin = std::max<int64_t>(raw_start, cached_len);
+    const int64_t query_end = std::min<int64_t>(raw_end, device_len);
+    if (query_begin >= query_end) continue;
+    host::RuntimeCheck(query_begin == expected_query,
+                       "Occurrence segments do not preserve flattened query order");
+    for (int64_t query = query_begin; query < query_end; ++query) {
+      const int64_t causal_count = prefix_length + (query - raw_start) + 1;
+      const int64_t threshold =
+          static_cast<int64_t>(query_positions[query]) - sliding_window;
+      const auto *begin = keys + key_begin;
+      const auto *causal_end = begin + causal_count;
+      const auto *left = std::lower_bound(
+          begin, causal_end, threshold,
+          [positions](int32_t occurrence, int64_t value) {
+            return static_cast<int64_t>(positions[occurrence]) < value;
+          });
+      const int64_t count = causal_end - left;
+      host::RuntimeCheck(count > 0 && count <= std::numeric_limits<int32_t>::max(),
+                         "Occurrence sliding row has an invalid key count");
+      lengths[local_query++] = static_cast<int32_t>(count);
+      for (const auto *selected = left; selected < causal_end; ++selected) {
+        const int32_t selected_raw = raw[*selected];
+        host::RuntimeCheck(selected_raw >= 0,
+                           "Occurrence raw token must be non-negative");
+        if (selected_raw < initial_cached_len) used_cached[selected_raw] = true;
+      }
+    }
+    expected_query = query_end;
+  }
+  host::RuntimeCheck(expected_query == device_len && local_query == query_count,
+                     "Occurrence segments do not cover the request extension");
+}
+
+auto fill_occurrence_sliding_keys(
+    const tvm::ffi::TensorView occurrence_positions,
+    const tvm::ffi::TensorView query_starts,
+    const tvm::ffi::TensorView query_ends,
+    const tvm::ffi::TensorView key_offsets,
+    const tvm::ffi::TensorView flat_keys,
+    const tvm::ffi::TensorView true_positions, int64_t cached_len,
+    int64_t device_len, int64_t sliding_window, int64_t occurrence_base,
+    const tvm::ffi::TensorView output_offsets,
+    const tvm::ffi::TensorView key_positions) -> void {
+  validate_occurrence_sliding_inputs(
+      occurrence_positions, query_starts, query_ends, key_offsets, flat_keys,
+      true_positions, cached_len, device_len, sliding_window);
+  const int64_t query_count = device_len - cached_len;
+  host::RuntimeCheck(occurrence_base >= 0 &&
+                         occurrence_base + occurrence_positions.size(0) <=
+                             std::numeric_limits<int32_t>::max(),
+                     "Occurrence batch key positions exceed int32 capacity");
+  host::RuntimeCheck(is_cpu_int32_vector(output_offsets) &&
+                         output_offsets.size(0) == query_count + 1 &&
+                         is_cpu_int32_vector(key_positions),
+                     "Occurrence sliding outputs must be contiguous CPU int32 vectors");
+  const auto *out_offsets =
+      static_cast<const int32_t *>(output_offsets.data_ptr());
+  host::RuntimeCheck(out_offsets[0] == 0 &&
+                         out_offsets[query_count] == key_positions.size(0),
+                     "Occurrence sliding offsets do not cover output keys");
+
+  const auto *positions =
+      static_cast<const int32_t *>(occurrence_positions.data_ptr());
+  const auto *starts = static_cast<const int32_t *>(query_starts.data_ptr());
+  const auto *ends = static_cast<const int32_t *>(query_ends.data_ptr());
+  const auto *offsets = static_cast<const int32_t *>(key_offsets.data_ptr());
+  const auto *keys = static_cast<const int32_t *>(flat_keys.data_ptr());
+  const auto *query_positions =
+      static_cast<const int32_t *>(true_positions.data_ptr());
+  auto *output = static_cast<int32_t *>(key_positions.data_ptr());
+  int64_t local_query = 0;
+  for (int64_t segment = 0; segment < query_starts.size(0); ++segment) {
+    const int64_t raw_start = starts[segment];
+    const int64_t raw_end = ends[segment];
+    const int64_t key_begin = offsets[segment];
+    const int64_t key_end = offsets[segment + 1];
+    const int64_t prefix_length = key_end - key_begin - (raw_end - raw_start);
+    const int64_t query_begin = std::max<int64_t>(raw_start, cached_len);
+    const int64_t query_end = std::min<int64_t>(raw_end, device_len);
+    if (query_begin >= query_end) continue;
+    for (int64_t query = query_begin; query < query_end; ++query) {
+      const int64_t causal_count = prefix_length + (query - raw_start) + 1;
+      const int64_t threshold =
+          static_cast<int64_t>(query_positions[query]) - sliding_window;
+      const auto *begin = keys + key_begin;
+      const auto *causal_end = begin + causal_count;
+      const auto *left = std::lower_bound(
+          begin, causal_end, threshold,
+          [positions](int32_t occurrence, int64_t value) {
+            return static_cast<int64_t>(positions[occurrence]) < value;
+          });
+      int64_t cursor = out_offsets[local_query];
+      for (const auto *selected = left; selected < causal_end; ++selected) {
+        output[cursor++] = static_cast<int32_t>(occurrence_base + *selected);
+      }
+      host::RuntimeCheck(cursor == out_offsets[local_query + 1],
+                         "Occurrence sliding count/fill passes disagree");
+      ++local_query;
+    }
+  }
+  host::RuntimeCheck(local_query == query_count,
+                     "Occurrence sliding fill did not cover all queries");
+}
+
+auto build_occurrence_capacity_index(
+    const tvm::ffi::TensorView occurrence_raw_tokens,
+    const tvm::ffi::TensorView occurrence_positions,
+    const tvm::ffi::TensorView birth_occurrences,
+    const tvm::ffi::TensorView terminal_occurrences,
+    const tvm::ffi::TensorView segment_query_starts,
+    const tvm::ffi::TensorView segment_query_ends,
+    const tvm::ffi::TensorView segment_key_offsets,
+    const tvm::ffi::TensorView segment_key_occurrences,
+    const tvm::ffi::TensorView terminal_owned,
+    const tvm::ffi::TensorView final_keep, int64_t chunk_start,
+    int64_t max_chunk_end, int64_t output_len,
+    const tvm::ffi::TensorView first_required_end,
+    const tvm::ffi::TensorView current_allocations,
+    const tvm::ffi::TensorView persistent_allocations,
+    const tvm::ffi::TensorView future_reserve) -> void {
+  host::RuntimeCheck(
+      is_cpu_int32_vector(occurrence_raw_tokens) &&
+          is_cpu_int32_vector(occurrence_positions) &&
+          is_cpu_int32_vector(birth_occurrences) &&
+          is_cpu_int32_vector(terminal_occurrences) &&
+          is_cpu_int32_vector(segment_query_starts) &&
+          is_cpu_int32_vector(segment_query_ends) &&
+          is_cpu_int32_vector(segment_key_offsets) &&
+          is_cpu_int32_vector(segment_key_occurrences),
+      "Occurrence capacity metadata must be contiguous CPU int32 vectors");
+  host::RuntimeCheck(is_cpu_bool_vector(terminal_owned) &&
+                         is_cpu_bool_vector(final_keep),
+                     "Occurrence ownership metadata must be contiguous CPU bool vectors");
+
+  const int64_t occurrence_count = occurrence_raw_tokens.size(0);
+  const int64_t raw_count = birth_occurrences.size(0);
+  const int64_t segment_count = segment_query_starts.size(0);
+  const int64_t endpoint_count = max_chunk_end - chunk_start;
+  host::RuntimeCheck(
+      occurrence_count > 0 && occurrence_positions.size(0) == occurrence_count &&
+          terminal_occurrences.size(0) == raw_count &&
+          terminal_owned.size(0) == raw_count && final_keep.size(0) == raw_count,
+      "Occurrence capacity token metadata lengths disagree");
+  host::RuntimeCheck(
+      chunk_start >= 0 && max_chunk_end > chunk_start &&
+          max_chunk_end <= raw_count &&
+          max_chunk_end < std::numeric_limits<int32_t>::max() && output_len >= 0,
+      "Occurrence capacity chunk bounds are invalid");
+  host::RuntimeCheck(
+      segment_query_ends.size(0) == segment_count &&
+          segment_key_offsets.size(0) == segment_count + 1,
+      "Occurrence capacity segment metadata lengths disagree");
+  host::RuntimeCheck(
+      is_cpu_int32_vector(first_required_end) &&
+          first_required_end.size(0) == occurrence_count &&
+          is_cpu_int64_vector(current_allocations) &&
+          current_allocations.size(0) == endpoint_count &&
+          is_cpu_int64_vector(persistent_allocations) &&
+          persistent_allocations.size(0) == endpoint_count &&
+          is_cpu_int64_vector(future_reserve) &&
+          future_reserve.size(0) == endpoint_count,
+      "Occurrence capacity outputs have invalid layouts");
+
+  const auto *raw =
+      static_cast<const int32_t *>(occurrence_raw_tokens.data_ptr());
+  const auto *positions =
+      static_cast<const int32_t *>(occurrence_positions.data_ptr());
+  const auto *birth =
+      static_cast<const int32_t *>(birth_occurrences.data_ptr());
+  const auto *terminal =
+      static_cast<const int32_t *>(terminal_occurrences.data_ptr());
+  const auto *starts =
+      static_cast<const int32_t *>(segment_query_starts.data_ptr());
+  const auto *ends =
+      static_cast<const int32_t *>(segment_query_ends.data_ptr());
+  const auto *offsets =
+      static_cast<const int32_t *>(segment_key_offsets.data_ptr());
+  const auto *keys =
+      static_cast<const int32_t *>(segment_key_occurrences.data_ptr());
+  const auto *initial_owned =
+      static_cast<const bool *>(terminal_owned.data_ptr());
+  const auto *keep = static_cast<const bool *>(final_keep.data_ptr());
+  auto *activation_output =
+      static_cast<int32_t *>(first_required_end.data_ptr());
+  auto *current_output =
+      static_cast<int64_t *>(current_allocations.data_ptr());
+  auto *persistent_output =
+      static_cast<int64_t *>(persistent_allocations.data_ptr());
+  auto *future_output = static_cast<int64_t *>(future_reserve.data_ptr());
+
+  for (int64_t occurrence = 0; occurrence < occurrence_count; ++occurrence) {
+    host::RuntimeCheck(raw[occurrence] >= 0 && raw[occurrence] < raw_count,
+                       "Occurrence capacity references an invalid raw token");
+  }
+  for (int64_t raw_token = 0; raw_token < raw_count; ++raw_token) {
+    host::RuntimeCheck(
+        birth[raw_token] >= 0 && birth[raw_token] < occurrence_count &&
+            terminal[raw_token] >= 0 && terminal[raw_token] < occurrence_count &&
+            raw[birth[raw_token]] == raw_token &&
+            raw[terminal[raw_token]] == raw_token,
+        "Occurrence birth or terminal mapping is invalid");
+  }
+  host::RuntimeCheck(offsets[0] == 0 &&
+                         offsets[segment_count] == segment_key_occurrences.size(0),
+                     "Occurrence capacity offsets do not cover segment keys");
+
+  const int32_t never_required = static_cast<int32_t>(max_chunk_end + 1);
+  std::fill(activation_output, activation_output + occurrence_count,
+            never_required);
+  auto mark_required = [&](int32_t occurrence, int64_t endpoint) {
+    host::RuntimeCheck(occurrence >= 0 && occurrence < occurrence_count,
+                       "Occurrence capacity segment references an invalid occurrence");
+    host::RuntimeCheck(endpoint > chunk_start && endpoint <= max_chunk_end,
+                       "Occurrence capacity activation endpoint is invalid");
+    activation_output[occurrence] = std::min<int32_t>(
+        activation_output[occurrence], static_cast<int32_t>(endpoint));
+  };
+
+  for (int64_t raw_token = chunk_start; raw_token < max_chunk_end;
+       ++raw_token) {
+    mark_required(birth[raw_token], raw_token + 1);
+    mark_required(terminal[raw_token], raw_token + 1);
+  }
+  for (int64_t segment = 0; segment < segment_count; ++segment) {
+    host::RuntimeCheck(offsets[segment] >= 0 &&
+                           offsets[segment] <= offsets[segment + 1],
+                       "Occurrence capacity offsets must be monotonic");
+    const int64_t raw_start = starts[segment];
+    const int64_t raw_end = ends[segment];
+    const int64_t key_begin = offsets[segment];
+    const int64_t key_end = offsets[segment + 1];
+    const int64_t prefix_length = key_end - key_begin - (raw_end - raw_start);
+    host::RuntimeCheck(raw_start >= 0 && raw_start < raw_end &&
+                           raw_end <= raw_count && prefix_length >= 0,
+                       "Occurrence capacity segment bounds are invalid");
+    for (int64_t cursor = key_begin; cursor < key_end; ++cursor) {
+      host::RuntimeCheck(keys[cursor] >= 0 && keys[cursor] < occurrence_count,
+                         "Occurrence capacity segment references an invalid occurrence");
+    }
+
+    const int64_t query_start = std::max<int64_t>(chunk_start, raw_start);
+    const int64_t query_end = std::min<int64_t>(max_chunk_end, raw_end);
+    if (query_start >= query_end) continue;
+    const int64_t included_keys =
+        prefix_length + query_end - raw_start;
+    for (int64_t local_key = 0; local_key < included_keys; ++local_key) {
+      const int64_t endpoint =
+          local_key < prefix_length
+              ? query_start + 1
+              : std::max<int64_t>(
+                    query_start, raw_start + local_key - prefix_length) +
+                    1;
+      mark_required(keys[key_begin + local_key], endpoint);
+    }
+  }
+
+  std::vector<int64_t> current_delta(endpoint_count, 0);
+  std::vector<int64_t> persistent_delta(endpoint_count, 0);
+  std::vector<int32_t> terminal_acquire_end(raw_count, never_required);
+  for (int64_t occurrence = 0; occurrence < occurrence_count; ++occurrence) {
+    const int64_t endpoint = activation_output[occurrence];
+    if (endpoint > max_chunk_end) continue;
+    host::RuntimeCheck(raw[occurrence] < endpoint,
+                       "Occurrence chunk references an uncomputed future token");
+    const int64_t endpoint_index = endpoint - chunk_start - 1;
+    const int64_t raw_token = raw[occurrence];
+    if (raw_token < chunk_start) {
+      const int32_t canonical_position =
+          initial_owned[raw_token] &&
+                  positions[occurrence] == positions[terminal[raw_token]]
+              ? positions[terminal[raw_token]]
+              : positions[birth[raw_token]];
+      const bool prior_new = positions[occurrence] != canonical_position;
+      if (prior_new) ++current_delta[endpoint_index];
+      if (prior_new && occurrence == terminal[raw_token]) {
+        ++persistent_delta[endpoint_index];
+        terminal_acquire_end[raw_token] = std::min<int32_t>(
+            terminal_acquire_end[raw_token], static_cast<int32_t>(endpoint));
+      }
+    } else {
+      ++current_delta[endpoint_index];
+    }
+  }
+
+  int64_t needs_terminal = 0;
+  int64_t recyclable_terminal_pages = 0;
+  std::vector<int64_t> needs_terminal_delta(endpoint_count, 0);
+  std::vector<int64_t> recyclable_delta(endpoint_count, 0);
+  for (int64_t raw_token = 0; raw_token < raw_count; ++raw_token) {
+    const bool distinct_terminal =
+        positions[terminal[raw_token]] != positions[birth[raw_token]];
+    if (distinct_terminal && !initial_owned[raw_token] && keep[raw_token]) {
+      ++needs_terminal;
+    }
+    if (distinct_terminal && initial_owned[raw_token] && !keep[raw_token]) {
+      ++recyclable_terminal_pages;
+    }
+    if (initial_owned[raw_token]) continue;
+    int32_t acquire_end = terminal_acquire_end[raw_token];
+    if (raw_token >= chunk_start && raw_token < max_chunk_end) {
+      acquire_end = std::min<int32_t>(
+          acquire_end, static_cast<int32_t>(raw_token + 1));
+    }
+    if (distinct_terminal && acquire_end <= max_chunk_end) {
+      const int64_t endpoint_index = acquire_end - chunk_start - 1;
+      if (keep[raw_token]) {
+        --needs_terminal_delta[endpoint_index];
+      } else {
+        ++recyclable_delta[endpoint_index];
+      }
+    }
+  }
+
+  int64_t current = 0;
+  int64_t persistent = 0;
+  for (int64_t local_endpoint = 0; local_endpoint < endpoint_count;
+       ++local_endpoint) {
+    const int64_t endpoint = chunk_start + local_endpoint + 1;
+    current += current_delta[local_endpoint];
+    persistent += persistent_delta[local_endpoint];
+    needs_terminal += needs_terminal_delta[local_endpoint];
+    recyclable_terminal_pages += recyclable_delta[local_endpoint];
+    host::RuntimeCheck(needs_terminal >= 0,
+                       "Occurrence terminal reserve accounting underflowed");
+
+    const int64_t fresh_raw = endpoint - 1;
+    ++persistent;
+    if (birth[fresh_raw] != terminal[fresh_raw]) ++persistent;
+
+    current_output[local_endpoint] = current;
+    persistent_output[local_endpoint] = persistent;
+    const int64_t output_reserve =
+        std::max<int64_t>(0, output_len - recyclable_terminal_pages);
+    future_output[local_endpoint] =
+        raw_count - endpoint + needs_terminal + output_reserve;
+  }
 }
 
 auto first_mask_free_conflict_event(
@@ -100,3 +820,17 @@ auto first_mask_free_conflict_event(
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(first_mask_free_conflict_event,
                               first_mask_free_conflict_event);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(count_context_full_keys,
+                              count_context_full_keys);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(fill_context_full_keys,
+                              fill_context_full_keys);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(count_context_sliding_keys,
+                              count_context_sliding_keys);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(fill_context_sliding_keys,
+                              fill_context_sliding_keys);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(count_occurrence_sliding_keys,
+                              count_occurrence_sliding_keys);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(fill_occurrence_sliding_keys,
+                              fill_occurrence_sliding_keys);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(build_occurrence_capacity_index,
+                              build_occurrence_capacity_index);

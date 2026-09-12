@@ -6,9 +6,18 @@ from typing import TYPE_CHECKING, List
 
 import torch
 from minisgl.core import Batch, Req, get_global_ctx
-from minisgl.kernel.context_plan import first_mask_free_conflict_event
+from minisgl.kernel.context_plan import (
+    first_mask_free_conflict_event,
+    try_build_occurrence_capacity_index,
+)
 from minisgl.utils import init_logger
 
+from .reposition_occurrence import (
+    compile_occurrence_window,
+    install_occurrence_plan,
+    pack_compact_occurrence_pending_fields,
+    unpack_compact_occurrence_pending_fields,
+)
 from .utils import PendingReq
 
 if TYPE_CHECKING:
@@ -21,6 +30,12 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 _sparse_kernel_failure_logged = False
+
+
+class OccurrenceInputError(ValueError):
+    def __init__(self, uid: int, detail: str) -> None:
+        super().__init__(detail)
+        self.uid = uid
 
 
 @dataclass
@@ -114,12 +129,15 @@ class PrefillAllocation:
     context_usage_cached_positions: torch.Tensor | None = None
     occurrence_pages: torch.Tensor | None = None
     occurrence_transient_pages: torch.Tensor | None = None
-    occurrence_fresh_source_pages: torch.Tensor | None = None
-    occurrence_fresh_destination_pages: torch.Tensor | None = None
-    occurrence_fresh_position_pairs: torch.Tensor | None = None
+    occurrence_birth_pages: torch.Tensor | None = None
+    occurrence_birth_owned_mask: torch.Tensor | None = None
+    occurrence_transform_source_pages: torch.Tensor | None = None
+    occurrence_transform_destination_pages: torch.Tensor | None = None
+    occurrence_transform_position_pairs: torch.Tensor | None = None
     occurrence_terminal_owned_mask: torch.Tensor | None = None
     occurrence_initial_source_positions: torch.Tensor | None = None
     occurrence_repositioned_cached_mask: torch.Tensor | None = None
+    occurrence_allocated_pages: torch.Tensor | None = None
 
 
 def _mask_free_context_reason_reference(
@@ -299,8 +317,6 @@ class PrefillAdder:
         *,
         start: int,
         end: int,
-        initial_cached_len: int,
-        source_positions: torch.Tensor,
         terminal_owned: torch.Tensor,
     ) -> tuple[torch.Tensor, int, int, int]:
         """Return IDs, current allocations, persistent allocations, and future reserve."""
@@ -314,27 +330,32 @@ class PrefillAdder:
         required_positions = req.occurrence_positions[required]
         terminal_ids = req.occurrence_terminal_indices.to(torch.int64)
         terminal_positions = req.occurrence_positions[terminal_ids]
+        birth_ids = req.occurrence_birth_indices.to(torch.int64)
+        birth_positions = req.occurrence_positions[birth_ids]
 
         prior = required_raw < start
         current = (required_raw >= start) & (required_raw < end)
         if bool(torch.any(~(prior | current)).item()):
             raise RuntimeError("Occurrence chunk references an uncomputed future token.")
         prior_raw = required_raw[prior]
-        canonical_positions = torch.empty(len(prior_raw), dtype=torch.int32, device="cpu")
-        if len(prior_raw) > 0:
-            prior_owned = terminal_owned[prior_raw]
-            canonical_positions[prior_owned] = terminal_positions[prior_raw[prior_owned]]
-            borrowed = ~prior_owned
-            if bool(torch.any(borrowed).item()):
-                borrowed_raw = prior_raw[borrowed]
-                if bool(torch.any(borrowed_raw >= initial_cached_len).item()):
-                    raise RuntimeError("A computed occurrence token has no canonical KV page.")
-                canonical_positions[borrowed] = source_positions[borrowed_raw]
+        prior_birth_ids = req.occurrence_birth_indices[prior_raw].to(torch.int64)
+        canonical_positions = req.occurrence_positions[prior_birth_ids]
+        reuse_terminal = terminal_owned[prior_raw] & (
+            required_positions[prior] == terminal_positions[prior_raw]
+        )
+        canonical_positions[reuse_terminal] = terminal_positions[prior_raw[reuse_terminal]]
         prior_new = required_positions[prior] != canonical_positions
         current_new = int(torch.count_nonzero(current).item())
         current_allocations = int(torch.count_nonzero(prior_new).item()) + current_new
         persistent_prior = prior_new & (required[prior] == terminal_ids[prior_raw])
-        persistent_allocations = int(torch.count_nonzero(persistent_prior).item()) + (end - start)
+        fresh_birth_is_terminal = (
+            req.occurrence_birth_indices[start:end] == req.occurrence_terminal_indices[start:end]
+        )
+        persistent_allocations = (
+            int(torch.count_nonzero(persistent_prior).item())
+            + (end - start)
+            + int(torch.count_nonzero(~fresh_birth_is_terminal).item())
+        )
 
         owner_after = terminal_owned.clone()
         if len(prior_raw) > 0 and bool(torch.any(persistent_prior).item()):
@@ -347,13 +368,17 @@ class PrefillAdder:
         )
         if len(final_keep) != len(owner_after):
             raise RuntimeError("Occurrence final keep mask does not cover the prompt plan.")
-        needs_terminal = final_keep & (~owner_after)
-        if initial_cached_len > 0:
-            borrowed_initial = torch.arange(initial_cached_len, dtype=torch.int64)
-            needs_terminal[:initial_cached_len] &= (
-                source_positions != terminal_positions[borrowed_initial]
-            )
-        future_reserve = int(torch.count_nonzero(needs_terminal).item()) + req.output_len
+        needs_terminal = final_keep & (~owner_after) & (terminal_positions != birth_positions)
+        recyclable_terminal_pages = int(
+            torch.count_nonzero(
+                owner_after & (~final_keep) & (terminal_positions != birth_positions)
+            ).item()
+        )
+        output_reserve = max(0, req.output_len - recyclable_terminal_pages)
+        future_birth_pages = len(owner_after) - end
+        future_reserve = (
+            future_birth_pages + int(torch.count_nonzero(needs_terminal).item()) + output_reserve
+        )
         return required, current_allocations, persistent_allocations, future_reserve
 
     def _try_allocate_occurrence(
@@ -365,26 +390,51 @@ class PrefillAdder:
             return None
         if self.kv_cache is None or self.retry_rope_cache is None:
             raise RuntimeError("Paged-occurrence KV materialization is not configured.")
-        plan = (
-            req.occurrence_raw_tokens,
-            req.occurrence_positions,
-            req.occurrence_birth_indices,
-            req.occurrence_terminal_indices,
-            req.occurrence_segment_query_starts,
-            req.occurrence_segment_query_ends,
-            req.occurrence_segment_key_offsets,
-            req.occurrence_segment_key_indices,
-        )
-        if not all(tensor is not None for tensor in plan):
-            raise RuntimeError("Paged-occurrence request is missing its occurrence plan.")
-        occurrence_raw, occurrence_positions, birth_ids, terminal_ids = plan[:4]
-        assert occurrence_raw is not None
-        assert occurrence_positions is not None
-        assert birth_ids is not None
-        assert terminal_ids is not None
-        occurrence_count = len(occurrence_raw)
-        plan_token_count = len(birth_ids)
         initial_allocation = chunked_req is None
+        compact_layout = (
+            unpack_compact_occurrence_pending_fields(req) if initial_allocation else None
+        )
+        if compact_layout is not None:
+            # PendingReq intentionally reuses its legacy occurrence slots for the
+            # compact wire program.  Preserve the immutable source program after
+            # installing a runtime plan so a later scheduling attempt can adapt
+            # to a changed exact-prefix match.
+            setattr(req, "_compact_occurrence_layout", compact_layout)
+        elif initial_allocation:
+            compact_layout = getattr(req, "_compact_occurrence_layout", None)
+
+        occurrence_raw = None
+        occurrence_positions = None
+        birth_ids = None
+        terminal_ids = None
+        occurrence_count = 0
+        plan_token_count = 0
+
+        def refresh_occurrence_plan() -> None:
+            nonlocal occurrence_count, occurrence_positions, occurrence_raw
+            nonlocal birth_ids, plan_token_count, terminal_ids
+            plan = (
+                req.occurrence_raw_tokens,
+                req.occurrence_positions,
+                req.occurrence_birth_indices,
+                req.occurrence_terminal_indices,
+                req.occurrence_segment_query_starts,
+                req.occurrence_segment_query_ends,
+                req.occurrence_segment_key_offsets,
+                req.occurrence_segment_key_indices,
+            )
+            if not all(tensor is not None for tensor in plan):
+                raise RuntimeError("Paged-occurrence request is missing its occurrence plan.")
+            occurrence_raw, occurrence_positions, birth_ids, terminal_ids = plan[:4]
+            assert occurrence_raw is not None
+            assert occurrence_positions is not None
+            assert birth_ids is not None
+            assert terminal_ids is not None
+            occurrence_count = len(occurrence_raw)
+            plan_token_count = len(birth_ids)
+
+        if compact_layout is None:
+            refresh_occurrence_plan()
         initial_resources_live = False
         match = None
         fallback_to_empty = False
@@ -394,13 +444,15 @@ class PrefillAdder:
                 match = (
                     self.cache_manager.match_empty_req(req)
                     if fallback_to_empty
-                    else self.cache_manager.match_req(req)
+                    else self.cache_manager.match_occurrence_req(req)
                 )
                 match_elapsed_ns = time.perf_counter_ns() - match_started_ns
                 match_retry_plan_ns = 0 if match is None else match.retry_plan_ns
                 req.radix_match_ns += max(0, match_elapsed_ns - match_retry_plan_ns)
                 if match is None:
                     return None
+                if match.retry_plan is not None or match.retry_plan_ns != 0:
+                    raise RuntimeError("Paged-occurrence matching produced a staged Retry plan.")
                 req.retry_plan_ns += match.retry_plan_ns
                 cached_len = match.full_cached_len
                 if match.active_cached_len != cached_len:
@@ -411,6 +463,22 @@ class PrefillAdder:
                     raise RuntimeError(
                         "Prefix matching must leave at least one occurrence query token."
                     )
+                if compact_layout is not None:
+                    if req.full_token_visible_until is None or req.radix_positions is None:
+                        raise RuntimeError(
+                            "Compact occurrence compilation requires visibility and terminal positions."
+                        )
+                    install_occurrence_plan(
+                        req,
+                        compile_occurrence_window(
+                            compact_layout,
+                            req.full_token_visible_until,
+                            req.radix_positions,
+                            query_start=cached_len,
+                            query_end=req.input_len,
+                        ),
+                    )
+                    refresh_occurrence_plan()
                 cache_handle = match.handle
                 table_idx: int | None = None
                 cache_locked = False
@@ -418,6 +486,7 @@ class PrefillAdder:
                     self.cache_manager.lock(cache_handle)
                     cache_locked = True
                     table_idx = self.table_manager.allocate()
+                    self.table_manager.prepare_occurrence(table_idx, plan_token_count)
                     source_pages = match.full_match_indices[:cached_len].clone()
                     matched_virtual = (
                         cache_handle.get_matched_virtual_mask()[: cache_handle.cached_len]
@@ -438,16 +507,14 @@ class PrefillAdder:
                         raise RuntimeError(
                             "Matched source positions do not cover the cached prefix."
                         )
-                    if match.retry_plan is not None and len(match.retry_plan) > 0:
-                        retry_source = match.retry_plan[:, 0].to(torch.int64)
-                        retry_target = match.retry_plan[:, 1].to(torch.int64)
-                        source_pages[retry_target.to(source_pages.device)] = (
-                            match.full_match_indices[
-                                retry_source.to(match.full_match_indices.device)
-                            ]
-                        )
-                        source_positions[retry_target] = match.retry_plan[:, 2].to(torch.int32)
                     terminal_owned = torch.zeros(plan_token_count, dtype=torch.bool, device="cpu")
+                    birth_pages = torch.full(
+                        (plan_token_count,),
+                        -1,
+                        dtype=torch.int32,
+                        device=self.cache_manager.device,
+                    )
+                    birth_owned = torch.zeros(plan_token_count, dtype=torch.bool, device="cpu")
                     repositioned_cached = torch.zeros(cached_len, dtype=torch.bool, device="cpu")
                     usage_positions = None
                     usage_cached_tokens = None
@@ -455,11 +522,12 @@ class PrefillAdder:
                     radix_cached_tokens = cache_handle.physical_cached_len
                     full_prefix_len, _ = self.cache_manager.matchable_prefix_lens(req)
                     cache_reuse_ratio = _calculate_cache_reuse_ratio(cached_len, full_prefix_len)
-                    table = self.table_manager.page_table[table_idx]
+                    table = self.table_manager.occurrence_pages(table_idx)
                     table[:plan_token_count].fill_(-1)
                     if cached_len > 0:
+                        birth_pages[:cached_len].copy_(source_pages)
                         table[:cached_len].copy_(source_pages)
-                        self.table_manager.token_pool[table_idx, :cached_len].copy_(
+                        self.table_manager.occurrence_tokens(table_idx)[:cached_len].copy_(
                             req.input_ids[:cached_len].pin_memory(), non_blocking=True
                         )
                 except Exception:
@@ -477,11 +545,31 @@ class PrefillAdder:
                 table_idx = chunked_req.table_idx
                 source_pages = chunked_req.initial_full_match_indices
                 source_positions = chunked_req.occurrence_initial_source_positions
-                terminal_owned = chunked_req.occurrence_terminal_owned_mask
-                repositioned_cached = chunked_req.occurrence_repositioned_cached_mask
+                terminal_owned = (
+                    None
+                    if chunked_req.occurrence_terminal_owned_mask is None
+                    else chunked_req.occurrence_terminal_owned_mask.clone()
+                )
+                birth_pages = (
+                    None
+                    if chunked_req.occurrence_birth_pages is None
+                    else chunked_req.occurrence_birth_pages.clone()
+                )
+                birth_owned = (
+                    None
+                    if chunked_req.occurrence_birth_owned_mask is None
+                    else chunked_req.occurrence_birth_owned_mask.clone()
+                )
+                repositioned_cached = (
+                    None
+                    if chunked_req.occurrence_repositioned_cached_mask is None
+                    else chunked_req.occurrence_repositioned_cached_mask.clone()
+                )
                 if (
                     source_positions is None
                     or terminal_owned is None
+                    or birth_pages is None
+                    or birth_owned is None
                     or repositioned_cached is None
                 ):
                     raise RuntimeError("Chunked occurrence request lost its persistent metadata.")
@@ -495,27 +583,148 @@ class PrefillAdder:
                 max_end = min(req.input_len, cached_len + self.token_budget)
                 best: tuple[torch.Tensor, int, int, int] | None = None
                 best_end: int | None = None
-                low = cached_len + 1
-                high = max_end
                 available_pages = self.cache_manager.available_size
-                while low <= high:
-                    candidate = (low + high) // 2
-                    capacity = self._occurrence_capacity_for_chunk(
-                        req,
-                        start=cached_len,
-                        end=candidate,
-                        initial_cached_len=len(source_positions),
-                        source_positions=source_positions,
-                        terminal_owned=terminal_owned,
+                if max_end > cached_len:
+                    assert occurrence_raw is not None
+                    assert occurrence_positions is not None
+                    assert birth_ids is not None
+                    assert terminal_ids is not None
+                    assert req.occurrence_segment_query_starts is not None
+                    assert req.occurrence_segment_query_ends is not None
+                    assert req.occurrence_segment_key_offsets is not None
+                    assert req.occurrence_segment_key_indices is not None
+                    final_keep = (
+                        req.full_keep_mask.to(dtype=torch.bool, device="cpu").contiguous()
+                        if req.full_keep_mask is not None
+                        else torch.ones(
+                            plan_token_count,
+                            dtype=torch.bool,
+                            device="cpu",
+                        )
                     )
-                    _, current_pages, persistent_pages, future_pages = capacity
-                    required_pages = max(current_pages, persistent_pages + future_pages)
-                    if required_pages + self.reserved_size <= available_pages:
-                        best = capacity
-                        best_end = candidate
-                        low = candidate + 1
+                    capacity_index = try_build_occurrence_capacity_index(
+                        occurrence_raw,
+                        occurrence_positions,
+                        birth_ids,
+                        terminal_ids,
+                        req.occurrence_segment_query_starts,
+                        req.occurrence_segment_query_ends,
+                        req.occurrence_segment_key_offsets,
+                        req.occurrence_segment_key_indices,
+                        terminal_owned.contiguous(),
+                        final_keep,
+                        chunk_start=cached_len,
+                        max_chunk_end=max_end,
+                        output_len=req.output_len,
+                    )
+
+                    if capacity_index is not None:
+                        first_required_end, current_curve, persistent_curve, future_curve = (
+                            capacity_index
+                        )
+
+                        def indexed_capacity(end: int) -> tuple[int, int, int]:
+                            index = end - cached_len - 1
+                            return (
+                                int(current_curve[index]),
+                                int(persistent_curve[index]),
+                                int(future_curve[index]),
+                            )
+
+                        # Most scheduling attempts can consume the whole token-budget
+                        # window. Test that endpoint first and only search when it does
+                        # not fit; every later predicate lookup is O(1).
+                        current_pages, persistent_pages, future_pages = indexed_capacity(max_end)
+                        required_pages = max(
+                            current_pages,
+                            persistent_pages + future_pages,
+                        )
+                        if required_pages + self.reserved_size <= available_pages:
+                            best_end = max_end
+                        else:
+                            low = cached_len + 1
+                            high = max_end - 1
+                            while low <= high:
+                                candidate = (low + high) // 2
+                                current_pages, persistent_pages, future_pages = indexed_capacity(
+                                    candidate
+                                )
+                                required_pages = max(
+                                    current_pages,
+                                    persistent_pages + future_pages,
+                                )
+                                if required_pages + self.reserved_size <= available_pages:
+                                    best_end = candidate
+                                    low = candidate + 1
+                                else:
+                                    high = candidate - 1
+                        if best_end is not None:
+                            current_pages, persistent_pages, future_pages = indexed_capacity(
+                                best_end
+                            )
+                            required = (
+                                torch.nonzero(
+                                    first_required_end <= best_end,
+                                    as_tuple=False,
+                                )
+                                .view(-1)
+                                .to(torch.int64)
+                            )
+                            if len(required) == 0:
+                                raise RuntimeError(
+                                    "Occurrence chunk has no physical page requirements."
+                                )
+                            best = (
+                                required,
+                                current_pages,
+                                persistent_pages,
+                                future_pages,
+                            )
                     else:
-                        high = candidate - 1
+                        # Keep a semantics-identical reference fallback for platforms
+                        # where the CPU AOT planner cannot be loaded.
+                        capacity_cache: dict[int, tuple[torch.Tensor, int, int, int]] = {}
+
+                        def reference_capacity(
+                            end: int,
+                        ) -> tuple[torch.Tensor, int, int, int]:
+                            capacity = capacity_cache.get(end)
+                            if capacity is None:
+                                capacity = self._occurrence_capacity_for_chunk(
+                                    req,
+                                    start=cached_len,
+                                    end=end,
+                                    terminal_owned=terminal_owned,
+                                )
+                                capacity_cache[end] = capacity
+                            return capacity
+
+                        capacity = reference_capacity(max_end)
+                        _, current_pages, persistent_pages, future_pages = capacity
+                        required_pages = max(
+                            current_pages,
+                            persistent_pages + future_pages,
+                        )
+                        if required_pages + self.reserved_size <= available_pages:
+                            best = capacity
+                            best_end = max_end
+                        else:
+                            low = cached_len + 1
+                            high = max_end - 1
+                            while low <= high:
+                                candidate = (low + high) // 2
+                                capacity = reference_capacity(candidate)
+                                _, current_pages, persistent_pages, future_pages = capacity
+                                required_pages = max(
+                                    current_pages,
+                                    persistent_pages + future_pages,
+                                )
+                                if required_pages + self.reserved_size <= available_pages:
+                                    best = capacity
+                                    best_end = candidate
+                                    low = candidate + 1
+                                else:
+                                    high = candidate - 1
             except Exception:
                 if initial_resources_live:
                     self.table_manager.free(table_idx)
@@ -538,8 +747,6 @@ class PrefillAdder:
                 req,
                 start=cached_len,
                 end=cached_len + 1,
-                initial_cached_len=len(source_positions),
-                source_positions=source_positions,
                 terminal_owned=terminal_owned,
             )
             _, current_pages, persistent_pages, future_pages = minimum
@@ -547,6 +754,16 @@ class PrefillAdder:
             self_pinned_pages = len(torch.unique(source_pages)) + int(
                 torch.count_nonzero(terminal_owned).item()
             )
+            if bool(torch.any(birth_owned).item()):
+                owned_birth_pages = birth_pages[
+                    birth_owned.pin_memory().to(self.cache_manager.device, non_blocking=True)
+                ]
+                terminal_pages = self.table_manager.occurrence_pages(table_idx)[
+                    : len(terminal_owned)
+                ][terminal_owned.pin_memory().to(self.cache_manager.device, non_blocking=True)]
+                self_pinned_pages = len(
+                    torch.unique(torch.cat((source_pages, terminal_pages, owned_birth_pages)))
+                )
             theoretical_available_pages = self.cache_manager.num_pages - self_pinned_pages
             if self.reserved_size > 0 or minimum_pages <= theoretical_available_pages:
                 # Pages protected by other running requests are transient pressure.
@@ -566,29 +783,37 @@ class PrefillAdder:
         required_positions = occurrence_positions[required_ids]
         prior = required_raw < cached_len
         prior_raw = required_raw[prior]
-        canonical_positions = torch.empty(len(prior_raw), dtype=torch.int32, device="cpu")
+        prior_birth_ids = birth_ids[prior_raw].to(torch.int64)
+        canonical_positions = occurrence_positions[prior_birth_ids]
         canonical_pages = torch.empty(
             len(prior_raw), dtype=torch.int32, device=self.cache_manager.device
         )
         if len(prior_raw) > 0:
-            prior_owned = terminal_owned[prior_raw]
-            canonical_positions[prior_owned] = occurrence_positions[
-                terminal_ids[prior_raw[prior_owned]].to(torch.int64)
-            ]
-            borrowed = ~prior_owned
-            if bool(torch.any(borrowed).item()):
-                canonical_positions[borrowed] = source_positions[prior_raw[borrowed]]
             prior_raw_device = prior_raw.pin_memory().to(
                 self.cache_manager.device, non_blocking=True
             )
-            owner_device = prior_owned.pin_memory().to(self.cache_manager.device, non_blocking=True)
-            borrowed_device = ~owner_device
-            if bool(torch.any(borrowed).item()):
-                canonical_pages[borrowed_device] = source_pages[prior_raw_device[borrowed_device]]
-            if bool(torch.any(prior_owned).item()):
-                canonical_pages[owner_device] = self.table_manager.page_table[
-                    table_idx, prior_raw_device[owner_device]
+            reuse_terminal = terminal_owned[prior_raw] & (
+                required_positions[prior]
+                == occurrence_positions[terminal_ids[prior_raw].to(torch.int64)]
+            )
+            canonical_positions[reuse_terminal] = required_positions[prior][reuse_terminal]
+            birth_source = ~reuse_terminal
+            birth_source_device = birth_source.pin_memory().to(
+                self.cache_manager.device, non_blocking=True
+            )
+            if bool(torch.any(birth_source).item()):
+                canonical_pages[birth_source_device] = birth_pages[
+                    prior_raw_device[birth_source_device]
                 ]
+            if bool(torch.any(reuse_terminal).item()):
+                terminal_source_device = reuse_terminal.pin_memory().to(
+                    self.cache_manager.device, non_blocking=True
+                )
+                canonical_pages[terminal_source_device] = self.table_manager.occurrence_pages(
+                    table_idx
+                )[prior_raw_device[terminal_source_device]]
+            if bool(torch.any(canonical_pages < 0).item()):
+                raise RuntimeError("A computed occurrence token has no retained KV page.")
         prior_new = required_positions[prior] != canonical_positions
         new_mask = torch.zeros(len(required_ids), dtype=torch.bool, device="cpu")
         new_mask[prior] = prior_new
@@ -633,25 +858,29 @@ class PrefillAdder:
             cached_transform = prior_new
             cached_ids = required_ids[prior][cached_transform]
             cached_raw = prior_raw[cached_transform]
+            cached_source_pages = torch.empty(
+                0, dtype=torch.int32, device=self.cache_manager.device
+            )
+            cached_destination_pages = torch.empty(
+                0, dtype=torch.int32, device=self.cache_manager.device
+            )
+            cached_position_pairs = torch.empty(
+                (0, 2), dtype=torch.int32, device=self.cache_manager.device
+            )
             if len(cached_ids) > 0:
                 cached_reuse_device = cached_transform.pin_memory().to(
                     self.cache_manager.device, non_blocking=True
                 )
-                cached_destination = runtime_pages[
+                cached_source_pages = canonical_pages[cached_reuse_device]
+                cached_destination_pages = runtime_pages[
                     cached_ids.pin_memory().to(self.cache_manager.device, non_blocking=True)
                 ]
                 cached_pairs_cpu = torch.column_stack(
                     (canonical_positions[cached_transform], occurrence_positions[cached_ids])
                 ).to(torch.int32)
                 self._validate_occurrence_rope_positions(cached_pairs_cpu)
-                cached_pairs = cached_pairs_cpu.pin_memory().to(
+                cached_position_pairs = cached_pairs_cpu.pin_memory().to(
                     self.cache_manager.device, non_blocking=True
-                )
-                self.kv_cache.retry_reposition(
-                    canonical_pages[cached_reuse_device],
-                    cached_destination,
-                    cached_pairs,
-                    self.retry_rope_cache,
                 )
                 req.reposition_h2d_bytes += (
                     cached_pairs_cpu.numel() * cached_pairs_cpu.element_size()
@@ -682,8 +911,29 @@ class PrefillAdder:
                 self.cache_manager.device, non_blocking=True
             )
             req.reposition_h2d_bytes += fresh_pairs_cpu.numel() * fresh_pairs_cpu.element_size()
+            transform_source_pages = torch.cat((cached_source_pages, fresh_source_pages))
+            transform_destination_pages = torch.cat(
+                (cached_destination_pages, fresh_destination_pages)
+            )
+            transform_position_pairs = torch.cat((cached_position_pairs, fresh_position_pairs))
 
-            transient_ids = allocated_ids[~persistent_allocated]
+            fresh_birth_occurrences = birth_ids[fresh_raw].to(torch.int64)
+            fresh_birth_pages = runtime_pages[
+                fresh_birth_occurrences.pin_memory().to(
+                    self.cache_manager.device, non_blocking=True
+                )
+            ]
+            birth_pages = birth_pages.clone()
+            birth_owned = birth_owned.clone()
+            birth_pages.index_copy_(
+                0,
+                fresh_raw.pin_memory().to(self.cache_manager.device, non_blocking=True),
+                fresh_birth_pages,
+            )
+            birth_owned[fresh_raw] = True
+
+            retained_ids = torch.unique(torch.cat((persistent_ids, fresh_birth_occurrences)))
+            transient_ids = allocated_ids[~torch.isin(allocated_ids, retained_ids)]
             transient_pages = runtime_pages[
                 transient_ids.pin_memory().to(self.cache_manager.device, non_blocking=True)
             ]
@@ -694,7 +944,7 @@ class PrefillAdder:
                 persistent_raw_device = persistent_raw.pin_memory().to(
                     self.cache_manager.device, non_blocking=True
                 )
-                self.table_manager.page_table[table_idx].index_copy_(
+                self.table_manager.occurrence_pages(table_idx).index_copy_(
                     0, persistent_raw_device, persistent_pages
                 )
                 terminal_owned[persistent_raw] = True
@@ -723,12 +973,15 @@ class PrefillAdder:
             context_usage_cached_positions=usage_positions,
             occurrence_pages=runtime_pages,
             occurrence_transient_pages=transient_pages,
-            occurrence_fresh_source_pages=fresh_source_pages,
-            occurrence_fresh_destination_pages=fresh_destination_pages,
-            occurrence_fresh_position_pairs=fresh_position_pairs,
+            occurrence_birth_pages=birth_pages,
+            occurrence_birth_owned_mask=birth_owned,
+            occurrence_transform_source_pages=transform_source_pages,
+            occurrence_transform_destination_pages=transform_destination_pages,
+            occurrence_transform_position_pairs=transform_position_pairs,
             occurrence_terminal_owned_mask=terminal_owned,
             occurrence_initial_source_positions=source_positions,
             occurrence_repositioned_cached_mask=repositioned_cached,
+            occurrence_allocated_pages=allocated_pages,
         )
 
     def _validate_occurrence_rope_positions(self, position_pairs: torch.Tensor) -> None:
@@ -1092,7 +1345,32 @@ class PrefillAdder:
             inactive_cached_pages=retry_inactive_pages,
         )
 
-    def _add_one_req(
+    def _add_one_req(self, **kwargs) -> Req:
+        """Transfer an allocation to Req, or roll it back before propagating failure."""
+        allocated = kwargs.pop("occurrence_allocated_pages", None)
+        pending = kwargs["pending_req"]
+        budget, reserved = self.token_budget, self.reserved_size
+        try:
+            return self._construct_req(**kwargs)
+        except Exception as exc:
+            self.token_budget, self.reserved_size = budget, reserved
+            if allocated is not None:
+                slot = kwargs["table_idx"]
+                table = self.table_manager.occurrence_pages(slot)
+                owned = kwargs["occurrence_terminal_owned_mask"]
+                # Error-only rollback. Never release borrowed source pages.
+                newly_owned = torch.isin(table[: len(owned)], allocated).cpu()
+                owned[newly_owned] = False
+                table[: len(owned)][newly_owned.to(table.device)] = -1
+                self.cache_manager.free_occurrence_pages(allocated)
+                if pending.chunked_req is None:
+                    self.cache_manager.unlock(kwargs["cache_handle"])
+                    self.table_manager.free(slot)
+                if isinstance(exc, ValueError):
+                    raise OccurrenceInputError(pending.uid, str(exc)) from exc
+            raise
+
+    def _construct_req(
         self,
         pending_req: PendingReq,
         cache_handle: BaseCacheHandle,
@@ -1109,9 +1387,11 @@ class PrefillAdder:
         usage_repos_tokens: int | None = None,
         occurrence_pages: torch.Tensor | None = None,
         occurrence_transient_pages: torch.Tensor | None = None,
-        occurrence_fresh_source_pages: torch.Tensor | None = None,
-        occurrence_fresh_destination_pages: torch.Tensor | None = None,
-        occurrence_fresh_position_pairs: torch.Tensor | None = None,
+        occurrence_birth_pages: torch.Tensor | None = None,
+        occurrence_birth_owned_mask: torch.Tensor | None = None,
+        occurrence_transform_source_pages: torch.Tensor | None = None,
+        occurrence_transform_destination_pages: torch.Tensor | None = None,
+        occurrence_transform_position_pairs: torch.Tensor | None = None,
         occurrence_terminal_owned_mask: torch.Tensor | None = None,
         occurrence_initial_source_positions: torch.Tensor | None = None,
         occurrence_repositioned_cached_mask: torch.Tensor | None = None,
@@ -1139,9 +1419,16 @@ class PrefillAdder:
             self.reserved_size += remain_len + pending_req.output_len
         # NOTE: update the tokens ids only; new pages will be allocated in the scheduler
         _slice = slice(cached_len, cached_len + chunk_size)
-        device_ids = self.table_manager.token_pool[table_idx, _slice]
+        device_ids = (
+            self.table_manager.occurrence_tokens(table_idx)[_slice]
+            if is_occurrence
+            else self.table_manager.token_pool[table_idx, _slice]
+        )
         device_ids.copy_(pending_req.input_ids[_slice].pin_memory(), non_blocking=True)
         return CLS(
+            occurrence_external_storage=(
+                is_occurrence and self.table_manager.has_occurrence_storage(table_idx)
+            ),
             input_ids=pending_req.input_ids[: cached_len + chunk_size],
             true_positions=pending_req.true_positions[: cached_len + chunk_size],
             raw_positions=pending_req.raw_positions[: cached_len + chunk_size],
@@ -1224,9 +1511,11 @@ class PrefillAdder:
             occurrence_segment_key_indices=pending_req.occurrence_segment_key_indices,
             occurrence_pages=occurrence_pages,
             occurrence_transient_pages=occurrence_transient_pages,
-            occurrence_fresh_source_pages=occurrence_fresh_source_pages,
-            occurrence_fresh_destination_pages=occurrence_fresh_destination_pages,
-            occurrence_fresh_position_pairs=occurrence_fresh_position_pairs,
+            occurrence_birth_pages=occurrence_birth_pages,
+            occurrence_birth_owned_mask=occurrence_birth_owned_mask,
+            occurrence_transform_source_pages=occurrence_transform_source_pages,
+            occurrence_transform_destination_pages=occurrence_transform_destination_pages,
+            occurrence_transform_position_pairs=occurrence_transform_position_pairs,
             occurrence_terminal_owned_mask=occurrence_terminal_owned_mask,
             occurrence_initial_source_positions=occurrence_initial_source_positions,
             occurrence_repositioned_cached_mask=occurrence_repositioned_cached_mask,
@@ -1266,9 +1555,15 @@ class PrefillAdder:
                     usage_repos_tokens=resource.usage_repos_tokens,
                     occurrence_pages=resource.occurrence_pages,
                     occurrence_transient_pages=resource.occurrence_transient_pages,
-                    occurrence_fresh_source_pages=resource.occurrence_fresh_source_pages,
-                    occurrence_fresh_destination_pages=resource.occurrence_fresh_destination_pages,
-                    occurrence_fresh_position_pairs=resource.occurrence_fresh_position_pairs,
+                    occurrence_birth_pages=resource.occurrence_birth_pages,
+                    occurrence_birth_owned_mask=resource.occurrence_birth_owned_mask,
+                    occurrence_transform_source_pages=(resource.occurrence_transform_source_pages),
+                    occurrence_transform_destination_pages=(
+                        resource.occurrence_transform_destination_pages
+                    ),
+                    occurrence_transform_position_pairs=(
+                        resource.occurrence_transform_position_pairs
+                    ),
                     occurrence_terminal_owned_mask=resource.occurrence_terminal_owned_mask,
                     occurrence_initial_source_positions=resource.occurrence_initial_source_positions,
                     occurrence_repositioned_cached_mask=(
@@ -1277,6 +1572,7 @@ class PrefillAdder:
                     context_usage_cached_positions=resource.context_usage_cached_positions,
                     chunk_size_override=resource.chunk_size,
                     occurrence_reserved_pages=resource.reserved_pages,
+                    occurrence_allocated_pages=resource.occurrence_allocated_pages,
                 )
             result = self._add_one_req(
                 pending_req=pending_req,
@@ -1312,15 +1608,20 @@ class PrefillAdder:
                 usage_repos_tokens=resource.usage_repos_tokens,
                 occurrence_pages=resource.occurrence_pages,
                 occurrence_transient_pages=resource.occurrence_transient_pages,
-                occurrence_fresh_source_pages=resource.occurrence_fresh_source_pages,
-                occurrence_fresh_destination_pages=resource.occurrence_fresh_destination_pages,
-                occurrence_fresh_position_pairs=resource.occurrence_fresh_position_pairs,
+                occurrence_birth_pages=resource.occurrence_birth_pages,
+                occurrence_birth_owned_mask=resource.occurrence_birth_owned_mask,
+                occurrence_transform_source_pages=resource.occurrence_transform_source_pages,
+                occurrence_transform_destination_pages=(
+                    resource.occurrence_transform_destination_pages
+                ),
+                occurrence_transform_position_pairs=resource.occurrence_transform_position_pairs,
                 occurrence_terminal_owned_mask=resource.occurrence_terminal_owned_mask,
                 occurrence_initial_source_positions=resource.occurrence_initial_source_positions,
                 occurrence_repositioned_cached_mask=(resource.occurrence_repositioned_cached_mask),
                 context_usage_cached_positions=resource.context_usage_cached_positions,
                 chunk_size_override=resource.chunk_size,
                 occurrence_reserved_pages=resource.reserved_pages,
+                occurrence_allocated_pages=resource.occurrence_allocated_pages,
             )
             return result
 
@@ -1348,6 +1649,25 @@ class PrefillManager:
                 raise ValueError(
                     "Context-mask Prefill requires a full token stream and Radix keys."
                 )
+        occurrence_fields = pack_compact_occurrence_pending_fields(
+            birth_positions=req.occurrence_layout_birth_positions,
+            birth_stages=req.occurrence_layout_birth_stages,
+            transition_offsets=req.occurrence_layout_transition_offsets,
+            transition_raw_tokens=req.occurrence_layout_transition_raw_tokens,
+            transition_old_positions=req.occurrence_layout_transition_old_positions,
+            transition_new_positions=req.occurrence_layout_transition_new_positions,
+        )
+        if not occurrence_fields:
+            occurrence_fields = {
+                "occurrence_raw_tokens": req.occurrence_raw_tokens,
+                "occurrence_positions": req.occurrence_positions,
+                "occurrence_birth_indices": req.occurrence_birth_indices,
+                "occurrence_terminal_indices": req.occurrence_terminal_indices,
+                "occurrence_segment_query_starts": req.occurrence_segment_query_starts,
+                "occurrence_segment_query_ends": req.occurrence_segment_query_ends,
+                "occurrence_segment_key_offsets": req.occurrence_segment_key_offsets,
+                "occurrence_segment_key_indices": req.occurrence_segment_key_indices,
+            }
         self.pending_list.append(
             PendingReq(
                 uid=req.uid,
@@ -1389,14 +1709,7 @@ class PrefillManager:
                 reposition_h2d_bytes=req.reposition_h2d_bytes,
                 reposition_d2h_bytes=req.reposition_d2h_bytes,
                 reposition_execution_mode=req.reposition_execution_mode,
-                occurrence_raw_tokens=req.occurrence_raw_tokens,
-                occurrence_positions=req.occurrence_positions,
-                occurrence_birth_indices=req.occurrence_birth_indices,
-                occurrence_terminal_indices=req.occurrence_terminal_indices,
-                occurrence_segment_query_starts=req.occurrence_segment_query_starts,
-                occurrence_segment_query_ends=req.occurrence_segment_query_ends,
-                occurrence_segment_key_offsets=req.occurrence_segment_key_offsets,
-                occurrence_segment_key_indices=req.occurrence_segment_key_indices,
+                **occurrence_fields,
             )
         )
 
@@ -1408,9 +1721,9 @@ class PrefillManager:
         self.cache_manager.free_occurrence_pages(chunk.occurrence_transient_pages)
         chunk.occurrence_transient_pages = None
         chunk.occurrence_pages = None
-        chunk.occurrence_fresh_source_pages = None
-        chunk.occurrence_fresh_destination_pages = None
-        chunk.occurrence_fresh_position_pairs = None
+        chunk.occurrence_transform_source_pages = None
+        chunk.occurrence_transform_destination_pages = None
+        chunk.occurrence_transform_position_pairs = None
         chunk.occurrence_inflight = False
 
         owned = chunk.occurrence_terminal_owned_mask
@@ -1432,8 +1745,18 @@ class PrefillManager:
                 .pin_memory()
                 .to(self.cache_manager.device, non_blocking=True)
             )
-            table = self.table_manager.page_table[chunk.table_idx]
-            self.cache_manager.free_occurrence_pages(table[raw_device].clone())
+            table = self.table_manager.occurrence_pages(chunk.table_idx)
+            released = table[raw_device].clone()
+            birth_pages = chunk.occurrence_birth_pages
+            birth_owned = chunk.occurrence_birth_owned_mask
+            if birth_pages is None or birth_owned is None:
+                raise RuntimeError("Occurrence chunk lost its birth page-lifetime metadata.")
+            if bool(torch.any(birth_owned).item()):
+                owned_birth_pages = birth_pages[
+                    birth_owned.pin_memory().to(self.cache_manager.device, non_blocking=True)
+                ]
+                released = released[~torch.isin(released, owned_birth_pages)]
+            self.cache_manager.free_occurrence_pages(torch.unique(released))
             table[raw_device] = -1
             owned[releasable] = False
 
@@ -1485,7 +1808,7 @@ class PrefillManager:
                     break
             try:
                 req = adder.try_add_one(pending_req, context_plan)
-            except RepositionCapacityError:
+            except (RepositionCapacityError, OccurrenceInputError):
                 if not reqs:
                     raise
                 break

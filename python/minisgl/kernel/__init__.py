@@ -11,7 +11,7 @@ from .radix import (
     radix_record_edge_hash,
     radix_record_retry_token,
 )
-from .retry_reposition import retry_reposition_kv
+from .reposition_kv import reposition_kv_with_rope_delta
 from .store import store_cache
 from .tensor import test_tensor
 
@@ -26,7 +26,7 @@ __all__ = [
     "radix_record_compare_backend",
     "radix_record_edge_hash",
     "radix_record_retry_token",
-    "retry_reposition_kv",
+    "reposition_kv_with_rope_delta",
     "store_cache",
     "test_tensor",
     "init_pynccl",

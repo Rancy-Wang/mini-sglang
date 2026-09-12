@@ -18,7 +18,12 @@ from .base import (
 
 
 class CacheManagerCreator(Protocol):
-    def __call__(self, device: torch.device) -> BasePrefixCache: ...
+    def __call__(
+        self,
+        device: torch.device,
+        *,
+        track_shared_page_owners: bool = True,
+    ) -> BasePrefixCache: ...
 
 
 SUPPORTED_CACHE_MANAGER = Registry[CacheManagerCreator]("Cache Manager")
@@ -45,21 +50,41 @@ def create_kvcache_pool(
 
 
 @SUPPORTED_CACHE_MANAGER.register("naive")
-def create_naive_cache(device: torch.device):
+def create_naive_cache(
+    device: torch.device,
+    *,
+    track_shared_page_owners: bool = True,
+):
     from .naive_cache import NaivePrefixCache
 
+    del track_shared_page_owners
     return NaivePrefixCache(device=device)
 
 
 @SUPPORTED_CACHE_MANAGER.register("radix")
-def create_radix_cache(device: torch.device):
+def create_radix_cache(
+    device: torch.device,
+    *,
+    track_shared_page_owners: bool = True,
+):
     from .radix_cache import RadixPrefixCache
 
-    return RadixPrefixCache(device=device)
+    return RadixPrefixCache(
+        device=device,
+        track_shared_page_owners=track_shared_page_owners,
+    )
 
 
-def create_prefix_cache(device: torch.device, type: str) -> BasePrefixCache:
-    return SUPPORTED_CACHE_MANAGER[type](device)
+def create_prefix_cache(
+    device: torch.device,
+    type: str,
+    *,
+    track_shared_page_owners: bool = True,
+) -> BasePrefixCache:
+    return SUPPORTED_CACHE_MANAGER[type](
+        device,
+        track_shared_page_owners=track_shared_page_owners,
+    )
 
 
 __all__ = [

@@ -126,7 +126,7 @@ class FlashAttentionBackend(BaseAttnBackend):
                 or batch.occurrence_rope_cache is None
             ):
                 raise RuntimeError("Occurrence layer transform metadata is incomplete.")
-            self.kvcache.reposition_layer(
+            self.kvcache.materialize_occurrence_layer(
                 batch.occurrence_source_pages,
                 batch.occurrence_destination_pages,
                 batch.occurrence_position_pairs,
@@ -219,7 +219,15 @@ class FlashAttentionBackend(BaseAttnBackend):
         sliding_context_segments = None
 
         def _compile_fa_segments(context_batch):
-            compiled = compile_context_page_tables(page_table, context_batch)
+            compiled = compile_context_page_tables(
+                page_table,
+                context_batch,
+                output_layout="padded",
+            )
+            if compiled.padded_page_table is None:
+                raise RuntimeError(
+                    "FlashAttention Context compilation did not produce a page table."
+                )
             context_cu_q = context_batch.cu_seqlens_q.pin_memory().to(device, non_blocking=True)
             context_cu_k = context_batch.cu_seqlens_k.pin_memory().to(device, non_blocking=True)
             return FAContextSegmentMetadata(

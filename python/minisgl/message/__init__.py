@@ -4,6 +4,8 @@ from .backend import (
     BatchBackendMsg,
     ExitMsg,
     RepositionOpenMsg,
+    RepositionStepMsg,
+    StagedRepositionInit,
     UserMsg,
 )
 from .frontend import (
@@ -19,8 +21,8 @@ from .tokenizer import (
     BaseTokenizerMsg,
     BatchTokenizerMsg,
     DetokenizeMsg,
-    RequestRejectMsg,
     RepositionOpenAckMsg,
+    RequestRejectMsg,
     TokenizeMsg,
     WarmupAckMsg,
 )
@@ -32,6 +34,8 @@ __all__ = [
     "BatchBackendMsg",
     "ExitMsg",
     "RepositionOpenMsg",
+    "RepositionStepMsg",
+    "StagedRepositionInit",
     "UserMsg",
     "BaseTokenizerMsg",
     "BatchTokenizerMsg",

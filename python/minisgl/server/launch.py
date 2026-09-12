@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import logging
 import multiprocessing as mp
+import os
 import queue
 import signal
 import socket
 import sys
+import threading
 import time
+from contextlib import contextmanager
 from dataclasses import replace
 from typing import TYPE_CHECKING, Callable, Sequence
 
@@ -18,6 +21,28 @@ if TYPE_CHECKING:
 
 
 logger = init_logger(__name__, "initializer")
+
+
+@contextmanager
+def _backend_failure_interrupt():
+    """Unwind the API even when a dead backend leaves an HTTP request pending.
+
+    Uvicorn owns SIGINT/SIGTERM and may wait indefinitely for open transports
+    even after its second SIGINT. A separate, scoped signal interrupts its event
+    loop instead: asyncio cancels requests, then run_api_server's finally closes
+    frontend resources and stops this instance's remaining worker processes.
+    This is only for actual worker exit, never a request timeout or normal stop.
+    """
+    previous = signal.getsignal(signal.SIGUSR1)
+
+    def interrupt(_signum, _frame):
+        raise SystemExit(1)
+
+    signal.signal(signal.SIGUSR1, interrupt)
+    try:
+        yield lambda: os.kill(os.getpid(), signal.SIGUSR1)
+    finally:
+        signal.signal(signal.SIGUSR1, previous)
 
 
 def _check_public_port(host: str, port: int) -> None:
@@ -43,6 +68,29 @@ def _find_available_internal_port(*, exclude: set[int] | None = None) -> int:
 
 def _exited_workers(processes: Sequence[mp.Process]) -> list[mp.Process]:
     return [process for process in processes if process.exitcode is not None]
+
+
+def _start_worker_watchdog(
+    processes: Sequence[mp.Process], on_failure: Callable[[], None], *, poll_interval_s: float = 0.2
+) -> Callable[[], None]:
+    """Detect runtime worker loss; cancellation must precede normal worker shutdown."""
+    cancelled = threading.Event()
+
+    def watch() -> None:
+        while not cancelled.wait(poll_interval_s):
+            if _exited_workers(processes):
+                on_failure()
+                return
+
+    thread = threading.Thread(target=watch, name="minisgl-worker-watchdog", daemon=True)
+    thread.start()
+
+    def cancel() -> None:
+        cancelled.set()
+        if threading.current_thread() is not thread:
+            thread.join(timeout=1.0)
+
+    return cancel
 
 
 def _wait_for_worker_acks(
@@ -236,7 +284,17 @@ def launch_server(run_shell: bool = False) -> None:
 
             # Only the primary scheduler sends an acknowledgment after all TP ranks sync.
             _wait_for_worker_acks(processes, ack_queue, num_tokenizers + 2)
-            return stop
+            def failed() -> None:
+                logger.error("Backend worker exited; stopping this server instance.")
+                interrupt_backend_failure()
+
+            cancel_watchdog = _start_worker_watchdog(processes, failed)
+
+            def stop_monitored() -> None:
+                cancel_watchdog()
+                stop()
+
+            return stop_monitored
         except BaseException:
             stop()
             raise
@@ -248,7 +306,8 @@ def launch_server(run_shell: bool = False) -> None:
 
     signal.signal(signal.SIGTERM, interrupt_startup)
     try:
-        run_api_server(server_args, start_subprocess, run_shell=run_shell)
+        with _backend_failure_interrupt() as interrupt_backend_failure:
+            run_api_server(server_args, start_subprocess, run_shell=run_shell)
     finally:
         signal.signal(signal.SIGTERM, previous_sigterm)
 

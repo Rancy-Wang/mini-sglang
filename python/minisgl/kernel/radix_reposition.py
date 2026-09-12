@@ -128,9 +128,7 @@ def compile_radix_reposition_layout(
     effective_reposition_stages = torch.full(
         (reposition_count,), -1, dtype=torch.int32, device="cpu"
     )
-    drop_event_to_key = torch.full(
-        (len(drop_insert_offsets),), -1, dtype=torch.int64, device="cpu"
-    )
+    drop_event_to_key = torch.full((len(drop_insert_offsets),), -1, dtype=torch.int64, device="cpu")
     effective = torch.zeros(reposition_count, dtype=torch.bool, device="cpu")
     ignored = torch.zeros(reposition_count, dtype=torch.bool, device="cpu")
     status = torch.zeros(6, dtype=torch.int64, device="cpu")
@@ -199,6 +197,20 @@ def compile_radix_reposition_layout(
         next_position=int(status[3]),
         current_reposition=int(status[5]),
         compile_ns=time.perf_counter_ns() - compile_started_ns,
+    )
+
+
+def prewarm_radix_reposition_layout_kernel() -> None:
+    """Load and execute the structured Radix compiler before accepting work."""
+
+    empty = torch.empty(0, dtype=torch.int32, device="cpu")
+    compile_radix_reposition_layout(
+        torch.tensor([0], dtype=torch.int32, device="cpu"),
+        empty,
+        torch.zeros(1, dtype=torch.int32, device="cpu"),
+        empty,
+        empty,
+        empty,
     )
 
 
@@ -282,13 +294,9 @@ def validate_radix_reposition_records(
                 f"Delta range [{int(delta_start[row])}, {int(delta_end[row])}) precedes "
                 f"its materialization boundary {int(materialized_before[row])}."
             )
-        misplaced_reposition = is_reposition & (
-            field_one + 1 != materialized_before
-        )
+        misplaced_reposition = is_reposition & (field_one + 1 != materialized_before)
         if bool(torch.any(misplaced_reposition)):
-            raise ValueError(
-                "Reposition raw boundary does not match its record insertion point."
-            )
+            raise ValueError("Reposition raw boundary does not match its record insertion point.")
 
 
 def compile_radix_reposition_layout_batch(
@@ -333,5 +341,6 @@ __all__ = [
     "RadixRepositionLayout",
     "compile_radix_reposition_layout",
     "compile_radix_reposition_layout_batch",
+    "prewarm_radix_reposition_layout_kernel",
     "validate_radix_reposition_records",
 ]

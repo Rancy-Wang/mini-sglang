@@ -30,10 +30,63 @@ class ExitMsg(BaseBackendMsg):
 
 
 @dataclass
+class StagedRepositionInit:
+    """Immutable staged-Reposition program transferred once per request."""
+
+    input_ids: torch.Tensor
+    radix_records: torch.Tensor
+    radix_key_virtual_mask: torch.Tensor
+    radix_key_to_token: torch.Tensor
+    radix_token_to_key: torch.Tensor
+    initial_positions: torch.Tensor
+    initial_repos: torch.Tensor
+    drop_event_positions: torch.Tensor
+    drop_range_offsets: torch.Tensor
+    drop_position_ranges: torch.Tensor
+    full_token_visible_until: torch.Tensor | None
+    sampling_params: SamplingParams
+    prompt_tokens: int
+    radix_next_position: int
+    radix_final_reposition: int
+    enable_thinking: bool | None = None
+    stop: List[str] | None = None
+    stop_token_seqs: List[List[int]] | None = None
+    message_meta: Dict | None = None
+    request_is_warmup: bool = False
+    internal_uid: int | None = None
+    request_received_ns: int | None = None
+    tokenize_invocations: int = 1
+    chat_template_invocations: int = 0
+    radix_compile_ns: int = 0
+
+
+@dataclass
 class RepositionOpenMsg(BaseBackendMsg):
-    """Open a staged Reposition sequence and obtain its Prefill quantum."""
+    """Open staged Reposition and transfer its immutable program once."""
 
     uid: int
+    init: StagedRepositionInit
+
+
+@dataclass
+class RepositionStepMsg(BaseBackendMsg):
+    """Small per-dispatch cursor and optional position-transition delta."""
+
+    uid: int
+    end: int
+    is_final: bool
+    radix_commit_key_len: int | None
+    radix_current_reposition: int
+    transition_raw_tokens: torch.Tensor | None = None
+    transition_new_positions: torch.Tensor | None = None
+    transition_boundary: int | None = None
+    context_stage_count: int = 0
+    radix_match_ns: int = 0
+    retry_plan_ns: int = 0
+    reposition_transition_count: int = 0
+    reposition_h2d_bytes: int = 0
+    reposition_d2h_bytes: int = 0
+    reposition_ipc_tensor_bytes: int = 0
 
 
 @dataclass
@@ -83,6 +136,16 @@ class UserMsg(BaseBackendMsg):
     reposition_d2h_bytes: int = 0
     reposition_ipc_tensor_bytes: int = 0
     reposition_execution_mode: str | None = None
+    # Compact paged-occurrence wire program.  The scheduler performs exact
+    # Radix matching before expanding only the query window that missed cache.
+    occurrence_layout_birth_positions: torch.Tensor | None = None
+    occurrence_layout_birth_stages: torch.Tensor | None = None
+    occurrence_layout_transition_offsets: torch.Tensor | None = None
+    occurrence_layout_transition_raw_tokens: torch.Tensor | None = None
+    occurrence_layout_transition_old_positions: torch.Tensor | None = None
+    occurrence_layout_transition_new_positions: torch.Tensor | None = None
+    # Expanded runtime plan.  Retained for scheduler-local compatibility and
+    # tests; production tokenizer messages leave these fields empty.
     occurrence_raw_tokens: torch.Tensor | None = None
     occurrence_positions: torch.Tensor | None = None
     occurrence_birth_indices: torch.Tensor | None = None

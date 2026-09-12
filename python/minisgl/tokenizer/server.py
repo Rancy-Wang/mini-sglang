@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import multiprocessing as mp
+import time
 from typing import Any, List
 
 import torch
+from minisgl.core import SamplingParams
 from minisgl.message import (
     AbortBackendMsg,
     AbortMsg,
@@ -105,28 +107,57 @@ def _build_user_msg(msg: TokenizeMsg, t: Any) -> UserMsg:
     )
 
 
-def _build_occurrence_user_msg(msg: TokenizeMsg, t: Any) -> UserMsg:
-    from .reposition_occurrence import compile_reposition_occurrence_plan
+def _build_occurrence_radix_records(t: Any) -> torch.Tensor:
+    """Freeze real-token Radix rows at the KV position where each token was born."""
 
+    layout = t.reposition_layout
+    raw_boundaries = t.reposition_raw_boundaries
+    if layout is None or raw_boundaries is None:
+        raise ValueError("Paged-occurrence Reposition requires compiled event boundaries.")
+    if len(raw_boundaries) != len(layout.effective_reposition_stages):
+        raise ValueError("Reposition boundaries and effective stages have different lengths.")
+
+    stage_boundaries = torch.full(
+        (len(layout.transition_offsets),), -1, dtype=torch.int32, device="cpu"
+    )
+    effective_stages = layout.effective_reposition_stages.to(torch.int64)
+    effective = effective_stages > 0
+    if bool(torch.any(effective).item()):
+        stage_boundaries[effective_stages[effective]] = raw_boundaries[effective]
+
+    birth_stages = layout.birth_stages.to(torch.int64)
+    if bool(torch.any(birth_stages < 0).item()) or bool(
+        torch.any(birth_stages >= len(stage_boundaries)).item()
+    ):
+        raise ValueError("Paged-occurrence token birth stage is outside the compiled layout.")
+    token_boundaries = stage_boundaries[birth_stages]
+    if bool(torch.any((birth_stages > 0) & (token_boundaries < 0)).item()):
+        raise ValueError("Paged-occurrence token birth stage has no Reposition boundary.")
+
+    records = layout.records.clone()
+    token_rows = layout.token_to_key
+    records[token_rows, 2] = token_boundaries
+    records[token_rows, 3] = layout.birth_positions
+    return records
+
+
+def _build_occurrence_user_msg(msg: TokenizeMsg, t: Any) -> UserMsg:
     if t.reposition_layout is None or t.reposition_input_ids is None:
         raise ValueError("Paged-occurrence Reposition requires a precompiled layout.")
-    plan = compile_reposition_occurrence_plan(
-        t.reposition_layout,
-        t.full_token_visible_until,
-    )
     token_count = len(t.reposition_input_ids)
     visible_until = t.full_token_visible_until
     if visible_until is None:
         visible_until = torch.full((token_count,), token_count + 1, dtype=torch.int32, device="cpu")
     keep_mask = t.reposition_layout.keep_mask.to(dtype=torch.int32).contiguous()
     raw_positions = torch.arange(token_count, dtype=torch.int32, device="cpu")
+    radix_records = _build_occurrence_radix_records(t)
     message = UserMsg(
         uid=msg.uid,
         input_ids=t.reposition_input_ids,
         true_positions=t.reposition_layout.birth_positions,
         raw_positions=raw_positions,
-        radix_input_ids=t.reposition_layout.records[t.reposition_layout.token_to_key].contiguous(),
-        radix_match_ids=t.reposition_layout.records,
+        radix_input_ids=radix_records[t.reposition_layout.token_to_key].contiguous(),
+        radix_match_ids=radix_records,
         sampling_params=msg.sampling_params,
         prompt_tokens=t.prompt_tokens,
         radix_key_virtual_mask=t.reposition_layout.virtual_mask,
@@ -161,14 +192,16 @@ def _build_occurrence_user_msg(msg: TokenizeMsg, t: Any) -> UserMsg:
         radix_compile_ns=t.reposition_layout.compile_ns,
         reposition_transition_count=len(t.reposition_layout.transition_raw_tokens),
         reposition_execution_mode="paged-occurrence",
-        occurrence_raw_tokens=plan.occurrence_raw_tokens,
-        occurrence_positions=plan.occurrence_positions,
-        occurrence_birth_indices=plan.birth_occurrences,
-        occurrence_terminal_indices=plan.terminal_occurrences,
-        occurrence_segment_query_starts=plan.segment_query_starts,
-        occurrence_segment_query_ends=plan.segment_query_ends,
-        occurrence_segment_key_offsets=plan.segment_key_offsets,
-        occurrence_segment_key_indices=plan.segment_key_occurrences,
+        occurrence_layout_birth_positions=t.reposition_layout.birth_positions,
+        occurrence_layout_birth_stages=t.reposition_layout.birth_stages,
+        occurrence_layout_transition_offsets=t.reposition_layout.transition_offsets,
+        occurrence_layout_transition_raw_tokens=t.reposition_layout.transition_raw_tokens,
+        occurrence_layout_transition_old_positions=(
+            t.reposition_layout.transition_old_positions
+        ),
+        occurrence_layout_transition_new_positions=(
+            t.reposition_layout.transition_new_positions
+        ),
     )
     message.reposition_ipc_tensor_bytes = sum(
         value.numel() * value.element_size()
@@ -176,6 +209,45 @@ def _build_occurrence_user_msg(msg: TokenizeMsg, t: Any) -> UserMsg:
         if isinstance(value, torch.Tensor)
     )
     return message
+
+
+def _prewarm_tokenizer_worker(
+    tokenizer: Any,
+    tokenize_manager: Any,
+    *,
+    radix_drop_key_mode: str,
+    reposition_execution_mode: str,
+) -> None:
+    """Pay production tokenizer and structured Radix first-use costs before ready."""
+
+    tokenizer.encode("")
+    tokenizer.decode([])
+    if tokenize_manager.is_gpt_oss:
+        ordinary = TokenizeMsg(
+            uid=-1,
+            text=[{"role": "user", "content": "Tokenizer startup warmup."}],
+            sampling_params=SamplingParams(max_tokens=1),
+        )
+        tokenize_manager.tokenize([ordinary])
+    if radix_drop_key_mode == "delta-marker":
+        from minisgl.kernel.radix_reposition import prewarm_radix_reposition_layout_kernel
+
+        prewarm_radix_reposition_layout_kernel()
+        if tokenize_manager.is_gpt_oss:
+            structured = TokenizeMsg(
+                uid=-2,
+                text=[
+                    {"role": "user", "content": "old"},
+                    {"role": "assistant", "content": "answer"},
+                    {"role": "user", "content": "new"},
+                ],
+                sampling_params=SamplingParams(max_tokens=1),
+                drop_message={1: [0]},
+                reposition=[1],
+            )
+            tokenized = tokenize_manager.tokenize([structured])[0]
+            if reposition_execution_mode == "paged-occurrence":
+                _build_occurrence_user_msg(structured, tokenized)
 
 
 @torch.inference_mode()
@@ -209,6 +281,17 @@ def tokenize_worker(
     tokenize_manager = TokenizeManager(tokenizer, radix_drop_key_mode=radix_drop_key_mode)
     detokenize_manager = DetokenizeManager(tokenizer)
     reposition_sequences: dict[int, RepositionSequenceState] = {}
+    prewarm_started_ns = time.perf_counter_ns()
+    _prewarm_tokenizer_worker(
+        tokenizer,
+        tokenize_manager,
+        radix_drop_key_mode=radix_drop_key_mode,
+        reposition_execution_mode=reposition_execution_mode,
+    )
+    logger.info(
+        "Tokenizer/Radix prewarm completed in %.2f ms.",
+        (time.perf_counter_ns() - prewarm_started_ns) / 1e6,
+    )
 
     if ack_queue is not None:
         ack_queue.put(f"Tokenize server {tokenizer_id} is ready")
