@@ -261,6 +261,7 @@ def test_flashattention_uses_segments_only_for_sliding_layers(monkeypatch) -> No
     batch = SimpleNamespace(
         attn_metadata=metadata,
         out_loc=torch.tensor([0], dtype=torch.int32),
+        occurrence_source_pages=None,
     )
     q = torch.zeros((1, 1, 2))
     k = torch.zeros((1, 2))
@@ -333,6 +334,7 @@ def test_flashinfer_gap_decode_uses_decode_wrapper_and_preserves_sinks() -> None
     batch = SimpleNamespace(
         attn_metadata=metadata,
         out_loc=torch.tensor([0], dtype=torch.int32),
+        occurrence_source_pages=None,
     )
     q = torch.zeros((1, 1, 2))
     k = torch.zeros((1, 2))
