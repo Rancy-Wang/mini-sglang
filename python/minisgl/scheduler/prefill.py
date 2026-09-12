@@ -932,8 +932,10 @@ class PrefillAdder:
             )
             birth_owned[fresh_raw] = True
 
-            retained_ids = torch.unique(torch.cat((persistent_ids, fresh_birth_occurrences)))
-            transient_ids = allocated_ids[~torch.isin(allocated_ids, retained_ids)]
+            retained_mask = torch.zeros(occurrence_count, dtype=torch.bool, device="cpu")
+            retained_mask[persistent_ids] = True
+            retained_mask[fresh_birth_occurrences] = True
+            transient_ids = allocated_ids[~retained_mask[allocated_ids]]
             transient_pages = runtime_pages[
                 transient_ids.pin_memory().to(self.cache_manager.device, non_blocking=True)
             ]

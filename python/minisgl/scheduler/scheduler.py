@@ -223,7 +223,8 @@ class Scheduler(SchedulerIOMixin):
             self._process_one_msg(msg)
 
         # A final masked prefill must compact before an overlapping decode reads
-        # its page table. Process the sampled token once, then resume overlap.
+        # its page table. Normally _forward queues that transition on the engine
+        # stream; keep this synchronous fallback for batches not transitioned yet.
         if last_data is not None and any(
             not isinstance(req, ChunkedReq) and req.context_post_prefill_keep_mask is not None
             for req in last_data[0].batch.reqs
@@ -387,9 +388,17 @@ class Scheduler(SchedulerIOMixin):
         prompt_raw = req.raw_positions[:prompt_len].to(dtype=torch.int64, device="cpu")
         if len(prompt_raw) == 0 or int(prompt_raw[-1]) >= len(keep_mask):
             raise RuntimeError("Post-Prefill keep mask does not cover the prompt raw positions.")
-        keep = (keep_mask[prompt_raw] != 0).to(dtype=torch.bool, device="cpu")
+        keep = req.context_decode_keep_mask
+        keep_indices = req.context_decode_keep_indices
+        dropped_owned_indices = req.context_decode_dropped_owned_indices
+        if keep is None:
+            keep = (keep_mask[prompt_raw] != 0).to(dtype=torch.bool, device="cpu")
+        elif len(keep) != prompt_len:
+            raise RuntimeError("Prepared Decode keep mask does not cover the prompt.")
         if not bool(torch.any(keep).item()):
             raise RuntimeError("Cannot Drop every prompt token before generation.")
+        if keep_indices is None:
+            keep_indices = torch.nonzero(keep, as_tuple=False).view(-1)
 
         external_storage = req.occurrence_external_storage
         page_row = (
@@ -398,7 +407,6 @@ class Scheduler(SchedulerIOMixin):
             else self.table_manager.page_table[req.table_idx]
         )
         pages = page_row[:prompt_len].clone()
-        keep_device = keep.to(device=pages.device, non_blocking=True)
         active_slots = torch.arange(prompt_len, dtype=torch.int64, device="cpu")
         if req.occurrence_terminal_owned_mask is not None:
             if len(req.occurrence_terminal_owned_mask) != prompt_len:
@@ -409,10 +417,12 @@ class Scheduler(SchedulerIOMixin):
             if req.retry_transformed_mask is not None:
                 owned[: len(req.retry_transformed_mask)] |= req.retry_transformed_mask
         dropped_owned = (~keep) & owned
-        if bool(torch.any(dropped_owned).item()):
-            dropped_device = dropped_owned.to(device=pages.device, non_blocking=True)
+        if dropped_owned_indices is None:
+            dropped_owned_indices = torch.nonzero(dropped_owned, as_tuple=False).view(-1)
+        if len(dropped_owned_indices) > 0:
+            dropped_device = dropped_owned_indices.to(device=pages.device, non_blocking=True)
             dropped_positions = prompt_raw[dropped_owned]
-            dropped_pages = pages[dropped_device]
+            dropped_pages = pages.index_select(0, dropped_device)
             if req.inactive_cached_positions is None:
                 req.inactive_cached_positions = dropped_positions
                 req.inactive_cached_pages = dropped_pages
@@ -423,7 +433,7 @@ class Scheduler(SchedulerIOMixin):
                 )
                 req.inactive_cached_pages = torch.cat((req.inactive_cached_pages, dropped_pages))
 
-        kept_count = int(torch.count_nonzero(keep).item())
+        kept_count = len(keep_indices)
         if kept_count + 1 > self.table_manager.page_table.shape[1]:
             raise RuntimeError("Active prompt and sampled token exceed the decode table.")
         tokens = (
@@ -431,9 +441,12 @@ class Scheduler(SchedulerIOMixin):
             if external_storage
             else self.table_manager.token_pool[req.table_idx]
         )
-        self.table_manager.page_table[req.table_idx, :kept_count].copy_(pages[keep_device])
+        keep_device = keep_indices.to(device=pages.device, non_blocking=True)
+        self.table_manager.page_table[req.table_idx, :kept_count].copy_(
+            pages.index_select(0, keep_device)
+        )
         self.table_manager.token_pool[req.table_idx, :kept_count].copy_(
-            tokens[:prompt_len][keep_device]
+            tokens[:prompt_len].index_select(0, keep_device)
         )
         self.table_manager.token_pool[req.table_idx, kept_count].copy_(tokens[prompt_len])
         if external_storage:
@@ -475,6 +488,9 @@ class Scheduler(SchedulerIOMixin):
         req.use_context_mask = False
         req.context_compact_stream = False
         req.context_post_prefill_keep_mask = None
+        req.context_decode_keep_mask = None
+        req.context_decode_keep_indices = None
+        req.context_decode_dropped_owned_indices = None
         req.full_input_ids = None
         req.full_token_visible_until = None
         req.full_keep_mask = None
@@ -758,6 +774,10 @@ class Scheduler(SchedulerIOMixin):
             transient = req.occurrence_transient_pages
             if transient is not None:
                 released.append(transient)
+            # Early post-Prefill compaction can move owned terminal pages out of
+            # the active row before an abort arrives. They are still request-owned.
+            if req.inactive_cached_pages is not None:
+                released.append(req.inactive_cached_pages)
             owned = req.occurrence_terminal_owned_mask
             if owned is not None and bool(torch.any(owned).item()):
                 owned_device = (
@@ -766,7 +786,12 @@ class Scheduler(SchedulerIOMixin):
                     .pin_memory()
                     .to(self.cache_manager.device, non_blocking=True)
                 )
-                pages = self.table_manager.occurrence_pages(req.table_idx)[owned_device].clone()
+                page_row = (
+                    self.table_manager.occurrence_pages(req.table_idx)
+                    if req.occurrence_external_storage
+                    else self.table_manager.page_table[req.table_idx]
+                )
+                pages = page_row[owned_device].clone()
                 released.append(pages)
             birth_pages = req.occurrence_birth_pages
             birth_owned = req.occurrence_birth_owned_mask
@@ -839,6 +864,26 @@ class Scheduler(SchedulerIOMixin):
         else:
             batch.out_loc = self.engine.page_table[input_mapping]
         self.engine.attn_backend.prepare_metadata(batch)
+        for req in batch.reqs:
+            if isinstance(req, ChunkedReq) or req.context_post_prefill_keep_mask is None:
+                continue
+            prompt_len = req.device_len
+            prompt_raw = req.raw_positions[:prompt_len].to(dtype=torch.int64, device="cpu")
+            keep = (req.context_post_prefill_keep_mask[prompt_raw] != 0).to(torch.bool)
+            if not bool(torch.any(keep).item()):
+                raise RuntimeError("Cannot Drop every prompt token before generation.")
+            owned = torch.arange(prompt_len, dtype=torch.int64) >= req.initial_active_cached_len
+            if req.occurrence_terminal_owned_mask is not None:
+                if len(req.occurrence_terminal_owned_mask) != prompt_len:
+                    raise RuntimeError("Occurrence-owned pages do not cover the prompt stream.")
+                owned = req.occurrence_terminal_owned_mask
+            elif req.retry_transformed_mask is not None:
+                owned[: len(req.retry_transformed_mask)] |= req.retry_transformed_mask
+            req.context_decode_keep_mask = keep
+            req.context_decode_keep_indices = torch.nonzero(keep, as_tuple=False).view(-1)
+            req.context_decode_dropped_owned_indices = torch.nonzero(
+                (~keep) & owned, as_tuple=False
+            ).view(-1)
         forward_input = ForwardInput(
             batch=batch,
             sample_args=self.engine.sampler.prepare(batch),
@@ -900,6 +945,19 @@ class Scheduler(SchedulerIOMixin):
                 self.table_manager.occurrence_tokens(req.table_idx)[req.cached_len].copy_(
                     forward_output.next_tokens_gpu[index]
                 )
+        transitioned = False
+        for req in batch.reqs:
+            if not isinstance(req, ChunkedReq) and getattr(
+                req, "context_post_prefill_keep_mask", None
+            ) is not None:
+                self._compact_context_after_prefill(req)
+                transitioned = True
+        if transitioned:
+            # The scheduler stream may prepare the next Decode immediately, but
+            # its graph-visible table reads must follow the engine-stream copy.
+            transition_done = torch.cuda.Event()
+            transition_done.record(self.engine.stream)
+            self.stream.wait_event(transition_done)
         self.decode_manager.filter_reqs(forward_input.batch.reqs)
         return forward_output
 
