@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import copy
 import json
 import sys
 import time
 from pathlib import Path
 
+from scripts.compare_occurrence_replays import canonical_message, compare_pair
 from scripts.profile_reposition_matrix import (
     PROFILE_CONFIG_ENV,
     EventProfiler,
@@ -14,6 +16,35 @@ from scripts.profile_reposition_matrix import (
     summarize_profile,
     targets_for_framework,
 )
+
+
+def test_replay_comparator_only_ignores_tool_call_uuid():
+    message = {"content": "same", "reasoning_content": "same reasoning",
+               "tool_calls": [{"id": "call_a", "function": {"name": "f", "arguments": "{}"}}]}
+    changed = copy.deepcopy(message)
+    changed["tool_calls"][0]["id"] = "call_b"
+    assert canonical_message(changed) == canonical_message(message)
+    assert message["tool_calls"][0]["id"] == "call_a"
+    changed["tool_calls"][0]["function"]["arguments"] = "{ }"
+    assert canonical_message(changed) != canonical_message(message)
+
+
+def test_replay_comparator_rejects_token_difference_even_with_equal_text():
+    manifest = {key: None for key in (
+        "argv", "mode", "qid", "uid_range", "max_tokens", "gpus",
+        "trajectory_sha256", "tools_sha256", "rolling_k", "head"
+    )}
+    replay = {"manifest": manifest, "inputs": {0: "fingerprint"}, "tokens": {0: [1, 2]},
+              "turns": [{"uid": 0, "request_sha256": "request", "server_ttft_ms": 1,
+                         "server_tpot_ms": 1, "canonical_response": {
+                             "message": {"content": "same text"}, "finish_reason": "length",
+                             "usage": {"prompt_tokens": 4, "completion_tokens": 2}}}]}
+    candidate = copy.deepcopy(replay)
+    assert compare_pair(replay, candidate)["output_pass"]
+    candidate["tokens"][0] = [1, 3]
+    report = compare_pair(replay, candidate)
+    assert not report["output_pass"]
+    assert report["turns"][0]["message_equal"]
 
 
 def _profile_probe(profiler: EventProfiler) -> None:
