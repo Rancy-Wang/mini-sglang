@@ -318,6 +318,7 @@ class PrefillAdder:
         start: int,
         end: int,
         terminal_owned: torch.Tensor,
+        initial_source_positions: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, int, int, int]:
         """Return IDs, current allocations, persistent allocations, and future reserve."""
 
@@ -340,7 +341,13 @@ class PrefillAdder:
         prior_raw = required_raw[prior]
         prior_birth_ids = req.occurrence_birth_indices[prior_raw].to(torch.int64)
         canonical_positions = req.occurrence_positions[prior_birth_ids]
-        reuse_terminal = terminal_owned[prior_raw] & (
+        if initial_source_positions is None:
+            initial_source_positions = torch.empty(0, dtype=torch.int32, device="cpu")
+        matched_prior = prior_raw < len(initial_source_positions)
+        canonical_positions[matched_prior] = initial_source_positions[
+            prior_raw[matched_prior]
+        ]
+        reuse_terminal = (~matched_prior) & terminal_owned[prior_raw] & (
             required_positions[prior] == terminal_positions[prior_raw]
         )
         canonical_positions[reuse_terminal] = terminal_positions[prior_raw[reuse_terminal]]
@@ -368,13 +375,15 @@ class PrefillAdder:
         )
         if len(final_keep) != len(owner_after):
             raise RuntimeError("Occurrence final keep mask does not cover the prompt plan.")
-        needs_terminal = final_keep & (~owner_after) & (terminal_positions != birth_positions)
-        recyclable_terminal_pages = int(
-            torch.count_nonzero(
-                owner_after & (~final_keep) & (terminal_positions != birth_positions)
-            ).item()
+        # All final pages, including dropped tokens, must survive until Radix
+        # adopts them. The matched prefix already has its terminal source pages.
+        uncached_raw = torch.arange(len(owner_after), device="cpu") >= len(
+            initial_source_positions
         )
-        output_reserve = max(0, req.output_len - recyclable_terminal_pages)
+        needs_terminal = (
+            uncached_raw & (~owner_after) & (terminal_positions != birth_positions)
+        )
+        output_reserve = req.output_len
         future_birth_pages = len(owner_after) - end
         future_reserve = (
             future_birth_pages + int(torch.count_nonzero(needs_terminal).item()) + output_reserve
@@ -507,6 +516,13 @@ class PrefillAdder:
                         raise RuntimeError(
                             "Matched source positions do not cover the cached prefix."
                         )
+                    terminal_positions = occurrence_positions[
+                        terminal_ids[:cached_len].to(torch.int64)
+                    ]
+                    if not torch.equal(source_positions, terminal_positions):
+                        raise RuntimeError(
+                            "Matched occurrence pages are not keyed by final positions."
+                        )
                     terminal_owned = torch.zeros(plan_token_count, dtype=torch.bool, device="cpu")
                     birth_pages = torch.full(
                         (plan_token_count,),
@@ -613,6 +629,7 @@ class PrefillAdder:
                         req.occurrence_segment_key_indices,
                         terminal_owned.contiguous(),
                         final_keep,
+                        source_positions.contiguous(),
                         chunk_start=cached_len,
                         max_chunk_end=max_end,
                         output_len=req.output_len,
@@ -695,6 +712,7 @@ class PrefillAdder:
                                     start=cached_len,
                                     end=end,
                                     terminal_owned=terminal_owned,
+                                    initial_source_positions=source_positions,
                                 )
                                 capacity_cache[end] = capacity
                             return capacity
@@ -748,6 +766,7 @@ class PrefillAdder:
                 start=cached_len,
                 end=cached_len + 1,
                 terminal_owned=terminal_owned,
+                initial_source_positions=source_positions,
             )
             _, current_pages, persistent_pages, future_pages = minimum
             minimum_pages = max(current_pages, persistent_pages + future_pages)
@@ -792,7 +811,11 @@ class PrefillAdder:
             prior_raw_device = prior_raw.pin_memory().to(
                 self.cache_manager.device, non_blocking=True
             )
-            reuse_terminal = terminal_owned[prior_raw] & (
+            matched_prior = prior_raw < len(source_positions)
+            canonical_positions[matched_prior] = source_positions[
+                prior_raw[matched_prior]
+            ]
+            reuse_terminal = (~matched_prior) & terminal_owned[prior_raw] & (
                 required_positions[prior]
                 == occurrence_positions[terminal_ids[prior_raw].to(torch.int64)]
             )
@@ -1727,40 +1750,8 @@ class PrefillManager:
         chunk.occurrence_transform_destination_pages = None
         chunk.occurrence_transform_position_pairs = None
         chunk.occurrence_inflight = False
-
-        owned = chunk.occurrence_terminal_owned_mask
-        visible_until = chunk.full_token_visible_until
-        keep_mask = chunk.full_keep_mask
-        if owned is None or visible_until is None or keep_mask is None:
-            raise RuntimeError("Occurrence chunk lost its terminal page-lifetime metadata.")
-        raw = torch.arange(len(owned), dtype=torch.int64, device="cpu")
-        releasable = (
-            owned
-            & (~keep_mask.to(dtype=torch.bool, device="cpu"))
-            & (raw < chunk.cached_len)
-            & (visible_until.to(dtype=torch.int64, device="cpu") <= chunk.cached_len)
-        )
-        if bool(torch.any(releasable).item()):
-            raw_device = (
-                torch.nonzero(releasable, as_tuple=False)
-                .view(-1)
-                .pin_memory()
-                .to(self.cache_manager.device, non_blocking=True)
-            )
-            table = self.table_manager.occurrence_pages(chunk.table_idx)
-            released = table[raw_device].clone()
-            birth_pages = chunk.occurrence_birth_pages
-            birth_owned = chunk.occurrence_birth_owned_mask
-            if birth_pages is None or birth_owned is None:
-                raise RuntimeError("Occurrence chunk lost its birth page-lifetime metadata.")
-            if bool(torch.any(birth_owned).item()):
-                owned_birth_pages = birth_pages[
-                    birth_owned.pin_memory().to(self.cache_manager.device, non_blocking=True)
-                ]
-                released = released[~torch.isin(released, owned_birth_pages)]
-            self.cache_manager.free_occurrence_pages(torch.unique(released))
-            table[raw_device] = -1
-            owned[releasable] = False
+        # Dropped terminal pages are still final Radix candidates. Do not
+        # recycle them before the finished-request commit (or abort cleanup).
 
     def schedule_next_batch(self, prefill_budget: int) -> Batch | None:
         if len(self.pending_list) == 0:

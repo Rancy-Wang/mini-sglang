@@ -438,24 +438,12 @@ class CacheManager:
             old_full_cached_len = old_handle.physical_cached_len
             occurrence_birth_pages = getattr(req, "occurrence_birth_pages", None)
             occurrence_birth_owned = getattr(req, "occurrence_birth_owned_mask", None)
-            birth_prefix_len = 0
             if occurrence_birth_pages is not None:
                 if occurrence_birth_owned is None:
                     raise RuntimeError("Occurrence birth page ownership is missing.")
-                birth_prefix_len = min(len(occurrence_birth_pages), full_token_prefix_len)
-                canonical_birth_pages = occurrence_birth_pages[:birth_prefix_len]
-                if bool(torch.any(canonical_birth_pages < 0).item()):
-                    raise RuntimeError("Occurrence canonical birth cache contains a page hole.")
-                full_indices[:birth_prefix_len] = canonical_birth_pages
-                filled[:birth_prefix_len] = True
-                if old_full_cached_len > birth_prefix_len:
-                    raise RuntimeError("Matched occurrence prefix exceeds canonical birth pages.")
-                if old_full_cached_len > 0 and not torch.equal(
-                    canonical_birth_pages[:old_full_cached_len],
-                    req.initial_full_match_indices[:old_full_cached_len],
-                ):
-                    raise RuntimeError("Matched occurrence pages disagree with canonical births.")
-            elif old_full_cached_len > 0:
+                if old_full_cached_len > len(occurrence_birth_pages):
+                    raise RuntimeError("Matched occurrence prefix exceeds its page metadata.")
+            if old_full_cached_len > 0:
                 if len(req.initial_full_match_indices) < old_full_cached_len:
                     raise RuntimeError(
                         "Initial full-token match indices are shorter than the cache handle."
@@ -471,7 +459,6 @@ class CacheManager:
                 device=active_indices.device, non_blocking=True
             )
             overlap = active_positions < old_full_cached_len
-            birth_backed = active_positions < birth_prefix_len
             if bool(torch.any(overlap).item()):
                 transformed = torch.zeros(len(active_indices), dtype=torch.bool, device="cpu")
                 if req.retry_transformed_mask is not None:
@@ -484,7 +471,11 @@ class CacheManager:
                             "Occurrence-owned mask exceeds the active cache candidate prefix."
                         )
                     transformed[:occurrence_owned_len] |= occurrence_owned
-                ordinary_overlap = overlap & (~transformed) & (~birth_backed)
+                # A final-key occurrence hit must still point at exactly the
+                # matched final page. Staged Retry retains its old exception.
+                ordinary_overlap = (
+                    overlap if occurrence_birth_pages is not None else overlap & (~transformed)
+                )
                 ordinary_device = ordinary_overlap.to(
                     device=active_indices.device, non_blocking=True
                 )
@@ -493,7 +484,11 @@ class CacheManager:
                     active_indices[ordinary_device],
                 ):
                     raise RuntimeError("Matched delta-marker tokens use different KV slots.")
-            active_write = ~birth_backed
+            active_write = (
+                ~overlap
+                if occurrence_birth_pages is not None
+                else torch.ones(len(active_indices), dtype=torch.bool, device="cpu")
+            )
             active_write_device = active_write.to(
                 device=active_indices.device, dtype=torch.bool, non_blocking=True
             )
@@ -512,7 +507,11 @@ class CacheManager:
                 inactive_device = inactive_positions.to(
                     device=active_indices.device, dtype=torch.int64, non_blocking=True
                 )
-                inactive_write = inactive_positions >= birth_prefix_len
+                inactive_write = (
+                    inactive_positions >= old_full_cached_len
+                    if occurrence_birth_pages is not None
+                    else torch.ones(len(inactive_positions), dtype=torch.bool, device="cpu")
+                )
                 inactive_write_device = inactive_write.to(
                     device=inactive_pages.device, dtype=torch.bool, non_blocking=True
                 )

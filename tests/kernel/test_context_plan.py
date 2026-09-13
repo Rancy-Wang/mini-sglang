@@ -330,15 +330,17 @@ def test_occurrence_sliding_plan_accepts_window_starting_at_cached_len() -> None
 
 
 @pytest.mark.parametrize(
-    ("chunk_start", "terminal_owned"),
+    ("chunk_start", "terminal_owned", "source_positions"),
     [
-        (0, [False, False, False, False, False]),
-        (2, [True, False, False, False, False]),
+        (0, [False, False, False, False, False], []),
+        (2, [True, False, False, False, False], []),
+        (2, [False, False, False, False, False], [-1, 0]),
     ],
 )
 def test_occurrence_capacity_index_matches_reference_for_every_endpoint(
     chunk_start: int,
     terminal_owned: list[bool],
+    source_positions: list[int],
 ) -> None:
     occurrence_raw = torch.tensor([0, 1, 2, 3, 4, 0, 1, 2], dtype=torch.int32)
     occurrence_positions = torch.tensor([0, 1, 2, 3, 4, -1, 0, 1], dtype=torch.int32)
@@ -349,6 +351,7 @@ def test_occurrence_capacity_index_matches_reference_for_every_endpoint(
     segment_offsets = torch.tensor([0, 2, 7], dtype=torch.int32)
     segment_keys = torch.tensor([0, 1, 5, 6, 2, 3, 4], dtype=torch.int32)
     owned = torch.tensor(terminal_owned, dtype=torch.bool)
+    source = torch.tensor(source_positions, dtype=torch.int32)
     final_keep = torch.tensor([False, True, True, False, True], dtype=torch.bool)
     req = PendingReq(
         uid=7,
@@ -381,6 +384,7 @@ def test_occurrence_capacity_index_matches_reference_for_every_endpoint(
         segment_keys,
         owned,
         final_keep,
+        source,
         chunk_start=chunk_start,
         max_chunk_end=5,
         output_len=req.output_len,
@@ -395,6 +399,7 @@ def test_occurrence_capacity_index_matches_reference_for_every_endpoint(
                 start=chunk_start,
                 end=endpoint,
                 terminal_owned=owned,
+                initial_source_positions=source,
             )
         )
         actual_required = (

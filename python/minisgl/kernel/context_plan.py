@@ -113,6 +113,7 @@ def prewarm_context_plan_variants() -> None:
         raw_positions,
         torch.zeros(2, dtype=torch.bool, device="cpu"),
         torch.ones(2, dtype=torch.bool, device="cpu"),
+        torch.tensor([0], dtype=torch.int32, device="cpu"),
         chunk_start=1,
         max_chunk_end=2,
         output_len=1,
@@ -313,6 +314,7 @@ def try_build_occurrence_capacity_index(
     segment_key_occurrences: torch.Tensor,
     terminal_owned: torch.Tensor,
     final_keep: torch.Tensor,
+    initial_source_positions: torch.Tensor | None = None,
     *,
     chunk_start: int,
     max_chunk_end: int,
@@ -339,6 +341,10 @@ def try_build_occurrence_capacity_index(
         return None
     if not _is_cpu_bool_vector(terminal_owned) or not _is_cpu_bool_vector(final_keep):
         return None
+    if initial_source_positions is None:
+        initial_source_positions = torch.empty(0, dtype=torch.int32, device="cpu")
+    if not _is_cpu_int32_vector(initial_source_positions):
+        return None
 
     endpoint_count = int(max_chunk_end) - int(chunk_start)
     if endpoint_count <= 0:
@@ -351,6 +357,7 @@ def try_build_occurrence_capacity_index(
         *int32_inputs,
         terminal_owned,
         final_keep,
+        initial_source_positions,
         int(chunk_start),
         int(max_chunk_end),
         int(output_len),

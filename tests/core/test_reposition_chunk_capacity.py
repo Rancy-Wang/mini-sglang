@@ -239,7 +239,7 @@ def _owned_occurrence_pages(req, table: TableManager) -> torch.Tensor:
     return torch.unique(torch.cat([part[part >= 0] for part in parts]))
 
 
-def test_occurrence_radix_records_freeze_token_rows_at_birth_state() -> None:
+def test_occurrence_radix_records_use_final_compiler_state() -> None:
     layout = _layout()
     altered_records = layout.records.clone()
     altered_records[layout.token_to_key, 2] += 100
@@ -254,9 +254,10 @@ def test_occurrence_radix_records_freeze_token_rows_at_birth_state() -> None:
         SimpleNamespace(reposition_layout=altered, reposition_raw_boundaries=boundaries)
     )
 
-    assert torch.equal(original, later_terminal)
-    assert original[:, 2].tolist() == [-1, -1, -1, -1, 3, 3, 3, 6]
-    assert torch.equal(original[:, 3], layout.birth_positions)
+    assert torch.equal(original, layout.records)
+    assert torch.equal(later_terminal, altered_records)
+    assert torch.equal(original[:, 3], layout.positions)
+    assert not torch.equal(original[:, 3], layout.birth_positions)
 
 
 @pytest.mark.parametrize("budget", [2, 8])
@@ -335,6 +336,10 @@ def test_paged_occurrence_chunks_until_the_full_prompt_is_covered() -> None:
         transient_count = len(req.occurrence_transient_pages)
         available_before = cache.available_size
         _complete_intermediate_chunk(manager, req)
+        if req.cached_len >= 4:
+            # The first raw token is already dropped, but its final page is
+            # still needed for the finished-request Radix commit.
+            assert int(table.occurrence_pages(req.table_idx)[0]) >= 0
         assert cache.available_size >= available_before + transient_count
         owned_pages = _owned_occurrence_pages(req, table)
         assert cache.available_size + len(owned_pages) == cache.num_pages
@@ -408,7 +413,7 @@ def test_paged_occurrence_max_endpoint_uses_precomputed_capacity(
     _free_occurrence_request(req, cache, table)
 
 
-def test_paged_occurrence_reuses_a_canonical_birth_prefix() -> None:
+def test_paged_occurrence_reuses_a_canonical_final_prefix() -> None:
     manager, cache, table, _ = _manager(num_pages=14, table_count=1)
     pending = _pending(uid=102)
     cached_pages = cache._allocate(6)
@@ -429,7 +434,28 @@ def test_paged_occurrence_reuses_a_canonical_birth_prefix() -> None:
     cache.check_integrity()
 
 
-def test_finished_occurrence_caches_birth_pages_and_releases_terminal_copies() -> None:
+def test_matched_final_page_is_rotated_to_an_earlier_prefill_stage() -> None:
+    manager, cache, table, _ = _manager(num_pages=32, table_count=1)
+    pending = _pending(uid=117)
+    cached_pages = cache._allocate(3)
+    cache.prefix_cache.insert_prefix(pending.radix_match_ids[:3], cached_pages)
+    manager.pending_list.append(pending)
+
+    batch = manager.schedule_next_batch(prefill_budget=5)
+
+    assert batch is not None
+    req = batch.reqs[0]
+    assert req.cached_len == 3
+    assert req.occurrence_initial_source_positions.tolist() == [0, 0, 1]
+    assert req.occurrence_transform_position_pairs is not None
+    assert [0, 1] in req.occurrence_transform_position_pairs.tolist()
+    assert req.occurrence_birth_owned_mask is not None
+    assert not bool(torch.any(req.occurrence_birth_owned_mask[:3]).item())
+    _free_occurrence_request(req, cache, table)
+    cache.check_integrity()
+
+
+def test_finished_occurrence_caches_final_pages_and_releases_birth_copies() -> None:
     manager, cache, table, _ = _manager(num_pages=32, table_count=1)
     pending = _pending(uid=114)
     pending.context_post_prefill_keep_mask = pending.full_keep_mask
@@ -446,6 +472,7 @@ def test_finished_occurrence_caches_birth_pages_and_releases_terminal_copies() -
     birth_pages = req.occurrence_birth_pages.clone()
     terminal_pages = table.occurrence_pages(req.table_idx)[: len(birth_pages)].clone()
     terminal_only = terminal_pages[~torch.isin(terminal_pages, birth_pages)]
+    birth_only = birth_pages[~torch.isin(birth_pages, terminal_pages)]
     assert len(terminal_only) > 0
 
     req.complete_one()
@@ -475,11 +502,19 @@ def test_finished_occurrence_caches_birth_pages_and_releases_terminal_copies() -
 
     assert match is not None
     assert match.full_cached_len == 8
-    assert torch.equal(match.full_match_indices, birth_pages)
+    assert torch.equal(match.full_match_indices, terminal_pages)
     assert match.retry_plan is None
     assert match.retry_plan_ns == 0
     free_pages = set(cache.free_slots.tolist())
-    assert set(terminal_only.tolist()).issubset(free_pages)
+    assert set(terminal_only.tolist()).isdisjoint(free_pages)
+    assert set(birth_only.tolist()).issubset(free_pages)
+    changed_final = later.radix_match_ids.clone()
+    changed_final[3, 3] += 1
+    later.radix_match_ids = changed_final
+    changed_match = cache.match_occurrence_req(later)
+    assert changed_match is not None
+    assert changed_match.full_cached_len == 3
+    assert changed_match.retry_plan is None
     cache.check_integrity()
 
 
