@@ -44,12 +44,17 @@ def load_replay(path: Path) -> dict:
         for line in file.read_text().splitlines():
             row = json.loads(line)
             inputs.setdefault(row["uid"], []).append((row["warmup"], row["tensors"]))
+    # TokenizerServer.run startup probes are not model requests. Preserve and
+    # compare them separately; never discard unknown or missing request UIDs.
+    probes = {uid: inputs.pop(uid) for uid in (-1, -2) if uid in inputs}
     if sorted(tokens) != expected or sorted(inputs) != expected:
         raise ValueError(f"Missing token IDs or input fingerprints: {path}")
-    return dict(manifest=manifest, turns=turns, tokens=tokens, inputs=inputs)
+    return dict(manifest=manifest, turns=turns, tokens=tokens, inputs=inputs, probes=probes)
 
 
 def compare_pair(baseline: dict, candidate: dict) -> dict:
+    if baseline.get("probes", {}) != candidate.get("probes", {}):
+        raise ValueError("Tokenizer startup probe fingerprints differ")
     for key in ("argv", "mode", "qid", "uid_range", "max_tokens", "gpus",
                 "trajectory_sha256", "tools_sha256", "rolling_k"):
         if baseline["manifest"][key] != candidate["manifest"][key]:

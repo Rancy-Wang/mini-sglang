@@ -6,7 +6,7 @@ import sys
 import time
 from pathlib import Path
 
-from scripts.compare_occurrence_replays import canonical_message, compare_pair
+from scripts.compare_occurrence_replays import canonical_message, compare_pair, load_replay
 from scripts.profile_reposition_matrix import (
     PROFILE_CONFIG_ENV,
     EventProfiler,
@@ -45,6 +45,30 @@ def test_replay_comparator_rejects_token_difference_even_with_equal_text():
     report = compare_pair(replay, candidate)
     assert not report["output_pass"]
     assert report["turns"][0]["message_equal"]
+
+
+def test_replay_loader_preserves_probes_and_rejects_missing_requests(tmp_path):
+    (tmp_path / "complete.json").write_text(json.dumps({"status": "complete", "records": 1}))
+    (tmp_path / "manifest.json").write_text(json.dumps({"uid_range": [0, 0]}))
+    (tmp_path / "turns.jsonl").write_text(json.dumps({"uid": 0}) + "\n")
+    observer = tmp_path / "observer"
+    observer.mkdir()
+    (observer / "tokens-0.json").write_text(json.dumps({"0": [1, 2]}))
+    rows = [{"uid": uid, "warmup": False, "tensors": {"input_ids": "hash"}}
+            for uid in (-1, -2, 0)]
+    inputs = observer / "inputs-1.jsonl"
+    inputs.write_text("\n".join(json.dumps(row) for row in rows))
+    replay = load_replay(tmp_path)
+    assert sorted(replay["inputs"]) == [0]
+    assert sorted(replay["probes"]) == [-2, -1]
+    for invalid in (rows[:2], rows + [dict(rows[0], uid=-3)]):
+        inputs.write_text("\n".join(json.dumps(row) for row in invalid))
+        try:
+            load_replay(tmp_path)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("Missing requests and unknown UIDs must fail")
 
 
 def _profile_probe(profiler: EventProfiler) -> None:
