@@ -361,7 +361,7 @@ class Scheduler(SchedulerIOMixin):
                             drop_skipped_tokens=req.drop_skipped_tokens if finished else 0,
                             repos_tokens=req.reported_repos_tokens if finished else 0,
                             prompt_tokens=req.prompt_tokens if finished else None,
-                            completion_tokens=req.completion_tokens if finished else None,
+                            completion_tokens=req.reported_completion_tokens if finished else None,
                             server_metrics=server_metrics,
                         )
                     )

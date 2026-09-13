@@ -810,6 +810,13 @@ class Req:
 
     @property
     def completion_tokens(self) -> int:
+        # Device-side generation progress is also the seeded sampler's offset.
+        # Keep its pre-existing lookahead semantics independent of usage reports.
+        active_prompt_tokens = self.max_device_len - self.output_len
+        return self.device_len - active_prompt_tokens
+
+    @property
+    def reported_completion_tokens(self) -> int:
         active_prompt_tokens = self.max_device_len - self.output_len
         # Overlap can advance device_len before the sampled token is committed
         # to the host stream. Count only tokens actually sent to detokenization.

@@ -75,12 +75,12 @@ def test_completion_usage_counts_committed_tokens_not_overlap_lookahead(structur
     req = _req(structured=structured, output_len=2)
     req.complete_one()
     req.complete_one()
-    assert req.completion_tokens == 0
+    assert req.reported_completion_tokens == 0
     req.append_host(torch.tensor([21], dtype=torch.int32))
-    assert req.completion_tokens == 1
+    assert req.reported_completion_tokens == 1
     assert not req.can_decode  # Reporting must not change the stopping rule.
     req.append_host(torch.tensor([22], dtype=torch.int32))
-    assert req.completion_tokens == 2
+    assert req.reported_completion_tokens == 2
 
 
 @pytest.mark.parametrize("structured", [False, True])
@@ -88,13 +88,44 @@ def test_completion_usage_is_invariant_under_prompt_compaction(structured):
     req = _req(structured=structured, output_len=2)
     req.complete_one()
     req.append_host(torch.tensor([21], dtype=torch.int32))
-    assert req.completion_tokens == 1
+    assert req.reported_completion_tokens == 1
     # The scheduler removes one prompt token from both the host stream and the
     # device budget; raw/full prompt_tokens is deliberately not the denominator.
     req.input_ids = req.input_ids[[0, 2, 3]].contiguous()
     req.max_device_len -= 1
     req.device_len -= 1
-    assert req.completion_tokens == 1
+    assert req.reported_completion_tokens == 1
+
+
+@pytest.mark.parametrize("structured", [False, True])
+def test_seeded_sampling_keeps_device_offset_separate_from_reported_usage(structured, monkeypatch):
+    from types import SimpleNamespace
+
+    import minisgl.engine.sample as sampling
+
+    # This checks the production prepare path without requiring a CUDA transfer.
+    monkeypatch.setattr(sampling, "make_device_tensor",
+                        lambda data, dtype, device: torch.tensor(data, dtype=dtype))
+    req = _req(structured=structured, output_len=3)
+    req.sampling_params = SamplingParams(max_tokens=3, temperature=0.8, seed=17)
+    sampler = sampling.Sampler(device=torch.device("cpu"), vocab_size=100)
+    batch = SimpleNamespace(reqs=[req])
+
+    def check(offset, committed):
+        args = sampler.prepare(batch)
+        # Exact pre-change formula consumed by the RNG, not the usage counter.
+        baseline_offset = req.device_len - (req.max_device_len - req.output_len)
+        assert args.offsets.tolist() == [baseline_offset] == [offset]
+        assert args.seeds.tolist() == [17]
+        assert req.reported_completion_tokens == committed
+
+    check(0, 0)
+    req.complete_one()
+    check(1, 0)
+    req.complete_one()  # Overlap can schedule while CPU output is still pending.
+    check(2, 0)
+    req.append_host(torch.tensor([21], dtype=torch.int32))
+    check(2, 1)
 
 
 def test_host_buffer_rebuilds_after_external_compaction() -> None:
