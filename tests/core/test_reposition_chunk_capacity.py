@@ -455,6 +455,69 @@ def test_matched_final_page_is_rotated_to_an_earlier_prefill_stage() -> None:
     cache.check_integrity()
 
 
+def test_occurrence_retry_owns_borrowed_final_pages_before_cacheback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def compare_occurrence_retry(source: torch.Tensor, target: torch.Tensor) -> int:
+        for index, (left, right) in enumerate(zip(source, target, strict=False)):
+            if int(left[0]) == 2 or int(right[0]) == 2:
+                return index
+            if int(left[0]) != int(right[0]) or int(left[1]) != int(right[1]):
+                return index
+            if int(left[0]) != 0 and not torch.equal(left, right):
+                return index
+        return min(len(source), len(target))
+
+    monkeypatch.setattr(
+        radix_kernel,
+        "fast_compare_occurrence_retry_radix_records",
+        compare_occurrence_retry,
+    )
+    manager, cache, table, _ = _manager(num_pages=48, table_count=1)
+    pending = _pending(uid=118)
+    pending.context_post_prefill_keep_mask = pending.full_keep_mask
+    source_key = pending.radix_match_ids[:6].clone()
+    source_key[1, 3] += 1  # Different source and target final positions.
+    source_key[2, 2] += 1  # Same final position, but a different Radix branch.
+    source_pages = cache._allocate(6)
+    cache.prefix_cache.insert_prefix(source_key, source_pages)
+    manager.pending_list.append(pending)
+
+    batch = manager.schedule_next_batch(prefill_budget=8)
+
+    assert batch is not None and len(batch.reqs) == 1
+    req = batch.reqs[0]
+    assert req.cached_len == 6
+    assert req.occurrence_exact_full_cached_len == 1
+    assert req.occurrence_terminal_owned_mask[:6].tolist() == [
+        False, True, True, True, True, True
+    ]
+    terminal_pages = table.occurrence_pages(req.table_idx)[:8].clone()
+    assert int(terminal_pages[0]) == int(source_pages[0])
+    assert not set(terminal_pages[1:6].tolist()) & set(source_pages.tolist())
+    assert [1, 0] in req.occurrence_transform_position_pairs.tolist()
+    assert [1, 1] in req.occurrence_transform_position_pairs.tolist()
+
+    req.complete_one()
+    scheduler = object.__new__(Scheduler)
+    scheduler.cache_manager = cache
+    scheduler.table_manager = table
+    scheduler._release_occurrence_transients(req)
+    scheduler._compact_context_after_prefill(req)
+    cache.cache_req(req, finished=True)
+    table.free(req.table_idx)
+
+    target_handle = cache.prefix_cache.match_prefix(
+        pending.radix_match_ids, pending.radix_key_virtual_mask
+    ).cuda_handle
+    assert target_handle.cached_len == len(pending.radix_match_ids)
+    assert torch.equal(target_handle.get_matched_indices(), terminal_pages)
+    source_handle = cache.prefix_cache.match_prefix(source_key).cuda_handle
+    assert source_handle.cached_len == 6
+    assert torch.equal(source_handle.get_matched_indices(), source_pages)
+    cache.check_integrity()
+
+
 def test_finished_occurrence_caches_final_pages_and_releases_birth_copies() -> None:
     manager, cache, table, _ = _manager(num_pages=32, table_count=1)
     pending = _pending(uid=114)
@@ -513,7 +576,8 @@ def test_finished_occurrence_caches_final_pages_and_releases_birth_copies() -> N
     later.radix_match_ids = changed_final
     changed_match = cache.match_occurrence_req(later)
     assert changed_match is not None
-    assert changed_match.full_cached_len == 3
+    assert changed_match.full_cached_len == 8
+    assert changed_match.exact_full_cached_len == 3
     assert changed_match.retry_plan is None
     cache.check_integrity()
 

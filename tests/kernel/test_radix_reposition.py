@@ -8,6 +8,7 @@ import torch
 pytest.importorskip("tvm_ffi")
 
 from minisgl.kernel.radix import (
+    fast_compare_occurrence_retry_radix_records,
     fast_compare_radix_records,
     fast_compare_retry_radix_records,
     fast_compare_retry_radix_records_plan,
@@ -364,6 +365,24 @@ def test_structured_comparators_use_exact_and_retry_semantics() -> None:
     target[2, 2] = -3
     target[3, 1] = 9
     assert fast_compare_retry_radix_records(cached, target) == 3
+
+
+def test_occurrence_retry_stops_before_r_even_when_r_records_are_equal() -> None:
+    cached = torch.tensor(
+        [
+            [TOKEN_KIND, 10, 1, 4],
+            [TOKEN_KIND, 11, 1, 5],
+            [REPOSITION_KIND, 8, -1, -1],
+            [TOKEN_KIND, 12, 1, 6],
+        ],
+        dtype=torch.int32,
+    )
+    target = cached.clone()
+    target[:2, 2:] = torch.tensor([[9, 0], [9, 1]], dtype=torch.int32)
+    assert fast_compare_retry_radix_records(cached, target) == 4
+    assert fast_compare_occurrence_retry_radix_records(cached, target) == 2
+    assert fast_compare_radix_records(cached, cached) == 4
+    assert fast_compare_occurrence_retry_radix_records(cached, cached) == 2
 
 
 def test_delta_child_edge_hashes_and_compares_the_complete_range_block() -> None:

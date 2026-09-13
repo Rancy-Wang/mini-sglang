@@ -276,6 +276,28 @@ auto fast_compare_retry_radix_records(const tvm::ffi::TensorView cached,
   return common_len;
 }
 
+auto fast_compare_occurrence_retry_radix_records(
+    const tvm::ffi::TensorView cached, const tvm::ffi::TensorView target)
+    -> size_t {
+  host::RuntimeCheck(
+      _is_radix_record_tensor(cached) && _is_radix_record_tensor(target),
+      "Both occurrence Retry Radix records must be contiguous CPU int32 [N, 4] tensors.");
+  const auto common_len = std::min(cached.size(0), target.size(0));
+  const auto *cached_ptr = static_cast<const int32_t *>(cached.data_ptr());
+  const auto *target_ptr = static_cast<const int32_t *>(target.data_ptr());
+  for (size_t row = 0; row < common_len; ++row) {
+    const auto *cached_record = cached_ptr + row * 4;
+    const auto *target_record = target_ptr + row * 4;
+    // An exact Radix match may cross R. A relaxed occurrence match must not:
+    // post-R values may have attended to a different active history.
+    if (cached_record[0] == 2 || target_record[0] == 2 ||
+        !_retry_record_equal(cached_record, target_record)) {
+      return row;
+    }
+  }
+  return common_len;
+}
+
 auto fast_compare_retry_radix_records_plan(
     const tvm::ffi::TensorView cached, const tvm::ffi::TensorView target,
     const tvm::ffi::TensorView cached_key_to_token,
@@ -341,6 +363,8 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(fast_compare_radix_records,
                               fast_compare_radix_records);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fast_compare_retry_radix_records,
                               fast_compare_retry_radix_records);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(fast_compare_occurrence_retry_radix_records,
+                              fast_compare_occurrence_retry_radix_records);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fast_compare_retry_radix_records_plan,
                               fast_compare_retry_radix_records_plan);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(radix_record_compare_backend,

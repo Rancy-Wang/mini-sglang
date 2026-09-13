@@ -27,6 +27,9 @@ class ContextMatchResult:
     active_full_positions: torch.Tensor
     retry_plan: torch.Tensor | None = None
     retry_plan_ns: int = 0
+    # Occurrence pages beyond this exact final-key prefix are borrowed and
+    # must be copied into pages owned by the target branch before cache-back.
+    exact_full_cached_len: int = 0
 
 
 @dataclass(frozen=True)
@@ -116,14 +119,9 @@ class CacheManager:
         return full_token_prefix_len, active_token_prefix_len
 
     def match_occurrence_req(self, req: PendingReq) -> ContextMatchResult | None:
-        """Match only the exact Radix prefix for paged-occurrence execution.
+        """Match the exact final key, then borrow a pre-R occurrence Retry prefix."""
 
-        Paged-occurrence materializes position changes directly from the exact
-        reusable KV prefix.  It must never walk a structured Retry branch or
-        compile a staged Retry plan.
-        """
-
-        return self._match_req(req, allow_structured_retry=False)
+        return self._match_req(req, allow_structured_retry=True, occurrence_retry=True)
 
     def match_req(self, req: PendingReq) -> ContextMatchResult | None:
         """Match a request, including the legacy staged structured-Retry path."""
@@ -135,11 +133,15 @@ class CacheManager:
         req: PendingReq,
         *,
         allow_structured_retry: bool,
+        occurrence_retry: bool = False,
     ) -> ContextMatchResult | None:
         assert req.input_len > 0, "Input length must be greater than 0."
         radix_query, query_virtual_mask = self._radix_query_prefix(req)
         matched = self._match_prefix(radix_query, query_virtual_mask)
         handle, key_match_indices, matched_virtual_mask = matched
+        exact_full_cached_len = (
+            int(torch.count_nonzero(~matched_virtual_mask).item()) if occurrence_retry else 0
+        )
         used_retry = False
         if (
             allow_structured_retry
@@ -153,7 +155,12 @@ class CacheManager:
                 handle, RadixCacheHandle
             ):
                 raise RuntimeError("Structured Retry requires the Radix prefix cache.")
-            retry_handle = self.prefix_cache.match_retry_prefix(
+            retry_match = (
+                self.prefix_cache.match_occurrence_retry_prefix
+                if occurrence_retry
+                else self.prefix_cache.match_retry_prefix
+            )
+            retry_handle = retry_match(
                 radix_query,
                 (
                     query_virtual_mask
@@ -175,6 +182,18 @@ class CacheManager:
         result = self._derive_active_match(req, handle, full_match_indices)
         if not used_retry:
             return result
+
+        if occurrence_retry:
+            return ContextMatchResult(
+                handle=result.handle,
+                full_match_indices=result.full_match_indices,
+                full_cached_len=result.full_cached_len,
+                active_match_indices=result.active_match_indices,
+                active_cached_len=result.active_cached_len,
+                initial_active_cached_len=result.initial_active_cached_len,
+                active_full_positions=result.active_full_positions,
+                exact_full_cached_len=exact_full_cached_len,
+            )
 
         if req.radix_key_to_token is None:
             raise RuntimeError("Structured Retry requires a target key-to-token mapping.")
@@ -255,6 +274,7 @@ class CacheManager:
             active_cached_len=len(active_match_indices),
             initial_active_cached_len=len(active_match_indices),
             active_full_positions=active_full_positions,
+            exact_full_cached_len=len(full_match_indices),
         )
 
     def allocate_retry_pages(self, count: int) -> torch.Tensor:
@@ -438,20 +458,29 @@ class CacheManager:
             old_full_cached_len = old_handle.physical_cached_len
             occurrence_birth_pages = getattr(req, "occurrence_birth_pages", None)
             occurrence_birth_owned = getattr(req, "occurrence_birth_owned_mask", None)
+            exact_full_cached_len = (
+                getattr(req, "occurrence_exact_full_cached_len", None)
+                if occurrence_birth_pages is not None
+                else None
+            )
+            if exact_full_cached_len is None:
+                exact_full_cached_len = old_full_cached_len
+            if not 0 <= exact_full_cached_len <= old_full_cached_len:
+                raise RuntimeError("Occurrence exact prefix exceeds its borrowed source prefix.")
             if occurrence_birth_pages is not None:
                 if occurrence_birth_owned is None:
                     raise RuntimeError("Occurrence birth page ownership is missing.")
                 if old_full_cached_len > len(occurrence_birth_pages):
                     raise RuntimeError("Matched occurrence prefix exceeds its page metadata.")
-            if old_full_cached_len > 0:
-                if len(req.initial_full_match_indices) < old_full_cached_len:
+            if exact_full_cached_len > 0:
+                if len(req.initial_full_match_indices) < exact_full_cached_len:
                     raise RuntimeError(
                         "Initial full-token match indices are shorter than the cache handle."
                     )
-                full_indices[:old_full_cached_len] = req.initial_full_match_indices[
-                    :old_full_cached_len
+                full_indices[:exact_full_cached_len] = req.initial_full_match_indices[
+                    :exact_full_cached_len
                 ]
-                filled[:old_full_cached_len] = True
+                filled[:exact_full_cached_len] = True
 
             if bool(torch.any(active_positions >= full_token_prefix_len).item()):
                 raise RuntimeError("A cached active token lies outside the full-token prefix.")
@@ -459,8 +488,8 @@ class CacheManager:
                 device=active_indices.device, non_blocking=True
             )
             overlap = active_positions < old_full_cached_len
+            transformed = torch.zeros(len(active_indices), dtype=torch.bool, device="cpu")
             if bool(torch.any(overlap).item()):
-                transformed = torch.zeros(len(active_indices), dtype=torch.bool, device="cpu")
                 if req.retry_transformed_mask is not None:
                     transformed[: len(req.retry_transformed_mask)] = req.retry_transformed_mask
                 occurrence_owned = getattr(req, "occurrence_terminal_owned_mask", None)
@@ -471,11 +500,15 @@ class CacheManager:
                             "Occurrence-owned mask exceeds the active cache candidate prefix."
                         )
                     transformed[:occurrence_owned_len] |= occurrence_owned
-                # A final-key occurrence hit must still point at exactly the
-                # matched final page. Staged Retry retains its old exception.
-                ordinary_overlap = (
-                    overlap if occurrence_birth_pages is not None else overlap & (~transformed)
-                )
+                ordinary_overlap = overlap & (~transformed)
+                if occurrence_birth_pages is not None and bool(
+                    torch.any(
+                        ordinary_overlap & (active_positions >= exact_full_cached_len)
+                    ).item()
+                ):
+                    raise RuntimeError(
+                        "An occurrence Retry page was not materialized under its target key."
+                    )
                 ordinary_device = ordinary_overlap.to(
                     device=active_indices.device, non_blocking=True
                 )
@@ -485,7 +518,7 @@ class CacheManager:
                 ):
                     raise RuntimeError("Matched delta-marker tokens use different KV slots.")
             active_write = (
-                ~overlap
+                (~overlap) | transformed
                 if occurrence_birth_pages is not None
                 else torch.ones(len(active_indices), dtype=torch.bool, device="cpu")
             )
@@ -507,10 +540,8 @@ class CacheManager:
                 inactive_device = inactive_positions.to(
                     device=active_indices.device, dtype=torch.int64, non_blocking=True
                 )
-                inactive_write = (
-                    inactive_positions >= old_full_cached_len
-                    if occurrence_birth_pages is not None
-                    else torch.ones(len(inactive_positions), dtype=torch.bool, device="cpu")
+                inactive_write = torch.ones(
+                    len(inactive_positions), dtype=torch.bool, device="cpu"
                 )
                 inactive_write_device = inactive_write.to(
                     device=inactive_pages.device, dtype=torch.bool, non_blocking=True
@@ -526,7 +557,7 @@ class CacheManager:
                 if len(missing_positions) > 0
                 else full_token_prefix_len
             )
-            if cacheable_full_len < old_full_cached_len:
+            if cacheable_full_len < exact_full_cached_len:
                 raise RuntimeError("A new real-token hole overlaps the matched Radix prefix.")
             cacheable_key_len = (
                 int(req.radix_token_to_key[cacheable_full_len].item())

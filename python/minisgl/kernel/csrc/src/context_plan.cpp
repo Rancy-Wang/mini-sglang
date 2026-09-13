@@ -608,10 +608,6 @@ auto build_occurrence_capacity_index(
             raw[terminal[raw_token]] == raw_token,
         "Occurrence birth or terminal mapping is invalid");
   }
-  for (int64_t raw_token = 0; raw_token < source_count; ++raw_token) {
-    host::RuntimeCheck(source_positions[raw_token] == positions[terminal[raw_token]],
-                       "Occurrence source is not at its final Radix position");
-  }
   host::RuntimeCheck(offsets[0] == 0 &&
                          offsets[segment_count] == segment_key_occurrences.size(0),
                      "Occurrence capacity offsets do not cover segment keys");
@@ -632,6 +628,13 @@ auto build_occurrence_capacity_index(
        ++raw_token) {
     mark_required(birth[raw_token], raw_token + 1);
     mark_required(terminal[raw_token], raw_token + 1);
+  }
+  if (max_chunk_end == raw_count) {
+    // Borrowed source pages must be owned at the target's final positions
+    // before Decode, including tokens no longer present in active attention.
+    for (int64_t raw_token = 0; raw_token < source_count; ++raw_token) {
+      mark_required(terminal[raw_token], raw_count);
+    }
   }
   for (int64_t segment = 0; segment < segment_count; ++segment) {
     host::RuntimeCheck(offsets[segment] >= 0 &&
@@ -678,11 +681,11 @@ auto build_occurrence_capacity_index(
     const int64_t raw_token = raw[occurrence];
     if (raw_token < chunk_start) {
       int32_t canonical_position = positions[birth[raw_token]];
-      if (raw_token < source_count) {
-        canonical_position = source_positions[raw_token];
-      } else if (initial_owned[raw_token] &&
-                 positions[occurrence] == positions[terminal[raw_token]]) {
+      if (initial_owned[raw_token] &&
+          positions[occurrence] == positions[terminal[raw_token]]) {
         canonical_position = positions[terminal[raw_token]];
+      } else if (raw_token < source_count) {
+        canonical_position = source_positions[raw_token];
       }
       const bool prior_new = positions[occurrence] != canonical_position;
       if (prior_new) ++current_delta[endpoint_index];
@@ -699,9 +702,10 @@ auto build_occurrence_capacity_index(
   int64_t needs_terminal = 0;
   std::vector<int64_t> needs_terminal_delta(endpoint_count, 0);
   for (int64_t raw_token = 0; raw_token < raw_count; ++raw_token) {
-    const bool distinct_terminal =
-        positions[terminal[raw_token]] != positions[birth[raw_token]];
-    if (distinct_terminal && !initial_owned[raw_token] && raw_token >= source_count) {
+    const bool distinct_terminal = positions[terminal[raw_token]] !=
+        (raw_token < source_count ? source_positions[raw_token]
+                                  : positions[birth[raw_token]]);
+    if (distinct_terminal && !initial_owned[raw_token]) {
       ++needs_terminal;
     }
     if (initial_owned[raw_token]) continue;
@@ -712,9 +716,7 @@ auto build_occurrence_capacity_index(
     }
     if (distinct_terminal && acquire_end <= max_chunk_end) {
       const int64_t endpoint_index = acquire_end - chunk_start - 1;
-      if (raw_token >= source_count) {
-        --needs_terminal_delta[endpoint_index];
-      }
+      --needs_terminal_delta[endpoint_index];
     }
   }
 

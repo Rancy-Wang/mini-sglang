@@ -222,6 +222,8 @@ class Req:
     occurrence_transform_position_pairs: torch.Tensor | None = None
     occurrence_terminal_owned_mask: torch.Tensor | None = None
     occurrence_initial_source_positions: torch.Tensor | None = None
+    occurrence_exact_full_cached_len: int | None = None
+    occurrence_same_position_retry_copy_count: int = 0
     occurrence_repositioned_cached_mask: torch.Tensor | None = None
     occurrence_inflight: bool = False
     occurrence_abort_deferred: bool = False
@@ -520,6 +522,12 @@ class Req:
                 or len(self.occurrence_initial_source_positions) != self.initial_active_cached_len
             ):
                 raise ValueError("Occurrence source positions must cover the initial cache hits.")
+            if self.occurrence_exact_full_cached_len is not None and not (
+                0 <= self.occurrence_exact_full_cached_len <= self.initial_active_cached_len
+            ):
+                raise ValueError("Occurrence exact prefix must lie within its source prefix.")
+            if self.occurrence_same_position_retry_copy_count < 0:
+                raise ValueError("Occurrence Retry copy count must be non-negative.")
             if self.occurrence_repositioned_cached_mask is not None and (
                 not self.occurrence_repositioned_cached_mask.is_cpu
                 or self.occurrence_repositioned_cached_mask.dtype != torch.bool

@@ -44,6 +44,14 @@ def fast_compare_retry_radix_records(cached: torch.Tensor, target: torch.Tensor)
     return _load_radix_module().fast_compare_retry_radix_records(cached, target)
 
 
+def fast_compare_occurrence_retry_radix_records(
+    cached: torch.Tensor, target: torch.Tensor
+) -> int:
+    """Compare occurrence Retry records, stopping before either side's R marker."""
+
+    return _load_radix_module().fast_compare_occurrence_retry_radix_records(cached, target)
+
+
 def fast_compare_retry_radix_records_plan(
     cached: torch.Tensor,
     target: torch.Tensor,

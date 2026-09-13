@@ -101,6 +101,69 @@ def test_retry_greedily_selects_largest_reachable_source_branch() -> None:
     assert retry.get_matched_indices()[:3].tolist() == [2, 3, 4]
 
 
+def test_occurrence_retry_selects_longest_actual_prefix() -> None:
+    cache = _paged_cache()
+    short = _records(
+        [[TOKEN_KIND, 10, 1, 1], [TOKEN_KIND, 11, 1, 2], [TOKEN_KIND, 12, 1, 3]]
+    )
+    misleading_long = _records(
+        [
+            [TOKEN_KIND, 10, 2, 2],
+            [TOKEN_KIND, 99, 2, 3],
+            [TOKEN_KIND, 98, 2, 4],
+            [TOKEN_KIND, 97, 2, 5],
+            [TOKEN_KIND, 96, 2, 6],
+        ]
+    )
+    cache.insert_prefix(short, torch.tensor([0, 1, 2], dtype=torch.int32), _mask(3))
+    cache.insert_prefix(
+        misleading_long, torch.tensor([3, 4, 5, 6, 7], dtype=torch.int32), _mask(5)
+    )
+    target = _records(
+        [
+            [TOKEN_KIND, 10, 7, 0],
+            [TOKEN_KIND, 11, 7, 1],
+            [TOKEN_KIND, 12, 7, 2],
+            [TOKEN_KIND, 40, 7, 3],
+        ]
+    )
+
+    exact = cache.match_prefix(target, _mask(4)).cuda_handle
+    retry = cache.match_occurrence_retry_prefix(target, _mask(4), exact)
+
+    assert exact.cached_len == 0
+    assert retry.cached_len == 3
+    assert retry.get_matched_indices()[:3].tolist() == [0, 1, 2]
+    cache.check_integrity()
+
+
+def test_occurrence_retry_stops_at_r_but_exact_match_can_cross_it() -> None:
+    cache = _paged_cache()
+    source = _records(
+        [
+            [TOKEN_KIND, 10, 1, 3],
+            [TOKEN_KIND, 11, 1, 4],
+            [REPOSITION_KIND, 8, -1, -1],
+            [TOKEN_KIND, 12, 1, 5],
+        ]
+    )
+    virtual = torch.tensor([False, False, True, False], dtype=torch.bool)
+    cache.insert_prefix(source, torch.tensor([0, 1, -1, 2], dtype=torch.int32), virtual)
+    target = source.clone()
+    target[:2, 2:] = torch.tensor([[9, 0], [9, 1]], dtype=torch.int32)
+    target[3, 2:] = torch.tensor([9, 2], dtype=torch.int32)
+
+    exact = cache.match_prefix(target, virtual).cuda_handle
+    retry = cache.match_occurrence_retry_prefix(target, virtual, exact)
+    assert exact.cached_len == 0
+    assert retry.cached_len == 2
+    assert retry.get_matched_indices()[:2].tolist() == [0, 1]
+
+    exact_source = cache.match_prefix(source, virtual).cuda_handle
+    assert exact_source.cached_len == len(source)
+    cache.check_integrity()
+
+
 def test_structured_exact_index_survives_edge_split() -> None:
     cache = _cache()
     first = _records(
@@ -356,7 +419,7 @@ def test_retry_position_plan_keeps_changed_pages_that_are_dropped_later() -> Non
     assert match.retry_plan.tolist() == [[1, 1, 1, 0]]
 
 
-def test_occurrence_match_never_walks_a_structured_retry_branch(
+def test_occurrence_match_uses_retry_source_without_staged_plan(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     page_table = torch.zeros((1, 8), dtype=torch.int32, device="cpu")
@@ -382,27 +445,31 @@ def test_occurrence_match_never_walks_a_structured_retry_branch(
         [
             [TOKEN_KIND, 10, -1, 0],
             [TOKEN_KIND, 11, 1, 0],
+            [TOKEN_KIND, 12, 1, 1],
         ]
     )
     req = SimpleNamespace(
-        input_len=2,
+        input_len=3,
         radix_match_ids=target,
-        radix_token_to_key=torch.tensor([0, 1], dtype=torch.int64),
-        radix_key_to_token=torch.tensor([0, 1], dtype=torch.int64),
-        radix_key_virtual_mask=_mask(2),
+        radix_token_to_key=torch.tensor([0, 1, 2], dtype=torch.int64),
+        radix_key_to_token=torch.tensor([0, 1, 2], dtype=torch.int64),
+        radix_key_virtual_mask=_mask(3),
         radix_commit_key_len=None,
-        raw_positions=torch.tensor([0, 1], dtype=torch.int32),
-        prefix_keep_mask=torch.ones(2, dtype=torch.int32),
+        raw_positions=torch.tensor([0, 1, 2], dtype=torch.int32),
+        prefix_keep_mask=torch.ones(3, dtype=torch.int32),
     )
 
-    def fail_retry(*_args, **_kwargs):
-        raise AssertionError("paged-occurrence attempted structured Retry")
+    def fail_staged_plan(*_args, **_kwargs):
+        raise AssertionError("paged-occurrence attempted staged Retry planning")
 
-    monkeypatch.setattr(manager.prefix_cache, "match_retry_prefix", fail_retry)
+    monkeypatch.setattr(
+        "minisgl.kernel.radix.fast_compare_retry_radix_records_plan", fail_staged_plan
+    )
     match = manager.match_occurrence_req(req)
 
     assert match is not None
-    assert match.full_cached_len == 1
+    assert match.full_cached_len == 2
+    assert match.exact_full_cached_len == 1
     assert match.retry_plan is None
     assert match.retry_plan_ns == 0
 

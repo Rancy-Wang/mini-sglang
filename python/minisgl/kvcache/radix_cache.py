@@ -408,6 +408,57 @@ class RadixPrefixCache(BasePrefixCache):
             node.timestamp = tic
         return RadixCacheHandle(cursor, node)
 
+    def match_occurrence_retry_prefix(
+        self,
+        target: torch.Tensor,
+        virtual_mask: torch.Tensor,
+        exact_handle: RadixCacheHandle,
+    ) -> RadixCacheHandle:
+        """Choose the longest compatible source without crossing a relaxed R marker.
+
+        Source selection is read-only; only the chosen partial edge is split to
+        produce a lockable handle. Staged Retry keeps its original greedy walk.
+        """
+
+        del virtual_mask  # The record comparator validates virtual rows.
+        if target.ndim != 2 or target.shape[1] != 4:
+            return exact_handle
+        from minisgl.kernel.radix import fast_compare_occurrence_retry_radix_records
+
+        best_len = exact_handle.cached_len
+        best_node = exact_handle.node
+        best_edge_len = 0
+        frontier: list[tuple[int, int, RadixTreeNode, int]] = []
+
+        def add_children(parent: RadixTreeNode, cursor: int) -> None:
+            if cursor >= len(target):
+                return
+            for child in parent.retry_children(target[cursor:]):
+                bound = min(len(target), cursor + child.max_reachable_depth)
+                if bound > best_len:
+                    heapq.heappush(frontier, (-bound, child.uuid, child, cursor))
+
+        add_children(exact_handle.node, exact_handle.cached_len)
+        while frontier and -frontier[0][0] > best_len:
+            _, _, child, cursor = heapq.heappop(frontier)
+            matched = fast_compare_occurrence_retry_radix_records(child._key, target[cursor:])
+            if matched <= 0:
+                continue
+            end = cursor + matched
+            if end > best_len:
+                best_len = end
+                best_node = child
+                best_edge_len = matched
+            if matched == child.length:
+                add_children(child, end)
+
+        if best_len == exact_handle.cached_len:
+            return exact_handle
+        if best_edge_len < best_node.length:
+            best_node = self._split_node(best_node, best_edge_len)
+        best_node.timestamp = time.monotonic_ns()
+        return RadixCacheHandle(best_len, best_node)
+
     def insert_prefix(
         self,
         input_ids: torch.Tensor,
