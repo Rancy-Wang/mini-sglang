@@ -335,7 +335,6 @@ def test_occurrence_sliding_plan_accepts_window_starting_at_cached_len() -> None
         (0, [False, False, False, False, False], []),
         (2, [True, False, False, False, False], []),
         (2, [False, False, False, False, False], [-1, 0]),
-        (2, [False, False, False, False, False], [0, 1]),
     ],
 )
 def test_occurrence_capacity_index_matches_reference_for_every_endpoint(

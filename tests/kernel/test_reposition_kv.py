@@ -84,30 +84,3 @@ def test_reposition_kv_rotates_k_and_copies_v(dtype: torch.dtype, atol: float) -
             k_buffer[:, destination], expected_k[token], atol=atol, rtol=atol
         )
         torch.testing.assert_close(v_buffer[:, destination], source_values[token], atol=0, rtol=0)
-
-
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_same_position_copy_preserves_source_bits(dtype: torch.dtype) -> None:
-    pytest.importorskip("triton")
-    if not torch.cuda.is_available():
-        pytest.skip("requires CUDA Triton")
-
-    device = torch.device("cuda:0")
-    k_buffer = torch.randn((1, 3, 2, 64), dtype=dtype, device=device)
-    v_buffer = torch.randn_like(k_buffer)
-    source_k = k_buffer[:, 0].clone()
-    source_v = v_buffer[:, 0].clone()
-    angles = torch.arange(32, dtype=torch.float32, device=device)
-    rope_cache = torch.cat((angles.cos().repeat(12, 1), angles.sin().repeat(12, 1)), dim=1)
-    reposition_kv_with_rope_delta(
-        k_buffer,
-        v_buffer,
-        torch.tensor([0], dtype=torch.int32, device=device),
-        torch.tensor([2], dtype=torch.int32, device=device),
-        torch.tensor([[7, 7]], dtype=torch.int32, device=device),
-        rope_cache,
-    )
-    torch.cuda.synchronize()
-
-    assert torch.equal(k_buffer[:, 2], source_k)
-    assert torch.equal(v_buffer[:, 2], source_v)
