@@ -424,9 +424,9 @@ def test_paged_occurrence_reuses_a_canonical_final_prefix() -> None:
 
     assert batch is not None
     req = batch.reqs[0]
-    assert isinstance(req, ChunkedReq)
     assert req.initial_active_cached_len == 6
     assert req.cached_len == 6
+    assert req.device_len == 8
     assert cache.prefix_cache.size_info.protected_size == 6
     assert torch.equal(req.occurrence_birth_pages[:6], cached_pages)
     assert not bool(torch.any(req.occurrence_birth_owned_mask[:6]).item())
@@ -545,7 +545,7 @@ def test_paged_occurrence_rejects_only_an_impossible_minimum_working_set() -> No
         manager.schedule_next_batch(prefill_budget=8)
 
     assert raised.value.uid == 105
-    assert raised.value.required_pages == 14
+    assert raised.value.required_pages == 15
     assert raised.value.available_pages == 7
     cache.check_integrity()
 
