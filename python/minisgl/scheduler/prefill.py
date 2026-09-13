@@ -930,7 +930,6 @@ class PrefillAdder:
 
             cached_transform = prior_new
             cached_ids = required_ids[prior][cached_transform]
-            cached_raw = prior_raw[cached_transform]
             cached_source_pages = torch.empty(
                 0, dtype=torch.int32, device=self.cache_manager.device
             )
