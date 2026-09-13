@@ -9,7 +9,10 @@ import pytest
 import torch
 from minisgl.attention.base import build_occurrence_attention_batch
 from minisgl.core import SamplingParams
-from minisgl.kernel.radix_reposition import RadixRepositionLayout
+from minisgl.kernel.radix_reposition import (
+    RadixRepositionLayout,
+    compile_radix_reposition_layout,
+)
 from minisgl.message import AbortBackendMsg, RequestRejectMsg
 from minisgl.scheduler.cache import CacheManager
 from minisgl.scheduler.prefill import (
@@ -460,8 +463,6 @@ def test_occurrence_retry_owns_borrowed_final_pages_before_cacheback(
 ) -> None:
     def compare_occurrence_retry(source: torch.Tensor, target: torch.Tensor) -> int:
         for index, (left, right) in enumerate(zip(source, target, strict=False)):
-            if int(left[0]) == 2 or int(right[0]) == 2:
-                return index
             if int(left[0]) != int(right[0]) or int(left[1]) != int(right[1]):
                 return index
             if int(left[0]) != 0 and not torch.equal(left, right):
@@ -515,6 +516,122 @@ def test_occurrence_retry_owns_borrowed_final_pages_before_cacheback(
     source_handle = cache.prefix_cache.match_prefix(source_key).cuda_handle
     assert source_handle.cached_len == 6
     assert torch.equal(source_handle.get_matched_indices(), source_pages)
+    cache.check_integrity()
+
+
+def test_occurrence_retry_crosses_r_and_commits_owned_target_pages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def compare_occurrence_retry(source: torch.Tensor, target: torch.Tensor) -> int:
+        for index, (left, right) in enumerate(zip(source, target, strict=False)):
+            if int(left[0]) != int(right[0]) or int(left[1]) != int(right[1]):
+                return index
+            if int(left[0]) != 0 and not torch.equal(left, right):
+                return index
+        return min(len(source), len(target))
+
+    monkeypatch.setattr(
+        radix_kernel, "fast_compare_occurrence_retry_radix_records", compare_occurrence_retry
+    )
+
+    def layout(tokens: list[int], drops: list[tuple[int, int, int]], boundaries: list[int]):
+        return compile_radix_reposition_layout(
+            torch.tensor(tokens, dtype=torch.int32),
+            torch.tensor([offset for offset, _, _ in drops], dtype=torch.int32),
+            torch.arange(len(drops) + 1, dtype=torch.int32),
+            torch.tensor(
+                [value for _, start, end in drops for value in (start, end)], dtype=torch.int32
+            ),
+            torch.tensor(boundaries, dtype=torch.int32),
+            torch.tensor([boundary + 1 for boundary in boundaries], dtype=torch.int32),
+        )
+
+    source_layout = layout([10, 11, 12, 13, 14], [(3, 1, 2)], [2])
+    target_layout = layout([10, 11, 12, 13, 14, 15], [(3, 1, 2), (5, 0, 1)], [2, 4])
+    visible_until = torch.tensor([5, 3, 7, 7, 7, 7], dtype=torch.int32)
+    plan = compile_reposition_occurrence_plan(target_layout, visible_until)
+    target_key = _build_occurrence_radix_records(
+        SimpleNamespace(
+            reposition_layout=target_layout,
+            reposition_raw_boundaries=torch.tensor([2, 4], dtype=torch.int32),
+        )
+    )
+    pending = PendingReq(
+        uid=119,
+        input_ids=torch.tensor([10, 11, 12, 13, 14, 15], dtype=torch.int32),
+        true_positions=target_layout.birth_positions,
+        raw_positions=torch.arange(6, dtype=torch.int32),
+        radix_input_ids=target_key,
+        radix_match_ids=target_key,
+        sampling_params=SamplingParams(max_tokens=1),
+        prompt_tokens=6,
+        is_warmup=True,
+        prefix_keep_mask=torch.ones(6, dtype=torch.int32),
+        full_input_ids=torch.tensor([10, 11, 12, 13, 14, 15], dtype=torch.int32),
+        full_token_visible_until=visible_until,
+        full_keep_mask=target_layout.keep_mask.to(torch.int32),
+        use_context_mask=True,
+        context_compact_stream=False,
+        radix_key_virtual_mask=target_layout.virtual_mask,
+        radix_key_to_token=target_layout.key_to_token,
+        radix_token_to_key=target_layout.token_to_key,
+        radix_positions=target_layout.positions,
+        radix_repos_info=target_layout.repos_info,
+        radix_next_position=target_layout.next_position,
+        reposition_execution_mode="paged-occurrence",
+        occurrence_raw_tokens=plan.occurrence_raw_tokens,
+        occurrence_positions=plan.occurrence_positions,
+        occurrence_birth_indices=plan.birth_occurrences,
+        occurrence_terminal_indices=plan.terminal_occurrences,
+        occurrence_segment_query_starts=plan.segment_query_starts,
+        occurrence_segment_query_ends=plan.segment_query_ends,
+        occurrence_segment_key_offsets=plan.segment_key_offsets,
+        occurrence_segment_key_indices=plan.segment_key_occurrences,
+        context_post_prefill_keep_mask=target_layout.keep_mask.to(torch.int32),
+    )
+    manager, cache, table, _ = _manager(num_pages=48, table_count=1)
+    source_pages = cache._allocate(5)
+    source_key_pages = torch.full((len(source_layout.records),), -1, dtype=torch.int32)
+    source_key_pages[~source_layout.virtual_mask] = source_pages
+    cache.prefix_cache.insert_prefix(
+        source_layout.records, source_key_pages, source_layout.virtual_mask
+    )
+    manager.pending_list.append(pending)
+
+    batch = manager.schedule_next_batch(prefill_budget=6)
+    assert batch is not None and len(batch.reqs) == 1
+    req = batch.reqs[0]
+    assert req.cached_len == 5
+    assert req.occurrence_exact_full_cached_len == 2
+    assert req.occurrence_terminal_owned_mask[:5].tolist() == [False, False, True, True, True]
+    terminal_pages = table.occurrence_pages(req.table_idx)[:6].clone()
+    assert not set(terminal_pages[2:5].tolist()) & set(source_pages.tolist())
+    assert [1, 0] in req.occurrence_transform_position_pairs.tolist()
+    assert [2, 1] in req.occurrence_transform_position_pairs.tolist()
+    assert [3, 2] in req.occurrence_transform_position_pairs.tolist()
+
+    req.complete_one()
+    scheduler = object.__new__(Scheduler)
+    scheduler.cache_manager = cache
+    scheduler.table_manager = table
+    scheduler._release_occurrence_transients(req)
+    scheduler._compact_context_after_prefill(req)
+    cache.cache_req(req, finished=True)
+    table.free(req.table_idx)
+
+    target_handle = cache.prefix_cache.match_prefix(
+        target_key, target_layout.virtual_mask
+    ).cuda_handle
+    assert target_handle.cached_len == len(target_key)
+    assert torch.equal(
+        target_handle.get_matched_indices()[~target_layout.virtual_mask], terminal_pages
+    )
+    source_handle = cache.prefix_cache.match_prefix(
+        source_layout.records, source_layout.virtual_mask
+    ).cuda_handle
+    assert torch.equal(
+        source_handle.get_matched_indices()[~source_layout.virtual_mask], source_pages
+    )
     cache.check_integrity()
 
 

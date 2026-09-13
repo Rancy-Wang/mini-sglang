@@ -47,7 +47,7 @@ def fast_compare_retry_radix_records(cached: torch.Tensor, target: torch.Tensor)
 def fast_compare_occurrence_retry_radix_records(
     cached: torch.Tensor, target: torch.Tensor
 ) -> int:
-    """Compare occurrence Retry records, stopping before either side's R marker."""
+    """Ignore real-token positions but require identical D/R event records."""
 
     return _load_radix_module().fast_compare_occurrence_retry_radix_records(cached, target)
 

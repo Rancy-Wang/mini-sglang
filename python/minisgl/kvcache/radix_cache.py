@@ -414,7 +414,7 @@ class RadixPrefixCache(BasePrefixCache):
         virtual_mask: torch.Tensor,
         exact_handle: RadixCacheHandle,
     ) -> RadixCacheHandle:
-        """Choose the longest compatible source without crossing a relaxed R marker.
+        """Choose the longest compatible source across identical D/R events.
 
         Source selection is read-only; only the chosen partial edge is split to
         produce a lockable handle. Staged Retry keeps its original greedy walk.

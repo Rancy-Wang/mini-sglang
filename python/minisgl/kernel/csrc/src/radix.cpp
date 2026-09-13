@@ -288,10 +288,9 @@ auto fast_compare_occurrence_retry_radix_records(
   for (size_t row = 0; row < common_len; ++row) {
     const auto *cached_record = cached_ptr + row * 4;
     const auto *target_record = target_ptr + row * 4;
-    // An exact Radix match may cross R. A relaxed occurrence match must not:
-    // post-R values may have attended to a different active history.
-    if (cached_record[0] == 2 || target_record[0] == 2 ||
-        !_retry_record_equal(cached_record, target_record)) {
+    // Real tokens may differ in their final position. D/R events must match
+    // completely, so a shared R preserves the same visible history boundary.
+    if (!_retry_record_equal(cached_record, target_record)) {
       return row;
     }
   }

@@ -8,7 +8,12 @@ import torch
 pytest.importorskip("tvm_ffi")
 
 import minisgl.core as core
-from minisgl.kernel.radix_reposition import DELTA_KIND, REPOSITION_KIND, TOKEN_KIND
+from minisgl.kernel.radix_reposition import (
+    DELTA_KIND,
+    REPOSITION_KIND,
+    TOKEN_KIND,
+    compile_radix_reposition_layout,
+)
 from minisgl.kvcache.radix_cache import RadixPrefixCache
 from minisgl.scheduler.cache import CacheManager
 
@@ -137,30 +142,58 @@ def test_occurrence_retry_selects_longest_actual_prefix() -> None:
     cache.check_integrity()
 
 
-def test_occurrence_retry_stops_at_r_but_exact_match_can_cross_it() -> None:
-    cache = _paged_cache()
-    source = _records(
-        [
-            [TOKEN_KIND, 10, 1, 3],
-            [TOKEN_KIND, 11, 1, 4],
-            [REPOSITION_KIND, 8, -1, -1],
-            [TOKEN_KIND, 12, 1, 5],
-        ]
+def _compiled_records(
+    tokens: list[int], drops: list[tuple[int, int, int]], boundaries: list[int]
+) -> tuple[torch.Tensor, torch.Tensor]:
+    layout = compile_radix_reposition_layout(
+        torch.tensor(tokens, dtype=torch.int32),
+        torch.tensor([offset for offset, _, _ in drops], dtype=torch.int32),
+        torch.arange(len(drops) + 1, dtype=torch.int32),
+        torch.tensor([value for _, start, end in drops for value in (start, end)], dtype=torch.int32),
+        torch.tensor(boundaries, dtype=torch.int32),
+        torch.tensor([boundary + 1 for boundary in boundaries], dtype=torch.int32),
     )
-    virtual = torch.tensor([False, False, True, False], dtype=torch.bool)
-    cache.insert_prefix(source, torch.tensor([0, 1, -1, 2], dtype=torch.int32), virtual)
-    target = source.clone()
-    target[:2, 2:] = torch.tensor([[9, 0], [9, 1]], dtype=torch.int32)
-    target[3, 2:] = torch.tensor([9, 2], dtype=torch.int32)
+    return layout.records, layout.virtual_mask
 
-    exact = cache.match_prefix(target, virtual).cuda_handle
-    retry = cache.match_occurrence_retry_prefix(target, virtual, exact)
-    assert exact.cached_len == 0
-    assert retry.cached_len == 2
-    assert retry.get_matched_indices()[:2].tolist() == [0, 1]
 
-    exact_source = cache.match_prefix(source, virtual).cuda_handle
+def test_occurrence_retry_crosses_identical_r_and_stops_at_next_new_event() -> None:
+    cache = _paged_cache()
+    source, source_virtual = _compiled_records(
+        [10, 11, 12, 13, 14], [(3, 1, 2)], [2]
+    )
+    source_pages = torch.tensor([0, 1, 2, -1, -1, 3, 4], dtype=torch.int32)
+    cache.insert_prefix(source, source_pages, source_virtual)
+    target, target_virtual = _compiled_records(
+        [10, 11, 12, 13, 14, 15], [(3, 1, 2), (5, 0, 1)], [2, 4]
+    )
+    exact = cache.match_prefix(target, target_virtual).cuda_handle
+    retry = cache.match_occurrence_retry_prefix(target, target_virtual, exact)
+    assert exact.cached_len == 2
+    assert retry.cached_len == len(source) == 7
+    assert retry.get_matched_indices().tolist() == source_pages.tolist()
+    assert torch.equal(source[4], target[4])  # The shared R is crossed.
+    assert not torch.equal(source[2], target[2])  # Positions differ before R.
+
+    exact_source = cache.match_prefix(source, source_virtual).cuda_handle
     assert exact_source.cached_len == len(source)
+    cache.check_integrity()
+
+
+def test_occurrence_retry_stops_at_first_d_or_r_disagreement() -> None:
+    cache = _paged_cache()
+    source, virtual = _compiled_records(
+        [10, 11, 12, 13, 14], [(3, 1, 2)], [2]
+    )
+    cache.insert_prefix(
+        source, torch.tensor([0, 1, 2, -1, -1, 3, 4], dtype=torch.int32), virtual
+    )
+    for changed_row in (3, 4):
+        target = source.clone()
+        target[2, 3] += 1  # Force a Retry path before the event.
+        target[changed_row, 1] += 1
+        exact = cache.match_prefix(target, virtual).cuda_handle
+        retry = cache.match_occurrence_retry_prefix(target, virtual, exact)
+        assert retry.cached_len == changed_row
     cache.check_integrity()
 
 
