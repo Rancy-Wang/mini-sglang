@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import fields, replace
 import random
+from dataclasses import fields, replace
 from types import SimpleNamespace
 
 import minisgl.attention.base as attention_base

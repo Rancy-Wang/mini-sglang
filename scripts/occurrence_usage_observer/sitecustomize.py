@@ -7,14 +7,16 @@ PYTHONPATH. Page tracing synchronizes GPU reads and must not measure performance
 from __future__ import annotations
 
 import gzip
+import hashlib
 import json
 import os
 from pathlib import Path
 
 if "MINISGL_R2_OBSERVER_DIR" in os.environ:
     from minisgl.core import Req
-    from minisgl.scheduler.io import SchedulerIOMixin
     from minisgl.message.tokenizer import DetokenizeMsg
+    from minisgl.scheduler.io import SchedulerIOMixin
+    from minisgl.tokenizer.tokenize import TokenizeManager
 
     if "CS_VALIDATION_DATE" in os.environ:
         from datetime import date
@@ -31,6 +33,24 @@ if "MINISGL_R2_OBSERVER_DIR" in os.environ:
 
     root = Path(os.environ["MINISGL_R2_OBSERVER_DIR"])
     root.mkdir(parents=True, exist_ok=True)
+    original_tokenize = TokenizeManager.tokenize
+
+    def tokenize(self, messages):
+        results = original_tokenize(self, messages)
+        with (root / f"inputs-{os.getpid()}.jsonl").open("a") as stream:
+            for message, result in zip(messages, results, strict=True):
+                tensors = {}
+                for name in ("input_ids", "true_positions", "radix_match_ids", "radix_positions"):
+                    tensor = getattr(result, name, None)
+                    tensors[name] = None if tensor is None else hashlib.sha256(
+                        tensor.numpy().tobytes()
+                    ).hexdigest()
+                stream.write(json.dumps({"uid": int(message.uid),
+                                         "warmup": bool(message.is_warmup),
+                                         "tensors": tensors}) + "\n")
+        return results
+
+    TokenizeManager.tokenize = tokenize
     tokens = {}
     original_append = Req.append_host
 
@@ -55,7 +75,24 @@ if "MINISGL_R2_OBSERVER_DIR" in os.environ:
     SchedulerIOMixin._reply_tokenizer_rank0 = reply
 
     if os.environ.get("CS_USAGE_TRACE") == "1":
+        from dataclasses import fields
+
+        import torch
         from minisgl.attention.fi import FlashInferBackend
+        import minisgl.scheduler.prefill as prefill_module
+        from minisgl.scheduler.reposition_occurrence import compile_occurrence_window_reference
+
+        original_compile = prefill_module.compile_occurrence_window
+
+        def checked_compile(*args, **kwargs):
+            result = original_compile(*args, **kwargs)
+            reference = compile_occurrence_window_reference(*args, **kwargs)
+            for field in fields(result):
+                if not torch.equal(getattr(result, field.name), getattr(reference, field.name)):
+                    raise RuntimeError(f"Occurrence window differs from baseline: {field.name}")
+            return result
+
+        prefill_module.compile_occurrence_window = checked_compile
 
         wanted = {int(uid) for uid in os.environ.get("CS_USAGE_UIDS", "13,14,15,24,30").split(",")}
         traces = {}
