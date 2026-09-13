@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import fields, replace
+import random
 from types import SimpleNamespace
 
 import minisgl.attention.base as attention_base
@@ -20,6 +21,7 @@ from minisgl.scheduler.prefill import PrefillManager, RepositionCapacityError
 from minisgl.scheduler.reposition_occurrence import (
     CompactRepositionOccurrenceLayout,
     compile_occurrence_window,
+    compile_occurrence_window_reference,
     pack_compact_occurrence_pending_fields,
     unpack_compact_occurrence_pending_fields,
 )
@@ -185,6 +187,39 @@ def _semantic_window(plan, query_start: int, query_end: int):
             )
         )
     return semantic
+
+
+@pytest.mark.parametrize("seed", range(20))
+def test_native_window_is_array_exact_and_does_not_mutate_inputs(seed):
+    rng = random.Random(seed)
+    n = 40
+    birth = list(range(n))
+    stages = [i // 10 for i in range(n)]
+    current = birth.copy()
+    offsets, raw, old, new = [0], [], [], []
+    for stage in range(1, 4):
+        selected = rng.sample(range(stage * 10), rng.randrange(stage * 10))
+        # Unsorted but unique external transition programs remain supported.
+        for token in selected:
+            raw.append(token)
+            old.append(current[token])
+            current[token] = rng.randrange(n)
+            new.append(current[token])
+        offsets.append(len(raw))
+    tensor = lambda values: torch.tensor(values, dtype=torch.int32)
+    layout = CompactRepositionOccurrenceLayout(*map(tensor, (birth, stages, offsets, raw, old, new)))
+    visibility = tensor([rng.randint(i + 1, n + 1) for i in range(n)])
+    terminal = tensor(current)
+    original = [getattr(layout, f.name).clone() for f in fields(layout)]
+    for start in (0, 1, 9, 10, 17, 29, 30, 39):
+        for end in {start + 1, n}:
+            kwargs = dict(query_start=start, query_end=end)
+            expected = compile_occurrence_window_reference(layout, visibility, terminal, **kwargs)
+            actual = compile_occurrence_window(layout, visibility, terminal, **kwargs)
+            for f in fields(expected):
+                assert torch.equal(getattr(actual, f.name), getattr(expected, f.name)), f.name
+    for f, before in zip(fields(layout), original, strict=True):
+        assert torch.equal(getattr(layout, f.name), before)
 
 
 def test_compact_occurrence_pending_adapter_round_trips_without_expansion() -> None:

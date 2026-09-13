@@ -856,10 +856,18 @@ class Scheduler(SchedulerIOMixin):
                 source_pages.append(req.occurrence_transform_source_pages)
                 destination_pages.append(req.occurrence_transform_destination_pages)
                 position_pairs.append(req.occurrence_transform_position_pairs)
-            batch.out_loc = torch.cat(birth_pages)
-            batch.occurrence_source_pages = torch.cat(source_pages)
-            batch.occurrence_destination_pages = torch.cat(destination_pages)
-            batch.occurrence_position_pairs = torch.cat(position_pairs)
+            # These inputs are read-only during forward and owned by the live
+            # request. Avoid allocating/copying four new tensors for batch size 1.
+            batch.out_loc = birth_pages[0] if len(birth_pages) == 1 else torch.cat(birth_pages)
+            batch.occurrence_source_pages = (
+                source_pages[0] if len(source_pages) == 1 else torch.cat(source_pages)
+            )
+            batch.occurrence_destination_pages = (
+                destination_pages[0] if len(destination_pages) == 1 else torch.cat(destination_pages)
+            )
+            batch.occurrence_position_pairs = (
+                position_pairs[0] if len(position_pairs) == 1 else torch.cat(position_pairs)
+            )
             batch.occurrence_rope_cache = self.prefill_manager.retry_rope_cache
         else:
             batch.out_loc = self.engine.page_table[input_mapping]

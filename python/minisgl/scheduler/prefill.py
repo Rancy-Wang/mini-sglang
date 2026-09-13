@@ -1012,12 +1012,8 @@ class PrefillAdder:
             transient_pages = runtime_pages[
                 transient_ids.pin_memory().to(self.cache_manager.device, non_blocking=True)
             ]
-            if len(cached_raw) > 0:
-                changed_initial = cached_raw[
-                    (cached_raw < len(repositioned_cached))
-                    & (cached_pairs_cpu[:, 0] != cached_pairs_cpu[:, 1])
-                ]
-                repositioned_cached[changed_initial] = True
+            # Usage is recorded from occurrences actually selected by attention,
+            # not every transform scheduled here (some are cacheback-only).
             if len(persistent_ids) > 0:
                 persistent_raw_device = persistent_raw.pin_memory().to(
                     self.cache_manager.device, non_blocking=True
