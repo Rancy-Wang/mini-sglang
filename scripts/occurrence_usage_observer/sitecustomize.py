@@ -16,6 +16,19 @@ if "MINISGL_R2_OBSERVER_DIR" in os.environ:
     from minisgl.scheduler.io import SchedulerIOMixin
     from minisgl.message.tokenizer import DetokenizeMsg
 
+    if "CS_VALIDATION_DATE" in os.environ:
+        from datetime import date
+        import minisgl.tokenizer.tokenize as tokenize_module
+
+        fixed_date = date.fromisoformat(os.environ["CS_VALIDATION_DATE"])
+
+        class ValidationDate(date):
+            @classmethod
+            def today(cls):
+                return fixed_date
+
+        tokenize_module.date = ValidationDate
+
     root = Path(os.environ["MINISGL_R2_OBSERVER_DIR"])
     root.mkdir(parents=True, exist_ok=True)
     tokens = {}

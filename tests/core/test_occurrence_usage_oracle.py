@@ -66,6 +66,23 @@ def test_usage_rejects_wrong_source_position():
         audit_request(trace)
 
 
+def test_segment_trace_is_equivalent_to_expanded_causal_reads():
+    trace = _trace()
+    chunk = trace["chunks"][0]
+    chunk["birth_writes"].append({"page": 14, "raw": 4, "position": 3})
+    trace["visible_until"].append(5)
+    chunk["attention_reads"].append({"query_raw": 4, "pages": [21, 22, 13, 14]})
+    expanded = audit_request(trace)
+    chunk["attention_reads"] = []
+    chunk["attention_segments"] = [
+        {"query_start": 3, "query_end": 5, "pages": [21, 22, 13, 14]}
+    ]
+    assert audit_request(trace) == expanded
+    trace["visible_until"][1] = 4
+    with pytest.raises(ValueError, match="visibility boundary"):
+        audit_request(trace)
+
+
 @pytest.mark.parametrize("use_rotated", [False, True])
 def test_production_usage_agrees_with_page_lineage_oracle(use_rotated):
     import torch
