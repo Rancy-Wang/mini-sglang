@@ -49,6 +49,8 @@ def load_replay(path: Path) -> dict:
     probes = {uid: inputs.pop(uid) for uid in (-1, -2) if uid in inputs}
     if sorted(tokens) != expected or sorted(inputs) != expected:
         raise ValueError(f"Missing token IDs or input fingerprints: {path}")
+    if any(len(tokens[row["uid"]]) != row["server_metrics"]["generated_tokens"] for row in turns):
+        raise ValueError(f"Captured token IDs do not cover the committed output stream: {path}")
     return dict(manifest=manifest, turns=turns, tokens=tokens, inputs=inputs, probes=probes)
 
 
@@ -73,10 +75,14 @@ def compare_pair(baseline: dict, candidate: dict) -> dict:
             "finish_equal": old_response["finish_reason"] == new_response["finish_reason"],
             "token_count_equal": all(old_response["usage"][key] == new_response["usage"][key]
                                      for key in ("prompt_tokens", "completion_tokens")),
+            "prompt_count_equal": old_response["usage"]["prompt_tokens"]
+                                  == new_response["usage"]["prompt_tokens"],
+            "candidate_completion_usage_exact": new_response["usage"]["completion_tokens"]
+                                                == len(candidate["tokens"][uid]),
             "usage_equal": old_response["usage"] == new_response["usage"],
         }
         row["output_pass"] = all(row[key] for key in (
-            "input_equal", "tokens_equal", "message_equal", "finish_equal", "token_count_equal"
+            "input_equal", "tokens_equal", "message_equal", "finish_equal", "prompt_count_equal"
         ))
         for metric in ("server_ttft_ms", "server_tpot_ms"):
             row[metric] = {"baseline": old[metric], "candidate": new[metric],
@@ -116,6 +122,8 @@ def main():
     parser.add_argument("--modes", nargs="+", choices=("repos", "no_drop"),
                         default=["repos", "no_drop"])
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--require-accurate-usage", action="store_true",
+                        help="Also require completion usage to equal captured committed tokens.")
     args = parser.parse_args()
     if args.repeats < 1:
         raise ValueError("At least one complete paired replay is required.")
@@ -126,11 +134,16 @@ def main():
             load_replay(args.root / f"candidate_{mode}_r{repeat}"),
         ) for repeat in range(1, args.repeats + 1)]
         result[mode] = {"output_pass": all(pair["output_pass"] for pair in pairs),
+                        "completion_usage_pass": all(row["candidate_completion_usage_exact"]
+                                                     for pair in pairs for row in pair["turns"]),
                         "timing": summarize(pairs), "pairs": pairs}
     with args.output.open("x") as stream:
         json.dump(result, stream, indent=2)
         stream.write("\n")
     if not all(mode["output_pass"] for mode in result.values()):
+        raise SystemExit(1)
+    if args.require_accurate_usage and not all(mode["completion_usage_pass"]
+                                             for mode in result.values()):
         raise SystemExit(1)
 
 

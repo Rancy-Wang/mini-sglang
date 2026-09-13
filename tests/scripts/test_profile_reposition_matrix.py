@@ -46,11 +46,22 @@ def test_replay_comparator_rejects_token_difference_even_with_equal_text():
     assert not report["output_pass"]
     assert report["turns"][0]["message_equal"]
 
+    candidate = copy.deepcopy(replay)
+    replay["turns"][0]["canonical_response"]["usage"]["completion_tokens"] = 3
+    report = compare_pair(replay, candidate)
+    assert report["output_pass"]
+    assert not report["turns"][0]["token_count_equal"]
+    assert report["turns"][0]["candidate_completion_usage_exact"]
+    candidate["turns"][0]["canonical_response"]["usage"]["completion_tokens"] = 3
+    assert not compare_pair(replay, candidate)["turns"][0]["candidate_completion_usage_exact"]
+
 
 def test_replay_loader_preserves_probes_and_rejects_missing_requests(tmp_path):
     (tmp_path / "complete.json").write_text(json.dumps({"status": "complete", "records": 1}))
     (tmp_path / "manifest.json").write_text(json.dumps({"uid_range": [0, 0]}))
-    (tmp_path / "turns.jsonl").write_text(json.dumps({"uid": 0}) + "\n")
+    (tmp_path / "turns.jsonl").write_text(json.dumps({
+        "uid": 0, "server_metrics": {"generated_tokens": 2}
+    }) + "\n")
     observer = tmp_path / "observer"
     observer.mkdir()
     (observer / "tokens-0.json").write_text(json.dumps({"0": [1, 2]}))

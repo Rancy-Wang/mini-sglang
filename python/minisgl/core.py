@@ -811,7 +811,9 @@ class Req:
     @property
     def completion_tokens(self) -> int:
         active_prompt_tokens = self.max_device_len - self.output_len
-        return self.device_len - active_prompt_tokens
+        # Overlap can advance device_len before the sampled token is committed
+        # to the host stream. Count only tokens actually sent to detokenization.
+        return len(self.input_ids) - active_prompt_tokens
 
     def match_stop(self) -> tuple[bool, str | None]:
         if not self.stop_token_seqs:

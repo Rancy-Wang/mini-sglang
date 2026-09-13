@@ -70,6 +70,33 @@ def test_overlapped_tokens_keep_their_own_positions(structured: bool) -> None:
         assert req.radix_match_ids.tolist() == [10, 11, 12, 21, 22]
 
 
+@pytest.mark.parametrize("structured", [False, True])
+def test_completion_usage_counts_committed_tokens_not_overlap_lookahead(structured):
+    req = _req(structured=structured, output_len=2)
+    req.complete_one()
+    req.complete_one()
+    assert req.completion_tokens == 0
+    req.append_host(torch.tensor([21], dtype=torch.int32))
+    assert req.completion_tokens == 1
+    assert not req.can_decode  # Reporting must not change the stopping rule.
+    req.append_host(torch.tensor([22], dtype=torch.int32))
+    assert req.completion_tokens == 2
+
+
+@pytest.mark.parametrize("structured", [False, True])
+def test_completion_usage_is_invariant_under_prompt_compaction(structured):
+    req = _req(structured=structured, output_len=2)
+    req.complete_one()
+    req.append_host(torch.tensor([21], dtype=torch.int32))
+    assert req.completion_tokens == 1
+    # The scheduler removes one prompt token from both the host stream and the
+    # device budget; raw/full prompt_tokens is deliberately not the denominator.
+    req.input_ids = req.input_ids[[0, 2, 3]].contiguous()
+    req.max_device_len -= 1
+    req.device_len -= 1
+    assert req.completion_tokens == 1
+
+
 def test_host_buffer_rebuilds_after_external_compaction() -> None:
     req = _req(structured=False)
     req.complete_one()
