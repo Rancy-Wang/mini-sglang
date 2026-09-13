@@ -367,7 +367,7 @@ def test_structured_comparators_use_exact_and_retry_semantics() -> None:
     assert fast_compare_retry_radix_records(cached, target) == 3
 
 
-def test_occurrence_retry_stops_before_r_even_when_r_records_are_equal() -> None:
+def test_occurrence_retry_crosses_equal_r_and_stops_at_mismatched_events() -> None:
     cached = torch.tensor(
         [
             [TOKEN_KIND, 10, 1, 4],
@@ -379,10 +379,23 @@ def test_occurrence_retry_stops_before_r_even_when_r_records_are_equal() -> None
     )
     target = cached.clone()
     target[:2, 2:] = torch.tensor([[9, 0], [9, 1]], dtype=torch.int32)
+    target[3, 2:] = torch.tensor([9, 2], dtype=torch.int32)
     assert fast_compare_retry_radix_records(cached, target) == 4
-    assert fast_compare_occurrence_retry_radix_records(cached, target) == 2
+    assert fast_compare_occurrence_retry_radix_records(cached, target) == 4
     assert fast_compare_radix_records(cached, cached) == 4
-    assert fast_compare_occurrence_retry_radix_records(cached, cached) == 2
+    assert fast_compare_occurrence_retry_radix_records(cached, cached) == 4
+
+    changed_r = target.clone()
+    changed_r[2, 1] = 9
+    assert fast_compare_occurrence_retry_radix_records(cached, changed_r) == 2
+
+    cached_d = cached.clone()
+    cached_d[2] = torch.tensor([DELTA_KIND, -1, -3, -1], dtype=torch.int32)
+    target_d = target.clone()
+    target_d[2] = cached_d[2]
+    assert fast_compare_occurrence_retry_radix_records(cached_d, target_d) == 4
+    target_d[2, 2] = -4
+    assert fast_compare_occurrence_retry_radix_records(cached_d, target_d) == 2
 
 
 def test_delta_child_edge_hashes_and_compares_the_complete_range_block() -> None:

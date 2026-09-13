@@ -119,7 +119,7 @@ class CacheManager:
         return full_token_prefix_len, active_token_prefix_len
 
     def match_occurrence_req(self, req: PendingReq) -> ContextMatchResult | None:
-        """Match the exact final key, then borrow a pre-R occurrence Retry prefix."""
+        """Match the exact final key, then Retry through identical D/R events."""
 
         return self._match_req(req, allow_structured_retry=True, occurrence_retry=True)
 
