@@ -367,7 +367,8 @@ async def run_recovery(args):
     if not args.pages:
         args.pages = 32768
     root = args.output / "recovery"
-    child = launch(args, args.repo, root, True)
+    child = launch(args, args.baseline.resolve() if args.baseline else args.repo,
+                   root, args.baseline is None)
     url = f"http://127.0.0.1:{args.port}"
     responses = {}
     try:
@@ -388,11 +389,12 @@ async def run_recovery(args):
             # The reference already contains Reposition after TR13. TR14 adds
             # the second Delta; TR15 can release TR2 under that matched path.
             # Returning to TR13 needs TR2 and its earlier birth dependencies.
-            for label, rounds, capture, pressure in [
+            steps = [
                 ("reference", 13, True, False), ("noise", 13, True, False),
                 ("prime", 14, False, False), ("pressure", 15, False, True),
                 ("repair", 13, True, False), ("reuse", 13, True, False),
-            ]:
+            ]
+            for label, rounds, capture, pressure in (steps[:2] if args.baseline else steps):
                 selected = messages[:2 + 2 * rounds]
                 payload = {"model": args.model, "messages": selected, "tools": TOOLS,
                            "max_tokens": 8, "temperature": 0, "top_p": 1,
@@ -408,6 +410,8 @@ async def run_recovery(args):
                 print(json.dumps({"recovery_step": label, "status": row["status_code"]}), flush=True)
                 if label == "noise":
                     (root / "noise.json").write_text(json.dumps(compare_numerical(root, label), indent=2))
+            if args.baseline:
+                return
             events = [json.loads(line) for path in root.glob("events-*.jsonl")
                       for line in path.read_text().splitlines()]
             if len([e for e in events if e["kind"] == "pressure"]) != len(args.gpus.split(',')):
