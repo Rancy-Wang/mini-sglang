@@ -107,6 +107,29 @@ def test_another_active_reference_prevents_middle_eviction():
     c.lock_handle(dropped, unlock=True)
 
 
+@pytest.mark.parametrize("shared", [False, True])
+def test_completed_reads_release_only_kv_lease_and_survive_later_split(shared):
+    c = cache(shared)
+    keys, handle = insert(c)
+    c.configure_drop_lock(handle, torch.ones(5, dtype=torch.bool))
+    c.lock_handle(handle)
+    c.configure_drop_lock(handle, torch.tensor([True, False, False, True, True]),
+                          release_completed=True)
+    assert all(n.path_ref_count == 1 for n in nodes(handle))
+    assert c.evictable_size == 2
+    # Updating the same completed boundary cannot release the lease twice.
+    c.configure_drop_lock(handle, torch.tensor([True, False, False, True, True]),
+                          release_completed=True)
+    other = c.match_prefix(keys[:2], keys[:2, 0] != 0).cuda_handle
+    c.lock_handle(other)
+    assert c.evict(1).tolist() == [2]
+    c.lock_handle(other, unlock=True)
+    assert c.evict(1).tolist() == [1]
+    c.lock_handle(handle, unlock=True)
+    assert all(n.ref_count == n.path_ref_count == 0 for n in nodes(handle))
+    assert set(c.evict(3).tolist()) == {0, 3, 4}
+
+
 def test_hole_fill_uses_canonical_winner_without_overwrite():
     c = cache()
     keys, h = insert(c, pages=[0, -1, -1, 3, -1, 4])

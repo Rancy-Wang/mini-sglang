@@ -408,9 +408,9 @@ class RadixPrefixCache(BasePrefixCache):
             heapq.heapify(self._drop_candidates)
 
     def configure_drop_lock(
-        self, handle: RadixCacheHandle, required_raw: torch.Tensor
+        self, handle: RadixCacheHandle, required_raw: torch.Tensor, *, release_completed: bool = False
     ) -> None:
-        """Install proven Drop intervals before locking, splitting only their boundaries."""
+        """Install Drop intervals, or extend a live lease after its GPU readers finish."""
         if not self.drop_aware_eviction:
             return
         from minisgl.scheduler.drop_recovery import proven_skip_ranges
@@ -425,14 +425,25 @@ class RadixPrefixCache(BasePrefixCache):
                 start = boundary
             cursor -= node.length
             node = node.parent
-        handle.skip_ranges[:] = skip_ranges
         cursor, node = handle.cached_len, handle.node
         while not node.is_root():
             start = cursor - node.length
             if any(a <= start and cursor <= b for a, b in skip_ranges):
+                if release_completed and not any(
+                    a <= start and cursor <= b for a, b in handle.skip_ranges
+                ):
+                    assert node.ref_count > 0
+                    if node.ref_count == 1:
+                        if self.track_shared_page_owners:
+                            self._ordinary_node_became_evictable(node)
+                        else:
+                            self.protected_size -= node.page_length
+                            self.evictable_size += node.page_length
+                    node.ref_count -= 1
                 node.drop_eligible = True
                 self._update_candidate(node)
             cursor, node = start, node.parent
+        handle.skip_ranges[:] = skip_ranges
 
     def truncate_handle(self, handle: RadixCacheHandle, key_length: int) -> RadixCacheHandle:
         """Return a stable prefix handle without removing the cached suffix."""

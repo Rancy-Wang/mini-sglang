@@ -173,3 +173,59 @@ def test_occurrence_repair_skips_resident_suffix_and_drains(monkeypatch):
         assert len(cache.free_slots) == cache.num_pages
     finally:
         core._GLOBAL_CTX = previous
+
+
+def test_completed_recovery_chunk_releases_expired_borrowed_pages():
+    from types import SimpleNamespace
+    import minisgl.core as core
+    from minisgl.scheduler.drop_recovery import RecoveryPlan
+    from minisgl.scheduler.scheduler import Scheduler
+    from test_reposition_chunk_capacity import _manager
+
+    previous = core._GLOBAL_CTX
+    core._GLOBAL_CTX = None
+    core.set_global_ctx(core.Context(page_size=1))
+    try:
+        manager, cache, table, _ = _manager(16, drop_aware=True)
+        keys = torch.tensor([[0, 10, -1, 0], [0, 11, -1, 1], [0, 12, -1, 2],
+                             [0, 13, -1, 3], [1, -2, -4, -1], [0, 14, -1, 4]],
+                            dtype=torch.int32)
+        pages = cache._allocate(5)
+        values = torch.tensor([pages[0], pages[1], pages[2], -1, -1, pages[4]],
+                              dtype=torch.int32)
+        handle = cache.prefix_cache.insert_prefix(keys, values, keys[:, 0] != 0).handle
+        cache.prefix_cache.configure_drop_lock(handle, torch.ones(5, dtype=torch.bool))
+        cache.lock(handle)
+        slot = table.allocate()
+        table.page_table[slot, :5] = pages
+        chunk = SimpleNamespace(
+            uid=704, reposition_execution_mode="paged-occurrence", occurrence_inflight=True,
+            occurrence_transient_pages=torch.empty(0, dtype=torch.int32),
+            drop_recovery_plan=RecoveryPlan(((3, 4), (5, 6)), torch.ones(5, dtype=torch.bool),
+                                           5, torch.tensor([1, 1, 1, 0, 1], dtype=torch.bool)),
+            drop_recovery_query_start=3, cached_len=4, occurrence_birth_indices=torch.arange(6),
+            occurrence_positions=torch.arange(6), occurrence_initial_source_positions=torch.arange(5),
+            full_token_visible_until=torch.tensor([9, 4, 4, 9, 9, 9]),
+            occurrence_birth_owned_mask=torch.tensor([0, 0, 0, 1, 0, 0], dtype=torch.bool),
+            occurrence_birth_pages=torch.cat([pages, torch.tensor([-1], dtype=torch.int32)]),
+            cache_handle=handle, initial_full_match_indices=values[keys[:, 0] == 0].clone(),
+            table_idx=slot, inactive_cached_pages=None,
+            occurrence_terminal_owned_mask=torch.zeros(6, dtype=torch.bool),
+        )
+        assert cache.prefix_cache.evictable_size == 0
+        manager.complete_chunk(chunk)
+        assert cache.prefix_cache.evictable_size == 2
+        assert handle.skip_ranges == [(1, 3)]
+        assert chunk.initial_full_match_indices[1:3].tolist() == [-1, -1]
+        assert chunk.occurrence_birth_pages[1:3].tolist() == [-1, -1]
+        assert table.occurrence_pages(slot)[1:3].tolist() == [-1, -1]
+        cache._free(cache.prefix_cache.evict(2))
+        # Cancellation after the early release must only free the remaining lease.
+        scheduler = object.__new__(Scheduler)
+        scheduler.cache_manager, scheduler.table_manager = cache, table
+        scheduler._close_context_sequence = lambda uid: None
+        scheduler._free_aborted_occurrence_resources(chunk)
+        cache._free(cache.prefix_cache.evict(cache.prefix_cache.evictable_size))
+        assert len(cache.free_slots) == cache.num_pages
+    finally:
+        core._GLOBAL_CTX = previous

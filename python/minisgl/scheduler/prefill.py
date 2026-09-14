@@ -1868,6 +1868,21 @@ class PrefillManager:
                     )
                     chunk.occurrence_birth_pages[device_mask] = -1
                     chunk.occurrence_birth_owned_mask[expired] = False
+                required = chunk.drop_recovery_plan.required_prefix
+                expired_borrowed = required & (expiry[:len(required)] <= chunk.cached_len)
+                if bool(expired_borrowed.any()):
+                    required[expired_borrowed] = False
+                    self.cache_manager.prefix_cache.configure_drop_lock(
+                        chunk.cache_handle, required, release_completed=True
+                    )
+                    device_mask = expired_borrowed.to(
+                        chunk.occurrence_birth_pages.device, non_blocking=True
+                    )
+                    chunk.initial_full_match_indices[device_mask] = -1
+                    chunk.occurrence_birth_pages[:len(required)][device_mask] = -1
+                    self.table_manager.occurrence_pages(chunk.table_idx)[
+                        :len(required)
+                    ][device_mask] = -1
             return
         # Dropped terminal pages are still final Radix candidates. Do not
         # recycle them before the finished-request commit (or abort cleanup).
