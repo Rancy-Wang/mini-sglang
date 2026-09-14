@@ -56,8 +56,9 @@ def test_occurrence_repair_skips_resident_suffix_and_drains(monkeypatch):
             assert batch is not None
             req = batch.reqs[0]
             intervals.append((req.cached_len, req.device_len))
-            metadata = build_occurrence_attention_batch(batch.reqs, torch.device("cpu"))
+            metadata = build_occurrence_attention_batch(batch.reqs)
             assert metadata is not None
+            assert torch.all(metadata.direct_pages[metadata.key_positions.long()] >= 0)
             # All pages selected by attention must be resident.
             assert torch.all(req.occurrence_pages[req.occurrence_birth_indices[
                 req.cached_len:req.device_len].long()] >= 0)
