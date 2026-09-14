@@ -50,6 +50,7 @@ class CacheManager:
         type: str,
         *,
         track_shared_page_owners: bool = True,
+        drop_aware_eviction: bool = False,
     ):
         # The `_free_slots` follows a page-aligned manner. For example, if page_size = 2,
         # the `_free_slots` may look like [0, 2, 4, 6, ...], and each slot represents a page.
@@ -59,7 +60,9 @@ class CacheManager:
             device=device,
             type=type,
             track_shared_page_owners=track_shared_page_owners,
+            drop_aware_eviction=drop_aware_eviction,
         )
+        self.drop_aware_eviction = drop_aware_eviction
         self.device = device
         self.num_pages = num_pages
         self.page_table = page_table

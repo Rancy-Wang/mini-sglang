@@ -104,6 +104,11 @@ class Scheduler(SchedulerIOMixin):
                 "reposition_execution_mode must be 'staged' or 'paged-occurrence', got "
                 f"{config.reposition_execution_mode!r}."
             )
+        if config.drop_aware_eviction and (
+            config.cache_type != "radix" or config.radix_drop_key_mode != "delta-marker"
+            or config.page_size != 1
+        ):
+            raise ValueError("Drop-aware eviction requires radix, delta-marker and page_size=1.")
         self.reposition_execution_mode = config.reposition_execution_mode
         self.radix_symbol_registry = (
             RadixSymbolRegistry() if self.radix_drop_key_mode == "symbol" else None
@@ -114,6 +119,7 @@ class Scheduler(SchedulerIOMixin):
             self.engine.page_table,
             config.cache_type,
             track_shared_page_owners=(self.reposition_execution_mode == "staged"),
+            drop_aware_eviction=config.drop_aware_eviction,
         )
         self.decode_manager = DecodeManager(config.page_size)
         rotary_config = config.model_config.rotary_config
