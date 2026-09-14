@@ -74,6 +74,7 @@ def test_unused_holes_do_not_turn_retry_into_recovery():
         keys = pending.radix_match_ids[:7].clone()
         keys[:, 3] += 1  # All source positions differ from the requested version.
         values = torch.tensor([-1, 0, -1, 1, 2, 3, 4], dtype=torch.int32)
+        values[values >= 0] = cache._allocate(5)
         handle = cache.prefix_cache.insert_prefix(keys, values).handle
         cache._derive_active_match(pending, handle, values)
         assert pending.drop_recovery_plan.intervals == ((7, 8),)

@@ -117,6 +117,24 @@ def test_hole_fill_uses_canonical_winner_without_overwrite():
     assert c.size_info.total_size == 5
 
 
+def test_shared_physical_page_survives_drop_eviction_of_another_owner():
+    c = cache(shared=True)
+    _, dropped = insert(c)
+    c.configure_drop_lock(dropped, torch.tensor([True, False, False, True, True]))
+    c.lock_handle(dropped)
+    alternate = torch.tensor([[0, 91, -1, 0]], dtype=torch.int32)
+    other = c.insert_prefix(alternate, torch.tensor([1], dtype=torch.int32)).handle
+    c.lock_handle(other)
+    assert c.evictable_size == 1
+    assert c.evict(1).tolist() == [2]
+    assert other.get_matched_indices().tolist() == [1]
+    assert dropped.get_matched_indices().tolist() == [0, -1, -1, 3, -1, 4]
+    c.lock_handle(dropped, unlock=True)
+    c.lock_handle(other, unlock=True)
+    assert set(c.evict(4).tolist()) == {0, 1, 3, 4}
+    assert c.size_info.total_size == 0
+
+
 def test_candidate_storage_is_bounded_under_repeated_matches():
     c = cache()
     keys, _ = insert(c)
