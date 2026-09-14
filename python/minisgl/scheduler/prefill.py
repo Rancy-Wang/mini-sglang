@@ -574,6 +574,10 @@ class PrefillAdder:
                     usage_cached_tokens = None
                     usage_repos_tokens = None
                     radix_cached_tokens = cache_handle.physical_cached_len
+                    if recovery is not None and recovery.start < logical_cached_len:
+                        # A resident source rebuilt at another position is a cache miss,
+                        # not a Drop-skipped hit. Keep ordinary suffix accounting unchanged.
+                        radix_cached_tokens = int(recovery.reusable_prefix.numpy().sum())
                     full_prefix_len, _ = self.cache_manager.matchable_prefix_lens(req)
                     cache_reuse_ratio = _calculate_cache_reuse_ratio(cached_len, full_prefix_len)
                     table = self.table_manager.occurrence_pages(table_idx)

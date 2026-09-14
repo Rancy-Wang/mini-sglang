@@ -150,6 +150,10 @@ def test_occurrence_repair_skips_resident_suffix_and_drains(monkeypatch):
             intervals.append((req.cached_len, req.device_len))
             metadata = build_occurrence_attention_batch(batch.reqs)
             assert metadata is not None
+            # Raw 2 is resident but must be rebuilt at its historical position.
+            # Only raw 0, 4, 5, 6 remain reusable initial hits across both chunks.
+            assert req.radix_cached_tokens == 4
+            req.record_context_cache_usage(metadata.cached_tokens[0], metadata.cached_positions[0])
             assert torch.all(metadata.direct_pages[metadata.key_positions.long()] >= 0)
             sliding = build_occurrence_attention_batch(batch.reqs, sliding_window=128)
             assert torch.all(sliding.direct_pages[sliding.key_positions.long()] >= 0)
@@ -169,6 +173,8 @@ def test_occurrence_repair_skips_resident_suffix_and_drains(monkeypatch):
                 cache.cache_req(req, finished=True)
                 table.free(req.table_idx)
         assert intervals == [(1, 4), (7, 8)]
+        assert req.reported_cached_tokens + req.reported_repos_tokens == 4
+        assert req.drop_skipped_tokens == 0
         cache._free(cache.prefix_cache.evict(cache.prefix_cache.evictable_size))
         assert len(cache.free_slots) == cache.num_pages
     finally:
