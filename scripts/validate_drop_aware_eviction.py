@@ -201,6 +201,8 @@ def install_observers():
         spec = control()
         if spec.get("pressure") and spec["label"] not in pressure_seen:
             batch = forward_input.batch
+            if "batch_size" in spec:
+                assert batch.size == spec["batch_size"]
             if any(getattr(r.cache_handle, "skip_ranges", ()) for r in batch.reqs):
                 pressure_seen.add(spec["label"])
                 cache = self.cache_manager
@@ -212,19 +214,22 @@ def install_observers():
                 critical = torch.cat(critical).long()
                 assert bool(torch.all(critical >= 0))
                 protected = {n.uuid for n in tree_nodes(tree) if n.path_ref_count}
+                drop_before = tree.eviction_stats["drop_pages"]
                 held = cache._allocate(cache.available_size)
                 try:
                     assert not bool(torch.isin(critical, held.long()).any())
                     assert len(cache.free_slots) == cache.available_size == 0
                     assert protected <= {n.uuid for n in tree_nodes(tree)}
                     assert tree.eviction_stats["drop_pages"] > 0
+                    if spec.get("require_new_drop"):
+                        assert tree.eviction_stats["drop_pages"] > drop_before
                     # Poison reclaimed KV so stale page IDs cannot accidentally
                     # pass a numerical check by retaining their old contents.
                     for layer in range(self.engine.kv_cache.num_layers):
                         self.engine.kv_cache.k_cache(layer)[held.long()] = float("nan")
                         self.engine.kv_cache.v_cache(layer)[held.long()] = float("nan")
                     emit("pressure", eviction=dict(tree.eviction_stats), released=len(held),
-                         protected_nodes=len(protected))
+                         protected_nodes=len(protected), batch_size=batch.size)
                 finally:
                     cache.free_occurrence_pages(held)
         return original_scheduler_forward(self, forward_input)
@@ -486,6 +491,15 @@ async def run_server(args, repo, root, candidate, manifest):
                             for i in range(offset, min(args.requests, offset + args.concurrency))]
                 # Prepare the immediately preceding conversation states outside timing.
                 for index, payload in enumerate(payloads):
+                    if args.stress_pressure:
+                        seed = copy.deepcopy(payload)
+                        seed["messages"] = seed["messages"][:2 + 2 * args.rolling_keep]
+                        seed.update(workload_interface(seed["messages"], args.rolling_keep, args.workload))
+                        seed["max_tokens"] = 1
+                        row = await send(client, url + "/v1/chat/completions", seed,
+                                         f"seed-{offset + index}")
+                        if row.get("status_code") != 200:
+                            raise RuntimeError(f"Historical seed failed: {row}")
                     warm = copy.deepcopy(payload)
                     warm["messages"] = warm["messages"][:-2]
                     warm.update(workload_interface(warm["messages"], args.rolling_keep, args.workload))
@@ -494,11 +508,17 @@ async def run_server(args, repo, root, candidate, manifest):
                     if row.get("status_code") != 200:
                         raise RuntimeError(f"Preparation failed: {row}")
                 write_control(root / "wave.json", {"id": offset, "count": len(payloads)})
+                if args.stress_pressure:
+                    write_control(root / "numerical.json", {"label": f"wave-{offset}",
+                                  "pressure": True, "require_new_drop": True,
+                                  "batch_size": len(payloads)})
                 started = time.perf_counter()
                 rows = await asyncio.gather(*[send(client, url + "/v1/chat/completions", payload,
                     f"measured-{offset + index}") for index, payload in enumerate(payloads)])
                 elapsed = time.perf_counter() - started
                 (root / "wave.json").unlink()
+                if args.stress_pressure:
+                    (root / "numerical.json").unlink()
                 if any(row.get("status_code") != 200 for row in rows):
                     raise RuntimeError(f"Wave failed: {rows}")
                 records.append({"offset": offset, "elapsed_s": elapsed, "requests": rows})
@@ -519,6 +539,11 @@ async def run_server(args, repo, root, candidate, manifest):
     graph_events = [e for e in events if e["kind"] == "forward" and e["graph"]
                     and all(q[3] >= args.min_full_tokens for q in e["queries"])]
     graph = bool(graph_events)
+    if args.stress_pressure:
+        expected = (args.requests + args.concurrency - 1) // args.concurrency
+        pressures = [e for e in events if e["kind"] == "pressure"]
+        if len(pressures) != expected * len(args.gpus.split(',')):
+            raise RuntimeError("Not every stress wave evicted dropped pages under live locks")
     graph_bs8 = sum(e["size"] == 8 for e in graph_events) // len(args.gpus.split(','))
     elapsed = sum(r["elapsed_s"] for r in records)
     summary = {"elapsed_s": elapsed, "requests_per_second": args.requests / elapsed,
@@ -614,8 +639,13 @@ def main():
     parser.add_argument("--repetitions", type=int, default=3)
     parser.add_argument("--require-forward-bs8", action="store_true")
     parser.add_argument("--audit", action="store_true")
+    parser.add_argument("--stress-pressure", action="store_true",
+                        help="Candidate-only seeded-history live-lock reclamation, not a throughput comparison.")
     parser.add_argument("--mode", choices=["paged-occurrence", "staged"], default="paged-occurrence")
     args = parser.parse_args()
+    if args.stress_pressure and (args.baseline or args.suite != "stress"
+                                 or args.workload != "rolling-reposition"):
+        parser.error("--stress-pressure requires candidate-only rolling-reposition stress")
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", args.port))
     memory = subprocess.check_output(["nvidia-smi", "--query-gpu=index,memory.used",
