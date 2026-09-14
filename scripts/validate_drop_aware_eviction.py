@@ -286,8 +286,10 @@ def launch(args, repo, root, candidate):
                MINISGL_DAE_OBSERVER=str(root))
     if args.audit:
         env["MINISGL_DAE_AUDIT"] = "1"
-    runtime = args.output / "runtime"
-    runtime.mkdir(exist_ok=True)
+    runtime = (args.runtime_cache or args.output / "runtime").resolve()
+    if runtime == repo or repo in runtime.parents:
+        raise ValueError("Compilation caches must be outside the repository")
+    runtime.mkdir(parents=True, exist_ok=True)
     for name in ("TORCH_EXTENSIONS_DIR", "TRITON_CACHE_DIR", "TVM_FFI_CACHE_DIR", "CUDA_CACHE_PATH"):
         directory = runtime / name.lower()
         directory.mkdir(exist_ok=True)
@@ -620,6 +622,8 @@ def main():
     parser.add_argument("--baseline-only", action="store_true")
     parser.add_argument("--input", type=Path)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--runtime-cache", type=Path,
+                        help="Explicit compilation cache for sequential comparison runs.")
     parser.add_argument("--model", required=True)
     parser.add_argument("--tool-call-parser", default="gpt-oss")
     parser.add_argument("--reasoning-parser", default="gpt-oss")
