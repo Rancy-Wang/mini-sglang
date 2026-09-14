@@ -96,7 +96,7 @@ def install_observers():
     import torch
     from minisgl.engine.engine import Engine
     from minisgl.scheduler.scheduler import Scheduler
-    from minisgl.scheduler.prefill import PrefillManager
+    from minisgl.scheduler.prefill import ChunkedReq, PrefillManager
     from minisgl.engine.sample import Sampler
 
     root = Path(os.environ["MINISGL_DAE_OBSERVER"])
@@ -152,7 +152,7 @@ def install_observers():
             offset = 0
             for req, (_, start, end, _) in zip(batch.reqs, queries):
                 plan = getattr(req, "drop_recovery_plan", None)
-                if plan is not None:
+                if plan is not None and start == plan.start:
                     emit("recovery_plan", label=spec["label"], matched=plan.matched_length,
                          intervals=plan.intervals)
                 pages = batch.out_loc[offset:offset + end - start].long()
@@ -175,6 +175,8 @@ def install_observers():
             directory = root / spec["label"]
             directory.mkdir(exist_ok=True)
             for index, (_, start, end, _) in enumerate(queries):
+                if isinstance(batch.reqs[index], ChunkedReq):
+                    continue
                 torch.save(logits[index].detach().cpu(),
                            directory / f"logits-{os.getpid()}-{end}.pt")
         return original_sample(self, logits, sampling)
@@ -340,22 +342,23 @@ def compare_numerical(root, label):
     if not records:
         raise RuntimeError("No corresponding logits were compared")
     kv_records = []
+    by_pid = {}
+    for reference in sorted((root / "reference").glob("kv-*.pt")):
+        by_pid.setdefault(reference.name.split('-')[1], []).append(
+            torch.load(reference, weights_only=True))
+    reference_kv = {}
+    for pid, chunks in by_pid.items():
+        raw = torch.cat([row["raw"] for row in chunks])
+        order = torch.argsort(raw)
+        reference_kv[pid] = (raw[order], torch.cat([row["kv"] for row in chunks], dim=2)[:, :, order])
     for current in sorted((root / label).glob("kv-*.pt")):
         after = torch.load(current, weights_only=True)
         pid = current.name.split('-')[1]
-        matched = 0
-        for reference in (root / "reference").glob(f"kv-{pid}-*.pt"):
-            before = torch.load(reference, weights_only=True)
-            selected = (after["raw"] >= int(before["raw"][0])) & (after["raw"] <= int(before["raw"][-1]))
-            if not bool(selected.any()):
-                continue
-            lookup = torch.searchsorted(before["raw"], after["raw"][selected]).long()
-            assert torch.equal(before["raw"][lookup], after["raw"][selected])
-            expected, actual = before["kv"][:, :, lookup].float(), after["kv"][:, :, selected].float()
-            torch.testing.assert_close(actual, expected, atol=.02, rtol=.02)
-            matched += int(selected.sum())
-        assert matched == len(after["raw"]), (current.name, "KV positions not fully compared")
-        kv_records.append({"file": current.name, "tokens": matched})
+        raw, before = reference_kv[pid]
+        lookup = torch.searchsorted(raw, after["raw"]).long()
+        assert torch.equal(raw[lookup], after["raw"]), (current.name, "KV positions not fully compared")
+        torch.testing.assert_close(after["kv"].float(), before[:, :, lookup].float(), atol=.02, rtol=.02)
+        kv_records.append({"file": current.name, "tokens": len(after["raw"])})
     return {"logits": records, "kv": kv_records}
 
 
@@ -526,12 +529,14 @@ async def run(args):
         for candidate in ([False, True] if rep % 2 == 0 else [True, False]):
             if not candidate and args.baseline is None:
                 continue
+            if candidate and args.baseline_only:
+                continue
             repo = args.repo if candidate else args.baseline.resolve()
             root = args.output / f"rep-{rep}-{'candidate' if candidate else 'baseline'}"
             summary = await run_server(args, repo, root, candidate, manifest)
             results.append({"rep": rep, "candidate": candidate, **summary})
             (args.output / "summary.json").write_text(json.dumps(results, indent=2))
-    if args.baseline:
+    if args.baseline and not args.baseline_only:
         gains = [next(r["requests_per_second"] for r in results if r["rep"] == rep and r["candidate"])
                  / next(r["requests_per_second"] for r in results if r["rep"] == rep and not r["candidate"])
                  for rep in range(args.repetitions)]
@@ -552,6 +557,7 @@ def main():
     parser.add_argument("--suite", choices=["stress", "recovery"], default="stress")
     parser.add_argument("--repo", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--baseline", type=Path)
+    parser.add_argument("--baseline-only", action="store_true")
     parser.add_argument("--input", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--model", required=True)
