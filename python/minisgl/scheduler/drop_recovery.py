@@ -78,6 +78,12 @@ def plan_recovery(
     rewind = np.zeros(matched, dtype=np.bool_) if rewind_sources is None else rewind_sources.numpy()
     incompatible = (np.zeros(matched, dtype=np.bool_) if incompatible_sources is None
                     else incompatible_sources.numpy())
+    suffix_demand = expiry[:matched] > matched
+    if not np.any((~present | incompatible) & suffix_demand):
+        # No suffix query needs an absent/version-incompatible KV. Rewind-only
+        # sources are irrelevant until a historical query actually needs repair.
+        return RecoveryPlan(((matched, input_length),), torch.from_numpy(suffix_demand),
+                            matched, torch.from_numpy(present.copy()))
     missing = np.flatnonzero(~present | rewind | incompatible)
     needed = np.zeros(input_length, dtype=np.bool_)
     needed[matched:] = True

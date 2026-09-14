@@ -3,6 +3,40 @@ import torch
 from minisgl.scheduler.drop_recovery import plan_recovery
 
 
+def test_recovery_matches_visibility_dependency_oracle():
+    import random
+
+    rng = random.Random(1701)
+    for _ in range(256):
+        length = rng.randrange(1, 18)
+        matched = rng.randrange(length)
+        resident = [bool(rng.randrange(2)) for _ in range(matched)]
+        rewind = [bool(rng.randrange(2)) for _ in range(matched)]
+        incompatible = [bool(rng.randrange(2)) for _ in range(matched)]
+        expiry = [rng.randrange(raw + 1, length + 2) for raw in range(length)]
+        needed = set(range(matched, length))
+        # Explicit query-to-key edges provide an independent small-graph oracle.
+        for query in range(length - 1, -1, -1):
+            if query not in needed:
+                continue
+            for raw in range(min(query, matched)):
+                if expiry[raw] > query and (
+                    not resident[raw] or incompatible[raw]
+                    or (query < matched and rewind[raw])
+                ):
+                    needed.add(raw)
+        plan = plan_recovery(torch.tensor(resident, dtype=torch.bool),
+                             torch.tensor(expiry), length,
+                             torch.tensor(rewind, dtype=torch.bool),
+                             torch.tensor(incompatible, dtype=torch.bool))
+        assert {raw for a, b in plan.intervals for raw in range(a, b)} == needed
+        assert plan.required_prefix.tolist() == [
+            raw in needed or any(raw < query < expiry[raw] for query in needed)
+            for raw in range(matched)]
+        assert plan.reusable_prefix.tolist() == [
+            present and raw not in needed for raw, present in enumerate(resident)]
+
+
 def test_recursive_dependencies_reuse_resident_suffix():
     plan = plan_recovery(
         torch.tensor([True, False, True, False, True, True]),
