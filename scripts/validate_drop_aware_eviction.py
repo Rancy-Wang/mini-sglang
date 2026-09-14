@@ -299,7 +299,7 @@ def launch(args, repo, root, candidate):
             "--request-timeout", "7200", "--cache-type", "radix", "--page-size", "1",
             "--attention-backend", "fi", "--radix-drop-key-mode", "delta-marker",
             "--contextual-prefill-mode", "mask", "--reposition-execution-mode", args.mode,
-            "--tool-call-parser", "gpt-oss", "--reasoning-parser", "gpt-oss"]
+            "--tool-call-parser", args.tool_call_parser, "--reasoning-parser", args.reasoning_parser]
     if candidate:
         argv.append("--drop-aware-eviction")
     if args.pages:
@@ -593,6 +593,8 @@ def main():
     parser.add_argument("--input", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--model", required=True)
+    parser.add_argument("--tool-call-parser", default="gpt-oss")
+    parser.add_argument("--reasoning-parser", default="gpt-oss")
     parser.add_argument("--gpus", required=True)
     parser.add_argument("--port", type=int, default=30714)
     parser.add_argument("--chunk", type=int, default=65536)
