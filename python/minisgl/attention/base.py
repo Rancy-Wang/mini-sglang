@@ -797,7 +797,9 @@ def _try_build_occurrence_sliding_attention_batch(
             req.true_positions,
             cached_len=req.cached_len,
             device_len=req.device_len,
-            initial_cached_len=initial_cached_len,
+            # A repair chunk can precede the end of the logical match. Causal
+            # attention cannot read beyond this chunk's query end.
+            initial_cached_len=min(initial_cached_len, req.device_len),
             sliding_window=sliding_window,
             occurrence_base=occurrence_base,
         )

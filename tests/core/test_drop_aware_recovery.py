@@ -27,6 +27,21 @@ def test_dependency_drop_at_query_boundary_is_invisible():
     assert plan.required_prefix.tolist() == [False, True, True]
 
 
+def test_future_repair_reserves_repositioned_terminal_copy():
+    from test_reposition_chunk_capacity import _pending
+    from minisgl.scheduler.drop_recovery import build_drop_capacity_index
+
+    req = _pending(702)
+    resident = torch.tensor([True, False, True, False, True, True, True])
+    req.drop_recovery_plan = plan_recovery(resident, req.full_token_visible_until, 8)
+    source = req.radix_positions[:7]
+    owned = torch.zeros(8, dtype=torch.bool)
+    _, _, _, future = build_drop_capacity_index(req, owned, source, 7, 1, 2)
+    # After repairing raw 1, raw 3 still needs both its birth and terminal
+    # versions; raw 7 needs one page, and generation needs one page.
+    assert future.tolist() == [4]
+
+
 def test_occurrence_repair_skips_resident_suffix_and_drains(monkeypatch):
     from test_reposition_chunk_capacity import (
         _manager, _pending, _complete_intermediate_chunk, _free_occurrence_request,
@@ -59,6 +74,8 @@ def test_occurrence_repair_skips_resident_suffix_and_drains(monkeypatch):
             metadata = build_occurrence_attention_batch(batch.reqs)
             assert metadata is not None
             assert torch.all(metadata.direct_pages[metadata.key_positions.long()] >= 0)
+            sliding = build_occurrence_attention_batch(batch.reqs, sliding_window=128)
+            assert torch.all(sliding.direct_pages[sliding.key_positions.long()] >= 0)
             # All pages selected by attention must be resident.
             assert torch.all(req.occurrence_pages[req.occurrence_birth_indices[
                 req.cached_len:req.device_len].long()] >= 0)

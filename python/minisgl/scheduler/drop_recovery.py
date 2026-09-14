@@ -147,6 +147,10 @@ def build_drop_capacity_index(req, owned, source_positions, exact, start, end):
         retained[-1] += int((late_retry & keep[r]).sum())
     canonical_terminal = pos[birth].copy()
     canonical_terminal[:len(source)] = source
+    # Missing matched KV is recreated at its birth position, not at the
+    # evicted Radix source position. Reserve its later terminal copy too.
+    missing_source = np.flatnonzero(~req.drop_recovery_plan.resident_prefix.numpy())
+    canonical_terminal[missing_source] = pos[birth[missing_source]]
     terminal_needed = keep & ~owner & (
         (pos[terminal] != canonical_terminal)
         | ((np.arange(n) < len(source)) & (np.arange(n) >= exact))
