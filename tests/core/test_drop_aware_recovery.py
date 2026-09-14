@@ -61,6 +61,27 @@ def test_retry_version_repair_keeps_position_compatible_suffix():
     assert plan.reusable_prefix.tolist() == [True, False, False, False, False, True]
 
 
+def test_unused_holes_do_not_turn_retry_into_recovery():
+    from test_reposition_chunk_capacity import _manager, _pending
+    import minisgl.core as core
+
+    previous = core._GLOBAL_CTX
+    core._GLOBAL_CTX = None
+    core.set_global_ctx(core.Context(page_size=1))
+    try:
+        _, cache, _, _ = _manager(64, drop_aware=True)
+        pending = _pending(703)
+        keys = pending.radix_match_ids[:7].clone()
+        keys[:, 3] += 1  # All source positions differ from the requested version.
+        values = torch.tensor([-1, 0, -1, 1, 2, 3, 4], dtype=torch.int32)
+        handle = cache.prefix_cache.insert_prefix(keys, values).handle
+        cache._derive_active_match(pending, handle, values)
+        assert pending.drop_recovery_plan.intervals == ((7, 8),)
+        assert pending.drop_recovery_plan.required_prefix.tolist() == [False, True, False, True, True, True, True]
+    finally:
+        core._GLOBAL_CTX = previous
+
+
 def test_occurrence_repair_skips_resident_suffix_and_drains(monkeypatch):
     from test_reposition_chunk_capacity import (
         _manager, _pending, _complete_intermediate_chunk,
