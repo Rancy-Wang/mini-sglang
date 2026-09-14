@@ -123,3 +123,52 @@ def test_candidate_storage_is_bounded_under_repeated_matches():
     for _ in range(200):
         c.match_prefix(keys, keys[:, 0] != 0)
     assert len(c._leaf_candidates) + len(c._drop_candidates) <= 2 * len(c._candidates) + 64
+
+
+def test_cacheback_does_not_resurrect_evicted_snapshot_after_page_reuse():
+    from test_reposition_generated_cacheback import _final_message
+    from minisgl.core import Req
+    from minisgl.scheduler.cache import CacheManager
+
+    message = _final_message()
+    table = torch.full((1, 16), -1, dtype=torch.int32)
+    manager = CacheManager(6, 1, table, "radix", drop_aware_eviction=True)
+    key_end = int(message.radix_token_to_key[-1])
+    virtual = message.radix_key_virtual_mask[:key_end]
+    original = manager._allocate(5)
+    values = torch.full((key_end,), -1, dtype=torch.int32)
+    values[~virtual] = original
+    handle = manager.prefix_cache.insert_prefix(
+        message.radix_match_ids[:key_end], values, virtual).handle
+    manager.prefix_cache.configure_drop_lock(handle, message.prefix_keep_mask.to(torch.bool))
+    manager.lock(handle)
+    req = Req(
+        input_ids=message.input_ids, true_positions=message.true_positions,
+        raw_positions=message.raw_positions, radix_input_ids=message.radix_input_ids,
+        radix_match_ids=message.radix_match_ids, initial_full_match_indices=original.clone(),
+        initial_active_cached_len=3, true_seq_len=int(message.radix_next_position),
+        table_idx=0, cached_len=3, output_len=1, uid=message.uid,
+        sampling_params=message.sampling_params, cache_handle=handle,
+        prompt_tokens=message.prompt_tokens, prefix_keep_mask=message.prefix_keep_mask,
+        radix_key_virtual_mask=message.radix_key_virtual_mask,
+        radix_key_to_token=message.radix_key_to_token,
+        radix_token_to_key=message.radix_token_to_key,
+        radix_positions=message.radix_positions, radix_repos_info=message.radix_repos_info,
+        radix_next_position=message.radix_next_position,
+        radix_current_reposition=message.radix_current_reposition,
+    )
+    table[0, :3] = original[2:]
+    manager._free(manager.prefix_cache.evict(2))
+    reused = manager._allocate(3)
+    table[0, 3] = reused[0]
+    assert set(reused[1:].tolist()) == set(original[:2].tolist())
+    req.complete_one()
+    req.append_host(torch.tensor([100], dtype=torch.int32))
+    manager.cache_req(req, finished=True)
+    matched = manager.prefix_cache.match_prefix(
+        message.radix_match_ids[:key_end], virtual).cuda_handle
+    assert matched.get_matched_indices()[~virtual][:2].tolist() == [-1, -1]
+    manager._free(reused[1:])
+    manager.check_integrity()
+    manager._free(manager.prefix_cache.evict(manager.prefix_cache.evictable_size))
+    assert sorted(manager.free_slots.tolist()) == list(range(6))
