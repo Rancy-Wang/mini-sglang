@@ -175,13 +175,14 @@ def test_occurrence_repair_skips_resident_suffix_and_drains(monkeypatch):
         core._GLOBAL_CTX = previous
 
 
-def test_completed_recovery_chunk_releases_expired_borrowed_pages():
+def test_completed_recovery_chunk_releases_expired_borrowed_pages(monkeypatch):
     from types import SimpleNamespace
     import minisgl.core as core
     from minisgl.scheduler.drop_recovery import RecoveryPlan
     from minisgl.scheduler.scheduler import Scheduler
     from test_reposition_chunk_capacity import _manager
 
+    monkeypatch.setattr(torch.Tensor, "pin_memory", lambda self: self)
     previous = core._GLOBAL_CTX
     core._GLOBAL_CTX = None
     core.set_global_ctx(core.Context(page_size=1))
