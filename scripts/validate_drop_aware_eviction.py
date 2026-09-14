@@ -163,7 +163,7 @@ def install_observers():
                     for layer in range(self.kv_cache.num_layers)]).cpu()
                 torch.save({"kv": kv, "start": start, "end": end,
                             "raw": req.raw_positions[start:end].clone()},
-                           directory / f"kv-{os.getpid()}-{start}.pt")
+                           directory / f"kv-{os.getpid()}-{start}-{int(req.raw_positions[start])}.pt")
         batch_state.clear()
         emit("forward", queries=queries, size=batch.size, phase=str(batch.phase), graph=graph)
         return result
@@ -494,15 +494,20 @@ async def run_server(args, repo, root, candidate, manifest):
     events = [json.loads(line) for path in root.glob("events-*.jsonl") for line in path.read_text().splitlines()]
     bs8 = [e for e in events if e["kind"] == "forward" and e["size"] == 8
            and all(q[2] - q[1] > 1 and q[3] >= args.min_full_tokens for q in e["queries"])]
-    graph = any(e["kind"] == "forward" and e["size"] == 8 and e["graph"]
-                and all(q[3] >= args.min_full_tokens for q in e["queries"]) for e in events)
+    graph_events = [e for e in events if e["kind"] == "forward" and e["graph"]
+                    and all(q[3] >= args.min_full_tokens for q in e["queries"])]
+    graph = bool(graph_events)
+    graph_bs8 = sum(e["size"] == 8 for e in graph_events) // len(args.gpus.split(','))
     elapsed = sum(r["elapsed_s"] for r in records)
     summary = {"elapsed_s": elapsed, "requests_per_second": args.requests / elapsed,
                "full_tokens_per_second": sum(r["full_tokens"] for r in manifest) / elapsed,
-               "observed_bs8_prefill": len(bs8) // len(args.gpus.split(',')), "graph_replay": graph}
+               "observed_bs8_prefill": len(bs8) // len(args.gpus.split(',')),
+               "observed_bs8_decode": graph_bs8, "graph_replay": graph}
     (root / "summary.json").write_text(json.dumps(summary, indent=2))
     if args.require_forward_bs8 and summary["observed_bs8_prefill"] < 3:
         raise RuntimeError(f"Insufficient actual bs=8 prefill: {summary}")
+    if args.require_forward_bs8 and not graph_bs8:
+        raise RuntimeError(f"No actual bs=8 decode graph replay: {summary}")
     if not graph:
         raise RuntimeError("No normal decode CUDA graph replay observed")
     return summary
