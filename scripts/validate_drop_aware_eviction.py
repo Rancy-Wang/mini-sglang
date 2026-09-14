@@ -418,6 +418,8 @@ async def run_recovery(args):
                            "max_tokens": 8, "temperature": 0, "top_p": 1,
                            "seed": 17, "ignore_eos": True, "stream": False,
                            **rolling_interface(selected, 12)}
+                if args.recovery_tool_choice is not None:
+                    payload["tool_choice"] = args.recovery_tool_choice
                 if args.recovery_single_reposition:
                     # Directed recovery control, deliberately not canonical
                     # Rolling Drop: later Drops keep the first Reposition's
@@ -587,6 +589,7 @@ def main():
     parser.add_argument("--suite", choices=["stress", "recovery"], default="stress")
     parser.add_argument("--recovery-single-reposition", action="store_true",
                         help="Directed recovery control: later Drops preserve source positions.")
+    parser.add_argument("--recovery-tool-choice", choices=["auto", "none"])
     parser.add_argument("--repo", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--baseline", type=Path)
     parser.add_argument("--baseline-only", action="store_true")
