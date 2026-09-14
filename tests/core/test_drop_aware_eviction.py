@@ -94,6 +94,54 @@ def test_no_matched_delta_cannot_reduce_parent_ref():
     c.lock_handle(handle, unlock=True)
 
 
+def test_interleaved_leases_match_independent_key_demand_counts():
+    import random
+
+    rng = random.Random(1702)
+    c = cache()
+    records = [[0, 10 + raw, -1, raw] for raw in range(4)]
+    records += [[1, -2, -4, -1], [0, 14, -1, 4], [0, 15, -1, 5],
+                [1, -4, -6, -1], [0, 16, -1, 6], [0, 17, -1, 7]]
+    keys = torch.tensor(records, dtype=torch.int32)
+    virtual = keys[:, 0] != 0
+    pages = torch.full((10,), -1, dtype=torch.int32)
+    pages[~virtual] = torch.arange(8, dtype=torch.int32)
+    c.insert_prefix(keys, pages, virtual)
+    leases = []
+    for _ in range(80):
+        if leases and (len(leases) == 8 or rng.randrange(2)):
+            handle, _ = leases.pop(rng.randrange(len(leases)))
+            c.lock_handle(handle, unlock=True)
+        else:
+            length = rng.randrange(1, 11)
+            handle = c.match_prefix(keys[:length], virtual[:length]).cuda_handle
+            # Independent request ledger: only these two observed Delta events
+            # can waive KV demand, while historical repair may retain it.
+            eligible = ({1, 2} if length >= 5 else set()) | ({3, 4} if length >= 8 else set())
+            demand = [raw not in eligible or bool(rng.randrange(2))
+                      for raw in range(int((~virtual[:length]).sum()))]
+            key_demand, raw = [], 0
+            for is_marker in virtual[:length].tolist():
+                key_demand.append(True if is_marker else demand[raw])
+                raw += not is_marker
+            c.configure_drop_lock(handle, torch.tensor(demand, dtype=torch.bool))
+            c.lock_handle(handle)
+            leases.append((handle, key_demand))
+        node, cursor = c.root_node, 0
+        while node.children:
+            assert len(node.children) == 1
+            node = next(iter(node.children.values()))
+            end = cursor + node.length
+            assert node.path_ref_count == sum(h.cached_len >= end for h, _ in leases)
+            assert node.ref_count == sum(h.cached_len >= end and any(d[cursor:end])
+                                         for h, d in leases)
+            cursor = end
+    for handle, _ in leases:
+        c.lock_handle(handle, unlock=True)
+    assert set(c.evict(8).tolist()) == set(range(8))
+    assert c.size_info.total_size == 0
+
+
 def test_another_active_reference_prevents_middle_eviction():
     c = cache()
     keys, dropped = insert(c)
