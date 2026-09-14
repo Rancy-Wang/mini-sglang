@@ -483,10 +483,6 @@ class Scheduler(SchedulerIOMixin):
             req.occurrence_terminal_owned_mask = req.occurrence_terminal_owned_mask[
                 keep
             ].contiguous()
-        if req.occurrence_repositioned_cached_mask is not None:
-            req.occurrence_repositioned_cached_mask = req.occurrence_repositioned_cached_mask[
-                initial_keep
-            ].contiguous()
         removed = prompt_len - kept_count
         req.cached_len = kept_count
         req.device_len = kept_count + 1

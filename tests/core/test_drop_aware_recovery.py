@@ -44,10 +44,11 @@ def test_future_repair_reserves_repositioned_terminal_copy():
 
 def test_occurrence_repair_skips_resident_suffix_and_drains(monkeypatch):
     from test_reposition_chunk_capacity import (
-        _manager, _pending, _complete_intermediate_chunk, _free_occurrence_request,
+        _manager, _pending, _complete_intermediate_chunk,
     )
     import minisgl.core as core
     from minisgl.scheduler.prefill import ChunkedReq
+    from minisgl.scheduler.scheduler import Scheduler
     from minisgl.attention.base import build_occurrence_attention_batch
     from types import SimpleNamespace
 
@@ -59,6 +60,7 @@ def test_occurrence_repair_skips_resident_suffix_and_drains(monkeypatch):
     try:
         manager, cache, table, _ = _manager(64, drop_aware=True)
         pending = _pending(701)
+        pending.context_post_prefill_keep_mask = pending.full_keep_mask
         pages = cache._allocate(5)
         values = torch.full((7,), -1, dtype=torch.int32)
         values[torch.tensor([0, 2, 4, 5, 6])] = pages
@@ -82,7 +84,15 @@ def test_occurrence_repair_skips_resident_suffix_and_drains(monkeypatch):
             if isinstance(req, ChunkedReq):
                 _complete_intermediate_chunk(manager, req)
             else:
-                _free_occurrence_request(req, cache, table)
+                req.complete_one()
+                scheduler = object.__new__(Scheduler)
+                scheduler.cache_manager = cache
+                scheduler.table_manager = table
+                scheduler._release_occurrence_transients(req)
+                scheduler._compact_context_after_prefill(req)
+                assert torch.all(table.page_table[req.table_idx, :req.cached_len] >= 0)
+                cache.cache_req(req, finished=True)
+                table.free(req.table_idx)
         assert intervals == [(1, 2), (3, 4), (7, 8)]
         cache._free(cache.prefix_cache.evict(cache.prefix_cache.evictable_size))
         assert len(cache.free_slots) == cache.num_pages
