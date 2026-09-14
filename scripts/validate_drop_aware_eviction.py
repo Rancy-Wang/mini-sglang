@@ -120,6 +120,7 @@ def install_observers():
 
     root = Path(os.environ["MINISGL_DAE_OBSERVER"])
     audit = os.environ.get("MINISGL_DAE_AUDIT") == "1"
+    warmup_chunk = int(os.environ.get("MINISGL_DAE_WARMUP_CHUNK", "0"))
     original_forward = Engine.forward_batch
     original_idle = Scheduler.run_when_idle
     original_schedule = PrefillManager.schedule_next_batch
@@ -162,6 +163,8 @@ def install_observers():
                 if len(self.pending_list) < spec["count"]:
                     return None
                 barrier_seen.add(spec["id"])
+        elif warmup_chunk:
+            budget = min(budget, warmup_chunk)
         return original_schedule(self, budget)
 
     @functools.wraps(original_forward)
@@ -296,6 +299,8 @@ def launch(args, repo, root, candidate):
                MINISGL_DAE_OBSERVER=str(root))
     if args.audit:
         env["MINISGL_DAE_AUDIT"] = "1"
+    if args.warmup_chunk:
+        env["MINISGL_DAE_WARMUP_CHUNK"] = str(args.warmup_chunk)
     runtime = (args.runtime_cache or args.output / "runtime").resolve()
     if runtime == repo or repo in runtime.parents:
         raise ValueError("Compilation caches must be outside the repository")
@@ -644,6 +649,8 @@ def main():
     parser.add_argument("--gpus", required=True)
     parser.add_argument("--port", type=int, default=30714)
     parser.add_argument("--chunk", type=int, default=65536)
+    parser.add_argument("--warmup-chunk", type=int,
+                        help="Identical smaller prefill budget for untimed cache preparation only.")
     parser.add_argument("--memory-ratio", type=float, default=0.30)
     parser.add_argument("--pages", type=int)
     parser.add_argument("--requests", type=int, default=32)
