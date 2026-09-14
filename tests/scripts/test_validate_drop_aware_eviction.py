@@ -29,3 +29,12 @@ def test_workload_histories_are_distinct_and_tool_calls_pair():
     for messages in histories:
         for offset in range(2, len(messages), 2):
             assert messages[offset]["tool_calls"][0]["id"] == messages[offset + 1]["tool_call_id"]
+
+
+def test_control_workloads_preserve_drop_schedule_without_reposition():
+    module = load()
+    messages = module.make_messages(0, 15, 1)
+    assert module.workload_interface(messages, 12, "no-drop") == {}
+    dropped = module.workload_interface(messages, 12, "rolling-drop")
+    assert dropped == {"drop_message": module.rolling_interface(messages)["drop_message"]}
+    assert module.workload_interface(messages, 12, "rolling-reposition") == module.rolling_interface(messages)

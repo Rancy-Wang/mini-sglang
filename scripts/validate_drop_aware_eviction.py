@@ -28,6 +28,15 @@ def rolling_interface(messages, keep=12):
     return {"drop_message": drops, "reposition": [int(i) for i in drops]}
 
 
+def workload_interface(messages, keep, workload):
+    if workload == "no-drop":
+        return {}
+    schedule = rolling_interface(messages, keep)
+    if workload == "rolling-drop":
+        schedule.pop("reposition")
+    return schedule
+
+
 def make_messages(case, rounds, repetitions):
     messages = [{"role": "system", "content": "Read the supplied documents and answer briefly."},
                 {"role": "user", "content": f"Independent research case {case}. Summarize the evidence."}]
@@ -70,7 +79,7 @@ def prepare(args, root):
         repetitions = max(1, min(220, args.min_full_tokens // (rounds * 16)))
         while True:
             messages = make_messages(case, rounds, repetitions)
-            schedule = rolling_interface(messages, args.rolling_keep)
+            schedule = workload_interface(messages, args.rolling_keep, args.workload)
             result = manager.tokenize([TokenizeMsg(
                 uid=case + 1, text=messages, sampling_params=SamplingParams(max_tokens=8),
                 target_msg_id=len(messages), tools=TOOLS, use_context_mask=True,
@@ -466,7 +475,7 @@ async def run_server(args, repo, root, candidate, manifest):
                 for index, payload in enumerate(payloads):
                     warm = copy.deepcopy(payload)
                     warm["messages"] = warm["messages"][:-2]
-                    warm.update(rolling_interface(warm["messages"], args.rolling_keep))
+                    warm.update(workload_interface(warm["messages"], args.rolling_keep, args.workload))
                     warm["max_tokens"] = 1
                     row = await send(client, url + "/v1/chat/completions", warm, f"prepare-{offset + index}")
                     if row.get("status_code") != 200:
@@ -548,8 +557,12 @@ async def run(args):
                  for rep in range(args.repetitions)]
         report = {"paired_throughput_ratios": gains, "median_ratio": statistics.median(gains),
                   "repeatable_gain": len(gains) >= 3 and all(g > 1 for g in gains)}
+        if args.regression_limit is not None:
+            report["regression_limit"] = args.regression_limit
+            report["regression_pass"] = len(gains) >= 3 and all(
+                g >= 1 - args.regression_limit for g in gains)
         (args.output / "throughput.json").write_text(json.dumps(report, indent=2))
-        if not report["repeatable_gain"]:
+        if not report.get("regression_pass", report["repeatable_gain"]):
             raise RuntimeError(f"Required repeatable throughput improvement not established: {report}")
 
 
@@ -576,6 +589,10 @@ def main():
     parser.add_argument("--concurrency", type=int, default=8)
     parser.add_argument("--min-full-tokens", type=int, default=131073)
     parser.add_argument("--rolling-keep", type=int, default=12)
+    parser.add_argument("--workload", choices=["rolling-reposition", "rolling-drop", "no-drop"],
+                        default="rolling-reposition")
+    parser.add_argument("--regression-limit", type=float,
+                        help="For a regression control, allow at most this throughput loss per pair.")
     parser.add_argument("--repetitions", type=int, default=3)
     parser.add_argument("--require-forward-bs8", action="store_true")
     parser.add_argument("--audit", action="store_true")
