@@ -122,7 +122,10 @@ def install_observers():
 
     def control():
         path = root / "numerical.json"
-        return json.loads(path.read_text()) if path.exists() else {}
+        try:
+            return json.loads(path.read_text())
+        except FileNotFoundError:
+            return {}
 
     def tree_nodes(tree):
         stack = list(tree.root_node.children.values())
@@ -140,8 +143,11 @@ def install_observers():
         # Queue a specified test wave before admitting its first prefill. This
         # is identical on both revisions and does not force actual GPU bs=8.
         marker = root / "wave.json"
-        if marker.exists():
+        try:
             spec = json.loads(marker.read_text())
+        except FileNotFoundError:
+            spec = None
+        if spec is not None:
             if spec["id"] not in barrier_seen:
                 if len(self.pending_list) < spec["count"]:
                     return None
