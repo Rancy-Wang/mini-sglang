@@ -74,14 +74,17 @@ python scripts/benchmark_bcp_eviction.py run \
 python scripts/benchmark_bcp_eviction.py report --output /experiment/full --plot
 ```
 
-默认 chunk=16384、memory_ratio=0.9，保留 CUDA Graph。每个 TP 的第一个单元确定 pages
-容量，同一输出目录随后锁定该 TP 的容量；完整矩阵先运行并发8，避免先用小并发过高估算。
+默认 chunk=16384、memory_ratio=0.9，保留 CUDA Graph。按 TP 与 eviction 分组复用服务，
+完整矩阵只需四次模型/tokenizer初始化；每个单元之前实际排空缓存。服务捕获该组需要的
+batch sizes，客户端控制当前单元并发。每个 TP 的第一个单元确定 pages 容量，随后锁定
+该 TP 的容量；完整矩阵先运行并发8，避免先用小并发过高估算。
 GPU分配：TP2取前两张，TP4取前四张。运行前检查指定卡无任务；仅停止自己启动的进程组。
 模型、输入、chunk、内存参数或 smoke 设置改变时必须使用新输出目录。已产生 summary 的
 单元不会自动重跑；重试失败单元使用单独目录并保留失败证据。
 
 `--cell` 可限制单元，`--turn-limit` 只用于冒烟，报告中禁止冒烟加速比。
-`run.json`、每单元 `launch.json` 保存配置、GPU映射、Git HEAD和精确启动命令。
+`run.json`、每单元 `launch.json` 保存配置、GPU映射、Git HEAD和精确启动命令；共享
+服务日志和逐 rank audit 保存在 `servers/`，单元 summary 内也保存其 audit 结果。
 `turns.jsonl.gz` 保存实际输出与原始指标，`summary.json` 保存验证和汇总；
 `results.csv`、`comparisons.json` 和 `scaling-tp2/4.png` 提供对比。
 

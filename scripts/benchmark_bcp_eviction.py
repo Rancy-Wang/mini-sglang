@@ -400,7 +400,8 @@ def install_observers():
 
 async def audit(client, url, root, tp, label, model, **window):
     write_json(
-        root / "audit-command.json", {"id": label, "reset_counters": label == "initial", **window}
+        root / "audit-command.json",
+        {"id": label, "reset_counters": label.startswith("initial-"), **window},
     )
     wake = await client.post(
         url + "/v1/chat/completions",
@@ -452,6 +453,9 @@ def launch(args, cell, root, pages):
         compiler = Path(sys.executable).parent / f"x86_64-conda-linux-gnu-{suffix}"
         if compiler.exists():
             env[key] = str(compiler)
+    if "CXX" in env:
+        # nvcc does not honor CXX for its host compiler when invoked by TVM FFI.
+        env["NVCC_PREPEND_FLAGS"] = f"-ccbin={env['CXX']}"
     argv = [
         sys.executable,
         str(Path(__file__).resolve()),
@@ -521,6 +525,7 @@ def launch(args, cell, root, pages):
             ).strip(),
             "cell": cell,
             "requested_pages": pages,
+            "compiler_env": {key: env.get(key) for key in ("CC", "CXX", "NVCC_PREPEND_FLAGS")},
         },
     )
     return child
@@ -625,7 +630,7 @@ async def replay(args, cell, manifest, cases, root, client, url):
     return dict(summarize(records, (end - start) / 1e9, expected), start_ns=start, end_ns=end)
 
 
-async def run_cell(args, cell, manifest, pages):
+async def run_cell(args, cell, manifest, pages, session):
     import httpx
 
     root = external(args.output) / cell_name(cell)
@@ -653,9 +658,27 @@ async def run_cell(args, cell, manifest, pages):
         "case_ids": [case["case_id"] for case in cases],
         "smoke": bool(args.turn_limit),
     }
-    child = None
     try:
-        child = launch(args, cell, root, pages)
+        if session.get("child") is None:
+            server_root = (
+                external(args.output)
+                / "servers"
+                / (f"tp{cell['tp']}-{cell['eviction']}-{time.time_ns()}")
+            )
+            server_root.mkdir(parents=True)
+            session["root"] = server_root
+            session["child"] = launch(
+                args, dict(cell, concurrency=session["max_concurrency"]), server_root, pages
+            )
+        child, server_root = session["child"], session["root"]
+        write_json(
+            root / "launch.json",
+            {
+                **json.loads((server_root / "launch.json").read_text()),
+                "client_cell": cell,
+                "server_directory": str(server_root),
+            },
+        )
         url = f"http://127.0.0.1:{args.port}"
         async with httpx.AsyncClient(timeout=args.timeout, trust_env=False) as client:
             deadline = time.monotonic() + args.startup_timeout
@@ -671,20 +694,20 @@ async def run_cell(args, cell, manifest, pages):
                 if time.monotonic() > deadline:
                     raise TimeoutError("Server startup deadline exceeded")
                 await asyncio.sleep(2)
-            ready = [json.loads(path.read_text()) for path in root.glob("ready-*.json")]
+            ready = [json.loads(path.read_text()) for path in server_root.glob("ready-*.json")]
             if len(ready) != cell["tp"] or len({r["num_pages"] for r in ready}) != 1:
                 raise RuntimeError(f"Inconsistent TP initialization: {ready}")
             summary["num_pages"] = ready[0]["num_pages"]
             summary["initial_audit"] = await audit(
-                client, url, root, cell["tp"], "initial", args.model
+                client, url, server_root, cell["tp"], "initial-" + cell_name(cell), args.model
             )
             summary.update(await replay(args, cell, manifest, cases, root, client, url))
             summary["final_audit"] = await audit(
                 client,
                 url,
-                root,
+                server_root,
                 cell["tp"],
-                "final",
+                "final-" + cell_name(cell),
                 args.model,
                 start_ns=summary["start_ns"],
                 end_ns=summary["end_ns"],
@@ -709,8 +732,9 @@ async def run_cell(args, cell, manifest, pages):
     except Exception as exc:
         summary["error"] = f"{type(exc).__name__}: {exc}"
     finally:
-        if child is not None:
-            stop(child)
+        if summary["status"] != "PASS" and "final_audit" not in summary and session.get("child"):
+            stop(session.pop("child"))
+            await asyncio.sleep(5)
         write_json(root / "summary.json", summary)
     return summary
 
@@ -748,24 +772,41 @@ async def run(args):
     )
     capacity_path = output / "capacity.json"
     capacity = json.loads(capacity_path.read_text()) if capacity_path.exists() else {}
-    for cell in cells:
-        pages = args.pages or capacity.get(str(cell["tp"]))
-        summary = await run_cell(args, cell, manifest, pages)
-        if "num_pages" in summary:
-            capacity.setdefault(str(cell["tp"]), summary["num_pages"])
-            write_json(capacity_path, capacity)
-        print(
-            json.dumps(
-                {
-                    "finished": cell_name(cell),
-                    "status": summary["status"],
-                    "tokens_per_s": summary.get("output_tokens_per_s"),
-                    "error": summary.get("error"),
+    session, previous = {}, None
+    try:
+        # Stable grouping reuses model/tokenizer/graphs, with a verified empty cache per cell.
+        for cell in sorted(cells, key=lambda c: (c["tp"], c["eviction"] != "ordinary")):
+            key = (cell["tp"], cell["eviction"])
+            if key != previous:
+                if session.get("child"):
+                    stop(session["child"])
+                    await asyncio.sleep(5)
+                session = {
+                    "max_concurrency": max(
+                        c["concurrency"] for c in cells if (c["tp"], c["eviction"]) == key
+                    )
                 }
-            ),
-            flush=True,
-        )
-        await asyncio.sleep(5)
+                previous = key
+            pages = args.pages or capacity.get(str(cell["tp"]))
+            summary = await run_cell(args, cell, manifest, pages, session)
+            if "num_pages" in summary:
+                capacity.setdefault(str(cell["tp"]), summary["num_pages"])
+                write_json(capacity_path, capacity)
+            print(
+                json.dumps(
+                    {
+                        "finished": cell_name(cell),
+                        "status": summary["status"],
+                        "tokens_per_s": summary.get("output_tokens_per_s"),
+                        "error": summary.get("error"),
+                    }
+                ),
+                flush=True,
+            )
+            report(args)
+    finally:
+        if session.get("child"):
+            stop(session["child"])
     report(args)
 
 
