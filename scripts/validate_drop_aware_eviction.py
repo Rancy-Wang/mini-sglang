@@ -59,6 +59,10 @@ TOOLS = [{"type": "function", "function": {"name": "read_document",
     "properties": {"document": {"type": "string"}}, "required": ["document"]}}}]
 
 
+def workload_rounds(case, concurrency, wave_rounds=None):
+    return (wave_rounds[case // concurrency] if wave_rounds else 34) + case % 6
+
+
 def write_control(path, value):
     temporary = path.with_suffix(".tmp")
     temporary.write_text(json.dumps(value))
@@ -75,7 +79,7 @@ def prepare(args, root):
                               radix_drop_key_mode="delta-marker")
     manifest = []
     for case in range(args.requests):
-        rounds = 34 + case % 6
+        rounds = workload_rounds(case, args.concurrency, args.wave_rounds)
         repetitions = max(1, min(220, args.min_full_tokens // (rounds * 16)))
         while True:
             messages = make_messages(case, rounds, repetitions)
@@ -90,10 +94,14 @@ def prepare(args, root):
         payload = {"model": args.model, "messages": messages, "tools": TOOLS,
                    "max_tokens": 8, "temperature": 0, "top_p": 1, "seed": 17,
                    "ignore_eos": True, "stream": False, **schedule}
+        if args.tool_choice is not None:
+            payload["tool_choice"] = args.tool_choice
         encoded = json.dumps(payload, ensure_ascii=False).encode()
         (root / f"case-{case:02d}.json").write_bytes(encoded)
         manifest.append({"case": case, "full_tokens": result.prompt_tokens,
                          "active_tokens": len(result.input_ids), "rounds": rounds,
+                         "max_position": int((result.reposition_layout.birth_positions
+                             if result.reposition_layout is not None else result.true_positions).max()),
                          "repetitions": repetitions, "sha256": hashlib.sha256(encoded).hexdigest()})
         print(json.dumps(manifest[-1]), flush=True)
     (root / "manifest.json").write_text(json.dumps(manifest, indent=2))
@@ -552,7 +560,11 @@ async def run_server(args, repo, root, candidate, manifest):
                "full_tokens_per_second": sum(r["full_tokens"] for r in manifest) / elapsed,
                "observed_bs8_prefill": len(bs8) // len(args.gpus.split(',')),
                "observed_bs8_decode": graph_bs8, "graph_replay": graph}
+    summary["drop_pages"] = max((e.get("eviction", {}).get("drop_pages", 0)
+                                  for e in events if e["kind"] == "idle"), default=0)
     (root / "summary.json").write_text(json.dumps(summary, indent=2))
+    if candidate and args.require_drop_eviction and not summary["drop_pages"]:
+        raise RuntimeError("No natural internal Drop eviction occurred in the capacity comparison")
     if args.require_forward_bs8 and summary["observed_bs8_prefill"] < 3:
         raise RuntimeError(f"Insufficient actual bs=8 prefill: {summary}")
     if args.require_forward_bs8 and not graph_bs8:
@@ -636,6 +648,11 @@ def main():
     parser.add_argument("--concurrency", type=int, default=8)
     parser.add_argument("--min-full-tokens", type=int, default=131073)
     parser.add_argument("--rolling-keep", type=int, default=12)
+    parser.add_argument("--wave-rounds", type=lambda value: [int(n) for n in value.split(',')],
+                        help="Tool-response count per measured wave, plus per-request variation.")
+    parser.add_argument("--tool-choice", choices=["auto", "none"])
+    parser.add_argument("--require-drop-eviction", action="store_true",
+                        help="Require natural internal eviction in each candidate comparison run.")
     parser.add_argument("--workload", choices=["rolling-reposition", "rolling-drop", "no-drop"],
                         default="rolling-reposition")
     parser.add_argument("--regression-limit", type=float,
@@ -647,6 +664,11 @@ def main():
                         help="Candidate-only seeded-history live-lock reclamation, not a throughput comparison.")
     parser.add_argument("--mode", choices=["paged-occurrence", "staged"], default="paged-occurrence")
     args = parser.parse_args()
+    if args.wave_rounds is not None and (
+        len(args.wave_rounds) != (args.requests + args.concurrency - 1) // args.concurrency
+        or any(n <= args.rolling_keep for n in args.wave_rounds)
+    ):
+        parser.error("--wave-rounds must give one count above rolling-keep for each measured wave")
     if args.stress_pressure and (args.baseline or args.suite != "stress"
                                  or args.workload != "rolling-reposition"):
         parser.error("--stress-pressure requires candidate-only rolling-reposition stress")

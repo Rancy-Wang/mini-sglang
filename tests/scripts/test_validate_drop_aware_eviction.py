@@ -38,3 +38,15 @@ def test_control_workloads_preserve_drop_schedule_without_reposition():
     dropped = module.workload_interface(messages, 12, "rolling-drop")
     assert dropped == {"drop_message": module.rolling_interface(messages)["drop_message"]}
     assert module.workload_interface(messages, 12, "rolling-reposition") == module.rolling_interface(messages)
+
+
+def test_capacity_profile_varies_active_history_without_changing_rolling_timing():
+    module = load()
+    for case in range(32):
+        rounds = module.workload_rounds(case, 8, [96, 96, 96, 46])
+        assert rounds == (96 if case < 24 else 46) + case % 6
+        messages = module.make_messages(case, rounds, 1)
+        schedule = module.rolling_interface(messages)
+        assert len(schedule["reposition"]) == rounds - 12
+        assert schedule["reposition"][0] == 27
+        assert module.workload_rounds(case, 8) == 34 + case % 6
