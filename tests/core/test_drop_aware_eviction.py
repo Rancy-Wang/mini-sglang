@@ -140,7 +140,7 @@ def test_cacheback_does_not_resurrect_evicted_snapshot_after_page_reuse():
     values[~virtual] = original
     handle = manager.prefix_cache.insert_prefix(
         message.radix_match_ids[:key_end], values, virtual).handle
-    manager.prefix_cache.configure_drop_lock(handle, message.prefix_keep_mask.to(torch.bool))
+    manager.prefix_cache.configure_drop_lock(handle, message.prefix_keep_mask[:5].to(torch.bool))
     manager.lock(handle)
     req = Req(
         input_ids=message.input_ids, true_positions=message.true_positions,
