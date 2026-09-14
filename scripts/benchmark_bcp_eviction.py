@@ -686,7 +686,7 @@ async def run_cell(args, cell, manifest, pages, session):
                 if child.poll() is not None:
                     raise RuntimeError(f"Server exited during startup: {child.returncode}")
                 try:
-                    response = await client.get(url + "/health", timeout=5)
+                    response = await client.get(url + "/v1/models", timeout=5)
                     if response.status_code == 200:
                         break
                 except httpx.HTTPError:
