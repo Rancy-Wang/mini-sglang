@@ -434,6 +434,18 @@ class RadixPrefixCache(BasePrefixCache):
                 self._update_candidate(node)
             cursor, node = start, node.parent
 
+    def truncate_handle(self, handle: RadixCacheHandle, key_length: int) -> RadixCacheHandle:
+        """Return a stable prefix handle without removing the cached suffix."""
+        cursor, node = handle.cached_len, handle.node
+        while cursor > key_length:
+            start = cursor - node.length
+            if start < key_length:
+                node = self._split_node(node, key_length - start)
+                cursor = key_length
+            else:
+                cursor, node = start, node.parent
+        return RadixCacheHandle(cursor, node)
+
     def _lock_drop_handle(self, handle: RadixCacheHandle, unlock: bool) -> None:
         cursor, node = handle.cached_len, handle.node
         direction = -1 if unlock else 1

@@ -183,6 +183,11 @@ class CacheManager:
             (~matched_virtual_mask).to(device=key_match_indices.device, non_blocking=True)
         ]
         result = self._derive_active_match(req, handle, full_match_indices)
+        if self.drop_aware_eviction:
+            handle = result.handle
+            matched_virtual_mask = (handle.get_matched_virtual_mask() if handle.cached_len
+                                    else torch.empty(0, dtype=torch.bool))
+            exact_full_cached_len = min(exact_full_cached_len, result.full_cached_len)
         if not used_retry:
             return result
 
@@ -215,6 +220,8 @@ class CacheManager:
             req.radix_key_to_token[: handle.cached_len],
         )
         retry_plan_ns = time.perf_counter_ns() - retry_started_ns
+        if self.drop_aware_eviction and req.prefix_keep_mask is not None and len(retry_plan):
+            retry_plan = retry_plan[req.prefix_keep_mask[retry_plan[:, 1].long()].to(torch.bool)]
         if matched_len != handle.cached_len:
             raise RuntimeError("Retry plan compiler disagrees with the selected Radix path.")
         return ContextMatchResult(
@@ -259,6 +266,25 @@ class CacheManager:
                 expiry = torch.full((req.input_len,), req.input_len + 1, dtype=torch.int64)
             req.drop_recovery_plan = plan_recovery(resident, expiry, req.input_len)
             self.prefix_cache.configure_drop_lock(handle, req.drop_recovery_plan.required_prefix)
+        if (self.drop_aware_eviction and req.reposition_execution_mode != "paged-occurrence"
+                and handle.cached_len):
+            virtual = handle.get_matched_virtual_mask()
+            resident = handle.get_resident_mask()[~virtual]
+            required = torch.ones(len(resident), dtype=torch.bool)
+            if req.prefix_keep_mask is not None:
+                required &= req.prefix_keep_mask[:len(resident)].to(torch.bool)
+            if req.use_context_mask and req.full_token_visible_until is not None:
+                required = req.full_token_visible_until[:len(resident)] > len(resident)
+            missing = torch.nonzero(required & ~resident, as_tuple=False).view(-1)
+            if len(missing):
+                # Staged requests arrive in chronological stage order. Resume
+                # their existing stage prefill before the first missing input.
+                raw_end = int(missing[0])
+                key_end = int(torch.nonzero(~virtual, as_tuple=False)[raw_end])
+                handle = self.prefix_cache.truncate_handle(handle, key_end)
+                full_match_indices = full_match_indices[:raw_end]
+                required = required[:raw_end]
+            self.prefix_cache.configure_drop_lock(handle, required)
         active_match_indices = full_match_indices
         active_full_positions = torch.arange(
             len(full_match_indices), dtype=torch.int64, device="cpu"
@@ -341,12 +367,21 @@ class CacheManager:
         full_match_indices = key_match_indices[
             (~matched_virtual_mask).to(device=key_match_indices.device, non_blocking=True)
         ]
+        safe_length = len(full_match_indices)
+        if self.drop_aware_eviction and handle.cached_len:
+            resident = handle.get_resident_mask()[~matched_virtual_mask]
+            missing = torch.nonzero(~resident, as_tuple=False).view(-1)
+            if len(missing):
+                safe_length = int(missing[0])
+                key_end = int(torch.nonzero(~matched_virtual_mask, as_tuple=False)[safe_length])
+                handle = self.prefix_cache.truncate_handle(handle, key_end)
+                full_match_indices = full_match_indices[:safe_length]
         return FullMatchResult(
             handle=handle,
             full_match_indices=full_match_indices,
             full_cached_len=len(full_match_indices),
-            safe_match_indices=full_match_indices,
-            safe_cached_len=len(full_match_indices),
+            safe_match_indices=full_match_indices[:safe_length],
+            safe_cached_len=safe_length,
         )
 
     @property

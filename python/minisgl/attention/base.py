@@ -637,7 +637,9 @@ def build_occurrence_attention_batch(
         direct_page_parts.append(req.occurrence_pages)
 
         local_query = req.cached_len
-        initial_cached_len = getattr(req, "initial_active_cached_len", req.cached_len)
+        recovery = getattr(req, "drop_recovery_plan", None)
+        initial_cached_len = (recovery.matched_length if recovery is not None
+                              else getattr(req, "initial_active_cached_len", req.cached_len))
         reused_raw_parts = []
         for segment_index, (raw_start_tensor, raw_end_tensor) in enumerate(
             zip(query_starts, query_ends, strict=True)
@@ -677,6 +679,8 @@ def build_occurrence_attention_batch(
                     selected_np = selected_keys.numpy()
                     raw_np = selected_raw.numpy()
                     reused = raw_np < initial_cached_len
+                    if recovery is not None:
+                        reused[reused] &= recovery.resident_prefix.numpy()[raw_np[reused]]
                     reused_raw = raw_np[reused]
                     changed = (
                         occurrence_positions.numpy()[selected_np[reused]]
@@ -707,6 +711,8 @@ def build_occurrence_attention_batch(
             raise RuntimeError("Occurrence segments do not cover the request extension.")
         if reused_raw_parts:
             used_cached_positions = torch.unique(torch.cat(reused_raw_parts).to(torch.int64))
+            if recovery is not None:
+                used_cached_positions = used_cached_positions[recovery.resident_prefix[used_cached_positions]]
         else:
             used_cached_positions = torch.empty(0, dtype=torch.int64)
         cached_tokens.append(len(used_cached_positions))
@@ -778,7 +784,9 @@ def _try_build_occurrence_sliding_attention_batch(
             raise RuntimeError("Occurrence page allocation does not cover all occurrences.")
         if req.extend_len != req.device_len - req.cached_len:
             return None
-        initial_cached_len = getattr(req, "initial_active_cached_len", req.cached_len)
+        recovery = getattr(req, "drop_recovery_plan", None)
+        initial_cached_len = (recovery.matched_length if recovery is not None
+                              else getattr(req, "initial_active_cached_len", req.cached_len))
         plan = try_build_occurrence_sliding_plan(
             occurrence_raw,
             occurrence_positions,
@@ -796,6 +804,8 @@ def _try_build_occurrence_sliding_attention_batch(
         if plan is None:
             return None
         local_offsets, local_keys, used_cached_positions = plan
+        if recovery is not None:
+            used_cached_positions = used_cached_positions[recovery.resident_prefix[used_cached_positions.long()]]
         local_lengths = local_offsets[1:] - local_offsets[:-1]
         if len(local_lengths) != req.extend_len:
             return None

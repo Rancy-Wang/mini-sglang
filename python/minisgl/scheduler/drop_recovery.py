@@ -43,6 +43,7 @@ class RecoveryPlan:
     intervals: tuple[tuple[int, int], ...]
     required_prefix: torch.Tensor
     matched_length: int
+    resident_prefix: torch.Tensor
 
     @property
     def start(self) -> int:
@@ -85,7 +86,7 @@ def plan_recovery(
     )[::-1]
     required = expiry[:matched] > next_query[1:matched + 1]
     required |= needed[:matched]
-    return RecoveryPlan(tuple(mask_ranges(needed)), torch.from_numpy(required), matched)
+    return RecoveryPlan(tuple(mask_ranges(needed)), torch.from_numpy(required), matched, resident.clone())
 
 
 def build_drop_capacity_index(req, owned, source_positions, exact, start, end):

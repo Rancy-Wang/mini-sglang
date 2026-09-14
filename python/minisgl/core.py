@@ -648,7 +648,10 @@ class Req:
                 or len(cached_positions) != cached_tokens
                 or len(torch.unique(cached_positions)) != cached_tokens
                 or bool(torch.any(cached_positions < 0).item())
-                or bool(torch.any(cached_positions >= self.initial_active_cached_len).item())
+                or bool(torch.any(cached_positions >= (
+                    self.drop_recovery_plan.matched_length if self.drop_recovery_plan is not None
+                    else self.initial_active_cached_len
+                )).item())
             ):
                 raise ValueError("Attention cache positions must identify distinct initial hits.")
             used_positions = cached_positions.to(dtype=torch.int64, device="cpu")
