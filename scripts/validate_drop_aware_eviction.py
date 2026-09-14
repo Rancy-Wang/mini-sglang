@@ -80,7 +80,9 @@ def prepare(args, root):
     manifest = []
     for case in range(args.requests):
         rounds = workload_rounds(case, args.concurrency, args.wave_rounds)
-        repetitions = max(1, min(220, args.min_full_tokens // (rounds * 16)))
+        target = (args.wave_min_full_tokens[case // args.concurrency]
+                  if args.wave_min_full_tokens else args.min_full_tokens)
+        repetitions = max(1, min(220, target // (rounds * 16)))
         while True:
             messages = make_messages(case, rounds, repetitions)
             schedule = workload_interface(messages, args.rolling_keep, args.workload)
@@ -88,9 +90,9 @@ def prepare(args, root):
                 uid=case + 1, text=messages, sampling_params=SamplingParams(max_tokens=8),
                 target_msg_id=len(messages), tools=TOOLS, use_context_mask=True,
                 **schedule)])[0]
-            if result.prompt_tokens >= args.min_full_tokens:
+            if result.prompt_tokens >= target:
                 break
-            repetitions = int(repetitions * args.min_full_tokens / result.prompt_tokens) + 2
+            repetitions = int(repetitions * target / result.prompt_tokens) + 2
         payload = {"model": args.model, "messages": messages, "tools": TOOLS,
                    "max_tokens": 8, "temperature": 0, "top_p": 1, "seed": 17,
                    "ignore_eos": True, "stream": False, **schedule}
@@ -501,7 +503,7 @@ async def run_server(args, repo, root, candidate, manifest):
                             for i in range(offset, min(args.requests, offset + args.concurrency))]
                 # Prepare the immediately preceding conversation states outside timing.
                 for index, payload in enumerate(payloads):
-                    if args.stress_pressure:
+                    if args.stress_pressure or args.seed_history:
                         seed = copy.deepcopy(payload)
                         seed["messages"] = seed["messages"][:2 + 2 * args.rolling_keep]
                         seed.update(workload_interface(seed["messages"], args.rolling_keep, args.workload))
@@ -650,6 +652,10 @@ def main():
     parser.add_argument("--rolling-keep", type=int, default=12)
     parser.add_argument("--wave-rounds", type=lambda value: [int(n) for n in value.split(',')],
                         help="Tool-response count per measured wave, plus per-request variation.")
+    parser.add_argument("--wave-min-full-tokens", type=lambda value: [int(n) for n in value.split(',')],
+                        help="Full-history minimum per wave; each must meet min-full-tokens.")
+    parser.add_argument("--seed-history", action="store_true",
+                        help="Cache the first retained window before advancing each conversation.")
     parser.add_argument("--tool-choice", choices=["auto", "none"])
     parser.add_argument("--require-drop-eviction", action="store_true",
                         help="Require natural internal eviction in each candidate comparison run.")
@@ -669,6 +675,11 @@ def main():
         or any(n <= args.rolling_keep for n in args.wave_rounds)
     ):
         parser.error("--wave-rounds must give one count above rolling-keep for each measured wave")
+    if args.wave_min_full_tokens is not None and (
+        len(args.wave_min_full_tokens) != (args.requests + args.concurrency - 1) // args.concurrency
+        or any(n < args.min_full_tokens for n in args.wave_min_full_tokens)
+    ):
+        parser.error("--wave-min-full-tokens must meet the full-token minimum for every wave")
     if args.stress_pressure and (args.baseline or args.suite != "stress"
                                  or args.workload != "rolling-reposition"):
         parser.error("--stress-pressure requires candidate-only rolling-reposition stress")
