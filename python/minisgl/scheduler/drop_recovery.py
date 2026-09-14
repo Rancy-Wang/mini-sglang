@@ -62,6 +62,7 @@ def plan_recovery(
     visible_until: torch.Tensor,
     input_length: int,
     rewind_sources: torch.Tensor | None = None,
+    incompatible_sources: torch.Tensor | None = None,
 ) -> RecoveryPlan:
     """Close missing KV dependencies backwards without scanning the Radix tree.
 
@@ -75,14 +76,16 @@ def plan_recovery(
     if not 0 <= matched < input_length or len(expiry) < input_length:
         raise ValueError("Recovery metadata must leave an uncached query suffix.")
     rewind = np.zeros(matched, dtype=np.bool_) if rewind_sources is None else rewind_sources.numpy()
-    missing = np.flatnonzero(~present | rewind)
+    incompatible = (np.zeros(matched, dtype=np.bool_) if incompatible_sources is None
+                    else incompatible_sources.numpy())
+    missing = np.flatnonzero(~present | rewind | incompatible)
     needed = np.zeros(input_length, dtype=np.bool_)
     needed[matched:] = True
     earliest = matched
     for raw in missing[::-1]:
         # Rebuilding an earlier query must not use a lossy inverse rotation of
         # a later-position source. Ordinary suffix queries still reuse it.
-        if present[raw] and earliest == matched:
+        if present[raw] and not incompatible[raw] and earliest == matched:
             continue
         if expiry[raw] > earliest:
             needed[raw] = True

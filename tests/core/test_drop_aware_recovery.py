@@ -52,6 +52,15 @@ def test_future_repair_reserves_repositioned_terminal_copy():
     assert future.tolist() == [4]
 
 
+def test_retry_version_repair_keeps_position_compatible_suffix():
+    resident = torch.tensor([True, False, True, True, True, True])
+    changed = torch.tensor([False, False, True, True, True, True])
+    incompatible = torch.tensor([False, False, False, False, True, False])
+    plan = plan_recovery(resident, torch.full((8,), 9), 8, changed, incompatible)
+    assert plan.intervals == ((1, 5), (6, 8))
+    assert plan.reusable_prefix.tolist() == [True, False, False, False, False, True]
+
+
 def test_occurrence_repair_skips_resident_suffix_and_drains(monkeypatch):
     from test_reposition_chunk_capacity import (
         _manager, _pending, _complete_intermediate_chunk,
