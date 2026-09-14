@@ -53,9 +53,17 @@ def reposition_kv_with_rope_delta_kernel(
     scale_squared = old_cos * old_cos + old_sin * old_sin
     delta_cos = (new_cos * old_cos + new_sin * old_sin) / scale_squared
     delta_sin = (new_sin * old_cos - new_cos * old_sin) / scale_squared
-
-    tl.store(destination_k + offsets, first * delta_cos - second * delta_sin, mask=mask)
-    tl.store(destination_k + half_dim + offsets, second * delta_cos + first * delta_sin, mask=mask)
+    # A different final Radix branch can need its own page at the same position.
+    # In that case copy the source bits instead of round-tripping through RoPE.
+    same_position = old_position == new_position
+    rotated_first = first * delta_cos - second * delta_sin
+    rotated_second = second * delta_cos + first * delta_sin
+    tl.store(destination_k + offsets, tl.where(same_position, first, rotated_first), mask=mask)
+    tl.store(
+        destination_k + half_dim + offsets,
+        tl.where(same_position, second, rotated_second),
+        mask=mask,
+    )
 
     source_v = v_buffer + layer * v_stride_layer + source * v_stride_slot + head * v_stride_head
     destination_v = (

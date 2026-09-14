@@ -222,6 +222,8 @@ class Req:
     occurrence_transform_position_pairs: torch.Tensor | None = None
     occurrence_terminal_owned_mask: torch.Tensor | None = None
     occurrence_initial_source_positions: torch.Tensor | None = None
+    occurrence_exact_full_cached_len: int | None = None
+    occurrence_same_position_retry_copy_count: int = 0
     occurrence_repositioned_cached_mask: torch.Tensor | None = None
     occurrence_inflight: bool = False
     occurrence_abort_deferred: bool = False
@@ -520,6 +522,12 @@ class Req:
                 or len(self.occurrence_initial_source_positions) != self.initial_active_cached_len
             ):
                 raise ValueError("Occurrence source positions must cover the initial cache hits.")
+            if self.occurrence_exact_full_cached_len is not None and not (
+                0 <= self.occurrence_exact_full_cached_len <= self.initial_active_cached_len
+            ):
+                raise ValueError("Occurrence exact prefix must lie within its source prefix.")
+            if self.occurrence_same_position_retry_copy_count < 0:
+                raise ValueError("Occurrence Retry copy count must be non-negative.")
             if self.occurrence_repositioned_cached_mask is not None and (
                 not self.occurrence_repositioned_cached_mask.is_cpu
                 or self.occurrence_repositioned_cached_mask.dtype != torch.bool
@@ -802,8 +810,17 @@ class Req:
 
     @property
     def completion_tokens(self) -> int:
+        # Device-side generation progress is also the seeded sampler's offset.
+        # Keep its pre-existing lookahead semantics independent of usage reports.
         active_prompt_tokens = self.max_device_len - self.output_len
         return self.device_len - active_prompt_tokens
+
+    @property
+    def reported_completion_tokens(self) -> int:
+        active_prompt_tokens = self.max_device_len - self.output_len
+        # Overlap can advance device_len before the sampled token is committed
+        # to the host stream. Count only tokens actually sent to detokenization.
+        return len(self.input_ids) - active_prompt_tokens
 
     def match_stop(self) -> tuple[bool, str | None]:
         if not self.stop_token_seqs:

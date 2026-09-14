@@ -667,6 +667,22 @@ def build_occurrence_attention_batch(
                 key_lengths.append(len(selected_keys))
                 selected_raw = occurrence_raw[selected_keys]
                 reused_raw_parts.append(selected_raw[selected_raw < initial_cached_len])
+                # Allocation also materializes terminal pages solely for cacheback.
+                # Count a position change only when that occurrence is selected by
+                # full attention. Initial source positions remain canonical across
+                # chunks; terminal reuse does not erase the earlier transformation.
+                source_positions = getattr(req, "occurrence_initial_source_positions", None)
+                repos_mask = getattr(req, "occurrence_repositioned_cached_mask", None)
+                if source_positions is not None and repos_mask is not None:
+                    selected_np = selected_keys.numpy()
+                    raw_np = selected_raw.numpy()
+                    reused = raw_np < initial_cached_len
+                    reused_raw = raw_np[reused]
+                    changed = (
+                        occurrence_positions.numpy()[selected_np[reused]]
+                        != source_positions.numpy()[reused_raw]
+                    )
+                    repos_mask.numpy()[reused_raw[changed]] = True
             else:
                 for raw_query in range(query_start, query_end):
                     causal_count = prefix_length + (raw_query - raw_start) + 1

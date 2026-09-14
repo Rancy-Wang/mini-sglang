@@ -108,37 +108,14 @@ def _build_user_msg(msg: TokenizeMsg, t: Any) -> UserMsg:
 
 
 def _build_occurrence_radix_records(t: Any) -> torch.Tensor:
-    """Freeze real-token Radix rows at the KV position where each token was born."""
+    """Key occurrence pages by their frozen, post-Reposition KV positions."""
 
     layout = t.reposition_layout
-    raw_boundaries = t.reposition_raw_boundaries
-    if layout is None or raw_boundaries is None:
-        raise ValueError("Paged-occurrence Reposition requires compiled event boundaries.")
-    if len(raw_boundaries) != len(layout.effective_reposition_stages):
-        raise ValueError("Reposition boundaries and effective stages have different lengths.")
-
-    stage_boundaries = torch.full(
-        (len(layout.transition_offsets),), -1, dtype=torch.int32, device="cpu"
-    )
-    effective_stages = layout.effective_reposition_stages.to(torch.int64)
-    effective = effective_stages > 0
-    if bool(torch.any(effective).item()):
-        stage_boundaries[effective_stages[effective]] = raw_boundaries[effective]
-
-    birth_stages = layout.birth_stages.to(torch.int64)
-    if bool(torch.any(birth_stages < 0).item()) or bool(
-        torch.any(birth_stages >= len(stage_boundaries)).item()
-    ):
-        raise ValueError("Paged-occurrence token birth stage is outside the compiled layout.")
-    token_boundaries = stage_boundaries[birth_stages]
-    if bool(torch.any((birth_stages > 0) & (token_boundaries < 0)).item()):
-        raise ValueError("Paged-occurrence token birth stage has no Reposition boundary.")
-
-    records = layout.records.clone()
-    token_rows = layout.token_to_key
-    records[token_rows, 2] = token_boundaries
-    records[token_rows, 3] = layout.birth_positions
-    return records
+    if layout is None:
+        raise ValueError("Paged-occurrence Reposition requires a compiled layout.")
+    # The compiler already records final repos-info and final position for every
+    # real token. Birth positions belong only to the transient Prefill program.
+    return layout.records
 
 
 def _build_occurrence_user_msg(msg: TokenizeMsg, t: Any) -> UserMsg:
