@@ -680,7 +680,7 @@ def build_occurrence_attention_batch(
                     raw_np = selected_raw.numpy()
                     reused = raw_np < initial_cached_len
                     if recovery is not None:
-                        reused[reused] &= recovery.resident_prefix.numpy()[raw_np[reused]]
+                        reused[reused] &= recovery.reusable_prefix.numpy()[raw_np[reused]]
                     reused_raw = raw_np[reused]
                     changed = (
                         occurrence_positions.numpy()[selected_np[reused]]
@@ -712,7 +712,7 @@ def build_occurrence_attention_batch(
         if reused_raw_parts:
             used_cached_positions = torch.unique(torch.cat(reused_raw_parts).to(torch.int64))
             if recovery is not None:
-                used_cached_positions = used_cached_positions[recovery.resident_prefix[used_cached_positions]]
+                used_cached_positions = used_cached_positions[recovery.reusable_prefix[used_cached_positions]]
         else:
             used_cached_positions = torch.empty(0, dtype=torch.int64)
         cached_tokens.append(len(used_cached_positions))
@@ -807,7 +807,7 @@ def _try_build_occurrence_sliding_attention_batch(
             return None
         local_offsets, local_keys, used_cached_positions = plan
         if recovery is not None:
-            used_cached_positions = used_cached_positions[recovery.resident_prefix[used_cached_positions.long()]]
+            used_cached_positions = used_cached_positions[recovery.reusable_prefix[used_cached_positions.long()]]
         local_lengths = local_offsets[1:] - local_offsets[:-1]
         if len(local_lengths) != req.extend_len:
             return None

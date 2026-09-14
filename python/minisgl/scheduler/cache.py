@@ -264,7 +264,11 @@ class CacheManager:
             expiry = req.full_token_visible_until
             if expiry is None:
                 expiry = torch.full((req.input_len,), req.input_len + 1, dtype=torch.int64)
-            req.drop_recovery_plan = plan_recovery(resident, expiry, req.input_len)
+            rewind_sources = None
+            if bool(torch.any(~resident)):
+                source_positions = handle.get_matched_keys()[~virtual, 3]
+                rewind_sources = source_positions != req.true_positions[:len(resident)]
+            req.drop_recovery_plan = plan_recovery(resident, expiry, req.input_len, rewind_sources)
             self.prefix_cache.configure_drop_lock(handle, req.drop_recovery_plan.required_prefix)
         if (self.drop_aware_eviction and req.reposition_execution_mode != "paged-occurrence"
                 and handle.cached_len):

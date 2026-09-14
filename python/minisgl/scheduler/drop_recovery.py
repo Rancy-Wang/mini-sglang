@@ -43,7 +43,8 @@ class RecoveryPlan:
     intervals: tuple[tuple[int, int], ...]
     required_prefix: torch.Tensor
     matched_length: int
-    resident_prefix: torch.Tensor
+    # Initial resident tokens actually reused, excluding restored source versions.
+    reusable_prefix: torch.Tensor
 
     @property
     def start(self) -> int:
@@ -60,6 +61,7 @@ def plan_recovery(
     resident: torch.Tensor,
     visible_until: torch.Tensor,
     input_length: int,
+    rewind_sources: torch.Tensor | None = None,
 ) -> RecoveryPlan:
     """Close missing KV dependencies backwards without scanning the Radix tree.
 
@@ -72,11 +74,16 @@ def plan_recovery(
     matched = len(present)
     if not 0 <= matched < input_length or len(expiry) < input_length:
         raise ValueError("Recovery metadata must leave an uncached query suffix.")
-    missing = np.flatnonzero(~present)
+    rewind = np.zeros(matched, dtype=np.bool_) if rewind_sources is None else rewind_sources.numpy()
+    missing = np.flatnonzero(~present | rewind)
     needed = np.zeros(input_length, dtype=np.bool_)
     needed[matched:] = True
     earliest = matched
     for raw in missing[::-1]:
+        # Rebuilding an earlier query must not use a lossy inverse rotation of
+        # a later-position source. Ordinary suffix queries still reuse it.
+        if present[raw] and earliest == matched:
+            continue
         if expiry[raw] > earliest:
             needed[raw] = True
             earliest = int(raw)
@@ -86,7 +93,8 @@ def plan_recovery(
     )[::-1]
     required = expiry[:matched] > next_query[1:matched + 1]
     required |= needed[:matched]
-    return RecoveryPlan(tuple(mask_ranges(needed)), torch.from_numpy(required), matched, resident.clone())
+    return RecoveryPlan(tuple(mask_ranges(needed)), torch.from_numpy(required), matched,
+                        torch.from_numpy(present & ~needed[:matched]))
 
 
 def build_drop_capacity_index(req, owned, source_positions, exact, start, end):
@@ -149,7 +157,7 @@ def build_drop_capacity_index(req, owned, source_positions, exact, start, end):
     canonical_terminal[:len(source)] = source
     # Missing matched KV is recreated at its birth position, not at the
     # evicted Radix source position. Reserve its later terminal copy too.
-    missing_source = np.flatnonzero(~req.drop_recovery_plan.resident_prefix.numpy())
+    missing_source = np.flatnonzero(~req.drop_recovery_plan.reusable_prefix.numpy())
     canonical_terminal[missing_source] = pos[birth[missing_source]]
     terminal_needed = keep & ~owner & (
         (pos[terminal] != canonical_terminal)

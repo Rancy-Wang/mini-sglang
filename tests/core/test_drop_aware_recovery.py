@@ -27,6 +27,16 @@ def test_dependency_drop_at_query_boundary_is_invisible():
     assert plan.required_prefix.tolist() == [False, True, True]
 
 
+def test_historical_repair_restores_changed_source_versions_only_before_holes():
+    resident = torch.tensor([True, False, True, False, True, True])
+    changed = torch.tensor([False, False, True, False, True, True])
+    expiry = torch.full((8,), 9)
+    plan = plan_recovery(resident, expiry, 8, changed)
+    assert plan.intervals == ((1, 4), (6, 8))
+    assert plan.reusable_prefix.tolist() == [True, False, False, False, True, True]
+    assert plan_recovery(torch.ones(6, dtype=torch.bool), expiry, 8, changed).intervals == ((6, 8),)
+
+
 def test_future_repair_reserves_repositioned_terminal_copy():
     from test_reposition_chunk_capacity import _pending
     from minisgl.scheduler.drop_recovery import build_drop_capacity_index
@@ -93,7 +103,7 @@ def test_occurrence_repair_skips_resident_suffix_and_drains(monkeypatch):
                 assert torch.all(table.page_table[req.table_idx, :req.cached_len] >= 0)
                 cache.cache_req(req, finished=True)
                 table.free(req.table_idx)
-        assert intervals == [(1, 2), (3, 4), (7, 8)]
+        assert intervals == [(1, 4), (7, 8)]
         cache._free(cache.prefix_cache.evict(cache.prefix_cache.evictable_size))
         assert len(cache.free_slots) == cache.num_pages
     finally:
