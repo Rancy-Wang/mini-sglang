@@ -506,9 +506,11 @@ async def run_server(args, repo, root, candidate, manifest):
             for offset in range(0, args.requests, args.concurrency):
                 payloads = [json.loads((args.input / f"case-{i:02d}.json").read_text())
                             for i in range(offset, min(args.requests, offset + args.concurrency))]
-                # Prepare the immediately preceding conversation states outside timing.
-                for index, payload in enumerate(payloads):
-                    if args.stress_pressure or args.seed_history:
+                # Seed all histories before warming their continuation states. Otherwise
+                # a later historical seed can evict an earlier ready continuation by LRU.
+                # Both revisions use this same chronological preparation outside timing.
+                if args.stress_pressure or args.seed_history:
+                    for index, payload in enumerate(payloads):
                         seed = copy.deepcopy(payload)
                         seed["messages"] = seed["messages"][:2 + 2 * args.rolling_keep]
                         seed.update(workload_interface(seed["messages"], args.rolling_keep, args.workload))
@@ -517,6 +519,7 @@ async def run_server(args, repo, root, candidate, manifest):
                                          f"seed-{offset + index}")
                         if row.get("status_code") != 200:
                             raise RuntimeError(f"Historical seed failed: {row}")
+                for index, payload in enumerate(payloads):
                     warm = copy.deepcopy(payload)
                     warm["messages"] = warm["messages"][:-2]
                     warm.update(workload_interface(warm["messages"], args.rolling_keep, args.workload))
