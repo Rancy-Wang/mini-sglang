@@ -249,6 +249,16 @@ class CacheManager:
         handle: BaseCacheHandle,
         full_match_indices: torch.Tensor,
     ) -> ContextMatchResult:
+        if self.drop_aware_eviction and req.reposition_execution_mode == "paged-occurrence":
+            from .drop_recovery import plan_recovery
+
+            virtual = handle.get_matched_virtual_mask() if handle.cached_len else torch.empty(0, dtype=torch.bool)
+            resident = handle.get_resident_mask()[~virtual]
+            expiry = req.full_token_visible_until
+            if expiry is None:
+                expiry = torch.full((req.input_len,), req.input_len + 1, dtype=torch.int64)
+            req.drop_recovery_plan = plan_recovery(resident, expiry, req.input_len)
+            self.prefix_cache.configure_drop_lock(handle, req.drop_recovery_plan.required_prefix)
         active_match_indices = full_match_indices
         active_full_positions = torch.arange(
             len(full_match_indices), dtype=torch.int64, device="cpu"
@@ -458,7 +468,10 @@ class CacheManager:
                 device=active_indices.device,
             )
 
-            old_full_cached_len = old_handle.physical_cached_len
+            old_full_cached_len = (
+                old_handle.full_token_len if self.drop_aware_eviction
+                else old_handle.physical_cached_len
+            )
             occurrence_birth_pages = getattr(req, "occurrence_birth_pages", None)
             occurrence_birth_owned = getattr(req, "occurrence_birth_owned_mask", None)
             exact_full_cached_len = (
@@ -480,9 +493,13 @@ class CacheManager:
                     raise RuntimeError(
                         "Initial full-token match indices are shorter than the cache handle."
                     )
-                full_indices[:exact_full_cached_len] = req.initial_full_match_indices[
-                    :exact_full_cached_len
-                ]
+                source = req.initial_full_match_indices
+                if self.drop_aware_eviction:
+                    live_virtual = old_handle.get_matched_virtual_mask()
+                    source = old_handle.get_matched_indices()[
+                        (~live_virtual).to(active_indices.device, non_blocking=True)
+                    ]
+                full_indices[:exact_full_cached_len] = source[:exact_full_cached_len]
                 filled[:exact_full_cached_len] = True
 
             if bool(torch.any(active_positions >= full_token_prefix_len).item()):
@@ -560,6 +577,8 @@ class CacheManager:
                 if len(missing_positions) > 0
                 else full_token_prefix_len
             )
+            if self.drop_aware_eviction:
+                cacheable_full_len = full_token_prefix_len
             if cacheable_full_len < exact_full_cached_len:
                 raise RuntimeError("A new real-token hole overlaps the matched Radix prefix.")
             cacheable_key_len = (

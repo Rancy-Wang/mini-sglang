@@ -171,7 +171,7 @@ def _pending(uid: int) -> PendingReq:
     )
 
 
-def _manager(num_pages: int, table_count: int = 2, table_width: int = 32):
+def _manager(num_pages: int, table_count: int = 2, table_width: int = 32, *, drop_aware=False):
     page_table = torch.full((table_count, table_width), -1, dtype=torch.int32)
     cache = CacheManager(
         num_pages,
@@ -179,6 +179,7 @@ def _manager(num_pages: int, table_count: int = 2, table_width: int = 32):
         page_table,
         "radix",
         track_shared_page_owners=False,
+        drop_aware_eviction=drop_aware,
     )
     table = TableManager(table_count, page_table)
     kv_cache = _RecordingKVCache()

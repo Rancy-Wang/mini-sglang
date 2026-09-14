@@ -25,3 +25,48 @@ def test_dependency_drop_at_query_boundary_is_invisible():
                          torch.tensor([2, 10, 10, 10]), 4)
     assert plan.intervals == ((2, 4),)
     assert plan.required_prefix.tolist() == [False, True, True]
+
+
+def test_occurrence_repair_skips_resident_suffix_and_drains(monkeypatch):
+    from test_reposition_chunk_capacity import (
+        _manager, _pending, _complete_intermediate_chunk, _free_occurrence_request,
+    )
+    import minisgl.core as core
+    from minisgl.scheduler.prefill import ChunkedReq
+    from minisgl.attention.base import build_occurrence_attention_batch
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(torch.Tensor, "pin_memory", lambda self: self)
+    previous = core._GLOBAL_CTX
+    core._GLOBAL_CTX = None
+    core.set_global_ctx(core.Context(page_size=1))
+    core.get_global_ctx().attn_backend = SimpleNamespace(supports_multi_context_mask_prefill=True)
+    try:
+        manager, cache, table, _ = _manager(64, drop_aware=True)
+        pending = _pending(701)
+        pages = cache._allocate(5)
+        values = torch.full((7,), -1, dtype=torch.int32)
+        values[torch.tensor([0, 2, 4, 5, 6])] = pages
+        cache.prefix_cache.insert_prefix(pending.radix_match_ids[:7], values,
+                                         pending.radix_key_virtual_mask[:7])
+        manager.pending_list.append(pending)
+        intervals = []
+        while manager.pending_list:
+            batch = manager.schedule_next_batch(8)
+            assert batch is not None
+            req = batch.reqs[0]
+            intervals.append((req.cached_len, req.device_len))
+            metadata = build_occurrence_attention_batch(batch.reqs, torch.device("cpu"))
+            assert metadata is not None
+            # All pages selected by attention must be resident.
+            assert torch.all(req.occurrence_pages[req.occurrence_birth_indices[
+                req.cached_len:req.device_len].long()] >= 0)
+            if isinstance(req, ChunkedReq):
+                _complete_intermediate_chunk(manager, req)
+            else:
+                _free_occurrence_request(req, cache, table)
+        assert intervals == [(1, 2), (3, 4), (7, 8)]
+        cache._free(cache.prefix_cache.evict(cache.prefix_cache.evictable_size))
+        assert len(cache.free_slots) == cache.num_pages
+    finally:
+        core._GLOBAL_CTX = previous

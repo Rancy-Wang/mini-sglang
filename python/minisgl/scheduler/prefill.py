@@ -485,9 +485,11 @@ class PrefillAdder:
                 if match.retry_plan is not None or match.retry_plan_ns != 0:
                     raise RuntimeError("Paged-occurrence matching produced a staged Retry plan.")
                 req.retry_plan_ns += match.retry_plan_ns
-                cached_len = match.full_cached_len
+                logical_cached_len = match.full_cached_len
+                recovery = req.drop_recovery_plan
+                cached_len = recovery.start if recovery is not None else logical_cached_len
                 exact_full_cached_len = match.exact_full_cached_len
-                if match.active_cached_len != cached_len:
+                if match.active_cached_len != logical_cached_len:
                     raise RuntimeError(
                         "Paged-occurrence matching requires the complete full prefix."
                     )
@@ -519,7 +521,11 @@ class PrefillAdder:
                     cache_locked = True
                     table_idx = self.table_manager.allocate()
                     self.table_manager.prepare_occurrence(table_idx, plan_token_count)
-                    source_pages = match.full_match_indices[:cached_len].clone()
+                    source_pages = match.full_match_indices[:logical_cached_len].clone()
+                    if recovery is not None:
+                        # This snapshot must never become a source for a released page.
+                        unused = ~recovery.required_prefix
+                        source_pages[unused.to(source_pages.device, non_blocking=True)] = -1
                     matched_virtual = (
                         cache_handle.get_matched_virtual_mask()[: cache_handle.cached_len]
                         if cache_handle.cached_len > 0
@@ -532,15 +538,15 @@ class PrefillAdder:
                     )
                     source_positions = (
                         source_records[~matched_virtual, 3].to(dtype=torch.int32, device="cpu")
-                        if cached_len > 0
+                        if logical_cached_len > 0
                         else torch.empty(0, dtype=torch.int32, device="cpu")
                     )
-                    if len(source_positions) != cached_len:
+                    if len(source_positions) != logical_cached_len:
                         raise RuntimeError(
                             "Matched source positions do not cover the cached prefix."
                         )
                     terminal_positions = occurrence_positions[
-                        terminal_ids[:cached_len].to(torch.int64)
+                        terminal_ids[:logical_cached_len].to(torch.int64)
                     ]
                     if not torch.equal(
                         source_positions[:exact_full_cached_len],
@@ -563,7 +569,7 @@ class PrefillAdder:
                         device=self.cache_manager.device,
                     )
                     birth_owned = torch.zeros(plan_token_count, dtype=torch.bool, device="cpu")
-                    repositioned_cached = torch.zeros(cached_len, dtype=torch.bool, device="cpu")
+                    repositioned_cached = torch.zeros(logical_cached_len, dtype=torch.bool, device="cpu")
                     usage_positions = None
                     usage_cached_tokens = None
                     usage_repos_tokens = None
@@ -572,11 +578,11 @@ class PrefillAdder:
                     cache_reuse_ratio = _calculate_cache_reuse_ratio(cached_len, full_prefix_len)
                     table = self.table_manager.occurrence_pages(table_idx)
                     table[:plan_token_count].fill_(-1)
-                    if cached_len > 0:
-                        birth_pages[:cached_len].copy_(source_pages)
-                        table[:cached_len].copy_(source_pages)
-                        self.table_manager.occurrence_tokens(table_idx)[:cached_len].copy_(
-                            req.input_ids[:cached_len].pin_memory(), non_blocking=True
+                    if logical_cached_len > 0:
+                        birth_pages[:logical_cached_len].copy_(source_pages)
+                        table[:logical_cached_len].copy_(source_pages)
+                        self.table_manager.occurrence_tokens(table_idx)[:logical_cached_len].copy_(
+                            req.input_ids[:logical_cached_len].pin_memory(), non_blocking=True
                         )
                 except Exception:
                     if table_idx is not None:
@@ -589,6 +595,8 @@ class PrefillAdder:
             else:
                 assert chunked_req is not None
                 cached_len = chunked_req.cached_len
+                if req.drop_recovery_plan is not None:
+                    cached_len, _ = req.drop_recovery_plan.next_interval(cached_len)
                 cache_handle = chunked_req.cache_handle
                 table_idx = chunked_req.table_idx
                 source_pages = chunked_req.initial_full_match_indices
@@ -635,6 +643,9 @@ class PrefillAdder:
 
             try:
                 max_end = min(req.input_len, cached_len + self.token_budget)
+                if req.drop_recovery_plan is not None:
+                    _, interval_end = req.drop_recovery_plan.next_interval(cached_len)
+                    max_end = min(max_end, interval_end)
                 best: tuple[torch.Tensor, int, int, int] | None = None
                 best_end: int | None = None
                 available_pages = self.cache_manager.available_size
@@ -656,22 +667,31 @@ class PrefillAdder:
                             device="cpu",
                         )
                     )
-                    capacity_index = try_build_occurrence_capacity_index(
-                        occurrence_raw,
-                        occurrence_positions,
-                        birth_ids,
-                        terminal_ids,
-                        req.occurrence_segment_query_starts,
-                        req.occurrence_segment_query_ends,
-                        req.occurrence_segment_key_offsets,
-                        req.occurrence_segment_key_indices,
-                        terminal_owned.contiguous(),
-                        final_keep,
-                        source_positions.contiguous(),
-                        chunk_start=cached_len,
-                        max_chunk_end=max_end,
-                        output_len=req.output_len,
-                    )
+                    if req.drop_recovery_plan is not None:
+                        from .drop_recovery import build_drop_capacity_index
+
+                        capacity_index = build_drop_capacity_index(
+                            req, terminal_owned, source_positions, exact_full_cached_len,
+                            cached_len, max_end,
+                        )
+                        same_position_retry_copy_count = 0
+                    else:
+                        capacity_index = try_build_occurrence_capacity_index(
+                            occurrence_raw,
+                            occurrence_positions,
+                            birth_ids,
+                            terminal_ids,
+                            req.occurrence_segment_query_starts,
+                            req.occurrence_segment_query_ends,
+                            req.occurrence_segment_key_offsets,
+                            req.occurrence_segment_key_indices,
+                            terminal_owned.contiguous(),
+                            final_keep,
+                            source_positions.contiguous(),
+                            chunk_start=cached_len,
+                            max_chunk_end=max_end,
+                            output_len=req.output_len,
+                        )
 
                     if capacity_index is not None:
                         first_required_end, current_curve, persistent_curve, future_curve = (
@@ -922,6 +942,8 @@ class PrefillAdder:
             allocated_raw = occurrence_raw[allocated_ids].to(torch.int64)
             terminal_for_allocated = terminal_ids[allocated_raw].to(torch.int64)
             persistent_allocated = allocated_ids == terminal_for_allocated
+            if req.drop_recovery_plan is not None and req.full_keep_mask is not None:
+                persistent_allocated &= req.full_keep_mask[allocated_raw].to(torch.bool)
             persistent_ids = allocated_ids[persistent_allocated]
             persistent_raw = allocated_raw[persistent_allocated]
             persistent_pages = runtime_pages[
@@ -1503,6 +1525,8 @@ class PrefillAdder:
         )
         device_ids.copy_(pending_req.input_ids[_slice].pin_memory(), non_blocking=True)
         return CLS(
+            drop_recovery_plan=pending_req.drop_recovery_plan,
+            drop_recovery_query_start=cached_len,
             occurrence_external_storage=(
                 is_occurrence and self.table_manager.has_occurrence_storage(table_idx)
             ),
@@ -1812,6 +1836,27 @@ class PrefillManager:
         chunk.occurrence_transform_destination_pages = None
         chunk.occurrence_transform_position_pairs = None
         chunk.occurrence_inflight = False
+        if chunk.drop_recovery_plan is not None:
+            start = chunk.drop_recovery_query_start
+            end = min(chunk.cached_len, chunk.drop_recovery_plan.matched_length)
+            if start < end:
+                birth_ids = chunk.occurrence_birth_indices[start:end].to(torch.int64)
+                chunk.occurrence_initial_source_positions[start:end] = (
+                    chunk.occurrence_positions[birth_ids]
+                )
+            # GPU readers have completed. Expired owned birth pages are no longer
+            # dependencies of any later recovery interval or normal query.
+            expiry = chunk.full_token_visible_until
+            if expiry is not None:
+                expired = chunk.occurrence_birth_owned_mask & (expiry <= chunk.cached_len)
+                if bool(expired.any()):
+                    device_mask = expired.to(chunk.occurrence_birth_pages.device, non_blocking=True)
+                    self.cache_manager.free_occurrence_pages(
+                        chunk.occurrence_birth_pages[device_mask]
+                    )
+                    chunk.occurrence_birth_pages[device_mask] = -1
+                    chunk.occurrence_birth_owned_mask[expired] = False
+            return
         # Dropped terminal pages are still final Radix candidates. Do not
         # recycle them before the finished-request commit (or abort cleanup).
 
