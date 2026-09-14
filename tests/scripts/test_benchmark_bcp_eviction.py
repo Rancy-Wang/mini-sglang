@@ -1,5 +1,7 @@
+import asyncio
 import importlib.util
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -108,3 +110,68 @@ def test_experiment_outputs_cannot_land_in_repository():
     m = load()
     with pytest.raises(ValueError):
         m.external(m.REPO / "results")
+
+
+def test_replay_uses_recorded_prefixes_and_waits_for_each_turn(tmp_path):
+    m = load()
+    trajectory = [
+        {"role": "user", "content": "question"},
+        {"role": "assistant", "content": "recorded answer"},
+        {"role": "user", "content": "next question"},
+    ]
+    calls = []
+
+    class Client:
+        async def post(self, url, json):
+            calls.append(json)
+            index = len(calls)
+            metrics = {
+                "request_received_ns": 0,
+                "first_token_generated_ns": 1,
+                "request_finished_ns": 2,
+                "generated_tokens": 2,
+                "prompt_tokens": index,
+                "drop_skipped_tokens": 0,
+            }
+            return SimpleNamespace(
+                status_code=200,
+                raise_for_status=lambda: None,
+                json=lambda: {
+                    "server_metrics": metrics,
+                    "choices": [
+                        {
+                            "finish_reason": "stop",
+                            "message": {"role": "assistant", "content": "new generated answer"},
+                        }
+                    ],
+                },
+            )
+
+    turns = [
+        {"turn": i, "end": end, "full_tokens": i + 1, "messages_sha256": m.digest(trajectory[:end])}
+        for i, end in enumerate((1, 3))
+    ]
+    cell = {
+        "tp": 2,
+        "concurrency": 1,
+        "count": 1,
+        "workload": "no_drop",
+        "phase": "common",
+        "eviction": "ordinary",
+        "suite": "scaling",
+    }
+    result = asyncio.run(
+        m.replay(
+            SimpleNamespace(model="test"),
+            cell,
+            {"tools": [], "max_tokens": 4096},
+            [{"case_id": "1", "trajectory": trajectory, "selected_turns": turns}],
+            tmp_path,
+            Client(),
+            "http://test",
+        )
+    )
+    assert result["completed_turns"] == 2
+    assert calls[0]["messages"] == trajectory[:1]
+    assert calls[1]["messages"] == trajectory
+    assert all("drop_message" not in payload for payload in calls)

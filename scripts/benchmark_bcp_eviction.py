@@ -729,6 +729,7 @@ async def run(args):
             raise ValueError("Unknown cell name; use list-cells")
     fingerprint = {
         "manifest_sha256": digest(manifest),
+        "head": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip(),
         **{
             key: getattr(args, key)
             for key in ("model", "gpus", "chunk", "memory_ratio", "pages", "turn_limit", "timeout")
