@@ -494,7 +494,8 @@ async def run_server(args, repo, root, candidate, manifest):
     events = [json.loads(line) for path in root.glob("events-*.jsonl") for line in path.read_text().splitlines()]
     bs8 = [e for e in events if e["kind"] == "forward" and e["size"] == 8
            and all(q[2] - q[1] > 1 and q[3] >= args.min_full_tokens for q in e["queries"])]
-    graph = any(e["kind"] == "forward" and e["graph"] for e in events)
+    graph = any(e["kind"] == "forward" and e["size"] == 8 and e["graph"]
+                and all(q[3] >= args.min_full_tokens for q in e["queries"]) for e in events)
     elapsed = sum(r["elapsed_s"] for r in records)
     summary = {"elapsed_s": elapsed, "requests_per_second": args.requests / elapsed,
                "full_tokens_per_second": sum(r["full_tokens"] for r in manifest) / elapsed,

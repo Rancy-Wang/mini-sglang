@@ -854,10 +854,12 @@ def test_scheduler_rejection_releases_a_partial_occurrence_request() -> None:
     cache.check_integrity()
 
 
+@pytest.mark.parametrize("drop_aware", [False, True])
 def test_abort_releases_a_completed_partial_occurrence_request(
     monkeypatch: pytest.MonkeyPatch,
+    drop_aware: bool,
 ) -> None:
-    manager, cache, table, _ = _manager(num_pages=15, table_count=1)
+    manager, cache, table, _ = _manager(num_pages=15, table_count=1, drop_aware=drop_aware)
     pending = _pending(uid=112)
     manager.pending_list.append(pending)
     batch = manager.schedule_next_batch(prefill_budget=2)
@@ -886,10 +888,12 @@ def test_abort_releases_a_completed_partial_occurrence_request(
     cache.check_integrity()
 
 
+@pytest.mark.parametrize("drop_aware", [False, True])
 def test_abort_of_a_completed_occurrence_prefill_uses_normal_decode_cleanup(
     monkeypatch: pytest.MonkeyPatch,
+    drop_aware: bool,
 ) -> None:
-    manager, cache, table, _ = _manager(num_pages=32, table_count=1)
+    manager, cache, table, _ = _manager(num_pages=32, table_count=1, drop_aware=drop_aware)
     manager.pending_list.append(_pending(uid=113))
     batch = manager.schedule_next_batch(prefill_budget=8)
     assert batch is not None and len(batch.reqs) == 1

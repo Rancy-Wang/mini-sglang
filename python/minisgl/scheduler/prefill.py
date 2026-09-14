@@ -824,15 +824,27 @@ class PrefillAdder:
                 if cached_len > 0 and not fallback_to_empty:
                     fallback_to_empty = True
                     continue
-            minimum = self._occurrence_capacity_for_chunk(
-                req,
-                start=cached_len,
-                end=cached_len + 1,
-                terminal_owned=terminal_owned,
-                initial_source_positions=source_positions,
-                exact_full_cached_len=exact_full_cached_len,
-            )
-            _, current_pages, persistent_pages, future_pages = minimum
+            if req.drop_recovery_plan is not None:
+                # Use the same demand model for rejection as for admission.
+                # The legacy model includes discarded terminal copies.
+                _, current, persistent, future = build_drop_capacity_index(
+                    req, terminal_owned, source_positions, exact_full_cached_len,
+                    cached_len, cached_len + 1,
+                )
+                current_pages, persistent_pages, future_pages = (
+                    int(current[0]), int(persistent[0]), int(future[0])
+                )
+                source_pages = source_pages[source_pages >= 0]
+            else:
+                minimum = self._occurrence_capacity_for_chunk(
+                    req,
+                    start=cached_len,
+                    end=cached_len + 1,
+                    terminal_owned=terminal_owned,
+                    initial_source_positions=source_positions,
+                    exact_full_cached_len=exact_full_cached_len,
+                )
+                _, current_pages, persistent_pages, future_pages = minimum
             minimum_pages = max(current_pages, persistent_pages + future_pages)
             self_pinned_pages = len(torch.unique(source_pages)) + int(
                 torch.count_nonzero(terminal_owned).item()

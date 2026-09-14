@@ -605,7 +605,7 @@ class RadixPrefixCache(BasePrefixCache):
         value_virtual_mask = virtual_mask.to(device=indices.device, non_blocking=True)
         if bool(torch.any(indices[value_virtual_mask] != -1).item()):
             raise ValueError("Virtual Radix keys must use page value -1.")
-        if bool(torch.any(indices < -1).item()):
+        if self.drop_aware_eviction and bool(torch.any(indices < -1).item()):
             raise ValueError("Radix pages must be nonnegative or the -1 hole sentinel.")
         if not self.drop_aware_eviction and bool(torch.any(indices[~value_virtual_mask] < 0).item()):
             raise ValueError("Real Radix keys must not contain negative page holes.")
