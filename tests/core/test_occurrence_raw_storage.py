@@ -119,6 +119,9 @@ def test_compaction_lease_preserves_pages_positions_sample_and_ownership(externa
     table.occurrence_tokens(slot)[:10] = torch.arange(100, 110, dtype=torch.int32)
     keep = torch.tensor([1, 0, 1, 0, 1, 0, 1, 0, 1], dtype=torch.int32)
     prompt = torch.arange(100, 109, dtype=torch.int32)
+    # Identity occurrence plan: this test isolates post-Prefill index movement,
+    # while still satisfying the real Req constructor's plan/ownership checks.
+    raw = torch.arange(9, dtype=torch.int32)
     req = Req(input_ids=prompt, true_positions=torch.arange(9, dtype=torch.int32),
               raw_positions=torch.arange(9, dtype=torch.int32), radix_input_ids=prompt.to(torch.int64),
               radix_match_ids=prompt.to(torch.int64), true_seq_len=9, table_idx=slot,
@@ -127,6 +130,14 @@ def test_compaction_lease_preserves_pages_positions_sample_and_ownership(externa
               initial_full_match_indices=torch.arange(10, 13, dtype=torch.int32),
               context_post_prefill_keep_mask=keep, occurrence_external_storage=external,
               reposition_execution_mode="paged-occurrence", radix_positions=torch.arange(9),
+              occurrence_raw_tokens=raw, occurrence_positions=raw,
+              occurrence_birth_indices=raw, occurrence_terminal_indices=raw,
+              occurrence_segment_query_starts=torch.tensor([0], dtype=torch.int32),
+              occurrence_segment_query_ends=torch.tensor([9], dtype=torch.int32),
+              occurrence_segment_key_offsets=torch.tensor([0, 9], dtype=torch.int32),
+              occurrence_segment_key_indices=raw,
+              occurrence_birth_pages=torch.arange(10, 19, dtype=torch.int32),
+              occurrence_birth_owned_mask=(raw >= 3) | (raw == 1),
               retry_transformed_mask=torch.tensor([False, True, False]))
     req.cached_len, req.device_len, req.max_device_len = 9, 10, 11
     req.true_positions = req.raw_positions = torch.arange(10, dtype=torch.int32)
