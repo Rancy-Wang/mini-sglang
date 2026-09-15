@@ -80,6 +80,61 @@ class MetricsTests(unittest.TestCase):
 
 
 class AsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_full_client_outputs(self):
+        import gzip
+        import json
+        import tempfile
+        from unittest.mock import patch
+        from aiohttp import web
+
+        async def handler(request):
+            payload = await request.json()
+            await asyncio.sleep(.005)
+            text = 'data: {"choices":[{"delta":{"content":"a"},"finish_reason":"stop"}]}\n\n'
+            text += 'data: {"usage":{"prompt_tokens":3,"completion_tokens":1},"choices":[]}\n\n'
+            text += 'data: [DONE]\n\n'
+            self.assertTrue(payload["stream"])
+            return web.Response(text=text, content_type="text/event-stream")
+        app = web.Application()
+        app.router.add_post("/v1/chat/completions", handler)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                cases = []
+                for i in range(4):
+                    trajectory = [{"role": "user", "content": str(i)}]
+                    filename = f"{i}.gz"
+                    with gzip.open(root / filename, "wt") as stream:
+                        json.dump(trajectory, stream)
+                    cases.append(dict(case_id=str(i), long=i%2 == 0, file=filename,
+                                      trajectory_sha256=bench.digest(trajectory), turns=[dict(
+                                          turn=0, end=1, full_tokens=3, position_tokens=3,
+                                          drop_message={}, reposition=[])]))
+                bench.write_json(root / "manifest.json", dict(cases=cases, tools=[], tokenizer="fixture"))
+                args = types.SimpleNamespace(requests_path=str(root / "manifest.json"),
+                    num_requests=4, concurrency=2, max_token_len=4, tokenizer=None,
+                    output=str(root / "results"), host="127.0.0.1", port=port,
+                    post="/v1/chat/completions", model="fixture", api_key_env=None,
+                    timeout=10, smoke_max_turns=None, smoke_long_last=False,
+                    drop=False, context_limit=20)
+                tokenizer = types.SimpleNamespace(encode=lambda text, **kw: list(text))
+                fake = types.SimpleNamespace(AutoTokenizer=types.SimpleNamespace(from_pretrained=lambda *a, **kw: tokenizer))
+                with patch.dict("sys.modules", {"transformers": fake}):
+                    await bench.run(args)
+                latest = json.loads((root / "results/latest.json").read_text())
+                result = json.loads(Path(latest["result"]).read_text())
+                self.assertTrue(result["valid"])
+                self.assertEqual(len(result["rounds"]), 2)
+                self.assertEqual(len(list((root / "results").glob("*.round-*.json"))), 2)
+                self.assertEqual(sum(r["metrics"]["completed"] for r in result["rounds"]), result["overall"]["metrics"]["completed"])
+        finally:
+            await runner.cleanup()
+
     async def test_scheduler_tail_distinct_and_rounds(self):
         cases = [dict(case_id=str(i), long=i%2 == 0) for i in range(6)]
         live, events = set(), []
