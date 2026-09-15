@@ -17,6 +17,23 @@ profile = load("profile_bcp_ttft_concurrency")
 hooks = load("bcp_ttft_profile_hooks")
 
 
+def test_committed_comparison_rejects_missing_rank_and_late_token_difference():
+    from copy import deepcopy
+    request = dict(cell="fixed-c8-rolling", uid=1, mode="fixed", concurrency=8,
+                   workload="rolling", case_id="210", turn=9, request_sha256="same",
+                   response=dict(server_metrics=dict(generated_tokens=2),
+                                 choices=[dict(message=dict(content="same"))], usage=dict(cached_tokens=4)))
+    events = [dict(kind="committed_token", cell=request["cell"], uid=1, pid=pid, tokens=[token])
+              for pid in (10, 11) for token in (3, 4)]
+    assert profile.compare_committed([request], events, [request], events)[0]["passed"]
+    assert not profile.compare_committed([request], events[:2], [request], events)[0]["passed"]
+    changed = deepcopy(events)
+    changed[1]["tokens"] = changed[3]["tokens"] = [9]
+    result = profile.compare_committed([request], events, [request], changed)[0]
+    assert result["commits_valid"] and result["choices_equal"] and not result["tokens_equal"]
+    assert not result["passed"]
+
+
 def test_fixed_cohort_admits_one_then_seven_without_changing_requests():
     from types import SimpleNamespace as NS
     requests = [NS(uid=i, prompt_tokens=100+i) for i in range(8)]

@@ -326,6 +326,20 @@ def install():
             return previous_release(table, slot)
     TableManager.release_occurrence = release
 
+    # R4: observe the new pre-forward transfer separately from post-forward
+    # compaction. No tensor dispatch observer around model execution.
+    try:
+        from minisgl.scheduler.compact_indices import CompactIndexPool
+    except ModuleNotFoundError:
+        CompactIndexPool = None  # harness also supports the unchanged baseline
+    if CompactIndexPool is not None:
+        original_pack = CompactIndexPool.pack
+        def pack_indices(pool, indices):
+            with span("compact.indices.pack", [], requests=len(indices),
+                      bytes=sum(t.numel()*t.element_size() for pair in indices for t in pair)):
+                return original_pack(pool, indices)
+        CompactIndexPool.pack = pack_indices
+
     def gpu_range(fn, label):
         @functools.wraps(fn)
         def measured(*args, **kwargs):

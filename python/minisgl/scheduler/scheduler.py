@@ -30,6 +30,7 @@ from minisgl.message.tokenizer import get_gpt_oss_terminal_stop_token_ids
 from minisgl.utils import init_logger, load_tokenizer
 
 from .cache import CacheManager
+from .compact_indices import CompactIndexPool
 from .config import SchedulerConfig
 from .decode import DecodeManager
 from .io import SchedulerIOMixin
@@ -140,6 +141,13 @@ class Scheduler(SchedulerIOMixin):
             retry_rope_cache=retry_rope.cos_sin_cache,
         )
         startup_prewarm_started_ns = time.perf_counter_ns()
+        self.compact_index_pool = CompactIndexPool(
+            self.device,
+            # Cap startup reservation at two 8-MiB pairs, even with a large
+            # max-running setting. Exceptional raw streams grow before forward.
+            min(1 << 20, max(config.max_extend_tokens,
+                            config.max_running_req * self.engine.page_table.shape[1])),
+        )
         if config.radix_drop_key_mode == "delta-marker":
             # Delta-marker Radix queries are structured [N, 4] records.  Load
             # their CPU AOT comparator before the first real prefix lookup.
@@ -275,6 +283,7 @@ class Scheduler(SchedulerIOMixin):
 
     def shutdown(self) -> None:
         torch.cuda.synchronize(self.device)
+        self.compact_index_pool.clear_after_synchronize()
         self.sync_all_ranks()
         self.engine.shutdown()
 
@@ -397,6 +406,7 @@ class Scheduler(SchedulerIOMixin):
         keep = req.context_decode_keep_mask
         keep_indices = req.context_decode_keep_indices
         dropped_owned_indices = req.context_decode_dropped_owned_indices
+        index_lease = req.context_decode_index_lease
         if keep is None:
             keep = (keep_mask[prompt_raw] != 0).to(dtype=torch.bool, device="cpu")
         elif len(keep) != prompt_len:
@@ -426,7 +436,10 @@ class Scheduler(SchedulerIOMixin):
         if dropped_owned_indices is None:
             dropped_owned_indices = torch.nonzero(dropped_owned, as_tuple=False).view(-1)
         if len(dropped_owned_indices) > 0:
-            dropped_device = dropped_owned_indices.to(device=pages.device, non_blocking=True)
+            dropped_device = (
+                index_lease.dropped_owned if index_lease is not None
+                else dropped_owned_indices.to(device=pages.device, non_blocking=True)
+            )
             dropped_positions = prompt_raw[dropped_owned]
             dropped_pages = pages.index_select(0, dropped_device)
             if req.inactive_cached_positions is None:
@@ -447,7 +460,10 @@ class Scheduler(SchedulerIOMixin):
             if external_storage
             else self.table_manager.token_pool[req.table_idx]
         )
-        keep_device = keep_indices.to(device=pages.device, non_blocking=True)
+        keep_device = (
+            index_lease.keep if index_lease is not None
+            else keep_indices.to(device=pages.device, non_blocking=True)
+        )
         self.table_manager.page_table[req.table_idx, :kept_count].copy_(
             pages.index_select(0, keep_device)
         )
@@ -455,6 +471,7 @@ class Scheduler(SchedulerIOMixin):
             tokens[:prompt_len].index_select(0, keep_device)
         )
         self.table_manager.token_pool[req.table_idx, kept_count].copy_(tokens[prompt_len])
+        self._release_compact_indices(req)
         if external_storage:
             self.table_manager.release_occurrence(req.table_idx)
         req.occurrence_external_storage = False
@@ -745,6 +762,7 @@ class Scheduler(SchedulerIOMixin):
         return removed_state or removed_uid
 
     def _free_req_resources(self, req: Req) -> None:
+        self._release_compact_indices(req)
         engine = getattr(self, "engine", None)
         if engine is not None:
             engine.sampler.discard(req)
@@ -770,7 +788,14 @@ class Scheduler(SchedulerIOMixin):
         req.occurrence_transient_pages = None
         req.occurrence_inflight = False
 
+    def _release_compact_indices(self, req: Req) -> None:
+        lease = getattr(req, "context_decode_index_lease", None)
+        if lease is not None:
+            lease.release(torch.cuda.current_stream(self.device))
+            req.context_decode_index_lease = None
+
     def _free_aborted_occurrence_resources(self, req: Req) -> None:
+        self._release_compact_indices(req)
         try:
             released = []
             transient = req.occurrence_transient_pages
@@ -874,6 +899,7 @@ class Scheduler(SchedulerIOMixin):
         else:
             batch.out_loc = self.engine.page_table[input_mapping]
         self.engine.attn_backend.prepare_metadata(batch)
+        compact_reqs = []
         for req in batch.reqs:
             if isinstance(req, ChunkedReq) or req.context_post_prefill_keep_mask is None:
                 continue
@@ -894,12 +920,22 @@ class Scheduler(SchedulerIOMixin):
             req.context_decode_dropped_owned_indices = torch.nonzero(
                 (~keep) & owned, as_tuple=False
             ).view(-1)
+            compact_reqs.append(req)
         forward_input = ForwardInput(
             batch=batch,
             sample_args=self.engine.sampler.prepare(batch),
             input_tuple=input_mapping,
             write_tuple=write_mapping,
         )
+        if compact_reqs:
+            if any(req.context_decode_index_lease is not None for req in compact_reqs):
+                raise RuntimeError("A request still owns its previous compact indices.")
+            leases = self.compact_index_pool.pack([
+                (req.context_decode_keep_indices, req.context_decode_dropped_owned_indices)
+                for req in compact_reqs
+            ])
+            for req, lease in zip(compact_reqs, leases, strict=True):
+                req.context_decode_index_lease = lease
         for req in occurrence_reqs:
             req.occurrence_inflight = True
         return forward_input

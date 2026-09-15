@@ -814,6 +814,99 @@ def report(args):
             fig.tight_layout(); fig.savefig(root/f"{mode}-c{concurrency}.png", dpi=150); plt.close(fig)
 
 
+def committed_outputs(requests, events):
+    """Use Req.append_host commits, never infer output by truncating GPU launches."""
+    commits = defaultdict(lambda: defaultdict(list))
+    for event in events:
+        if event["kind"] == "committed_token":
+            commits[(event["cell"], event["uid"])][event["pid"]].extend(event["tokens"])
+    result = {}
+    for row in requests:
+        if "uid" not in row:
+            continue
+        key = (row["mode"], row["concurrency"], row["workload"], str(row["case_id"]), row["turn"])
+        ranks = list(commits[(row["cell"], row["uid"])].values())
+        expected = row["response"]["server_metrics"]["generated_tokens"]
+        valid = len(ranks) == 2 and all(len(tokens) == expected for tokens in ranks) and ranks[0] == ranks[1]
+        result[key] = dict(tokens=ranks[0] if valid else None, commit_valid=valid,
+                           rank_tokens=ranks, choices=row["response"]["choices"],
+                           usage=row["response"]["usage"], request_sha256=row["request_sha256"])
+    return result
+
+
+def compare_committed(before_requests, before_events, after_requests, after_events):
+    before = committed_outputs(before_requests, before_events)
+    after = committed_outputs(after_requests, after_events)
+    comparisons = []
+    for key in sorted(before.keys() | after.keys()):
+        left, right = before.get(key), after.get(key)
+        present = left is not None and right is not None
+        flags = {name+"_equal": bool(present and left[name] == right[name])
+                 for name in ("tokens", "choices", "usage", "request_sha256")}
+        valid = bool(present and left["commit_valid"] and right["commit_valid"])
+        comparisons.append(dict(mode=key[0], concurrency=key[1], workload=key[2],
+            case_id=key[3], turn=key[4], before=left, after=right,
+            commits_valid=valid, **flags, passed=valid and all(flags.values())))
+    return comparisons
+
+
+def compare_versions(args):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    roots = [external(args.before), external(args.after)]
+    output = external(args.output)
+    output.mkdir(parents=True, exist_ok=False)
+    data = []
+    for root in roots:
+        requests = [json.loads(line) for path in sorted(root.glob("*/requests.jsonl"))
+                    for line in path.read_text().splitlines()]
+        events = [json.loads(line) for path in sorted(root.glob("events-*.jsonl"))
+                  for line in path.read_text().splitlines()]
+        data.append((requests, events))
+    comparisons = compare_committed(*data[0], *data[1])
+    completed = all((root/"completed.json").exists() for root in roots)
+    fixed = [row for row in comparisons if row["mode"] == "fixed"]
+    write_json(output/"output-comparison.json", comparisons)
+    summary = []
+    keys = sorted({(r["mode"], r["concurrency"], r["workload"]) for r in data[0][0]})
+    for mode, concurrency, workload in keys:
+        for late in (False, True):
+            row = dict(mode=mode, concurrency=concurrency, workload=workload, late=late)
+            for metric in ("ttft_ms", "tpot_ms"):
+                values = [[r[metric] for r in requests if r["mode"] == mode and
+                           r["concurrency"] == concurrency and r["workload"] == workload and
+                           (not late or r["turn"] >= 9) and r.get(metric) is not None]
+                          for requests, _ in data]
+                for name, group in zip(("before", "after"), values):
+                    row[name+"_"+metric] = statistics.mean(group) if group else None
+                row[metric+"_change_pct"] = (100*(statistics.mean(values[1])/statistics.mean(values[0])-1)
+                                             if all(values) else None)
+            summary.append(row)
+    write_json(output/"performance.json", summary)
+    write_json(output/"verification.json", dict(
+        requests=len(comparisons), completed=completed,
+        full_output_pass=completed and bool(comparisons) and all(r["passed"] for r in comparisons),
+        fixed_output_pass=completed and bool(fixed) and all(r["passed"] for r in fixed),
+        note="One cohort per cell. Raw timing changes are not statistical confidence or a universal no-regression proof.",
+        heads=[json.loads((root/"launch.json").read_text())["head"] for root in roots]))
+    for mode, concurrency in sorted({key[:2] for key in keys}):
+        fig, axes = plt.subplots(2, 1, figsize=(13, 8), sharex=True)
+        for version, (requests, _) in zip(("Before", "After"), data):
+            for workload, color in (("no_drop", "tab:blue"), ("rolling", "tab:orange")):
+                rows = [r for r in requests if (r["mode"],r["concurrency"],r["workload"]) == (mode,concurrency,workload)]
+                turns = sorted({r["turn"] for r in rows})
+                for ax, metric in zip(axes, ("ttft_ms", "tpot_ms")):
+                    values = [statistics.mean(r[metric] for r in rows if r["turn"] == turn and r.get(metric) is not None) for turn in turns]
+                    ax.plot(turns, values, "o--" if version == "Before" else "s-", color=color,
+                            label=f"{version} | {workload}")
+                    ax.set_ylabel(metric); ax.grid(alpha=.2)
+        axes[0].legend(); axes[1].set_xlabel("Turn (zero-based); all peaks retained")
+        fig.suptitle(f"R4 | GPT-OSS-120B TP2 | {mode} C{concurrency} | one cohort")
+        fig.tight_layout(); fig.savefig(output/f"{mode}-c{concurrency}.png", dpi=150); plt.close(fig)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -837,6 +930,10 @@ def main():
     report_parser.add_argument("--output", type=Path, required=True)
     overlap_parser = sub.add_parser("overlap-report")
     overlap_parser.add_argument("--output", type=Path, required=True)
+    comparison_parser = sub.add_parser("compare")
+    comparison_parser.add_argument("--before", type=Path, required=True)
+    comparison_parser.add_argument("--after", type=Path, required=True)
+    comparison_parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.command == "prepare":
         prepare(args)
@@ -844,6 +941,8 @@ def main():
         asyncio.run(run(args))
     elif args.command == "overlap-report":
         overlap_report(args)
+    elif args.command == "compare":
+        compare_versions(args)
     else:
         report(args)
 

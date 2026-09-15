@@ -105,3 +105,58 @@ def test_external_sample_write_uses_post_forward_cached_length():
         (torch.tensor([slot]), torch.tensor([-1])),
     ))
     assert table.occurrence_tokens(slot)[9] == 999
+
+
+@pytest.mark.parametrize("external", [False, True])
+@pytest.mark.parametrize("prepared", [False, True])
+def test_compaction_lease_preserves_pages_positions_sample_and_ownership(external, prepared, monkeypatch):
+    from minisgl.core import Req, SamplingParams
+
+    table = TableManager(1, torch.full((2, 8 if external else 16), -1, dtype=torch.int32))
+    slot = table.allocate()
+    table.prepare_occurrence(slot, 9)
+    table.occurrence_pages(slot)[:9] = torch.arange(10, 19, dtype=torch.int32)
+    table.occurrence_tokens(slot)[:10] = torch.arange(100, 110, dtype=torch.int32)
+    keep = torch.tensor([1, 0, 1, 0, 1, 0, 1, 0, 1], dtype=torch.int32)
+    prompt = torch.arange(100, 109, dtype=torch.int32)
+    req = Req(input_ids=prompt, true_positions=torch.arange(9, dtype=torch.int32),
+              raw_positions=torch.arange(9, dtype=torch.int32), radix_input_ids=prompt.to(torch.int64),
+              radix_match_ids=prompt.to(torch.int64), true_seq_len=9, table_idx=slot,
+              cached_len=3, output_len=2, uid=1, sampling_params=SamplingParams(max_tokens=2),
+              cache_handle=SimpleNamespace(), initial_active_cached_len=3,
+              context_post_prefill_keep_mask=keep, occurrence_external_storage=external,
+              reposition_execution_mode="paged-occurrence", radix_positions=torch.arange(9),
+              retry_transformed_mask=torch.tensor([False, True, False]))
+    req.cached_len, req.device_len, req.max_device_len = 9, 10, 11
+    req.true_positions = req.raw_positions = torch.arange(10, dtype=torch.int32)
+    scheduler = object.__new__(Scheduler)
+    scheduler.table_manager = table
+    retired = []
+    if prepared:
+        req.context_decode_keep_mask = keep.bool()
+        req.context_decode_keep_indices = torch.tensor([0, 2, 4, 6, 8])
+        req.context_decode_dropped_owned_indices = torch.tensor([1, 3, 5, 7])
+        req.context_decode_index_lease = SimpleNamespace(
+            keep=req.context_decode_keep_indices.clone(),
+            dropped_owned=req.context_decode_dropped_owned_indices.clone())
+        original_to = torch.Tensor.to
+        def guarded_to(tensor, *args, **kwargs):
+            assert tensor is not req.context_decode_keep_indices
+            assert tensor is not req.context_decode_dropped_owned_indices
+            return original_to(tensor, *args, **kwargs)
+        monkeypatch.setattr(torch.Tensor, "to", guarded_to)
+        def retire(request):
+            retired.append(request.context_decode_index_lease)
+            request.context_decode_index_lease = None
+        scheduler._release_compact_indices = retire
+    scheduler._compact_context_after_prefill(req)
+    assert table.page_table[slot, :5].tolist() == [10, 12, 14, 16, 18]
+    assert table.token_pool[slot, :6].tolist() == [100, 102, 104, 106, 108, 109]
+    assert req.input_ids.tolist() == [100, 102, 104, 106, 108]
+    assert req.true_positions.tolist() == req.raw_positions.tolist() == [0, 2, 4, 6, 8, 9]
+    assert req.inactive_cached_pages.tolist() == [11, 13, 15, 17]
+    assert req.inactive_cached_positions.tolist() == [1, 3, 5, 7]
+    assert (req.cached_len, req.device_len, req.initial_active_cached_len) == (5, 6, 2)
+    assert req.context_decode_index_lease is None
+    assert not table.has_occurrence_storage(slot)
+    assert len(retired) == int(prepared)
