@@ -113,6 +113,21 @@ def launch(args, group, gpus, port, root):
     return child
 
 
+async def wait_for_gpus(gpus, root):
+    """Queue our service without interrupting another user's workload."""
+    started = time.time()
+    while True:
+        used = subprocess.check_output(["nvidia-smi", "--query-gpu=index,memory.used",
+                                        "--format=csv,noheader,nounits"], text=True)
+        usage = dict((i.strip(), int(v)) for i, v in (line.split(",") for line in used.splitlines()))
+        busy = {i: usage[i] for i in gpus.split(",") if usage[i] > 100}
+        write_json(root / "gpu_wait.json", dict(state="waiting" if busy else "available",
+                                               gpus=gpus, busy=busy, since=started, checked=time.time()))
+        if not busy:
+            return
+        await asyncio.sleep(60)
+
+
 def stop(child):
     try:
         os.killpg(child.pid, signal.SIGTERM)
@@ -155,6 +170,7 @@ async def group_run(args, group, gpus, port):
     group_root.mkdir(parents=True, exist_ok=True)
     root = group_root / ("server-" + str(time.time_ns()))
     root.mkdir()
+    await wait_for_gpus(gpus, root)
     child = launch(args, group, gpus, port, root)
     url = f"http://127.0.0.1:{port}"
     try:
@@ -227,9 +243,13 @@ async def run(args):
     root.mkdir(parents=True, exist_ok=True)
     write_json(root / "matrix.json", dict(head=args.head, input_hash=args.input_hash,
                                          model=args.model, smoke=args.smoke, rounds=3))
-    jobs = [group_run(args, "drop-aware", "0,1", args.port)]
+    if set(args.drop_aware_gpus.split(",")) & set(args.ordinary_gpus.split(",")):
+        raise ValueError("TP2 service GPU sets must be disjoint")
+    if any(len(set(gpus.split(","))) != 2 for gpus in (args.drop_aware_gpus, args.ordinary_gpus)):
+        raise ValueError("Each TP2 service requires two distinct GPUs")
+    jobs = [group_run(args, "drop-aware", args.drop_aware_gpus, args.port)]
     if not args.smoke:
-        jobs.append(group_run(args, "ordinary", "2,3", args.port + 1))
+        jobs.append(group_run(args, "ordinary", args.ordinary_gpus, args.port + 1))
     outcomes = await asyncio.gather(*jobs, return_exceptions=True)
     errors = [str(x) for x in outcomes if isinstance(x, BaseException)]
     write_json(root / "matrix_status.json", {"state": "failed" if errors else "completed", "errors": errors})
@@ -249,6 +269,8 @@ def main():
     parser.add_argument("--output", required=True)
     parser.add_argument("--port", type=int, default=30924)
     parser.add_argument("--pages", type=int)
+    parser.add_argument("--drop-aware-gpus", default="0,1")
+    parser.add_argument("--ordinary-gpus", default="2,3")
     parser.add_argument("--smoke", action="store_true")
     asyncio.run(run(parser.parse_args()))
 
