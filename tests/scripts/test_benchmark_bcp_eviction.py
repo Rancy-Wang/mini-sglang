@@ -162,7 +162,7 @@ def test_replay_uses_recorded_prefixes_and_waits_for_each_turn(tmp_path, fixed_o
                     "server_metrics": metrics,
                     "choices": [
                         {
-                            "finish_reason": "stop",
+                            "finish_reason": "length" if fixed_output else "stop",
                             "message": {"role": "assistant", "content": "new generated answer"},
                         }
                     ],
