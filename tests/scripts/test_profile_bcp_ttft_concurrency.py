@@ -42,6 +42,61 @@ def test_result_identity_uses_previous_batch_not_current_batch():
     assert hooks.result_uids(None) == []
 
 
+def test_nsys_correlation_is_process_local_and_uses_device_times(tmp_path):
+    import json
+    import sqlite3
+    path = tmp_path/"trace.sqlite"
+    with sqlite3.connect(path) as db:
+        db.executescript("""
+        CREATE TABLE StringIds(id INTEGER, value TEXT);
+        CREATE TABLE NVTX_EVENTS(start INTEGER, end INTEGER, text TEXT, globalTid INTEGER);
+        CREATE TABLE CUPTI_ACTIVITY_KIND_RUNTIME(start INTEGER,end INTEGER,globalTid INTEGER,
+            correlationId INTEGER,nameId INTEGER);
+        CREATE TABLE CUPTI_ACTIVITY_KIND_KERNEL(start INTEGER,end INTEGER,globalPid INTEGER,
+            correlationId INTEGER,demangledName INTEGER);
+        """)
+        db.executemany("INSERT INTO StringIds VALUES (?,?)", [(1,"cudaLaunchKernel"),(2,"kernel")])
+        for pid, uid in [(10,3),(11,7)]:
+            tid = (pid << 24) | pid
+            label = json.dumps(dict(r3="engine.forward",uids=[uid],host_ns=1))
+            db.execute("INSERT INTO NVTX_EVENTS VALUES (1,10,?,?)", (label,tid))
+            db.execute("INSERT INTO CUPTI_ACTIVITY_KIND_RUNTIME VALUES (2,3,?,9,1)",(tid,))
+            db.execute("INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (20,50,?,9,2)",(pid<<24,))
+    result = profile.nsys_rows(path)
+    assert [(g["pid"],g["uids"]) for g in result["gpu"]] == [(10,[3]),(11,[7])]
+    assert all(g["start"] == 20 and g["end"] == 50 and g["api_end"] == 3 for g in result["gpu"])
+
+
+def test_clock_alignment_retains_bracket_uncertainty():
+    clocks = [dict(pid=4, r3_clock=1000, start=100)]
+    host = [dict(kind="trace_clock", pid=4, before_ns=1000, after_ns=1004, cell="x",turn=9)]
+    value = profile.trace_clock_offset(clocks, host)
+    assert value["offset_ns"] == -902 and value["uncertainty_ns"] == 2
+    with pytest.raises(ValueError):
+        profile.trace_clock_offset([],host)
+    clocks.append(dict(pid=5,r3_clock=1000,start=200))
+    host.append(dict(kind="trace_clock",pid=5,before_ns=1000,after_ns=1004,cell="x",turn=9))
+    with pytest.raises(ValueError):
+        profile.trace_clock_offset(clocks,host)
+
+
+def test_execution_union_clips_and_does_not_double_count_stream_overlap():
+    rows = [dict(start=0,end=20),dict(start=10,end=30),dict(start=40,end=60)]
+    assert profile.execution_union_ns(rows,5,50) == 35
+    assert profile.execution_union_ns(rows,70,80) == 0
+
+
+def test_blocking_api_attribution_excludes_other_threads_and_ranks():
+    op = dict(pid=1,tid=2,r3="compact.op.to",start=10,end=50)
+    api = dict(pid=1,tid=2,start=12,end=48,correlationId=7)
+    trace = dict(ranges=[op],apis=[api,dict(api,tid=3,start=10,end=50)],gpu=[
+        dict(pid=1,deviceId=0,correlationId=7,start=46,end=49,kind="memcpy"),
+        dict(pid=2,deviceId=1,correlationId=7,start=0,end=100,kind="memcpy")])
+    result = profile.blocked_copy_evidence(trace)[0]
+    assert result["api"] == api and len(result["correlated_gpu"]) == 1
+    assert result["execution"][0]["active_union_ns"] == 2
+
+
 def trajectory():
     result = [{"role":"user", "content":"question"}]
     for i in range(15):
@@ -191,9 +246,10 @@ def test_physical_batch_audit_rejects_split_prefill_and_missing_rank():
     assert not profile.audit_prefill_batches(rows, complete+[batch(1,[8])])[0]["passed"]
 
 
-def test_output_gate_excludes_unused_overlap_but_rejects_missing_generated_tokens():
+@pytest.mark.parametrize("modes", [("baseline", "detail"), ("natural", "overlap")])
+def test_output_gate_excludes_unused_overlap_but_rejects_missing_generated_tokens(modes):
     rows, events = [], []
-    for mode, extra in (("baseline", 50), ("detail", 60)):
+    for mode, extra in zip(modes, (50, 60)):
         rows.append(dict(cell=mode, uid=7, turn=0, case_id="x", mode=mode,
                          concurrency=1, workload="no_drop", ttft_ms=10/1e6,
                          response={"server_metrics":dict(request_received_ns=0,
@@ -206,6 +262,8 @@ def test_output_gate_excludes_unused_overlap_but_rejects_missing_generated_token
                             start_ns=9,tokens=[extra])])
     _, comparison = profile.correlate(rows, events)
     assert comparison[0]["equal"]
+    assert comparison[0]["reference_mode"] == modes[0]
+    assert comparison[0]["measured_mode"] == modes[1]
     assert comparison[0]["detail_tokens"] == [42]
     rows[-1]["response"]["server_metrics"]["generated_tokens"] = 3
     _, comparison = profile.correlate(rows, events)

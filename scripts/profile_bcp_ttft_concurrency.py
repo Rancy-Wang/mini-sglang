@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import signal
+import sqlite3
 import statistics
 import subprocess
 import sys
@@ -61,6 +62,317 @@ def overlap_partition(engine_end, forward_end, collect_start, sync_start, sync_e
         raise ValueError("Non-monotonic overlap interval; do not invent attribution")
     names = ["post_engine", "control_gap", "collect_before_sync", "copy_wait", "record_gap"]
     return dict(zip(names, (b-a for a,b in zip(points, points[1:]))))
+
+
+def nsys_rows(path):
+    """Read an exported Nsight database without inventing device timestamps.
+
+    CUDA correlation IDs are process-local. NVTX and CUDA records already share
+    the Nsight time axis; the clock marks align our perf_counter request metrics.
+    """
+    with sqlite3.connect(f"file:{Path(path).resolve()}?mode=ro", uri=True) as db:
+        db.row_factory = sqlite3.Row
+        tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        strings = {r[0]:r[1] for r in db.execute("SELECT id,value FROM StringIds")}
+        ranges, clocks = [], []
+        for raw in db.execute("SELECT * FROM NVTX_EVENTS"):
+            r = dict(raw)
+            text = r.get("text") or strings.get(r.get("textId"), "")
+            try:
+                label = json.loads(text)
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(label, dict):
+                continue
+            if "r3_clock" in label:
+                clocks.append(dict(start=r["start"], **label))
+            if "r3" in label and r["end"] is not None:
+                ranges.append(dict(start=r["start"], end=r["end"],
+                                   pid=(r["globalTid"] >> 24) & 0xffffff,
+                                   tid=r["globalTid"] & 0xffffff, **label))
+        apis = []
+        for table in ("CUPTI_ACTIVITY_KIND_RUNTIME", "CUPTI_ACTIVITY_KIND_DRIVER"):
+            if table not in tables:
+                continue
+            for raw in db.execute("SELECT * FROM "+table):
+                r = dict(raw)
+                r.update(name=strings[r["nameId"]], pid=(r["globalTid"] >> 24) & 0xffffff,
+                         tid=r["globalTid"] & 0xffffff)
+                apis.append(r)
+        correlation = {(r["pid"],r["correlationId"]):r for r in apis}
+        gpu = []
+        for table, kind in (("CUPTI_ACTIVITY_KIND_KERNEL", "kernel"),
+                            ("CUPTI_ACTIVITY_KIND_MEMCPY", "memcpy"),
+                            ("CUPTI_ACTIVITY_KIND_MEMSET", "memset")):
+            if table not in tables:
+                continue
+            for raw in db.execute("SELECT * FROM "+table):
+                r = dict(raw)
+                r.update(kind=kind, pid=(r["globalPid"] >> 24) & 0xffffff)
+                if kind == "kernel":
+                    r["name"] = strings.get(r.get("demangledName"), "unknown kernel")
+                else:
+                    r["name"] = kind+":"+str(r.get("copyKind", ""))
+                api = correlation.get((r["pid"],r.get("correlationId")))
+                if api:
+                    r.update(api_start=api["start"], api_end=api["end"], api_name=api["name"])
+                    owners = [s for s in ranges if s["pid"] == api["pid"] and s["tid"] == api["tid"]
+                              and s["start"] <= api["start"] <= s["end"]]
+                    if owners:
+                        owner = min(owners, key=lambda s:s["end"]-s["start"])
+                        r.update(owner=owner["r3"], uids=owner["uids"], source=owner.get("source"))
+                gpu.append(r)
+        return dict(ranges=ranges, clocks=clocks, apis=apis, gpu=gpu)
+
+
+def trace_clock_offset(clocks, host_events):
+    """A mark occurred inside [before_ns, after_ns]; retain alignment error."""
+    host = {(e["pid"], e["before_ns"]):e for e in host_events if e["kind"] == "trace_clock"}
+    matches = [(c, host[(c["pid"],c["r3_clock"])]) for c in clocks
+               if (c["pid"],c["r3_clock"]) in host]
+    if not matches:
+        raise ValueError("No bracketed host/Nsight clock marker; cannot align request metrics")
+    lower = max(c["start"]-e["after_ns"] for c,e in matches)
+    upper = min(c["start"]-e["before_ns"] for c,e in matches)
+    if lower > upper:
+        raise ValueError("Clock brackets disagree across ranks; alignment requires investigation")
+    sample = matches[0][1]
+    return dict(offset_ns=(lower+upper)//2, uncertainty_ns=(upper-lower+1)//2,
+                cell=sample["cell"], turn=sample["turn"], marks=len(matches))
+
+
+def execution_union_ns(rows, lo, hi):
+    """Clipped execution union on one GPU, never sum overlapping streams/ranks."""
+    end, total = lo, 0
+    for row in sorted(rows, key=lambda r:r["start"]):
+        start, stop = max(lo, row["start"]), min(hi, row["end"])
+        if stop > max(start, end):
+            total += stop-max(start, end)
+            end = stop
+    return total
+
+
+def blocked_copy_evidence(trace):
+    """Attribute each rank's longest compact operator to its own host thread/API."""
+    result = []
+    for pid in sorted({r["pid"] for r in trace["ranges"]}):
+        ops = [r for r in trace["ranges"] if r["pid"] == pid and r["r3"].startswith("compact.op.")]
+        if not ops:
+            continue
+        op = max(ops, key=lambda r:r["end"]-r["start"])
+        apis = [a for a in trace["apis"] if a["pid"] == pid and a["tid"] == op["tid"]
+                and op["start"] <= a["start"] and a["end"] <= op["end"]]
+        if not apis:
+            continue
+        api = max(apis, key=lambda a:a["end"]-a["start"])
+        related = [g for g in trace["gpu"] if g["pid"] == pid
+                   and g.get("correlationId") == api["correlationId"]]
+        devices = sorted({g["deviceId"] for g in related})
+        execution = []
+        for device in devices:
+            gpu = [g for g in trace["gpu"] if g["deviceId"] == device
+                   and g["end"] > api["start"] and g["start"] < api["end"]]
+            kernels = defaultdict(list)
+            for g in gpu:
+                if g["kind"] == "kernel":
+                    kernels[g["name"]].append(g)
+            totals = [dict(name=name, count=len(gs), execution_union_ns=
+                           execution_union_ns(gs, api["start"], api["end"])) for name,gs in kernels.items()]
+            execution.append(dict(device=device, active_union_ns=execution_union_ns(gpu, api["start"], api["end"]),
+                top_kernels=sorted(totals,key=lambda r:r["execution_union_ns"],reverse=True)[:10]))
+        result.append(dict(pid=pid, operator=op, api=api, correlated_gpu=related, execution=execution))
+    return result
+
+
+def overlap_report(args):
+    root = external(args.output)
+    events = [json.loads(line) for path in root.glob("events-*.jsonl")
+              for line in path.read_text().splitlines()]
+    requests = [json.loads(line) for path in root.glob("*/requests.jsonl")
+                for line in path.read_text().splitlines()]
+    ranks = {e["pid"]:e["rank"] for e in events if e["kind"] == "communication_config"}
+    summaries = []
+    for path in sorted(root.glob("overlap*.sqlite")):
+        trace = nsys_rows(path)
+        clock = trace_clock_offset(trace["clocks"], events)
+        rows = [r for r in requests if r["cell"] == clock["cell"] and r["turn"] == clock["turn"]]
+        if len(rows) != 8 or len({g["deviceId"] for g in trace["gpu"]}) != 2:
+            raise ValueError("Missing requests or one TP GPU in trace")
+        req_by_uid = {r["uid"]:r for r in rows}
+        host = [e for e in events if e.get("cell") == clock["cell"] and e.get("turn") == clock["turn"]]
+        batches = sorted([e for e in host if e["kind"] == "batch" and e["phase"] == "prefill"],
+                         key=lambda e:(e["pid"],e["start_ns"]))
+        spans = [e for e in host if e["kind"] == "overlap_span"]
+        partitions = []
+        for pid in sorted({b["pid"] for b in batches}):
+            bs = [b for b in batches if b["pid"] == pid]
+            for previous, following in zip(bs, bs[1:]):
+                collect = next((s for s in spans if s["pid"] == pid and s["name"] == "result.collect"
+                                and s["uids"] == previous["uids"] and s["start_ns"] > previous["end_ns"]), None)
+                forward = next((s for s in spans if s["pid"] == pid and s["name"] == "scheduler.forward"
+                                and s["uids"] == following["uids"] and s["start_ns"] <= following["start_ns"]
+                                and s["end_ns"] >= following["end_ns"]), None)
+                if not collect or not forward or collect["start_ns"] < forward["end_ns"]:
+                    continue  # Different actual scheduling: never force a P1/P2 story.
+                sync = next((s for s in spans if s["pid"] == pid and s["name"] == "event.synchronize"
+                             and s.get("sample_copy") and s["uids"] == previous["uids"]
+                             and collect["start_ns"] <= s["start_ns"] <= collect["end_ns"]), None)
+                if sync is None:
+                    raise ValueError("Missing identified sample-copy synchronization")
+                # Only rank 0's generation timestamp is returned by the HTTP API.
+                recorded = req_by_uid[previous["uids"][0]]["response"]["server_metrics"]["first_token_generated_ns"]
+                endpoints = [following["end_ns"],forward["end_ns"],collect["start_ns"],sync["start_ns"],sync["end_ns"]]
+                rank0_clock = ranks.get(pid) == 0
+                if rank0_clock and not sync["end_ns"] <= recorded <= collect["end_ns"]:
+                    raise ValueError("Rank 0 token timestamp is outside its collection interval")
+                parts = overlap_partition(*endpoints, recorded) if rank0_clock else None
+                lo, hi = following["end_ns"]+clock["offset_ns"], sync["end_ns"]+clock["offset_ns"]
+                api_waits = sorted([dict(name=a["name"], start=a["start"], end=a["end"],
+                                        overlap_ns=max(0,min(hi,a["end"])-max(lo,a["start"])))
+                                    for a in trace["apis"] if a["pid"] == pid
+                                    and a["start"] < hi and a["end"] > lo],
+                                   key=lambda a:a["overlap_ns"],reverse=True)[:20]
+                engine_range = next((r for r in trace["ranges"] if r["pid"] == pid
+                                     and r["r3"] == "engine.forward" and r["uids"] == previous["uids"]), None)
+                copies = [] if engine_range is None else [g for g in trace["gpu"] if g["pid"] == pid
+                         and g["kind"] == "memcpy" and g.get("copyKind") == 2
+                         and g.get("bytes") == 4*len(previous["uids"])
+                         and engine_range["start"] <= g.get("api_start",-1) <= engine_range["end"]]
+                partitions.append(dict(pid=pid, previous=previous["uids"], following=following["uids"],
+                    engine_end_ns=following["end_ns"], forward_end_ns=forward["end_ns"],
+                    collect_start_ns=collect["start_ns"], sync_start_ns=sync["start_ns"],
+                    sync_end_ns=sync["end_ns"], recorded_ns=recorded if rank0_clock else None,
+                    partition_ns=parts, collection_end_ns=collect["end_ns"], top_cuda_api=api_waits,
+                    sample_d2h_candidates=copies,
+                    sample_ready_host_ns=copies[0]["end"]-clock["offset_ns"] if len(copies) == 1 else None))
+        summary = dict(file=path.name, clock=clock, partitions=partitions,
+                       gpu_rows=len(trace["gpu"]), api_rows=len(trace["apis"]),
+                       blocked_copy=blocked_copy_evidence(trace))
+        write_json(root/(path.stem+"-parsed.json"), dict(summary=summary, **trace))
+        summaries.append(summary)
+        plot_overlap_trace(root, path.stem, trace, clock, rows)
+    if not summaries:
+        raise ValueError("No exported overlap*.sqlite traces")
+    write_json(root/"overlap-summary.json", summaries)
+    plot_overlap_comparison(root, summaries, requests)
+
+
+def plot_overlap_comparison(root, summaries, requests):
+    """Compare actual adjacent batches only; no fabricated GPU forward rectangles."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Patch
+    selected = [s for s in summaries if any(p["partition_ns"] for p in s["partitions"])]
+    if not selected:
+        return
+    fig, axes = plt.subplots(len(selected), 1, figsize=(16, 4.4*len(selected)), squeeze=False)
+    colors = dict(engine="#457fb1", sync="#9a76b5", compact="#eda746", blocked="#d9594c",
+                  p1="#54a8b0", p2="#448763", unknown="#bcbfc4")
+    for ax, summary in zip(axes[:,0], selected):
+        trace = json.loads((root/(Path(summary["file"]).stem+"-parsed.json")).read_text())
+        clock = summary["clock"]
+        rows = [r for r in requests if r["cell"] == clock["cell"] and r["turn"] == clock["turn"]]
+        base = min(r["response"]["server_metrics"]["request_received_ns"] for r in rows)+clock["offset_ns"]
+        sec = lambda ns:(ns-base)/1e9
+        p = next(p for p in summary["partitions"] if p["partition_ns"])
+        pids = sorted({p["pid"] for p in summary["partitions"]})
+        for rank,pid in enumerate(pids):
+            y = rank*2
+            for name,color in (("engine.forward",colors["engine"]), ("compact",colors["compact"]),
+                               ("event.synchronize",colors["sync"])):
+                bars = [(sec(r["start"]),(r["end"]-r["start"])/1e9) for r in trace["ranges"]
+                        if r["pid"] == pid and r["r3"] == name]
+                ax.broken_barh(bars,(y-.3,.6),facecolors=color)
+            for evidence in summary["blocked_copy"]:
+                if evidence["pid"] == pid and evidence["api"]["end"]-evidence["api"]["start"] > 1e9:
+                    a = evidence["api"]
+                    ax.broken_barh([(sec(a["start"]),(a["end"]-a["start"])/1e9)],(y-.3,.6),facecolors=colors["blocked"])
+                    ax.text(sec((a["start"]+a["end"])//2),y,
+                            f"cudaMemcpyAsync host blocked: {(a['end']-a['start'])/1e9:.3f} s",ha="center",va="center",color="white",fontsize=10)
+            for label in ("unknown","p1","p2"):
+                def group(g):
+                    if g.get("owner") == "engine.forward":
+                        if g.get("uids") == p["previous"]: return "p1"
+                        if g.get("uids") == p["following"]: return "p2"
+                    return "unknown"
+                bars = [(sec(g["start"]),(g["end"]-g["start"])/1e9) for g in trace["gpu"]
+                        if g["pid"] == pid and group(g) == label]
+                ax.broken_barh(bars,(y+.7,.6),facecolors=colors[label])
+        ready = p["sample_ready_host_ns"]
+        recorded = sec(p["recorded_ns"]+clock["offset_ns"])
+        ax.axvline(recorded,color="#b62637",lw=1.5)
+        suffix = "P1 D2H unidentified"
+        if ready is not None:
+            ready_s = sec(ready+clock["offset_ns"])
+            ax.axvline(ready_s,color="#263238",lw=1,ls="--")
+            suffix = f"P1 D2H ready {ready_s:.3f} s | CPU records P1 {recorded:.3f} s | ready-to-record {(p['recorded_ns']-ready)/1e6:.2f} ms"
+        ax.set_title(f"{clock['cell']} / turn {clock['turn']} / physical batches {len(p['previous'])}+{len(p['following'])}\n{suffix}",loc="left",fontsize=12)
+        ax.set_yticks(range(len(pids)*2),[label for rank in range(len(pids)) for label in (f"CPU rank {rank}",f"GPU rank {rank}")])
+        ax.set_ylim(len(pids)*2-.4,-.6)
+        ax.set_xlim(0,max(sec(r["response"]["server_metrics"]["first_token_generated_ns"]+clock["offset_ns"]) for r in rows)+1)
+        ax.grid(axis="x",alpha=.2); ax.set_xlabel("Seconds since first HTTP receipt (one aligned CPU / GPU axis)")
+    common_end = max(ax.get_xlim()[1] for ax in axes[:,0])
+    for ax in axes[:,0]:
+        ax.set_xlim(0, common_end)
+    handles = [Patch(color=colors[k],label=v) for k,v in (("engine","CPU Engine (enqueue + any waits)"),
+        ("sync","CPU event wait"),("compact","CPU compact"),("blocked","CPU blocking CUDA API"),
+        ("p1","Actual GPU P1 work"),("p2","Actual GPU P2 work"),("unknown","Other / unassigned GPU work"))]
+    fig.legend(handles=handles,loc="lower center",ncol=4,fontsize=9,bbox_to_anchor=(.5,.018))
+    fig.text(.01,.004,"Dashed: P1 token reaches CPU memory. Red: CPU records P1. GPU lanes merge streams visually; raw stream plots remain available. Rank 1 P1 attribution may be absent at capture start.",fontsize=9)
+    fig.tight_layout(rect=(0,.105,1,1)); fig.savefig(root/"p1-p2-causal-comparison.png",dpi=160); plt.close(fig)
+
+
+def plot_overlap_trace(root, stem, trace, clock, requests):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Patch
+    base = min(r["response"]["server_metrics"]["request_received_ns"] for r in requests)+clock["offset_ns"]
+    sec = lambda ns:(ns-base)/1e9
+    first = {r["uid"]:r["response"]["server_metrics"]["first_token_generated_ns"]+clock["offset_ns"] for r in requests}
+    finish = max(r["response"]["server_metrics"]["request_finished_ns"] for r in requests)+clock["offset_ns"]
+    pids = sorted({r["pid"] for r in trace["ranges"] if r["r3"] == "scheduler.forward"})
+    colors = {"engine.forward":"#327da8", "compact":"#df9a37", "result.collect":"#a64962"}
+    groups = [(pid,g["deviceId"],g["streamId"]) for pid in pids for g in trace["gpu"] if g["pid"] == pid]
+    groups = sorted(set(groups))
+    lanes = [("cpu",pid,None) for pid in pids]+[("gpu",pid,(dev,stream)) for pid,dev,stream in groups]
+    for zoom in (False, True):
+        fig, ax = plt.subplots(figsize=(17,max(6,1.0*len(lanes))))
+        for y,(kind,pid,key) in enumerate(lanes):
+            if kind == "cpu":
+                for name,color in colors.items():
+                    for r in trace["ranges"]:
+                        if r["pid"] == pid and r["r3"] == name:
+                            ax.broken_barh([(sec(r["start"]),(r["end"]-r["start"])/1e9)],(y-.3,.6),facecolors=color)
+                for r in trace["ranges"]:
+                    if r["pid"] == pid and r["r3"].startswith("compact.op") and r["end"]-r["start"] > 5e7:
+                        ax.text(sec(r["start"]),y-.36,r["r3"].removeprefix("compact.op.")+"\n"+str(r.get("source","")).split("/")[-1],fontsize=8,va="top")
+            else:
+                dev,stream = key
+                for color,condition in (("#409878",lambda g:g["kind"] == "kernel"),
+                                        ("#9a70b0",lambda g:g["kind"] != "kernel")):
+                    bars = [(sec(g["start"]),(g["end"]-g["start"])/1e9) for g in trace["gpu"]
+                            if g["pid"] == pid and g["deviceId"] == dev and g["streamId"] == stream and condition(g)]
+                    ax.broken_barh(bars,(y-.3,.6),facecolors=color)
+        for uid,t in first.items():
+            ax.axvline(sec(t),color="#bd3546",alpha=.25,lw=.7)
+        ax.set_yticks(range(len(lanes)), [f"CPU PID {pid}" if kind == "cpu" else f"GPU {key[0]} / stream {key[1]}" for kind,pid,key in lanes])
+        ax.invert_yaxis(); ax.grid(axis="x",alpha=.2)
+        ax.set_xlabel("Seconds since first HTTP receipt (measured CPU / CUDA aligned timeline)")
+        ax.set_title(f"{clock['cell']} | Turn {clock['turn']} | "+("longest compact interval" if zoom else "whole wave"))
+        ax.legend(handles=[Patch(color=c,label=n) for n,c in colors.items()]+
+                  [Patch(color="#409878",label="GPU kernel"),Patch(color="#9a70b0",label="GPU memory operation")],loc="upper right",fontsize=9)
+        if zoom:
+            candidates = [r for r in trace["ranges"] if r["r3"] == "compact"]
+            if not candidates:
+                candidates = [r for r in trace["ranges"] if r["r3"] == "engine.forward"]
+            longest = max(candidates,key=lambda r:r["end"]-r["start"])
+            ax.set_xlim(max(0,sec(longest["start"])-.3),sec(longest["end"])+.3)
+        else:
+            ax.set_xlim(0,sec(finish)+.2)
+        fig.text(.01,.005,f"Clock alignment uncertainty <= {clock['uncertainty_ns']/1000:.1f} us. Red lines: CPU first-token records. GPU bars are execution, not host enqueue.",fontsize=10)
+        fig.tight_layout(rect=(0,.025,1,1)); fig.savefig(root/f"{stem}-{'zoom' if zoom else 'timeline'}.png",dpi=160); plt.close(fig)
 
 
 def rolling_interface(messages, keep=8):
@@ -188,10 +500,12 @@ def correlate(requests, events):
             raw_tokens[:generated] if len(raw_tokens) >= generated else None)
     comparison = []
     for key, tokens in output_tokens.items():
-        if key[0] != "detail":
+        if key[0] not in ("detail", "overlap"):
             continue
-        baseline = output_tokens.get(("baseline", *key[1:]))
+        reference_mode = "natural" if key[0] == "overlap" else "baseline"
+        baseline = output_tokens.get((reference_mode, *key[1:]))
         comparison.append(dict(concurrency=key[1], workload=key[2], case_id=key[3], turn=key[4],
+                               reference_mode=reference_mode, measured_mode=key[0],
                                baseline_tokens=baseline, detail_tokens=tokens,
                                equal=baseline is not None and tokens is not None and tokens==baseline))
     return components, comparison
@@ -514,11 +828,15 @@ def main():
     run_parser.add_argument("--skip-report", action="store_true", help="Export/plot captured artifacts locally")
     report_parser = sub.add_parser("report")
     report_parser.add_argument("--output", type=Path, required=True)
+    overlap_parser = sub.add_parser("overlap-report")
+    overlap_parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.command == "prepare":
         prepare(args)
     elif args.command == "run":
         asyncio.run(run(args))
+    elif args.command == "overlap-report":
+        overlap_report(args)
     else:
         report(args)
 
