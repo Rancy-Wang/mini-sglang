@@ -166,8 +166,12 @@ def correlate(requests, events):
         part["ttft_ms"] = row["ttft_ms"]
         part["partition_valid"] = all(a<=b for a,b in zip(points, points[1:])) and abs(part["sum_ms"]-row["ttft_ms"])<1e-6
         components.append(dict(cell=cell, uid=uid, turn=row["turn"], case_id=row["case_id"], pid=pid, **part))
-        output_tokens[(row["mode"], row["concurrency"], row["workload"], row["case_id"], row["turn"])] = [
-            event["tokens"][offset] for event,offset in sequence if "tokens" in event]
+        raw_tokens = [event["tokens"][offset] for event,offset in sequence if "tokens" in event]
+        # Overlap may execute an unused lookahead token after the request limit.
+        # Compare the generated sequence, retaining every raw launch in events.
+        generated = metrics.get("generated_tokens", len(raw_tokens))
+        output_tokens[(row["mode"], row["concurrency"], row["workload"], row["case_id"], row["turn"])] = (
+            raw_tokens[:generated] if len(raw_tokens) >= generated else None)
     comparison = []
     for key, tokens in output_tokens.items():
         if key[0] != "detail":
@@ -175,7 +179,7 @@ def correlate(requests, events):
         baseline = output_tokens.get(("baseline", *key[1:]))
         comparison.append(dict(concurrency=key[1], workload=key[2], case_id=key[3], turn=key[4],
                                baseline_tokens=baseline, detail_tokens=tokens,
-                               equal=baseline is not None and tokens==baseline))
+                               equal=baseline is not None and tokens is not None and tokens==baseline))
     return components, comparison
 
 
@@ -216,6 +220,31 @@ def ttft_function_totals(requests, events):
                 total["contained_"+metric.replace("_ns", "_ms")] += event[metric]/1e6
     return [dict(cell=k[0], turn=k[1], pid=k[2], name=k[3], phase=k[4], **value)
             for k,value in totals.items()]
+
+
+def audit_prefill_batches(requests, events):
+    """Require one complete physical prefill per TP rank, not just HTTP concurrency."""
+    waves = defaultdict(list)
+    for row in requests:
+        if "uid" in row:
+            waves[(row["cell"], row["turn"])].append(row)
+    result = []
+    for (cell, turn), rows in waves.items():
+        expected = rows[0]["concurrency"]
+        uids = sorted(r["uid"] for r in rows)
+        batches = [e for e in events if e.get("cell") == cell and e.get("turn") == turn
+                   and e["kind"] == "batch" and e["phase"] == "prefill"]
+        by_rank = defaultdict(list)
+        for batch in batches:
+            by_rank[batch["pid"]].append(batch)
+        passed = len(uids) == expected and len(set(uids)) == expected and len(by_rank) == 2
+        passed &= all(len(bs) == 1 and sorted(bs[0]["uids"]) == uids
+                      and bs[0]["size"] == expected for bs in by_rank.values())
+        result.append(dict(cell=cell, turn=turn, expected=expected, uids=uids,
+                           physical_batches={str(pid): [dict(size=b["size"], uids=b["uids"],
+                               extend=b.get("extend"), cached=b.get("cached")) for b in bs]
+                               for pid, bs in by_rank.items()}, passed=passed))
+    return result
 
 
 def launch(args, root):
@@ -370,6 +399,9 @@ def report(args):
     root = external(args.output)
     requests = [json.loads(line) for path in sorted(root.glob("*/requests.jsonl"))
                 for line in path.read_text().splitlines()]
+    failed = [r for r in requests if "ttft_ms" not in r]
+    write_json(root/"failed_requests.json", failed)
+    requests = [r for r in requests if "ttft_ms" in r]
     events = [json.loads(line) for path in sorted(root.glob("events-*.jsonl"))
               for line in path.read_text().splitlines()]
     by_cell = defaultdict(list)
@@ -379,6 +411,16 @@ def report(args):
     write_json(root/"components.json", components)
     write_json(root/"profile_output_comparison.json", output_comparison)
     write_json(root/"ttft_functions.json", ttft_function_totals(requests, events))
+    write_json(root/"batch_audit.json", audit_prefill_batches(requests, events))
+    gpu_totals = defaultdict(lambda: defaultdict(float))
+    for e in events:
+        if e["kind"] != "gpu_range" or "gpu_stream_ms" not in e:
+            continue
+        total = gpu_totals[(e["cell"], e["turn"], e["pid"], e["name"])]
+        total["calls"] += 1
+        total["gpu_stream_ms"] += e["gpu_stream_ms"]
+    write_json(root/"gpu_functions.json", [dict(cell=k[0], turn=k[1], pid=k[2], name=k[3], **v)
+                                          for k, v in gpu_totals.items()])
     summary, functions = [], []
     for cell, rows in by_cell.items():
         batches = [e for e in events if e.get("cell") == cell and e["kind"] == "batch"
@@ -389,7 +431,8 @@ def report(args):
         requested_c = rows[0]["concurrency"]
         summary.append(dict(cell=cell, requests=len(rows),
                        mean_ttft_ms=statistics.mean(r["ttft_ms"] for r in rows),
-                       late_ttft_ms=statistics.mean(r["ttft_ms"] for r in rows if r["turn"] >= 9),
+                       late_ttft_ms=(statistics.mean(r["ttft_ms"] for r in rows if r["turn"] >= 9)
+                                     if any(r["turn"] >= 9 for r in rows) else None),
                        first_prefill_batch_sizes={str(k):b["size"] for k,b in first_batches.items()},
                        actual_batch_gate=len(first_batches)==2*len({r["turn"] for r in rows})
                        and all(b["size"]==requested_c for b in first_batches.values())))
@@ -413,7 +456,10 @@ def report(args):
                 rows = [r for r in requests if r["mode"]==mode and r["concurrency"]==concurrency and r["workload"]==workload]
                 for axis, metric in zip(axes, ("ttft_ms", "tpot_ms")):
                     turns = sorted({r["turn"] for r in rows})
-                    values = [statistics.mean(r[metric] for r in rows if r["turn"]==t and r[metric] is not None) for t in turns]
+                    values = []
+                    for t in turns:
+                        measured = [r[metric] for r in rows if r["turn"]==t and r[metric] is not None]
+                        values.append(statistics.mean(measured) if measured else float("nan"))
                     axis.plot(turns, values, "o-" if workload=="no_drop" else "s-", label=label)
                     axis.set_ylabel(metric.replace("_ms", " (ms)").upper()); axis.grid(alpha=.2)
                     if workload == "rolling":

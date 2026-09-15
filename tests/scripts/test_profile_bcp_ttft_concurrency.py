@@ -153,3 +153,35 @@ def test_communication_timeout_override_preserves_original_config():
     assert effective.model_path == original.model_path
     with pytest.raises(ValueError):
         hooks.communication_config(original, 0)
+
+
+def test_physical_batch_audit_rejects_split_prefill_and_missing_rank():
+    rows = [dict(cell="x", turn=0, uid=u, concurrency=2) for u in (7,8)]
+    def batch(pid, uids):
+        return dict(kind="batch", cell="x", turn=0, pid=pid, phase="prefill",
+                    size=len(uids), uids=uids)
+    complete = [batch(1,[7,8]),batch(2,[8,7])]
+    assert profile.audit_prefill_batches(rows, complete)[0]["passed"]
+    assert not profile.audit_prefill_batches(rows, complete[:1])[0]["passed"]
+    assert not profile.audit_prefill_batches(rows, complete+[batch(1,[8])])[0]["passed"]
+
+
+def test_output_gate_excludes_unused_overlap_but_rejects_missing_generated_tokens():
+    rows, events = [], []
+    for mode, extra in (("baseline", 50), ("detail", 60)):
+        rows.append(dict(cell=mode, uid=7, turn=0, case_id="x", mode=mode,
+                         concurrency=1, workload="no_drop", ttft_ms=10/1e6,
+                         response={"server_metrics":dict(request_received_ns=0,
+                                   first_token_generated_ns=10, generated_tokens=1)}))
+        events.extend([dict(kind="tokenizer",cell=mode,uid=7,start_ns=1,end_ns=3),
+                       dict(kind="arrival",cell=mode,uid=7,pid=1,time_ns=4),
+                       dict(kind="batch",cell=mode,pid=1,uids=[7],phase="prefill",
+                            start_ns=6,tokens=[42]),
+                       dict(kind="batch",cell=mode,pid=1,uids=[7],phase="decode",
+                            start_ns=9,tokens=[extra])])
+    _, comparison = profile.correlate(rows, events)
+    assert comparison[0]["equal"]
+    assert comparison[0]["detail_tokens"] == [42]
+    rows[-1]["response"]["server_metrics"]["generated_tokens"] = 3
+    _, comparison = profile.correlate(rows, events)
+    assert not comparison[0]["equal"]
