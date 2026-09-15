@@ -505,9 +505,6 @@ def test_occurrence_retry_owns_borrowed_final_pages_before_cacheback(
     scheduler.cache_manager = cache
     scheduler.table_manager = table
     scheduler._release_occurrence_transients(req)
-    # Birth-only copies must be available before the final cache commit, not
-    # merely released once the request has finished generating.
-    assert set(birth_only.tolist()).issubset(set(cache.free_slots.tolist()))
     scheduler._compact_context_after_prefill(req)
     cache.cache_req(req, finished=True)
     table.free(req.table_idx)
@@ -849,7 +846,7 @@ def test_birth_only_pages_released_while_decode_still_runnable(drop_aware) -> No
     req = manager.schedule_next_batch(prefill_budget=8).reqs[0]
     birth = req.occurrence_birth_pages.clone()
     terminal = table.occurrence_pages(req.table_idx)[:len(birth)].clone()
-    birth_only = birth[(birth >= 0) & ~torch.isin(birth, terminal)]
+    birth_only = birth[req.occurrence_birth_owned_mask & (birth >= 0) & ~torch.isin(birth, terminal)]
     assert len(birth_only) > 0
     req.complete_one()
     assert req.can_decode

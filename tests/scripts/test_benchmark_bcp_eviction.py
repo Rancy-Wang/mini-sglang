@@ -46,6 +46,23 @@ def test_rolling_counts_responses_with_independent_message_ids():
             assert messages[removed[0]]["role"] == "tool"
 
 
+def test_pressure_queries_keep_canonical_trigger_and_seed_separate():
+    m = load()
+    messages = [{"role": "user"}]
+    for n in range(16):
+        messages.extend([{"role": "assistant"}, {"role": "tool"},
+                         {"role": "assistant"}, {"role": "assistant"}])
+    ends = m.pressure_turn_ends(messages)
+    for tr, end in zip(range(12, 16), ends, strict=True):
+        prefix = messages[:end]
+        assert sum(x["role"] == "tool" for x in prefix) == tr
+        assert prefix[-1]["role"] == "tool"
+        assert len(m.rolling_interface(prefix)["reposition"]) == tr - 12
+    assert len(ends[1:]) * 8 == 24
+    with pytest.raises(ValueError):
+        m.pressure_turn_ends(messages[:ends[0]])
+
+
 def test_common_turns_preserve_prefix_and_reserve_full_output_budget():
     m = load()
     turns = [{"full_tokens": size} for size in (1000, 126976, 126977, 100)]
@@ -116,7 +133,8 @@ def test_experiment_outputs_cannot_land_in_repository():
         m.external(m.REPO / "results")
 
 
-def test_replay_uses_recorded_prefixes_and_waits_for_each_turn(tmp_path):
+@pytest.mark.parametrize("fixed_output", [False, True])
+def test_replay_uses_recorded_prefixes_and_waits_for_each_turn(tmp_path, fixed_output):
     m = load()
     trajectory = [
         {"role": "user", "content": "question"},
@@ -168,7 +186,7 @@ def test_replay_uses_recorded_prefixes_and_waits_for_each_turn(tmp_path):
         m.replay(
             SimpleNamespace(model="test"),
             cell,
-            {"tools": [], "max_tokens": 4096},
+            {"tools": [], "max_tokens": 2, "fixed_output": fixed_output},
             [{"case_id": "1", "trajectory": trajectory, "selected_turns": turns}],
             tmp_path,
             Client(),
@@ -179,3 +197,4 @@ def test_replay_uses_recorded_prefixes_and_waits_for_each_turn(tmp_path):
     assert calls[0]["messages"] == trajectory[:1]
     assert calls[1]["messages"] == trajectory
     assert all("drop_message" not in payload for payload in calls)
+    assert all(payload.get("ignore_eos", False) == fixed_output for payload in calls)

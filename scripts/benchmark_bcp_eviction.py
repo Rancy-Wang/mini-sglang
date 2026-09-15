@@ -190,6 +190,80 @@ def metric_values(metrics):
     }
 
 
+def pressure_turn_ends(trajectory):
+    """First recorded assistant query after each of TR12, 13, 14 and 15."""
+    result, tools = {}, 0
+    for index, message in enumerate(trajectory):
+        if message.get("role") == "tool":
+            tools += 1
+        elif message.get("role") == "assistant" and 12 <= tools <= 15:
+            result.setdefault(tools, index)
+    if set(result) != {12, 13, 14, 15}:
+        raise ValueError("Need assistant queries immediately after TR12 through TR15")
+    return [result[n] for n in range(12, 16)]
+
+
+def prepare_pressure(args):
+    from minisgl.tokenizer.tokenize import TokenizeManager
+    from transformers import AutoTokenizer
+
+    source = json.loads((args.input / "manifest.json").read_text())
+    tokenizer = AutoTokenizer.from_pretrained(args.model, local_files_only=True)
+    manager = TokenizeManager(tokenizer, radix_drop_key_mode="delta-marker")
+    output = external(args.output)
+    output.mkdir(parents=True, exist_ok=False)
+    cases = []
+    for original in source["cases"]:
+        with gzip.open(args.input / original["file"], "rt") as stream:
+            trajectory = json.load(stream)
+        if digest(trajectory) != original["trajectory_sha256"]:
+            raise ValueError("Source trajectory hash mismatch")
+        try:
+            ends = pressure_turn_ends(trajectory)
+        except ValueError:
+            continue
+        trajectory = trajectory[:ends[-1]]
+        # Preserve original ordering and tool-call identifiers. Only document and
+        # reasoning text are shortened; this is explicitly a derived short workload.
+        for message in trajectory:
+            fields = [("content", args.tool_tokens)] if message["role"] == "tool" else []
+            if message["role"] == "assistant":
+                fields += [("reasoning_content", 192), ("content", 192)]
+            for field, cap in fields:
+                value = message.get(field)
+                if isinstance(value, str):
+                    ids = tokenizer.encode(value, add_special_tokens=False)
+                    message[field] = tokenizer.decode(ids[:cap])
+        turns = []
+        for tr, end in zip(range(12, 16), ends, strict=True):
+            messages = trajectory[:end]
+            tokens, _, _ = manager._render_harmony_message_drop(
+                messages, enable_thinking=None, tools=source["tools"]
+            )
+            if len(tokens) + 64 > 32768:
+                raise ValueError("Derived pressure context exceeds 32K")
+            turns.append(dict(turn=tr, end=end, full_tokens=len(tokens),
+                              messages_sha256=digest(messages)))
+        case = dict(case_id=original["case_id"], file=original["file"], turns=turns,
+                    trajectory_sha256=digest(trajectory),
+                    source_trajectory_sha256=original["trajectory_sha256"],
+                    source_full_tokens=original["full_tokens"])
+        with gzip.open(output / case["file"], "wt") as stream:
+            json.dump(trajectory, stream, ensure_ascii=False)
+        cases.append(case)
+        if len(cases) == 8:
+            break
+    if len(cases) != 8:
+        raise ValueError("Need eight distinct source conversations")
+    manifest = dict(plan="PLAN-CS-20260916-R2", pressure=True, fixed_output=True,
+                    max_tokens=64, model=args.model, tools=source["tools"],
+                    source_manifest_sha256=digest(source), tool_tokens=args.tool_tokens,
+                    assistant_text_tokens=192, rolling_keep=12, cases=cases)
+    write_json(output / "manifest.json", manifest)
+    print(json.dumps({"cases": [c["case_id"] for c in cases],
+                      "lengths": [[t["full_tokens"] for t in c["turns"]] for c in cases]}))
+
+
 def distribution(values):
     values = sorted(v for v in values if v is not None)
     if not values:
@@ -286,10 +360,15 @@ def install_observers():
     from minisgl.engine.engine import Engine
     from minisgl.kvcache.radix_cache import RadixPrefixCache
     from minisgl.scheduler.scheduler import Scheduler
+    from minisgl.scheduler.prefill import PrefillAdder
+    from minisgl.scheduler.cache import CacheManager
+    from minisgl.core import Req
 
     root = Path(os.environ["MINISGL_BCP_OBSERVER"])
     census = Counter()
     batches = []
+    pressure = Counter()
+    committed = []
     live_locks = 0
     live_drop_calls = 0
     evicted_pages = 0
@@ -297,6 +376,33 @@ def install_observers():
     original_init, original_forward = Engine.__init__, Engine.forward_batch
     original_idle = Scheduler.run_when_idle
     original_lock, original_evict = RadixPrefixCache.lock_handle, RadixPrefixCache.evict
+    original_allocate = PrefillAdder._try_allocate_one
+    original_empty = CacheManager.match_empty_req
+    original_release = Scheduler._release_occurrence_transients
+    original_append = Req.append_host
+
+    def append(req, token):
+        original_append(req, token)
+        committed.append((time.perf_counter_ns(), req.uid, token.tolist()))
+
+    def allocate(self, *args, **kwargs):
+        table_available = self.table_manager.available_size > 0
+        result = original_allocate(self, *args, **kwargs)
+        if result is None and table_available:
+            pressure["capacity_waits"] += 1
+        return result
+
+    def empty(self, *args, **kwargs):
+        pressure["empty_matches"] += 1
+        return original_empty(self, *args, **kwargs)
+
+    def release(self, req):
+        mask = req.occurrence_birth_owned_mask
+        before = int(mask.sum()) if mask is not None else 0
+        result = original_release(self, req)
+        after = int(mask.sum()) if mask is not None else 0
+        pressure["early_birth_releases"] += before - after
+        return result
 
     def nodes(tree):
         stack = list(tree.root_node.children.values())
@@ -364,6 +470,9 @@ def install_observers():
             "free": len(cache.free_slots),
             "available": cache.available_size,
             "total": cache.num_pages,
+            "pressure": dict(pressure),
+            "committed": [(uid, tokens) for stamp, uid, tokens in committed
+                          if spec.get("start_ns", 0) <= stamp <= spec.get("end_ns", 2**63 - 1)],
         }
         try:
             assert live_locks == 0, f"Unbalanced live handles: {live_locks}"
@@ -379,10 +488,11 @@ def install_observers():
                 assert not bool(torch.isin(free, torch.cat(resident)).any())
             assert len(torch.unique(all_pages)) == cache.num_pages
             assert cache.available_size == cache.num_pages
-            pages = cache._allocate(cache.num_pages)
-            assert len(torch.unique(pages)) == cache.num_pages
-            assert not any(node.page_length for node in nodes(tree))
-            cache.free_occurrence_pages(pages)
+            if spec.get("drain", True):
+                pages = cache._allocate(cache.num_pages)
+                assert len(torch.unique(pages)) == cache.num_pages
+                assert not any(node.page_length for node in nodes(tree))
+                cache.free_occurrence_pages(pages)
             result.update(passed=True, free_after_drain=len(cache.free_slots))
         except Exception as exc:
             result.update(passed=False, error=f"{type(exc).__name__}: {exc}")
@@ -390,12 +500,18 @@ def install_observers():
         if spec.get("reset_counters"):
             census.clear()
             batches.clear()
+            pressure.clear()
+            committed.clear()
             tree.eviction_stats.update(leaf_pages=0, drop_pages=0, hole_fills=0)
             live_drop_calls = evicted_pages = 0
 
     Engine.__init__, Engine.forward_batch = init, forward
     RadixPrefixCache.lock_handle, RadixPrefixCache.evict = lock, evict
     Scheduler.run_when_idle = idle
+    PrefillAdder._try_allocate_one = allocate
+    CacheManager.match_empty_req = empty
+    Scheduler._release_occurrence_transients = release
+    Req.append_host = append
 
 
 async def audit(client, url, root, tp, label, model, **window):
@@ -426,6 +542,7 @@ async def audit(client, url, root, tp, label, model, **window):
 
 
 def launch(args, cell, root, pages):
+    source_repo = Path(getattr(args, "source_repo", None) or REPO).resolve()
     gpus = args.gpus.split(",")[: cell["tp"]]
     if len(gpus) != cell["tp"]:
         raise ValueError("Insufficient GPUs for TP")
@@ -438,7 +555,7 @@ def launch(args, cell, root, pages):
     env = dict(
         os.environ,
         CUDA_VISIBLE_DEVICES=",".join(gpus),
-        PYTHONPATH=str(REPO / "python"),
+        PYTHONPATH=str(source_repo / "python"),
         HF_HUB_OFFLINE="1",
         TRANSFORMERS_OFFLINE="1",
         PYTHONDONTWRITEBYTECODE="1",
@@ -478,7 +595,7 @@ def launch(args, cell, root, pages):
         "--cuda-graph-max-bs",
         str(cell["concurrency"]),
         "--max-seq-len-override",
-        str(LIMIT),
+        str(getattr(args, "context_limit", LIMIT)),
         "--max-prefill-length",
         str(args.chunk),
         "--request-timeout",
@@ -508,7 +625,7 @@ def launch(args, cell, root, pages):
         child = subprocess.Popen(
             argv,
             env=env,
-            cwd=REPO,
+            cwd=source_repo,
             stdin=subprocess.DEVNULL,
             stdout=stream,
             stderr=stream,
@@ -521,7 +638,7 @@ def launch(args, cell, root, pages):
             "gpus": gpus,
             "pid": child.pid,
             "head": subprocess.check_output(
-                ["git", "rev-parse", "HEAD"], cwd=REPO, text=True
+                ["git", "rev-parse", "HEAD"], cwd=source_repo, text=True
             ).strip(),
             "cell": cell,
             "requested_pages": pages,
@@ -568,6 +685,8 @@ async def replay(args, cell, manifest, cases, root, client, url):
                         "seed": 17,
                         "stream": False,
                     }
+                    if manifest.get("fixed_output"):
+                        payload["ignore_eos"] = True
                     if cell["workload"] == "rolling":
                         payload.update(rolling_interface(messages))
                     row = {
@@ -597,6 +716,8 @@ async def replay(args, cell, manifest, cases, root, client, url):
                             )
                         if metrics["generated_tokens"] > manifest["max_tokens"]:
                             raise ValueError("Output cap exceeded")
+                        if manifest.get("fixed_output") and metrics["generated_tokens"] != manifest["max_tokens"]:
+                            raise ValueError("Fixed output length not reached")
                         if cell["workload"] == "no_drop" and metrics["drop_skipped_tokens"]:
                             raise ValueError("no_drop unexpectedly reports skipped Drop tokens")
                     except Exception as exc:
@@ -701,7 +822,35 @@ async def run_cell(args, cell, manifest, pages, session):
             summary["initial_audit"] = await audit(
                 client, url, server_root, cell["tp"], "initial-" + cell_name(cell), args.model
             )
-            summary.update(await replay(args, cell, manifest, cases, root, client, url))
+            if manifest.get("pressure"):
+                # Cold C1 output control, then TR12 seeding; neither is throughput.
+                control_root = root / "control"
+                control_root.mkdir()
+                control = dict(cases[0], selected_turns=cases[0]["selected_turns"][-1:])
+                summary["control"] = await asyncio.wait_for(
+                    replay(args, dict(cell, concurrency=1), manifest, [control],
+                           control_root, client, url), args.cell_timeout)
+                if summary["control"]["uncompleted_turns"]:
+                    raise RuntimeError("C1 control failed")
+                summary["control_audit"] = await audit(
+                    client, url, server_root, cell["tp"],
+                    "initial-seed-" + cell_name(cell), args.model,
+                    start_ns=summary["control"]["start_ns"],
+                    end_ns=summary["control"]["end_ns"])
+                seed_root = root / "seed"
+                seed_root.mkdir()
+                seeds = [dict(c, selected_turns=c["selected_turns"][:1]) for c in cases]
+                summary["seed"] = await asyncio.wait_for(
+                    replay(args, cell, manifest, seeds, seed_root, client, url), args.cell_timeout)
+                if summary["seed"]["uncompleted_turns"]:
+                    raise RuntimeError("TR12 seed failed")
+                await audit(client, url, server_root, cell["tp"],
+                            "initial-measure-" + cell_name(cell), args.model, drain=False)
+                cases = [dict(c, selected_turns=c["selected_turns"][1:]) for c in cases]
+                summary.update(await asyncio.wait_for(
+                    replay(args, cell, manifest, cases, root, client, url), args.cell_timeout))
+            else:
+                summary.update(await replay(args, cell, manifest, cases, root, client, url))
             summary["final_audit"] = await audit(
                 client,
                 url,
@@ -728,6 +877,10 @@ async def run_cell(args, cell, manifest, pages, session):
                 summary["status"] = "PASS"
             summary["drop_eviction_covered"] = any(
                 rank["eviction"]["drop_pages"] > 0 for rank in summary["final_audit"]
+            )
+            summary["capacity_wait_covered"] = any(
+                rank["pressure"].get("capacity_waits", 0) > 0
+                for rank in summary["final_audit"]
             )
     except Exception as exc:
         summary["error"] = f"{type(exc).__name__}: {exc}"
@@ -813,6 +966,60 @@ async def run(args):
         if session.get("child"):
             stop(session["child"])
     report(args)
+
+
+async def run_pressure(args):
+    """Six bounded cells with the same client and observer on both source trees."""
+    output = external(args.output)
+    output.mkdir(parents=True, exist_ok=False)
+    manifest = json.loads((args.input / "manifest.json").read_text())
+    if not manifest.get("pressure") or len(manifest["cases"]) != 8:
+        raise ValueError("Use prepare-pressure's eight-conversation manifest")
+    args.turn_limit = None
+    args.context_limit = 32768
+    results, session = [], {}
+    write_json(output / "run.json", dict(
+        manifest_sha256=digest(manifest), total_timeout_s=args.total_timeout,
+        args={k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}))
+    try:
+        async with asyncio.timeout(args.total_timeout):
+            for variant, source in (("before", args.before_repo), ("after", REPO)):
+                args.source_repo = source
+                for eviction in ("ordinary", "drop-aware"):
+                    session = {"max_concurrency": 8}
+                    workloads = ("no_drop", "rolling") if eviction == "ordinary" else ("rolling",)
+                    for workload in workloads:
+                        cell = dict(tp=2, concurrency=8, count=8, workload=workload,
+                                    phase="full", eviction=eviction, suite="pressure-" + variant)
+                        result = await run_cell(args, cell, manifest, args.pages, session)
+                        results.append(result)
+                        write_json(output / "results.json", results)
+                        print(json.dumps({"cell": cell_name(cell), "status": result["status"],
+                                          "tokens_per_s": result.get("output_tokens_per_s"),
+                                          "error": result.get("error")}), flush=True)
+                    if session.get("child"):
+                        stop(session.pop("child"))
+                        await asyncio.sleep(5)
+    except TimeoutError:
+        write_json(output / "deadline.json", {"status": "TOTAL_DEADLINE", "seconds": args.total_timeout})
+    finally:
+        if session.get("child"):
+            stop(session.pop("child"))
+    comparisons = []
+    for workload, eviction in (("no_drop", "ordinary"), ("rolling", "ordinary"),
+                               ("rolling", "drop-aware")):
+        pair = [r for r in results if r["cell"]["workload"] == workload
+                and r["cell"]["eviction"] == eviction]
+        complete = len(pair) == 2 and all(r["status"] == "PASS" for r in pair)
+        row = dict(workload=workload, eviction=eviction, complete=complete)
+        if complete:
+            row["throughput_ratio_after_before"] = pair[1]["output_tokens_per_s"] / pair[0]["output_tokens_per_s"]
+            controls = [[token for _, tokens in r["control_audit"][0]["committed"]
+                         for token in tokens] for r in pair]
+            row["cold_c1_token_counts"] = [len(tokens) for tokens in controls]
+            row["cold_c1_output_equal"] = controls[0] == controls[1] and len(controls[0]) == 64
+        comparisons.append(row)
+    write_json(output / "comparison.json", comparisons)
 
 
 def report(args):
@@ -928,6 +1135,25 @@ def main():
     prepare_parser.add_argument("--output", type=Path, required=True)
     prepare_parser.add_argument("--count", type=int, default=32)
     prepare_parser.add_argument("--max-tokens", type=int, default=4096)
+    short_prepare = commands.add_parser("prepare-pressure")
+    short_prepare.add_argument("--input", type=Path, required=True)
+    short_prepare.add_argument("--output", type=Path, required=True)
+    short_prepare.add_argument("--model", required=True)
+    short_prepare.add_argument("--tool-tokens", type=int, default=512)
+    pressure_parser = commands.add_parser("run-pressure")
+    pressure_parser.add_argument("--input", type=Path, required=True)
+    pressure_parser.add_argument("--output", type=Path, required=True)
+    pressure_parser.add_argument("--before-repo", type=Path, required=True)
+    pressure_parser.add_argument("--model", required=True)
+    pressure_parser.add_argument("--gpus", default="2,3")
+    pressure_parser.add_argument("--port", type=int, default=30916)
+    pressure_parser.add_argument("--chunk", type=int, default=2048)
+    pressure_parser.add_argument("--memory-ratio", type=float, default=0.9)
+    pressure_parser.add_argument("--pages", type=int, default=49152)
+    pressure_parser.add_argument("--timeout", type=int, default=300)
+    pressure_parser.add_argument("--cell-timeout", type=int, default=300)
+    pressure_parser.add_argument("--startup-timeout", type=int, default=600)
+    pressure_parser.add_argument("--total-timeout", type=int, default=3600)
     run_parser = commands.add_parser("run")
     run_parser.add_argument("--input", type=Path, required=True)
     run_parser.add_argument("--output", type=Path, required=True)
@@ -952,6 +1178,10 @@ def main():
     args = parser.parse_args()
     if args.command == "prepare":
         prepare(args)
+    elif args.command == "prepare-pressure":
+        prepare_pressure(args)
+    elif args.command == "run-pressure":
+        asyncio.run(run_pressure(args))
     elif args.command == "run":
         asyncio.run(run(args))
     elif args.command == "report":
