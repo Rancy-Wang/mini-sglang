@@ -15,6 +15,7 @@ import sys
 import threading
 import time
 from dataclasses import replace
+from contextlib import contextmanager
 from pathlib import Path
 
 
@@ -64,6 +65,14 @@ def communication_config(config, timeout):
     return replace(config, distributed_timeout=timeout)
 
 
+def overlap_enabled(control):
+    return bool(control.get("overlap") and control.get("turn") in (9, 10, 11))
+
+
+def result_uids(last_data):
+    return [] if last_data is None else [r.uid for r in last_data[0].batch.reqs]
+
+
 def install():
     if getattr(install, "done", False):
         return
@@ -83,6 +92,9 @@ def install():
     current = {}
     cleared = set()
     batch_number = 0
+    capturing = False
+    traced_wave = None
+    copy_owners = {}
 
     def emit(kind, **values):
         events.append(dict(kind=kind, pid=os.getpid(), tid=threading.get_native_id(),
@@ -91,6 +103,69 @@ def install():
     def control():
         current.clear()
         current.update(json.loads((root / "control.json").read_text()))
+
+    @contextmanager
+    def span(name, uids, **extra):
+        """R3: host ranges, never a device synchronization or a GPU timer."""
+        if not overlap_enabled(current):
+            yield
+            return
+        start, cpu = time.perf_counter_ns(), time.thread_time_ns()
+        label = json.dumps(dict(r3=name, uids=uids, host_ns=start, **extra), separators=(",", ":"))
+        torch.cuda.nvtx.range_push(label)
+        try:
+            yield
+        finally:
+            torch.cuda.nvtx.range_pop()
+            end = time.perf_counter_ns()
+            emit("overlap_span", name=name, uids=uids, start_ns=start, end_ns=end,
+                 cpu_ns=time.thread_time_ns()-cpu, **extra)
+
+    # Scope dispatch observation to compact only. Do not replace/copy its logic
+    # or put dispatch interception around the model, graph replay, or scheduler.
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    class CompactObserver(TorchDispatchMode):
+        def __init__(self, uid):
+            super().__init__()
+            self.uid = uid
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            frame = sys._getframe(1)
+            source = None
+            while frame is not None:
+                if frame.f_code.co_name == "_compact_context_after_prefill":
+                    source = f"{frame.f_code.co_filename}:{frame.f_lineno}"
+                    break
+                frame = frame.f_back
+            del frame
+            with span("compact.op."+str(func), [self.uid], source=source):
+                return func(*args, **(kwargs or {}))
+
+    def scoped(fn, name):
+        @functools.wraps(fn)
+        def call(self, value, *args, **kwargs):
+            if not overlap_enabled(current):
+                return fn(self, value, *args, **kwargs)
+            if name == "result.collect":
+                uids = result_uids(value)
+                if not uids:
+                    return fn(self, value, *args, **kwargs)
+            elif name == "compact":
+                uids = [value.uid]
+            else:
+                uids = [r.uid for r in value.batch.reqs]
+            with span(name, uids):
+                if name == "compact":
+                    previous = getattr(local, "compact_uid", None)
+                    local.compact_uid = value.uid
+                    try:
+                        with CompactObserver(value.uid):
+                            return fn(self, value, *args, **kwargs)
+                    finally:
+                        local.compact_uid = previous
+                return fn(self, value, *args, **kwargs)
+        return call
 
     original_communication = Engine._init_communication
 
@@ -219,6 +294,25 @@ def install():
                 if inspect.isfunction(value) and value in replacements:
                     setattr(module, name, replacements[value])
     torch.cuda.Event.synchronize = wrap(torch.cuda.Event.synchronize, "CUDA.Event.synchronize")
+    previous_sync = torch.cuda.Event.synchronize
+
+    def event_sync(event):
+        with span("event.synchronize", copy_owners.get(id(event), []),
+                  event_object=id(event), sample_copy=id(event) in copy_owners):
+            return previous_sync(event)
+    torch.cuda.Event.synchronize = event_sync
+    for method, label in (("_forward", "scheduler.forward"),
+                          ("_process_last_data", "result.collect"),
+                          ("_compact_context_after_prefill", "compact")):
+        replace_callable(Scheduler, method, lambda fn, label=label: scoped(fn, label))
+    from minisgl.scheduler.table import TableManager
+    previous_release = TableManager.release_occurrence
+
+    def release(table, slot):
+        uid = getattr(local, "compact_uid", None)
+        with span("storage.release", [] if uid is None else [uid], slot=slot):
+            return previous_release(table, slot)
+    TableManager.release_occurrence = release
 
     def gpu_range(fn, label):
         @functools.wraps(fn)
@@ -282,8 +376,26 @@ def install():
 
     original_process = Scheduler._process_one_msg
     def process(self, msg):
+        nonlocal capturing, traced_wave
         if isinstance(msg, UserMsg):
             control()
+            if not getattr(self, "_r3_send_wrapped", False):
+                previous_send = self.send_result
+                def send(values):
+                    uids = [v.uid for v in values if hasattr(v, "uid")]
+                    with span("result.send", uids):
+                        return previous_send(values)
+                self.send_result = send
+                self._r3_send_wrapped = True
+            wave = (current.get("cell"), current.get("turn"))
+            if overlap_enabled(current) and wave != traced_wave:
+                if self.engine.device.index == 0:
+                    torch.cuda.cudart().cudaProfilerStart()
+                    capturing = True
+                traced_wave = wave
+                before = time.perf_counter_ns()
+                torch.cuda.nvtx.mark(json.dumps(dict(r3_clock=before, pid=os.getpid())))
+                emit("trace_clock", before_ns=before, after_ns=time.perf_counter_ns())
             local.active = False
             if current["cell"] not in cleared:
                 if self.prefill_manager.pending_list or self.decode_manager.runnable:
@@ -335,16 +447,22 @@ def install():
         if current.get("detail") or current.get("gpu_detail"):
             start, stop = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
             start.record(self.stream)
-        output = original_forward(self, batch, sampling)
+        with span("engine.forward", local.uids[:], batch=batch_number):
+            output = original_forward(self, batch, sampling)
         if stop is not None:
             stop.record(self.stream)
         row["end_ns"] = time.perf_counter_ns()
+        if overlap_enabled(current):
+            copy_owners[id(output.copy_done_event)] = local.uids[:]
+            emit("sample_copy_event", batch=batch_number, uids=local.uids[:],
+                 event_object=id(output.copy_done_event), time_ns=row["end_ns"])
         pending_gpu.append((row, start, stop, output))
         return output
     Engine.forward_batch = forward
 
     original_idle = Scheduler.run_when_idle
     def idle(self):
+        nonlocal capturing
         local.active = False
         original_idle(self)
         usage = resource.getrusage(resource.RUSAGE_SELF)
@@ -354,6 +472,10 @@ def install():
              affinity=sorted(os.sched_getaffinity(0)),
              native_threads=len(list(Path("/proc/self/task").iterdir())))
         flush()
+        if capturing and gate.ready():
+            torch.cuda.cudart().cudaProfilerStop()
+            capturing = False
+        copy_owners.clear()
     Scheduler.run_when_idle = idle
     emit("installed", targets=installed, env={k: os.environ.get(k) for k in
          ("CUDA_VISIBLE_DEVICES", "OMP_NUM_THREADS", "MKL_NUM_THREADS", "TOKENIZERS_PARALLELISM")})

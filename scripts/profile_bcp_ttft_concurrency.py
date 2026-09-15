@@ -49,6 +49,20 @@ def bounded_turns(value):
     return value
 
 
+def mode_control(mode, turn):
+    return dict(detail=mode == "detail", gpu_detail=mode in ("detail", "gpu"),
+                barrier=mode not in ("natural", "overlap"), nvtx=False,
+                overlap=mode == "overlap" and turn in (9, 10, 11))
+
+
+def overlap_partition(engine_end, forward_end, collect_start, sync_start, sync_end, recorded):
+    points = [engine_end, forward_end, collect_start, sync_start, sync_end, recorded]
+    if points != sorted(points):
+        raise ValueError("Non-monotonic overlap interval; do not invent attribution")
+    names = ["post_engine", "control_gap", "collect_before_sync", "copy_wait", "record_gap"]
+    return dict(zip(names, (b-a for a,b in zip(points, points[1:]))))
+
+
 def rolling_interface(messages, keep=8):
     tools = [i for i, message in enumerate(messages) if message.get("role") == "tool"]
     drops = {str(event): [tools[n-keep]] for n, event in enumerate(tools) if n >= keep}
@@ -285,6 +299,13 @@ def launch(args, root):
             "--attention-backend", "fi", "--radix-drop-key-mode", "delta-marker",
             "--contextual-prefill-mode", "mask", "--reposition-execution-mode", "paged-occurrence",
             "--tool-call-parser", "gpt-oss", "--reasoning-parser", "gpt-oss"]
+    if "overlap" in args.modes:
+        if not args.nsys:
+            raise ValueError("The overlap mode requires --nsys for CPU/GPU aligned tracing")
+        argv = [str(args.nsys), "profile", "--sample=none", "--cpuctxsw=none",
+                "--trace=cuda,nvtx,osrt", "--capture-range=cudaProfilerApi",
+                "--capture-range-end=repeat:6", "--kill=none", "--cuda-graph-trace=graph",
+                "--output="+str(root/"overlap")] + argv
     write_json(root / "launch.json", dict(argv=argv, env={k:v for k,v in env.items() if k in
                {"CUDA_VISIBLE_DEVICES", "OMP_NUM_THREADS", "CUDA_HOME", "PATH", "LD_LIBRARY_PATH",
                 "CC", "CXX", "NVCC_CCBIN", "NVCC_PREPEND_FLAGS", "CPATH",
@@ -341,8 +362,7 @@ async def run(args):
                         with (cell_dir/"requests.jsonl").open("w") as output:
                             for turn in range(manifest["turns"]):
                                 write_json(root/"control.json", dict(cell=cell, turn=turn,
-                                           concurrency=concurrency, detail=mode=="detail", gpu_detail=mode in ("detail","gpu"),
-                                           barrier=mode!="natural", nvtx=False))
+                                           concurrency=concurrency, **mode_control(mode, turn)))
                                 async def request(case):
                                     spec = case["turns"][turn]
                                     messages = case["trajectory"][:spec["end"]]
@@ -388,7 +408,8 @@ async def run(args):
             except subprocess.TimeoutExpired:
                 os.killpg(process.pid, signal.SIGKILL)
                 process.wait(timeout=10)
-    report(argparse.Namespace(output=root))
+    if not args.skip_report:
+        report(argparse.Namespace(output=root))
 
 
 def report(args):
@@ -488,7 +509,9 @@ def main():
     run_parser.add_argument("--chunk", type=int, default=65536)
     run_parser.add_argument("--compile-cache", type=Path, help="Reuse an idle previous experiment's compile caches")
     run_parser.add_argument("--concurrency", type=int, choices=(1,2,4,8), nargs="+", default=[1,2,4,8])
-    run_parser.add_argument("--modes", choices=("baseline", "detail", "natural", "gpu"), nargs="+", default=["baseline", "detail"])
+    run_parser.add_argument("--modes", choices=("baseline", "detail", "natural", "gpu", "overlap"), nargs="+", default=["baseline", "detail"])
+    run_parser.add_argument("--nsys", type=Path, help="Existing Nsight Systems executable; no installation")
+    run_parser.add_argument("--skip-report", action="store_true", help="Export/plot captured artifacts locally")
     report_parser = sub.add_parser("report")
     report_parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()

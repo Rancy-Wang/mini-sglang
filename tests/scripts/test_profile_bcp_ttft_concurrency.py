@@ -17,6 +17,31 @@ profile = load("profile_bcp_ttft_concurrency")
 hooks = load("bcp_ttft_profile_hooks")
 
 
+def test_overlap_is_natural_and_bounded():
+    for turn in range(12):
+        control = dict(turn=turn, **profile.mode_control("overlap", turn))
+        assert not control["barrier"] and not control["detail"]
+        assert hooks.overlap_enabled(control) == (turn in (9,10,11))
+        assert not hooks.overlap_enabled(dict(turn=turn, **profile.mode_control("natural", turn)))
+    assert profile.mode_control("detail", 9)["barrier"]
+
+
+def test_overlap_partition_closes_and_rejects_reversed_clocks():
+    parts = profile.overlap_partition(10, 30, 31, 32, 39, 40)
+    assert parts == dict(post_engine=20, control_gap=1, collect_before_sync=1,
+                         copy_wait=7, record_gap=1)
+    assert sum(parts.values()) == 40-10
+    with pytest.raises(ValueError):
+        profile.overlap_partition(10, 9, 31, 32, 39, 40)
+
+
+def test_result_identity_uses_previous_batch_not_current_batch():
+    from types import SimpleNamespace as NS
+    previous = (NS(batch=NS(reqs=[NS(uid=3),NS(uid=5)])), object())
+    assert hooks.result_uids(previous) == [3,5]
+    assert hooks.result_uids(None) == []
+
+
 def trajectory():
     result = [{"role":"user", "content":"question"}]
     for i in range(15):
