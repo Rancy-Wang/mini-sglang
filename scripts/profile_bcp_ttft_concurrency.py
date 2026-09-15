@@ -59,6 +59,15 @@ def mode_control(mode, turn):
                 overlap=mode in ("overlap", "fixed-overlap") and turn in (9, 10, 11))
 
 
+def wave_control(mode, turn, seed_wave=False):
+    control = mode_control(mode, turn)
+    if seed_wave:
+        # All eight serial requests belong to one wave. The expected wave size
+        # stays eight; only the admission barrier is disabled during seeding.
+        control.update(fixed_split=False, barrier=False)
+    return control
+
+
 def overlap_partition(engine_end, forward_end, collect_start, sync_start, sync_end, recorded):
     points = [engine_end, forward_end, collect_start, sync_start, sync_end, recorded]
     if points != sorted(points):
@@ -711,11 +720,9 @@ async def run(args):
                         with (cell_dir/"requests.jsonl").open("w") as output:
                             for turn in selected_turns:
                                 seed_wave = short and turn == selected_turns[0]
-                                control = mode_control(mode, turn)
-                                if seed_wave:
-                                    control["fixed_split"] = False
+                                control = wave_control(mode, turn, seed_wave)
                                 write_json(root/"control.json", dict(cell=cell, turn=turn,
-                                           concurrency=1 if seed_wave else concurrency,
+                                           concurrency=concurrency,
                                            cohort=[dict(case_id=c["case_id"], tokens=c["turns"][turn]["full_tokens"])
                                                    for c in sorted(cases[:concurrency], key=lambda c:
                                                        ["210","215","229","236","226","223","231","233"].index(str(c["case_id"])))],

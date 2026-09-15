@@ -25,6 +25,24 @@ def test_short_validation_selects_real_tr8_tr9_tr10_only():
         profile.short_validation_turns(cases)
 
 
+def test_serial_seed_gate_accepts_eight_then_restores_measured_barrier():
+    gate = hooks.WaveGate()
+    control = profile.wave_control("fixed", 8, seed_wave=True)
+    assert not control["barrier"] and not control["fixed_split"]
+    for uid in range(8):
+        gate.arrive(("fixed-c8-no_drop", 8), 8, uid)
+        # The actual scheduler releases without waiting when barrier=False.
+        gate.released = True
+    assert gate.ready() and len(gate.arrivals) == 8
+    control = profile.wave_control("fixed", 9)
+    assert control["barrier"] and control["fixed_split"]
+    gate.arrive(("fixed-c8-no_drop", 9), 8, 8)
+    assert not gate.ready() and not gate.released
+    for uid in range(9, 16):
+        gate.arrive(("fixed-c8-no_drop", 9), 8, uid)
+    assert gate.ready()
+
+
 def test_short_performance_keeps_first_decode_wait_separate():
     request = dict(uid=4, case_id="210", turn=9, workload="rolling",
                    ttft_ms=10, tpot_ms=51, e2e_ms=112,
