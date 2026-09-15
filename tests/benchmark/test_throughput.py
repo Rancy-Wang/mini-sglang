@@ -97,8 +97,15 @@ def prepare(args):
                 ends = [i for i, m in enumerate(trajectory) if m.get("role") == "assistant"]
                 if not ends:
                     continue
-                ids, _, _ = manager._render_harmony_message_drop(
+                ids, owners, _ = manager._render_harmony_message_drop(
                     trajectory[:ends[-1]], enable_thinking=None, tools=tools)
+                schedule = rolling_schedule(trajectory[:ends[-1]], owners, len(ids))
+                if schedule["position_tokens"] >= LIMIT or any(
+                    x["before"] > LIMIT for x in schedule["reposition_checks"]
+                ):
+                    print(json.dumps({"excluded": key, "reason": "position_limit_before_legal_boundary",
+                                      "source": str(path), "line": line_number}), flush=True)
+                    continue
                 candidates.append(dict(case_id=key, trajectory=trajectory, ends=ends,
                                        full_tokens=len(ids), source=str(path),
                                        source_line=line_number, source_sha256=sha))
@@ -132,7 +139,7 @@ def prepare(args):
             actual = result.radix_next_position if result.reposition_layout is not None else len(ids)
             if actual != schedule["position_tokens"]:
                 raise ValueError(f"Position mismatch {row['case_id']}:{turn}: {actual} != {schedule}")
-            if actual >= LIMIT:
+            if actual >= LIMIT or any(x["before"] > LIMIT for x in schedule["reposition_checks"]):
                 raise ValueError(f"Rolling schedule exceeds model position capacity: {row['case_id']}:{turn}")
             turns.append(dict(turn=turn, end=end, full_tokens=len(ids),
                               messages_sha256=digest(messages), **schedule))
