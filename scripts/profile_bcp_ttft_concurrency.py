@@ -591,6 +591,7 @@ def launch(args, root):
     source = source.resolve()
     env = dict(os.environ, CUDA_VISIBLE_DEVICES=",".join(map(str, gpus)),
                MINISGL_SOURCE_REPO=str(source), PYTHONPATH=f"{source}:{source / 'python'}",
+               MINISGL_SHORT_TIMING="1" if getattr(args, "short_validation", False) else "0",
                MINISGL_TTFT_PROFILE_ROOT=str(root), PYTHONDONTWRITEBYTECODE="1",
                HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1", OMP_NUM_THREADS="1",
                NO_PROXY="127.0.0.1,localhost", no_proxy="127.0.0.1,localhost",
@@ -1043,9 +1044,37 @@ def main():
         report(args)
 
 
+def install_short_token_timing():
+    """Buffer CPU token-commit timestamps; no CUDA sync or per-token file I/O."""
+    from minisgl.core import Req
+    from minisgl.scheduler.scheduler import Scheduler
+
+    rows = []
+    original_append = Req.append_host
+    original_idle = Scheduler.run_when_idle
+
+    def append(req, token):
+        result = original_append(req, token)
+        rows.append(dict(uid=req.uid, time_ns=time.perf_counter_ns(), count=token.numel()))
+        return result
+
+    def idle(scheduler):
+        original_idle(scheduler)
+        if rows:
+            path = Path(os.environ["MINISGL_TTFT_PROFILE_ROOT"])/f"token-times-{os.getpid()}.jsonl"
+            with path.open("a") as stream:
+                stream.write("".join(json.dumps(row)+"\n" for row in rows))
+            rows.clear()
+
+    Req.append_host = append
+    Scheduler.run_when_idle = idle
+
+
 if os.environ.get("MINISGL_TTFT_PROFILE_ROOT"):
     from scripts.bcp_ttft_profile_hooks import install
     install()
+    if os.environ.get("MINISGL_SHORT_TIMING") == "1":
+        install_short_token_timing()
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "worker":
