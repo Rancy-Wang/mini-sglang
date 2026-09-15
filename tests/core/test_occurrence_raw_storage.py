@@ -124,6 +124,7 @@ def test_compaction_lease_preserves_pages_positions_sample_and_ownership(externa
               radix_match_ids=prompt.to(torch.int64), true_seq_len=9, table_idx=slot,
               cached_len=3, output_len=2, uid=1, sampling_params=SamplingParams(max_tokens=2),
               cache_handle=SimpleNamespace(), initial_active_cached_len=3,
+              initial_full_match_indices=torch.arange(10, 13, dtype=torch.int32),
               context_post_prefill_keep_mask=keep, occurrence_external_storage=external,
               reposition_execution_mode="paged-occurrence", radix_positions=torch.arange(9),
               retry_transformed_mask=torch.tensor([False, True, False]))
