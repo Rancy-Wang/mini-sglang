@@ -561,7 +561,8 @@ def launch(args, cell, root, pages):
         PYTHONDONTWRITEBYTECODE="1",
         MINISGL_BCP_OBSERVER=str(root),
     )
-    runtime = external(args.output) / f"runtime-tp{cell['tp']}"
+    runtime = external(getattr(args, "runtime_root", None) or
+                       (external(args.output) / f"runtime-tp{cell['tp']}"))
     for key in ("TORCH_EXTENSIONS_DIR", "TRITON_CACHE_DIR", "TVM_FFI_CACHE_DIR", "CUDA_CACHE_PATH"):
         directory = runtime / key.lower()
         directory.mkdir(parents=True, exist_ok=True)
@@ -1152,6 +1153,7 @@ def main():
     pressure_parser.add_argument("--input", type=Path, required=True)
     pressure_parser.add_argument("--output", type=Path, required=True)
     pressure_parser.add_argument("--before-repo", type=Path, required=True)
+    pressure_parser.add_argument("--runtime-root", type=Path)
     pressure_parser.add_argument("--model", required=True)
     pressure_parser.add_argument("--gpus", default="2,3")
     pressure_parser.add_argument("--port", type=int, default=30916)
