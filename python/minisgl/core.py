@@ -205,6 +205,8 @@ class Req:
     reposition_h2d_bytes: int = 0
     reposition_d2h_bytes: int = 0
     reposition_execution_mode: Literal["staged", "paged-occurrence"] | None = None
+    drop_recovery_plan: object | None = None
+    drop_recovery_query_start: int = 0
     occurrence_raw_tokens: torch.Tensor | None = None
     occurrence_positions: torch.Tensor | None = None
     occurrence_birth_indices: torch.Tensor | None = None
@@ -519,11 +521,17 @@ class Req:
                 not self.occurrence_initial_source_positions.is_cpu
                 or self.occurrence_initial_source_positions.dtype != torch.int32
                 or self.occurrence_initial_source_positions.ndim != 1
-                or len(self.occurrence_initial_source_positions) != self.initial_active_cached_len
+                or len(self.occurrence_initial_source_positions) != (
+                    self.drop_recovery_plan.matched_length if self.drop_recovery_plan is not None
+                    else self.initial_active_cached_len
+                )
             ):
                 raise ValueError("Occurrence source positions must cover the initial cache hits.")
             if self.occurrence_exact_full_cached_len is not None and not (
-                0 <= self.occurrence_exact_full_cached_len <= self.initial_active_cached_len
+                0 <= self.occurrence_exact_full_cached_len <= (
+                    self.drop_recovery_plan.matched_length if self.drop_recovery_plan is not None
+                    else self.initial_active_cached_len
+                )
             ):
                 raise ValueError("Occurrence exact prefix must lie within its source prefix.")
             if self.occurrence_same_position_retry_copy_count < 0:
@@ -532,7 +540,10 @@ class Req:
                 not self.occurrence_repositioned_cached_mask.is_cpu
                 or self.occurrence_repositioned_cached_mask.dtype != torch.bool
                 or self.occurrence_repositioned_cached_mask.ndim != 1
-                or len(self.occurrence_repositioned_cached_mask) != self.initial_active_cached_len
+                or len(self.occurrence_repositioned_cached_mask) != (
+                    self.drop_recovery_plan.matched_length if self.drop_recovery_plan is not None
+                    else self.initial_active_cached_len
+                )
             ):
                 raise ValueError(
                     "Occurrence repositioned-cache mask must cover the initial cache hits."
@@ -637,7 +648,10 @@ class Req:
                 or len(cached_positions) != cached_tokens
                 or len(torch.unique(cached_positions)) != cached_tokens
                 or bool(torch.any(cached_positions < 0).item())
-                or bool(torch.any(cached_positions >= self.initial_active_cached_len).item())
+                or bool(torch.any(cached_positions >= (
+                    self.drop_recovery_plan.matched_length if self.drop_recovery_plan is not None
+                    else self.initial_active_cached_len
+                )).item())
             ):
                 raise ValueError("Attention cache positions must identify distinct initial hits.")
             used_positions = cached_positions.to(dtype=torch.int64, device="cpu")

@@ -23,6 +23,7 @@ class CacheManagerCreator(Protocol):
         device: torch.device,
         *,
         track_shared_page_owners: bool = True,
+        drop_aware_eviction: bool = False,
     ) -> BasePrefixCache: ...
 
 
@@ -54,9 +55,12 @@ def create_naive_cache(
     device: torch.device,
     *,
     track_shared_page_owners: bool = True,
+    drop_aware_eviction: bool = False,
 ):
     from .naive_cache import NaivePrefixCache
 
+    if drop_aware_eviction:
+        raise ValueError("Drop-aware eviction requires the radix cache.")
     del track_shared_page_owners
     return NaivePrefixCache(device=device)
 
@@ -66,12 +70,14 @@ def create_radix_cache(
     device: torch.device,
     *,
     track_shared_page_owners: bool = True,
+    drop_aware_eviction: bool = False,
 ):
     from .radix_cache import RadixPrefixCache
 
     return RadixPrefixCache(
         device=device,
         track_shared_page_owners=track_shared_page_owners,
+        drop_aware_eviction=drop_aware_eviction,
     )
 
 
@@ -80,10 +86,12 @@ def create_prefix_cache(
     type: str,
     *,
     track_shared_page_owners: bool = True,
+    drop_aware_eviction: bool = False,
 ) -> BasePrefixCache:
     return SUPPORTED_CACHE_MANAGER[type](
         device,
         track_shared_page_owners=track_shared_page_owners,
+        drop_aware_eviction=drop_aware_eviction,
     )
 
 

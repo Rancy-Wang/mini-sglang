@@ -263,6 +263,12 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     )
 
     parser.add_argument(
+        "--drop-aware-eviction",
+        action="store_true",
+        default=ServerArgs.drop_aware_eviction,
+        help="Allow unused Drop intervals in locked Radix paths to release KV pages.",
+    )
+    parser.add_argument(
         "--radix-drop-key-mode",
         type=str,
         choices=["bitmask", "symbol", "delta-marker"],
