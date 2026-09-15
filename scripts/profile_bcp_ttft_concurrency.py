@@ -22,7 +22,7 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[1]
+REPO = Path(os.environ.get("MINISGL_SOURCE_REPO", Path(__file__).resolve().parents[1])).resolve()
 sys.path[:0] = [str(REPO), str(REPO / "python")]
 
 
@@ -584,9 +584,13 @@ def launch(args, root):
     usage = subprocess.check_output(["nvidia-smi", "--query-gpu=index,memory.used",
                                      "--format=csv,noheader,nounits"], text=True)
     used = dict(tuple(map(int, line.split(","))) for line in usage.splitlines())
-    if any(used[gpu] > 100 for gpu in (0, 1)):
-        raise RuntimeError(f"GPU 0,1 not idle; refusing launch: {used}")
-    env = dict(os.environ, CUDA_VISIBLE_DEVICES="0,1", PYTHONPATH=f"{REPO}:{REPO / 'python'}",
+    gpus = getattr(args, "gpus", [0, 1])
+    if len(gpus) != 2 or len(set(gpus)) != 2 or any(used[gpu] > 100 for gpu in gpus):
+        raise RuntimeError(f"Selected TP2 GPUs not idle/distinct; refusing launch: {gpus}, {used}")
+    source = getattr(args, "source_repo", None) or REPO
+    source = source.resolve()
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES=",".join(map(str, gpus)),
+               MINISGL_SOURCE_REPO=str(source), PYTHONPATH=f"{source}:{source / 'python'}",
                MINISGL_TTFT_PROFILE_ROOT=str(root), PYTHONDONTWRITEBYTECODE="1",
                HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1", OMP_NUM_THREADS="1",
                NO_PROXY="127.0.0.1,localhost", no_proxy="127.0.0.1,localhost",
@@ -631,11 +635,27 @@ def launch(args, root):
                 "MINISGL_TTFT_DISTRIBUTED_TIMEOUT", "TORCH_NCCL_TRACE_BUFFER_SIZE",
                 "TORCH_NCCL_DUMP_ON_TIMEOUT",
                 "TORCH_EXTENSIONS_DIR", "TRITON_CACHE_DIR", "TVM_FFI_CACHE_DIR", "CUDA_CACHE_PATH"}},
-               head=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip(),
+               head=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source, text=True).strip(),
+               source_repo=str(source), short_validation=getattr(args, "short_validation", False),
                gpu_preflight=usage))
     with (root/"server.log").open("w") as log:
         return subprocess.Popen(argv, cwd=REPO, env=env, stdout=log, stderr=subprocess.STDOUT,
                                 start_new_session=True)
+
+
+def short_validation_turns(cases):
+    """A real TR8 seed followed by TR9/TR10; never renumber history/events."""
+    indices = []
+    for count in (8, 9, 10):
+        matches = [{r["turn"] for r in case["turns"] if r["tool_responses"] == count}
+                   for case in cases]
+        common = set.intersection(*matches)
+        if not common:
+            raise ValueError(f"No common recorded query with exactly {count} tool responses")
+        indices.append(min(common))
+    if indices != sorted(set(indices)):
+        raise ValueError("Short validation must preserve chronological request order")
+    return indices
 
 
 async def run(args):
@@ -650,6 +670,12 @@ async def run(args):
     for case in manifest["cases"]:
         with gzip.open(args.manifest.parent/case["file"], "rt") as stream:
             cases.append(json.load(stream))
+    short = getattr(args, "short_validation", False)
+    if short and (args.modes != ["fixed"] or args.concurrency != [8]):
+        raise ValueError("Short validation permits only fixed C8, one group per workload")
+    selected_turns = short_validation_turns(cases) if short else list(range(manifest["turns"]))
+    write_json(root/"selection.json", dict(turns=selected_turns, seed=selected_turns[0] if short else None,
+               short_validation=short, expected_requests=len(selected_turns)*8*2 if short else None))
     write_json(root/"manifest.json", manifest)
     write_json(root/"control.json", dict(cell="startup", turn=-1, concurrency=1, detail=False))
     process = launch(args, root)
@@ -672,6 +698,7 @@ async def run(args):
                 await asyncio.sleep(2)
             # Same model/tokenizer instance throughout. Each cell flushes idle KV,
             # retains compile caches/CUDA graphs, and uses exactly one nested cohort.
+            inference_start = time.monotonic()
             for mode in args.modes:
                 for concurrency in args.concurrency:
                     if mode in ("fixed", "fixed-overlap") and concurrency != 8:
@@ -681,13 +708,17 @@ async def run(args):
                         cell_dir = root/cell
                         cell_dir.mkdir()
                         with (cell_dir/"requests.jsonl").open("w") as output:
-                            for turn in range(manifest["turns"]):
+                            for turn in selected_turns:
+                                seed_wave = short and turn == selected_turns[0]
+                                control = mode_control(mode, turn)
+                                if seed_wave:
+                                    control["fixed_split"] = False
                                 write_json(root/"control.json", dict(cell=cell, turn=turn,
-                                           concurrency=concurrency,
+                                           concurrency=1 if seed_wave else concurrency,
                                            cohort=[dict(case_id=c["case_id"], tokens=c["turns"][turn]["full_tokens"])
                                                    for c in sorted(cases[:concurrency], key=lambda c:
                                                        ["210","215","229","236","226","223","231","233"].index(str(c["case_id"])))],
-                                           **mode_control(mode, turn)))
+                                           **control))
                                 async def request(case):
                                     spec = case["turns"][turn]
                                     messages = case["trajectory"][:spec["end"]]
@@ -721,10 +752,23 @@ async def run(args):
                                     output.write(json.dumps(row, ensure_ascii=False)+"\n"); output.flush()
                                     print(json.dumps({k:row[k] for k in
                                           ("cell", "turn", "case_id", "uid", "ttft_ms", "tpot_ms")}), flush=True)
-                                await asyncio.gather(*(request(case) for case in cases[:concurrency]))
+                                remaining = args.inference_budget_seconds - (time.monotonic() - inference_start)
+                                if remaining <= 0:
+                                    raise TimeoutError("Approved inference budget exhausted; no automatic retry")
+                                async def wave():
+                                    if seed_wave:
+                                        # Cold prefixes exceed the 1+7 token budget.
+                                        # Compute real KV serially, identical across
+                                        # versions; measured waves remain strict 1+7.
+                                        for case in cases[:concurrency]:
+                                            await request(case)
+                                    else:
+                                        await asyncio.gather(*(request(case) for case in cases[:concurrency]))
+                                await asyncio.wait_for(wave(), timeout=remaining)
                                 # Allow out-of-request buffered observer flush to finish.
                                 await asyncio.sleep(0.2)
-            write_json(root/"completed.json", dict(completed=True, time_ns=time.perf_counter_ns()))
+            write_json(root/"completed.json", dict(completed=True, time_ns=time.perf_counter_ns(),
+                       inference_seconds=time.monotonic()-inference_start))
     finally:
         if process.poll() is None:
             os.killpg(process.pid, signal.SIGTERM)
@@ -972,6 +1016,12 @@ def main():
     run_parser.add_argument("--modes", choices=("baseline", "detail", "natural", "gpu", "overlap", "fixed", "fixed-overlap"), nargs="+", default=["baseline", "detail"])
     run_parser.add_argument("--nsys", type=Path, help="Existing Nsight Systems executable; no installation")
     run_parser.add_argument("--skip-report", action="store_true", help="Export/plot captured artifacts locally")
+    run_parser.add_argument("--gpus", type=int, nargs=2, default=[0, 1])
+    run_parser.add_argument("--source-repo", type=Path,
+                            help="Read-only Git worktree for baseline production code; same driver")
+    run_parser.add_argument("--short-validation", action="store_true",
+                            help="Only TR8 seed and TR9/TR10 measurements, fixed C8")
+    run_parser.add_argument("--inference-budget-seconds", type=float, default=float("inf"))
     report_parser = sub.add_parser("report")
     report_parser.add_argument("--output", type=Path, required=True)
     overlap_parser = sub.add_parser("overlap-report")

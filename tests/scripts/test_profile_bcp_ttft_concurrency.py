@@ -17,6 +17,14 @@ profile = load("profile_bcp_ttft_concurrency")
 hooks = load("bcp_ttft_profile_hooks")
 
 
+def test_short_validation_selects_real_tr8_tr9_tr10_only():
+    cases = [dict(turns=[dict(turn=i, tool_responses=i) for i in range(12)]) for _ in range(8)]
+    assert profile.short_validation_turns(cases) == [8, 9, 10]
+    cases[-1]["turns"][9]["tool_responses"] = 11
+    with pytest.raises(ValueError, match="exactly 9"):
+        profile.short_validation_turns(cases)
+
+
 def test_committed_comparison_rejects_missing_rank_and_late_token_difference():
     from copy import deepcopy
     request = dict(cell="fixed-c8-rolling", uid=1, mode="fixed", concurrency=8,
