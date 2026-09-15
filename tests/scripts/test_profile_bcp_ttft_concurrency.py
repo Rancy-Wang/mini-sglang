@@ -130,8 +130,26 @@ def test_ttft_function_window_excludes_decode_and_does_not_prorate_cpu():
     assert first["contained_cpu_ms"]==pytest.approx(2/1e6)
 
 
-def test_gpu_ranges_only_on_existing_last_turn_prefill():
+def test_gpu_ranges_only_on_existing_long_and_last_turn_prefill():
     assert hooks.gpu_detail_enabled(dict(gpu_detail=True,turn=11),"prefill")
+    assert hooks.gpu_detail_enabled(dict(gpu_detail=True,turn=6),"prefill")
     assert not hooks.gpu_detail_enabled(dict(gpu_detail=True,turn=10),"prefill")
     assert not hooks.gpu_detail_enabled(dict(gpu_detail=True,turn=11),"decode")
     assert not hooks.gpu_detail_enabled(dict(detail=True,turn=11),"prefill")
+
+
+def test_communication_timeout_override_preserves_original_config():
+    from dataclasses import dataclass
+
+    @dataclass(frozen=True)
+    class Config:
+        distributed_timeout: float = 60
+        model_path: str = "unchanged"
+
+    original = Config()
+    effective = hooks.communication_config(original, 600)
+    assert original.distributed_timeout == 60
+    assert effective.distributed_timeout == 600
+    assert effective.model_path == original.model_path
+    with pytest.raises(ValueError):
+        hooks.communication_config(original, 0)

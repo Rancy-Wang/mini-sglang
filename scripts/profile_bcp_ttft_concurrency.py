@@ -227,7 +227,9 @@ def launch(args, root):
     env = dict(os.environ, CUDA_VISIBLE_DEVICES="0,1", PYTHONPATH=f"{REPO}:{REPO / 'python'}",
                MINISGL_TTFT_PROFILE_ROOT=str(root), PYTHONDONTWRITEBYTECODE="1",
                HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1", OMP_NUM_THREADS="1",
-               NO_PROXY="127.0.0.1,localhost", no_proxy="127.0.0.1,localhost")
+               NO_PROXY="127.0.0.1,localhost", no_proxy="127.0.0.1,localhost",
+               MINISGL_TTFT_DISTRIBUTED_TIMEOUT="600",
+               TORCH_NCCL_TRACE_BUFFER_SIZE="4096", TORCH_NCCL_DUMP_ON_TIMEOUT="1")
     runtime = external(args.compile_cache) if args.compile_cache else root / "runtime"
     runtime.mkdir(exist_ok=bool(args.compile_cache))
     for key, name in {"TORCH_EXTENSIONS_DIR": "torch", "TRITON_CACHE_DIR": "triton",
@@ -257,6 +259,8 @@ def launch(args, root):
     write_json(root / "launch.json", dict(argv=argv, env={k:v for k,v in env.items() if k in
                {"CUDA_VISIBLE_DEVICES", "OMP_NUM_THREADS", "CUDA_HOME", "PATH", "LD_LIBRARY_PATH",
                 "CC", "CXX", "NVCC_CCBIN", "NVCC_PREPEND_FLAGS", "CPATH",
+                "MINISGL_TTFT_DISTRIBUTED_TIMEOUT", "TORCH_NCCL_TRACE_BUFFER_SIZE",
+                "TORCH_NCCL_DUMP_ON_TIMEOUT",
                 "TORCH_EXTENSIONS_DIR", "TRITON_CACHE_DIR", "TVM_FFI_CACHE_DIR", "CUDA_CACHE_PATH"}},
                head=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip(),
                gpu_preflight=usage))

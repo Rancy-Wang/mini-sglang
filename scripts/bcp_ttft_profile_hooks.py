@@ -14,6 +14,7 @@ import resource
 import sys
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 
 
@@ -52,8 +53,15 @@ def replace_callable(owner, name, wrapper):
 
 
 def gpu_detail_enabled(control, phase):
-    # Only the final existing turn; never add a thirteenth request or sync kernels.
-    return bool(control.get("gpu_detail") and control.get("turn") == 11 and phase == "prefill")
+    # Existing long-context and final turns; no added request or kernel sync.
+    return bool(control.get("gpu_detail") and control.get("turn") in (6, 11) and phase == "prefill")
+
+
+def communication_config(config, timeout):
+    """Override only the experiment's frozen config, leaving defaults untouched."""
+    if timeout <= 0:
+        raise ValueError("Communication timeout must be positive")
+    return replace(config, distributed_timeout=timeout)
 
 
 def install():
@@ -83,6 +91,16 @@ def install():
     def control():
         current.clear()
         current.update(json.loads((root / "control.json").read_text()))
+
+    original_communication = Engine._init_communication
+
+    def init_communication(self, config):
+        timeout = float(os.environ.get("MINISGL_TTFT_DISTRIBUTED_TIMEOUT", "600"))
+        emit("communication_config", rank=config.tp_info.rank,
+             original_timeout_s=config.distributed_timeout, effective_timeout_s=timeout)
+        return original_communication(self, communication_config(config, timeout))
+
+    Engine._init_communication = init_communication
 
     def flush():
         for row, start, stop in pending_ranges:
