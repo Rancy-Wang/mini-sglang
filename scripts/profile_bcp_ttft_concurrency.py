@@ -124,6 +124,61 @@ def metrics_values(metrics):
     return dict(ttft_ms=ttft, tpot_ms=tpot)
 
 
+def correlate(requests, events):
+    """Exact monotonic-clock partition, no summation of overlapping TP ranks."""
+    components, output_tokens = [], {}
+    tokenizer = {(e.get("cell"), e["uid"]): e for e in events if e["kind"] == "tokenizer"}
+    arrivals = defaultdict(list)
+    batches = defaultdict(list)
+    releases = {}
+    for event in events:
+        if event["kind"] == "arrival":
+            arrivals[(event["cell"], event["uid"])].append(event)
+        elif event["kind"] == "gate_release":
+            releases[(event["cell"], event["turn"], event["pid"])] = event["end_ns"]
+        elif event["kind"] == "batch":
+            for offset, uid in enumerate(event["uids"]):
+                batches[(event["cell"], uid, event["pid"])].append((event, offset))
+    for row in requests:
+        if "uid" not in row:
+            continue
+        cell, uid = row["cell"], row["uid"]
+        tok = tokenizer.get((cell, uid))
+        arrival_rows = arrivals.get((cell, uid), [])
+        if tok is None or not arrival_rows:
+            continue
+        # PID-labelled representative, plus retain both ranks in raw evidence.
+        arrival = min(arrival_rows, key=lambda e:e["pid"])
+        pid = arrival["pid"]
+        sequence = sorted(batches.get((cell, uid, pid), []), key=lambda e:e[0]["start_ns"])
+        prefill = [e for e, _ in sequence if e["phase"] == "prefill"]
+        if not prefill:
+            continue
+        metrics = row["response"]["server_metrics"]
+        points = [metrics["request_received_ns"], tok["start_ns"], tok["end_ns"],
+                  arrival["time_ns"], prefill[0]["start_ns"], metrics["first_token_generated_ns"]]
+        names = ["frontend_queue", "tokenizer", "tokenizer_to_scheduler", "scheduler_to_forward", "forward_to_first_token"]
+        part = dict(zip(names, [(b-a)/1e6 for a,b in zip(points, points[1:])]))
+        release = releases.get((cell, row["turn"], pid), arrival["time_ns"])
+        part["barrier_wait"] = (release-arrival["time_ns"])/1e6
+        part["schedule_after_barrier"] = part["scheduler_to_forward"]-part["barrier_wait"]
+        part["sum_ms"] = sum(part[name] for name in names)
+        part["ttft_ms"] = row["ttft_ms"]
+        part["partition_valid"] = all(a<=b for a,b in zip(points, points[1:])) and abs(part["sum_ms"]-row["ttft_ms"])<1e-6
+        components.append(dict(cell=cell, uid=uid, turn=row["turn"], case_id=row["case_id"], pid=pid, **part))
+        output_tokens[(row["mode"], row["concurrency"], row["workload"], row["case_id"], row["turn"])] = [
+            event["tokens"][offset] for event,offset in sequence if "tokens" in event]
+    comparison = []
+    for key, tokens in output_tokens.items():
+        if key[0] != "detail":
+            continue
+        baseline = output_tokens.get(("baseline", *key[1:]))
+        comparison.append(dict(concurrency=key[1], workload=key[2], case_id=key[3], turn=key[4],
+                               baseline_tokens=baseline, detail_tokens=tokens,
+                               equal=baseline is not None and tokens==baseline))
+    return components, comparison
+
+
 def launch(args, root):
     usage = subprocess.check_output(["nvidia-smi", "--query-gpu=index,memory.used",
                                      "--format=csv,noheader,nounits"], text=True)
@@ -271,6 +326,9 @@ def report(args):
     by_cell = defaultdict(list)
     for row in requests:
         by_cell[row["cell"]].append(row)
+    components, output_comparison = correlate(requests, events)
+    write_json(root/"components.json", components)
+    write_json(root/"profile_output_comparison.json", output_comparison)
     summary, functions = [], []
     for cell, rows in by_cell.items():
         batches = [e for e in events if e.get("cell") == cell and e["kind"] == "batch"
@@ -283,7 +341,8 @@ def report(args):
                        mean_ttft_ms=statistics.mean(r["ttft_ms"] for r in rows),
                        late_ttft_ms=statistics.mean(r["ttft_ms"] for r in rows if r["turn"] >= 9),
                        first_prefill_batch_sizes={str(k):b["size"] for k,b in first_batches.items()},
-                       actual_batch_gate=bool(first_batches) and all(b["size"]==requested_c for b in first_batches.values())))
+                       actual_batch_gate=len(first_batches)==2*len({r["turn"] for r in rows})
+                       and all(b["size"]==requested_c for b in first_batches.values())))
         # Totals by rank, not summed across TP. Inclusive vs exclusive are separate.
         totals = defaultdict(lambda: defaultdict(float))
         for event in events:
@@ -307,6 +366,11 @@ def report(args):
                     values = [statistics.mean(r[metric] for r in rows if r["turn"]==t and r[metric] is not None) for t in turns]
                     axis.plot(turns, values, "o-" if workload=="no_drop" else "s-", label=label)
                     axis.set_ylabel(metric.replace("_ms", " (ms)").upper()); axis.grid(alpha=.2)
+                    if workload == "rolling":
+                        effective = [r["turn"] for r in rows if r["source"]["rolling"]]
+                        if effective:
+                            axis.axvline(min(effective), color="gray", linestyle="--")
+                            axis.axvspan(min(effective), max(turns), color="teal", alpha=.04)
             axes[0].legend(); axes[1].set_xlabel("Turn (zero-based); all measured turns retained")
             fig.suptitle(f"GPT-OSS-120B TP=2 | concurrency={concurrency} | {mode} | one cohort")
             fig.tight_layout(); fig.savefig(root/f"{mode}-c{concurrency}.png", dpi=150); plt.close(fig)

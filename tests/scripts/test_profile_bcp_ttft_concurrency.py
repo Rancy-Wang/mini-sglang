@@ -97,3 +97,18 @@ def test_hook_preserves_static_class_and_instance_binding():
     assert Sample.static(1) == 2
     assert Sample.class_method(2) == 3
     assert Sample().instance(3) == 4
+
+
+def test_uid_clock_partition_does_not_sum_tp_ranks():
+    row = dict(cell="baseline-c1-no_drop", uid=7, turn=0, case_id="x", mode="baseline",
+               concurrency=1, workload="no_drop", ttft_ms=.000010,
+               response={"server_metrics":{"request_received_ns":0,"first_token_generated_ns":10}})
+    common = dict(cell=row["cell"],turn=0)
+    events = [dict(common,kind="tokenizer",uid=7,start_ns=1,end_ns=3)]
+    for pid in (100,200):
+        events.extend([dict(common,kind="arrival",uid=7,pid=pid,time_ns=4),
+                       dict(common,kind="gate_release",pid=pid,end_ns=5),
+                       dict(common,kind="batch",pid=pid,uids=[7],phase="prefill",start_ns=6,tokens=[42])])
+    parts, _ = profile.correlate([row],events)
+    assert len(parts)==1 and parts[0]["partition_valid"]
+    assert parts[0]["sum_ms"]==pytest.approx(.000010)
