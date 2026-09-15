@@ -17,6 +17,25 @@ profile = load("profile_bcp_ttft_concurrency")
 hooks = load("bcp_ttft_profile_hooks")
 
 
+def test_fixed_cohort_admits_one_then_seven_without_changing_requests():
+    from types import SimpleNamespace as NS
+    requests = [NS(uid=i, prompt_tokens=100+i) for i in range(8)]
+    selected, deferred = hooks.fixed_pending_partition(requests[::-1], range(100,108), True)
+    assert selected == requests[:1] and deferred == requests[1:]
+    selected, deferred = hooks.fixed_pending_partition(deferred, range(100,108), False)
+    assert selected == requests[1:] and not deferred
+    with pytest.raises(ValueError):
+        hooks.fixed_pending_partition(requests, [100,100], True)
+
+
+def test_fixed_trace_has_explicit_barrier_and_bounded_capture():
+    for turn in range(12):
+        value = profile.mode_control("fixed-overlap", turn)
+        assert value["fixed_split"] and value["barrier"]
+        assert value["overlap"] == (turn in (9,10,11))
+    assert not profile.mode_control("natural", 9)["fixed_split"]
+
+
 def test_overlap_is_natural_and_bounded():
     for turn in range(12):
         control = dict(turn=turn, **profile.mode_control("overlap", turn))

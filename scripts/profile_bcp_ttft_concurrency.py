@@ -53,7 +53,8 @@ def bounded_turns(value):
 def mode_control(mode, turn):
     return dict(detail=mode == "detail", gpu_detail=mode in ("detail", "gpu"),
                 barrier=mode not in ("natural", "overlap"), nvtx=False,
-                overlap=mode == "overlap" and turn in (9, 10, 11))
+                fixed_split=mode in ("fixed", "fixed-overlap"),
+                overlap=mode in ("overlap", "fixed-overlap") and turn in (9, 10, 11))
 
 
 def overlap_partition(engine_end, forward_end, collect_start, sync_start, sync_end, recorded):
@@ -613,7 +614,7 @@ def launch(args, root):
             "--attention-backend", "fi", "--radix-drop-key-mode", "delta-marker",
             "--contextual-prefill-mode", "mask", "--reposition-execution-mode", "paged-occurrence",
             "--tool-call-parser", "gpt-oss", "--reasoning-parser", "gpt-oss"]
-    if "overlap" in args.modes:
+    if any(mode in ("overlap", "fixed-overlap") for mode in args.modes):
         if not args.nsys:
             raise ValueError("The overlap mode requires --nsys for CPU/GPU aligned tracing")
         argv = [str(args.nsys), "profile", "--sample=none", "--cpuctxsw=none",
@@ -669,6 +670,8 @@ async def run(args):
             # retains compile caches/CUDA graphs, and uses exactly one nested cohort.
             for mode in args.modes:
                 for concurrency in args.concurrency:
+                    if mode in ("fixed", "fixed-overlap") and concurrency != 8:
+                        continue
                     for workload in ("no_drop", "rolling"):
                         cell = f"{mode}-c{concurrency}-{workload}"
                         cell_dir = root/cell
@@ -676,7 +679,11 @@ async def run(args):
                         with (cell_dir/"requests.jsonl").open("w") as output:
                             for turn in range(manifest["turns"]):
                                 write_json(root/"control.json", dict(cell=cell, turn=turn,
-                                           concurrency=concurrency, **mode_control(mode, turn)))
+                                           concurrency=concurrency,
+                                           cohort=[dict(case_id=c["case_id"], tokens=c["turns"][turn]["full_tokens"])
+                                                   for c in sorted(cases[:concurrency], key=lambda c:
+                                                       ["210","215","229","236","226","223","231","233"].index(str(c["case_id"])))],
+                                           **mode_control(mode, turn)))
                                 async def request(case):
                                     spec = case["turns"][turn]
                                     messages = case["trajectory"][:spec["end"]]
@@ -823,7 +830,7 @@ def main():
     run_parser.add_argument("--chunk", type=int, default=65536)
     run_parser.add_argument("--compile-cache", type=Path, help="Reuse an idle previous experiment's compile caches")
     run_parser.add_argument("--concurrency", type=int, choices=(1,2,4,8), nargs="+", default=[1,2,4,8])
-    run_parser.add_argument("--modes", choices=("baseline", "detail", "natural", "gpu", "overlap"), nargs="+", default=["baseline", "detail"])
+    run_parser.add_argument("--modes", choices=("baseline", "detail", "natural", "gpu", "overlap", "fixed", "fixed-overlap"), nargs="+", default=["baseline", "detail"])
     run_parser.add_argument("--nsys", type=Path, help="Existing Nsight Systems executable; no installation")
     run_parser.add_argument("--skip-report", action="store_true", help="Export/plot captured artifacts locally")
     report_parser = sub.add_parser("report")

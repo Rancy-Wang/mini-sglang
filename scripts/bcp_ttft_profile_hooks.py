@@ -43,6 +43,15 @@ class WaveGate:
         return len(self.arrivals) == self.expected
 
 
+def fixed_pending_partition(pending, prompt_order, first):
+    """Experiment-only admission: retain original requests, never edit a batch."""
+    order = {int(length): i for i, length in enumerate(prompt_order)}
+    if len(order) != len(prompt_order):
+        raise ValueError("Fixed cohort needs unique prompt lengths for identity")
+    ordered = sorted(pending, key=lambda req: order[req.prompt_tokens])
+    return (ordered[:1], ordered[1:]) if first else (ordered, [])
+
+
 def replace_callable(owner, name, wrapper):
     """Preserve binding semantics for static/class/ordinary methods."""
     descriptor = inspect.getattr_static(owner, name)
@@ -95,6 +104,9 @@ def install():
     capturing = False
     traced_wave = None
     copy_owners = {}
+    fixed_wave = None
+    fixed_first = True
+    uid_case = {}
 
     def emit(kind, **values):
         events.append(dict(kind=kind, pid=os.getpid(), tid=threading.get_native_id(),
@@ -409,6 +421,9 @@ def install():
                 cleared.add(current["cell"])
                 emit("cache_reset", free=len(cache.free_slots), total=cache.num_pages)
             gate.arrive((current["cell"], current["turn"]), current["concurrency"], msg.uid)
+            if current.get("fixed_split"):
+                identity = {int(x["tokens"]): x["case_id"] for x in current["cohort"]}
+                uid_case[msg.uid] = identity[msg.prompt_tokens]
             emit("arrival", uid=msg.uid, time_ns=time.perf_counter_ns())
             local.active, local.uids, local.phase = True, [msg.uid], "receive"
         return original_process(self, msg)
@@ -416,6 +431,7 @@ def install():
 
     original_schedule = Scheduler._schedule_next_batch
     def schedule(self):
+        nonlocal fixed_wave, fixed_first
         if current and not gate.released and current.get("barrier", True):
             if not gate.ready():
                 local.active = False
@@ -429,8 +445,47 @@ def install():
         local.active = bool(self.prefill_manager.pending_list or self.decode_manager.runnable)
         local.uids = [req.uid for req in self.prefill_manager.pending_list]
         local.phase = "select"
+        if current.get("fixed_split") and self.prefill_manager.pending_list:
+            wave = (current["cell"], current["turn"])
+            if wave != fixed_wave:
+                fixed_wave, fixed_first = wave, True
+            selected, deferred = fixed_pending_partition(
+                self.prefill_manager.pending_list,
+                [x["tokens"] for x in current["cohort"]], fixed_first)
+            self.prefill_manager.pending_list = selected
+            try:
+                result = original_schedule(self)
+            finally:
+                self.prefill_manager.pending_list.extend(deferred)
+            from minisgl.scheduler.prefill import ChunkedReq
+            expected = [r.uid for r in selected]
+            if (result is None or result.batch.phase != "prefill"
+                    or [r.uid for r in result.batch.reqs] != expected
+                    or any(isinstance(r, ChunkedReq) for r in result.batch.reqs)):
+                raise RuntimeError("Fixed 1+7 admission failed: refuse a mislabeled experiment")
+            fixed_first = False
+            return result
         return original_schedule(self)
     Scheduler._schedule_next_batch = schedule
+
+    from minisgl.scheduler.decode import DecodeManager
+    original_decode = DecodeManager.schedule_next_batch
+    def decode(manager):
+        batch = original_decode(manager)
+        if batch is not None and current.get("fixed_split"):
+            order = {x["case_id"]: i for i, x in enumerate(current["cohort"])}
+            batch.reqs.sort(key=lambda req: order[uid_case[req.uid]])
+        return batch
+    DecodeManager.schedule_next_batch = decode
+
+    from minisgl.core import Req
+    original_append = Req.append_host
+    def append(req, token):
+        result = original_append(req, token)
+        if current:
+            emit("committed_token", uid=req.uid, tokens=token.tolist())
+        return result
+    Req.append_host = append
 
     original_forward = Engine.forward_batch
     def forward(self, batch, sampling):
