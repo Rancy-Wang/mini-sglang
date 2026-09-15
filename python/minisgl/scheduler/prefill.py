@@ -877,6 +877,8 @@ class PrefillAdder:
                 retry_pages=current_pages - 1,
             )
 
+        from .metadata_indices import cpu_mask_indices, pack_cpu_metadata, select_cpu_mask
+
         required_ids, allocation_count, _, future_reserve = best
         required_raw = occurrence_raw[required_ids].to(torch.int64)
         required_positions = occurrence_positions[required_ids]
@@ -888,9 +890,6 @@ class PrefillAdder:
             len(prior_raw), dtype=torch.int32, device=self.cache_manager.device
         )
         if len(prior_raw) > 0:
-            prior_raw_device = prior_raw.pin_memory().to(
-                self.cache_manager.device, non_blocking=True
-            )
             matched_prior = prior_raw < len(source_positions)
             canonical_positions[matched_prior] = source_positions[
                 prior_raw[matched_prior]
@@ -901,20 +900,22 @@ class PrefillAdder:
             )
             canonical_positions[reuse_terminal] = required_positions[prior][reuse_terminal]
             birth_source = ~reuse_terminal
-            birth_source_device = birth_source.pin_memory().to(
-                self.cache_manager.device, non_blocking=True
+            birth_selection = cpu_mask_indices(birth_source)
+            terminal_selection = cpu_mask_indices(reuse_terminal)
+            birth_source_device, birth_raw_device, terminal_source_device, terminal_raw_device = (
+                pack_cpu_metadata([
+                    birth_selection, prior_raw[birth_selection],
+                    terminal_selection, prior_raw[terminal_selection],
+                ], self.cache_manager.device)
             )
             if bool(torch.any(birth_source).item()):
                 canonical_pages[birth_source_device] = birth_pages[
-                    prior_raw_device[birth_source_device]
+                    birth_raw_device
                 ]
             if bool(torch.any(reuse_terminal).item()):
-                terminal_source_device = reuse_terminal.pin_memory().to(
-                    self.cache_manager.device, non_blocking=True
-                )
                 canonical_pages[terminal_source_device] = self.table_manager.occurrence_pages(
                     table_idx
-                )[prior_raw_device[terminal_source_device]]
+                )[terminal_raw_device]
             if bool(torch.any(canonical_pages < 0).item()):
                 raise RuntimeError("A computed occurrence token has no retained KV page.")
         prior_new = required_positions[prior] != canonical_positions
@@ -933,25 +934,17 @@ class PrefillAdder:
         allocated_pages = torch.empty(0, dtype=torch.int32, device=self.cache_manager.device)
         try:
             allocated_pages = self.cache_manager.allocate_occurrence_pages(allocation_count)
-            required_device = required_ids.pin_memory().to(
-                self.cache_manager.device, non_blocking=True
-            )
-            new_device = new_mask.pin_memory().to(self.cache_manager.device, non_blocking=True)
+            reuse_prior = ~prior_new
+            new_device, prior_required, reuse_device = pack_cpu_metadata([
+                required_ids[new_mask], required_ids[prior][reuse_prior],
+                cpu_mask_indices(reuse_prior),
+            ], self.cache_manager.device)
             runtime_pages = torch.full(
                 (occurrence_count,), -1, dtype=torch.int32, device=self.cache_manager.device
             )
-            runtime_pages[required_device[new_device]] = allocated_pages
+            runtime_pages[new_device] = allocated_pages
             if len(prior_raw) > 0:
-                reuse_prior = ~prior_new
                 if bool(torch.any(reuse_prior).item()):
-                    prior_required = (
-                        required_ids[prior][reuse_prior]
-                        .pin_memory()
-                        .to(self.cache_manager.device, non_blocking=True)
-                    )
-                    reuse_device = reuse_prior.pin_memory().to(
-                        self.cache_manager.device, non_blocking=True
-                    )
                     runtime_pages[prior_required] = canonical_pages[reuse_device]
 
             allocated_ids = required_ids[new_mask]
@@ -978,10 +971,7 @@ class PrefillAdder:
                 (0, 2), dtype=torch.int32, device=self.cache_manager.device
             )
             if len(cached_ids) > 0:
-                cached_reuse_device = cached_transform.pin_memory().to(
-                    self.cache_manager.device, non_blocking=True
-                )
-                cached_source_pages = canonical_pages[cached_reuse_device]
+                cached_source_pages = select_cpu_mask(canonical_pages, cached_transform)
                 cached_destination_pages = runtime_pages[
                     cached_ids.pin_memory().to(self.cache_manager.device, non_blocking=True)
                 ]
