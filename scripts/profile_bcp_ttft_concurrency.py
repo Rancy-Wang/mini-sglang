@@ -245,7 +245,9 @@ def launch(args, root):
         env["NVCC_PREPEND_FLAGS"] = "-ccbin=" + env["CC"]
     argv = [sys.executable, str(Path(__file__).resolve()), "worker", "--model-path", args.model,
             "--host", "127.0.0.1", "--port", str(args.port), "--tp-size", "2",
-            "--dtype", "bfloat16", "--disable-pynccl", "--memory-ratio", "0.90",
+            # Keep room for the frozen cohort's 100k-token MoE activation/workspace.
+            # This value is fixed across every C and paired workload in the run.
+            "--dtype", "bfloat16", "--disable-pynccl", "--memory-ratio", "0.75",
             "--max-running-requests", "8", "--cuda-graph-max-bs", "8",
             "--max-seq-len-override", "131072", "--max-prefill-length", str(args.chunk),
             "--request-timeout", "1800", "--cache-type", "radix", "--page-size", "1",
@@ -306,7 +308,7 @@ async def run(args):
                         with (cell_dir/"requests.jsonl").open("w") as output:
                             for turn in range(manifest["turns"]):
                                 write_json(root/"control.json", dict(cell=cell, turn=turn,
-                                           concurrency=concurrency, detail=mode=="detail", gpu_detail=mode=="gpu",
+                                           concurrency=concurrency, detail=mode=="detail", gpu_detail=mode in ("detail","gpu"),
                                            barrier=mode!="natural", nvtx=False))
                                 async def request(case):
                                     spec = case["turns"][turn]
@@ -319,7 +321,10 @@ async def run(args):
                                         payload.update(rolling_interface(messages))
                                     start = time.perf_counter_ns()
                                     response = await client.post(url+"/v1/chat/completions", json=payload)
-                                    body = response.json()
+                                    try:
+                                        body = response.json()
+                                    except ValueError:
+                                        body = {"non_json_error": response.text}
                                     row = dict(cell=cell, concurrency=concurrency, mode=mode,
                                                workload=workload, case_id=case["case_id"], turn=turn,
                                                source=spec, request_sha256=digest(payload),
