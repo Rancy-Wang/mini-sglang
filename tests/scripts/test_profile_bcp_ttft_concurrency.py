@@ -77,3 +77,23 @@ def test_artifacts_not_written_into_git():
 def test_digest_preserves_message_content():
     assert profile.digest([{"a":1,"b":2}]) == profile.digest([{"b":2,"a":1}])
     assert profile.digest([{"a":1}]) != profile.digest([{"a":2}])
+
+
+def test_hook_preserves_static_class_and_instance_binding():
+    class Sample:
+        @staticmethod
+        def static(a):
+            return a + 1
+
+        @classmethod
+        def class_method(cls, a):
+            return cls.static(a)
+
+        def instance(self, a):
+            return self.static(a)
+
+    for name in ("static", "class_method", "instance"):
+        hooks.replace_callable(Sample, name, lambda fn: lambda *a, **kw: fn(*a, **kw))
+    assert Sample.static(1) == 2
+    assert Sample.class_method(2) == 3
+    assert Sample().instance(3) == 4

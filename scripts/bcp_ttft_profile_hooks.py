@@ -41,6 +41,16 @@ class WaveGate:
         return len(self.arrivals) == self.expected
 
 
+def replace_callable(owner, name, wrapper):
+    """Preserve binding semantics for static/class/ordinary methods."""
+    descriptor = inspect.getattr_static(owner, name)
+    fn = descriptor.__func__ if isinstance(descriptor, (staticmethod, classmethod)) else descriptor
+    replacement = wrapper(fn)
+    setattr(owner, name, type(descriptor)(replacement)
+            if isinstance(descriptor, (staticmethod, classmethod)) else replacement)
+    return fn, replacement
+
+
 def install():
     if getattr(install, "done", False):
         return
@@ -172,9 +182,7 @@ def install():
             else:
                 owner, method = module, label
             if owner is not None and hasattr(owner, method):
-                fn = getattr(owner, method)
-                replacement = wrap(fn, label)
-                setattr(owner, method, replacement)
+                fn, replacement = replace_callable(owner, method, lambda f: wrap(f, label))
                 replacements[fn] = replacement
                 installed.append(label)
     for module_name, module in list(sys.modules.items()):
