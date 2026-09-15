@@ -315,7 +315,7 @@ def test_occurrence_construction_failure_rolls_back_allocated_pages(monkeypatch)
 
 
 def test_paged_occurrence_chunks_until_the_full_prompt_is_covered() -> None:
-    # Birth and terminal pages remain live through Decode, so this plan's
+    # Birth and terminal pages coexist through Prefill, so this plan's
     # persistent set plus one output page needs 15 pages. A small token budget
     # still chunks the prompt without overcommitting that fixed KV capacity.
     manager, cache, table, kv_cache = _manager(num_pages=15, table_count=1)
@@ -505,6 +505,9 @@ def test_occurrence_retry_owns_borrowed_final_pages_before_cacheback(
     scheduler.cache_manager = cache
     scheduler.table_manager = table
     scheduler._release_occurrence_transients(req)
+    # Birth-only copies must be available before the final cache commit, not
+    # merely released once the request has finished generating.
+    assert set(birth_only.tolist()).issubset(set(cache.free_slots.tolist()))
     scheduler._compact_context_after_prefill(req)
     cache.cache_req(req, finished=True)
     table.free(req.table_idx)
@@ -788,12 +791,78 @@ def test_capacity_chunked_occurrence_request_runs_alone_until_completed() -> Non
     second = _pending(uid=109)
     manager.pending_list.extend([first, second])
 
-    batch = manager.schedule_next_batch(prefill_budget=2)
+    completed = []
+    for _ in range(16):
+        batch = manager.schedule_next_batch(prefill_budget=2)
+        assert batch is not None and len(batch.reqs) == 1
+        req = batch.reqs[0]
+        assert req.uid == (108 if not completed else 109)
+        if isinstance(req, ChunkedReq):
+            _complete_intermediate_chunk(manager, req)
+        else:
+            req.complete_one()
+            assert not req.can_decode  # This fixture reserves one output token.
+            _free_occurrence_request(req, cache, table)
+            completed.append(req.uid)
+        if not manager.pending_list:
+            break
+    assert completed == [108, 109]
+    cache.check_integrity()
 
-    assert batch is not None and len(batch.reqs) == 1
-    assert isinstance(batch.reqs[0], ChunkedReq)
-    assert [pending.uid for pending in manager.pending_list] == [108, 109]
-    _free_occurrence_request(batch.reqs[0], cache, table)
+
+def test_transient_pressure_waits_without_discarding_match(monkeypatch) -> None:
+    manager, cache, table, _ = _manager(num_pages=17, table_count=2)
+    pending = _pending(uid=310)
+    pages = cache._allocate(2)
+    cache.prefix_cache.insert_prefix(pending.radix_match_ids[:2], pages)
+    other_keys = pending.radix_match_ids[:6].clone()
+    other_keys[:, 1] += 1000
+    other = _protect_prefix(cache, other_keys)
+    manager.pending_list.append(pending)
+
+    def forbid_empty(_req):
+        pytest.fail("Transient pressure discarded a usable cached prefix")
+
+    monkeypatch.setattr(cache, "match_empty_req", forbid_empty)
+    assert manager.schedule_next_batch(prefill_budget=2) is None
+    assert table.available_size == 2
+    cache.unlock(other)
+    for _ in range(8):
+        batch = manager.schedule_next_batch(prefill_budget=2)
+        assert batch is not None
+        req = batch.reqs[0]
+        if isinstance(req, ChunkedReq):
+            _complete_intermediate_chunk(manager, req)
+        else:
+            _free_occurrence_request(req, cache, table)
+            break
+    assert not manager.pending_list
+    cache.check_integrity()
+
+
+@pytest.mark.parametrize("drop_aware", [False, True])
+def test_birth_only_pages_released_while_decode_still_runnable(drop_aware) -> None:
+    manager, cache, table, _ = _manager(num_pages=32, table_count=1, drop_aware=drop_aware)
+    pending = _pending(uid=311)
+    pending.sampling_params = SamplingParams(max_tokens=3)
+    manager.pending_list.append(pending)
+    req = manager.schedule_next_batch(prefill_budget=8).reqs[0]
+    birth = req.occurrence_birth_pages.clone()
+    terminal = table.occurrence_pages(req.table_idx)[:len(birth)].clone()
+    birth_only = birth[(birth >= 0) & ~torch.isin(birth, terminal)]
+    assert len(birth_only) > 0
+    req.complete_one()
+    assert req.can_decode
+    scheduler = object.__new__(Scheduler)
+    scheduler.cache_manager, scheduler.table_manager = cache, table
+    scheduler._release_occurrence_transients(req)
+    assert set(birth_only.tolist()).issubset(set(cache.free_slots.tolist()))
+    assert req.can_decode
+    scheduler._compact_context_after_prefill(req)
+    # The same early-release state must also support abort, without double free.
+    scheduler.context_sequence_uids = set()
+    scheduler._free_aborted_occurrence_resources(req)
+    assert cache.available_size == cache.num_pages
     cache.check_integrity()
 
 

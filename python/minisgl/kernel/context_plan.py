@@ -303,6 +303,52 @@ def try_build_occurrence_sliding_plan(
     return key_offsets, key_positions, cached_positions
 
 
+def occurrence_progress_peak(req, source_positions: torch.Tensor, start: int, exact: int) -> int:
+    """Additional pages sufficient for a singleton-query continuation.
+
+    Ordinary occurrence execution retains birth and terminal pages. Reserve
+    those plus the maximum *simultaneously live* intermediate positions, not
+    every historical occurrence. Matched terminal copies are budgeted from the
+    start, so acquiring one early in a larger chunk cannot invalidate the bound.
+    Existing borrowed pages are excluded: the caller has already locked them.
+    This CPU-only sweep is O(tokens + segment keys), independent of chunk size.
+    """
+    import numpy as np
+
+    birth = req.occurrence_birth_indices.numpy()
+    terminal = req.occurrence_terminal_indices.numpy()
+    positions = req.occurrence_positions.numpy()
+    raw = req.occurrence_raw_tokens.numpy()
+    count = len(birth)
+    canonical = positions[birth].copy()
+    canonical[:len(source_positions)] = source_positions.numpy()
+    terminal_positions = positions[terminal]
+    source_copies = np.count_nonzero(
+        (terminal_positions[:start] != canonical[:start]) | (np.arange(start) >= exact)
+    )
+    retained = np.cumsum(1 + (birth[start:] != terminal[start:]), dtype=np.int64)
+    transient_delta = np.zeros(count + 1, dtype=np.int64)
+    offsets = req.occurrence_segment_key_offsets.numpy()
+    keys = req.occurrence_segment_key_indices.numpy()
+    for i, (left, right) in enumerate(zip(
+        req.occurrence_segment_query_starts.tolist(),
+        req.occurrence_segment_query_ends.tolist(), strict=True,
+    )):
+        left = max(start, left)
+        if left >= right:
+            continue
+        ids = keys[offsets[i]:offsets[i + 1]]
+        tokens = raw[ids]
+        extra = (positions[ids] != canonical[tokens]) & (
+            positions[ids] != terminal_positions[tokens]
+        )
+        activation = np.maximum(left, tokens[extra])
+        np.add.at(transient_delta, activation, 1)
+        transient_delta[right] -= len(activation)
+    transient = np.cumsum(transient_delta)[start:count]
+    return int(source_copies + np.max(retained + transient) + req.output_len)
+
+
 def try_build_occurrence_capacity_index(
     occurrence_raw_tokens: torch.Tensor,
     occurrence_positions: torch.Tensor,

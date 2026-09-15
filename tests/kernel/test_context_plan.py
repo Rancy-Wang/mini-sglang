@@ -416,3 +416,56 @@ def test_occurrence_capacity_index_matches_reference_for_every_endpoint(
         assert int(current[index]) == expected_current
         assert int(persistent[index]) == expected_persistent
         assert int(future[index]) == expected_future
+
+
+def test_progress_peak_covers_late_intermediate_copies_and_linear_main_rule():
+    from types import SimpleNamespace
+    from minisgl.kernel.context_plan import occurrence_progress_peak
+
+    # Nine tokens eventually move twice. At query 8, eight old tokens need
+    # their middle positions, in addition to their retained birth/final pages.
+    raw = torch.tensor(list(range(10)) + list(range(9)) + list(range(8)), dtype=torch.int32)
+    positions = torch.tensor(list(range(100, 110)) + list(range(9)) + list(range(50, 58)), dtype=torch.int32)
+    birth = torch.arange(10, dtype=torch.int32)
+    terminal = torch.tensor(list(range(10, 19)) + [9], dtype=torch.int32)
+    req = SimpleNamespace(
+        occurrence_raw_tokens=raw, occurrence_positions=positions,
+        occurrence_birth_indices=birth, occurrence_terminal_indices=terminal,
+        occurrence_segment_query_starts=torch.tensor([0, 8, 9], dtype=torch.int32),
+        occurrence_segment_query_ends=torch.tensor([8, 9, 10], dtype=torch.int32),
+        occurrence_segment_key_offsets=torch.tensor([0, 8, 17, 27], dtype=torch.int32),
+        occurrence_segment_key_indices=torch.tensor(
+            list(range(8)) + list(range(19, 27)) + [8] + list(range(10, 19)) + [9],
+            dtype=torch.int32,
+        ),
+        full_keep_mask=torch.ones(10, dtype=torch.int32), output_len=1,
+    )
+    empty = torch.empty(0, dtype=torch.int32)
+    owned = torch.zeros(10, dtype=torch.bool)
+    _, _, initial_persistent, initial_future = PrefillAdder._occurrence_capacity_for_chunk(
+        req, start=0, end=1, terminal_owned=owned, initial_source_positions=empty,
+    )
+    assert initial_persistent + initial_future == 20
+    retained, observed = 0, 0
+    for start in range(10):
+        _, current, persistent, _ = PrefillAdder._occurrence_capacity_for_chunk(
+            req, start=start, end=start + 1, terminal_owned=owned,
+            initial_source_positions=empty,
+        )
+        observed = max(observed, retained + current + req.output_len)
+        retained += persistent
+        owned[start] = True
+    assert observed == 27
+    assert occurrence_progress_peak(req, empty, 0, 0) == observed
+
+    # Without position changes, main's remaining-input + output reservation
+    # is recovered exactly, including an already matched prefix.
+    req.occurrence_raw_tokens = birth
+    req.occurrence_positions = birth
+    req.occurrence_terminal_indices = birth
+    req.occurrence_segment_query_starts = torch.tensor([0], dtype=torch.int32)
+    req.occurrence_segment_query_ends = torch.tensor([10], dtype=torch.int32)
+    req.occurrence_segment_key_offsets = torch.tensor([0, 10], dtype=torch.int32)
+    req.occurrence_segment_key_indices = birth
+    for cached in (0, 3, 9):
+        assert occurrence_progress_peak(req, birth[:cached], cached, cached) == 10 - cached + 1

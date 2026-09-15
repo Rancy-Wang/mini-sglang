@@ -787,6 +787,28 @@ class Scheduler(SchedulerIOMixin):
         self.cache_manager.free_occurrence_pages(pages)
         req.occurrence_transient_pages = None
         req.occurrence_inflight = False
+        # This is the final Prefill completion (intermediate chunks use
+        # PrefillManager.complete_chunk). No later query needs birth-position
+        # copies distinct from terminal candidates. Fresh owned occurrences
+        # have distinct allocations, so CPU occurrence IDs establish aliasing
+        # without a GPU page-set comparison or a device synchronization.
+        birth_owned = req.occurrence_birth_owned_mask
+        if birth_owned is not None and req.occurrence_birth_indices is not None:
+            assert req.occurrence_terminal_indices is not None
+            assert req.occurrence_birth_pages is not None
+            obsolete = birth_owned & (
+                req.occurrence_birth_indices != req.occurrence_terminal_indices
+            )
+            indices = torch.nonzero(obsolete, as_tuple=False).view(-1)
+            if len(indices):
+                device_indices = indices.pin_memory().to(
+                    req.occurrence_birth_pages.device, non_blocking=True
+                )
+                self.cache_manager.free_occurrence_pages(
+                    req.occurrence_birth_pages.index_select(0, device_indices)
+                )
+                req.occurrence_birth_pages.index_fill_(0, device_indices, -1)
+                birth_owned[indices] = False
 
     def _release_compact_indices(self, req: Req) -> None:
         lease = getattr(req, "context_decode_index_lease", None)

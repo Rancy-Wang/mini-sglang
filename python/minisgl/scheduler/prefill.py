@@ -8,6 +8,7 @@ import torch
 from minisgl.core import Batch, Req, get_global_ctx
 from minisgl.kernel.context_plan import (
     first_mask_free_conflict_event,
+    occurrence_progress_peak,
     try_build_occurrence_capacity_index,
 )
 from minisgl.utils import init_logger
@@ -646,6 +647,22 @@ class PrefillAdder:
                 cache_reuse_ratio = chunked_req.cache_reuse_ratio
 
             try:
+                progress_pages = 0
+                if initial_allocation and req.drop_recovery_plan is None:
+                    cached_peak = getattr(req, "_occurrence_progress_peak", None)
+                    if (
+                        cached_peak is None
+                        or cached_peak[:2] != (cached_len, exact_full_cached_len)
+                        or not torch.equal(cached_peak[2], source_positions)
+                    ):
+                        cached_peak = (
+                            cached_len, exact_full_cached_len, source_positions.clone(),
+                            occurrence_progress_peak(
+                                req, source_positions, cached_len, exact_full_cached_len
+                            ),
+                        )
+                        req._occurrence_progress_peak = cached_peak
+                    progress_pages = cached_peak[3]
                 max_end = min(req.input_len, cached_len + self.token_budget)
                 if req.drop_recovery_plan is not None:
                     _, interval_end = req.drop_recovery_plan.next_interval(cached_len)
@@ -653,7 +670,7 @@ class PrefillAdder:
                 best: tuple[torch.Tensor, int, int, int] | None = None
                 best_end: int | None = None
                 available_pages = self.cache_manager.available_size
-                if max_end > cached_len:
+                if max_end > cached_len and progress_pages + self.reserved_size <= available_pages:
                     assert occurrence_raw is not None
                     assert occurrence_positions is not None
                     assert birth_ids is not None
@@ -825,9 +842,6 @@ class PrefillAdder:
                 self.table_manager.free(table_idx)
                 self.cache_manager.unlock(cache_handle)
                 initial_resources_live = False
-                if cached_len > 0 and not fallback_to_empty:
-                    fallback_to_empty = True
-                    continue
             if req.drop_recovery_plan is not None:
                 # Use the same demand model for rejection as for admission.
                 # The legacy model includes discarded terminal copies.
@@ -849,7 +863,7 @@ class PrefillAdder:
                     exact_full_cached_len=exact_full_cached_len,
                 )
                 _, current_pages, persistent_pages, future_pages = minimum
-            minimum_pages = max(current_pages, persistent_pages + future_pages)
+            minimum_pages = max(current_pages, persistent_pages + future_pages, progress_pages)
             self_pinned_pages = len(torch.unique(source_pages)) + int(
                 torch.count_nonzero(terminal_owned).item()
             )
@@ -869,6 +883,12 @@ class PrefillAdder:
                 # Keep this request pending so normal Decode/Prefill completion can
                 # release them instead of turning pressure into a terminal failure.
                 return None
+            if initial_allocation and cached_len > 0 and not fallback_to_empty:
+                # Only discard a usable match when its own pinned sources make
+                # the working set impossible. Other requests' reservations and
+                # pages are transient pressure: wait for them before retrying.
+                fallback_to_empty = True
+                continue
             raise RepositionCapacityError(
                 uid=req.uid,
                 required_pages=minimum_pages,
