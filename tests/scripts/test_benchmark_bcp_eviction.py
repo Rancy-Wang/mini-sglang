@@ -134,7 +134,8 @@ def test_experiment_outputs_cannot_land_in_repository():
 
 
 @pytest.mark.parametrize("fixed_output", [False, True])
-def test_replay_uses_recorded_prefixes_and_waits_for_each_turn(tmp_path, fixed_output):
+@pytest.mark.parametrize("finish_reason", ["length", "tool_calls"])
+def test_replay_uses_recorded_prefixes_and_waits_for_each_turn(tmp_path, fixed_output, finish_reason):
     m = load()
     trajectory = [
         {"role": "user", "content": "question"},
@@ -162,7 +163,7 @@ def test_replay_uses_recorded_prefixes_and_waits_for_each_turn(tmp_path, fixed_o
                     "server_metrics": metrics,
                     "choices": [
                         {
-                            "finish_reason": "length" if fixed_output else "stop",
+                            "finish_reason": finish_reason,
                             "message": {"role": "assistant", "content": "new generated answer"},
                         }
                     ],
