@@ -83,6 +83,11 @@ latency、TTFT、ITL，加整段持续时间及 tokenizer。输出为 BenchmarkM
 SGLang adapter一样不并入其 generated_text。这意味着重分词数可以小于completion_tokens。
 没有speculative accept_length配置，ITL不做猜测性的token均分。
 
+Drop 请求通过返回的 `drop_skipped_tokens` / `repos_tokens` 扩展字段确认协议支持；
+整组有 Drop 却没有任何确认时标为 invalid。单 turn 未返回这些字段时保存为未知，
+不会把冷缓存的零节省判成 Drop 失败。这是协议确认，不是逐 token 的 attention mask
+正确性证明；机制正确性仍依赖系统测试。完整 usage 和错误信息均保留供复核。
+
 这些是**请求级、端到端逻辑吞吐**：缓存命中、Drop跳过也在逻辑prompt中；不能将
 Prefill值解释为实际执行的GPU prefill tokens/s。缓存与服务端metadata原样保留在事件中。
 只凭最终 response.json 无法恢复流式TTFT/ITL；客户端必须对SSE到达时间计时。

@@ -177,6 +177,9 @@ async def group_run(args, group, gpus, port):
                 raise RuntimeError(f"Invalid capacity evidence: {ready}")
             write_json(group_root / "capacity.json", ready[0])
             for number, concurrency, drop in cells:
+                current_head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip()
+                if current_head != args.head:
+                    raise RuntimeError(f"Repository changed during matrix: {args.head} -> {current_head}")
                 cell_root = group_root / (f"{number:02d}_C{concurrency}_" + ("drop" if drop else "no_drop"))
                 cell_root.mkdir(exist_ok=True)
                 status_path = cell_root / "status.json"

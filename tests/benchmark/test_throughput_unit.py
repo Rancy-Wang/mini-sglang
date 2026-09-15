@@ -87,11 +87,15 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         from unittest.mock import patch
         from aiohttp import web
 
+        acknowledge_drop = True
         async def handler(request):
             payload = await request.json()
             await asyncio.sleep(.005)
             text = 'data: {"choices":[{"delta":{"content":"a"},"finish_reason":"stop"}]}\n\n'
-            text += 'data: {"usage":{"prompt_tokens":3,"completion_tokens":1},"choices":[]}\n\n'
+            usage = {"prompt_tokens": 3, "completion_tokens": 1}
+            if payload.get("drop_message") and acknowledge_drop:
+                usage["prompt_tokens_details"] = {"drop_skipped_tokens": 0}
+            text += 'data: ' + json.dumps({"usage": usage, "choices": []}) + '\n\n'
             text += 'data: [DONE]\n\n'
             self.assertTrue(payload["stream"])
             return web.Response(text=text, content_type="text/event-stream")
@@ -132,6 +136,17 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(result["rounds"]), 2)
                 self.assertEqual(len(list((root / "results").glob("*.round-*.json"))), 2)
                 self.assertEqual(sum(r["metrics"]["completed"] for r in result["rounds"]), result["overall"]["metrics"]["completed"])
+                # HTTP fixture tests protocol acknowledgement, not mask semantics.
+                for case in cases:
+                    case["turns"][0]["drop_message"] = {"0": [0]}
+                bench.write_json(root / "manifest.json", dict(cases=cases, tools=[], tokenizer="fixture"))
+                args.drop = True
+                with patch.dict("sys.modules", {"transformers": fake}):
+                    await bench.run(args)  # Zero cache savings is still valid.
+                    acknowledge_drop = False
+                    with self.assertRaises(SystemExit) as exc:
+                        await bench.run(args)
+                    self.assertEqual(exc.exception.code, 2)
         finally:
             await runner.cleanup()
 

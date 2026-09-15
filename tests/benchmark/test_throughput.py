@@ -448,8 +448,11 @@ async def run(args):
                 r["prompt_len"] = turn["full_tokens"]
                 r["usage_prompt_matches"] = bool(r["usage"] is not None and
                     r["usage"].get("prompt_tokens") == turn["full_tokens"])
-                r["drop_acknowledged"] = (not r["drop_events"] or
-                    (r["usage"] or {}).get("prompt_tokens_details", {}).get("drop_skipped_tokens", 0) > 0)
+                # Cache savings may be zero on a valid cold-cache Drop request.
+                # An extension field acknowledges the protocol, not every mask bit.
+                details = (r["usage"] or {}).get("prompt_tokens_details", {})
+                r["drop_acknowledged"] = (True if not r["drop_events"] or
+                    "drop_skipped_tokens" in details or "repos_tokens" in details else None)
                 records.append(r)
                 emit(dict(kind="http_turn", **r))
                 if r["cancelled"]:
@@ -490,11 +493,14 @@ async def run(args):
                    idle_slot_seconds=args.concurrency * (cutoff - scheduler.start) - http_busy)
     failures = [x["instance"] for x in scheduler.completed if x["instance"]["status"] not in
                 ("all_turns_completed", "context_limit_reached")]
+    drop_turns = [r for r in records if r["end_time"] <= cutoff and r["drop_events"]]
+    drop_protocol_acknowledged = not drop_turns or any(r["drop_acknowledged"] for r in drop_turns)
     result = dict(schema=1, reference_sglang=REFERENCE, started_at=started_wall,
                   args=vars(args), manifest_sha256=digest(json.loads(manifest_path.read_text())),
                   url=url, valid=not failures and overall["strict_failed_turns"] == 0
-                    and all(r["usage_prompt_matches"] and r["drop_acknowledged"]
-                            for r in records if r["end_time"] <= cutoff),
+                    and all(r["usage_prompt_matches"] for r in records if r["end_time"] <= cutoff)
+                    and drop_protocol_acknowledged,
+                  drop_protocol_acknowledged=drop_protocol_acknowledged,
                   smoke=bool(args.smoke_max_turns or args.smoke_long_last),
                   overall=overall, rounds=rounds, tasks=scheduler.instances,
                   completion_order=[x["instance"]["case_id"] for x in scheduler.completed],
