@@ -397,11 +397,18 @@ class FlashInferBackend(BaseAttnBackend):
             )
             if compiled.flat_indices is None:
                 raise RuntimeError("FlashInfer Context compilation did not produce flat indices.")
-            context_cu_q_cpu = context_batch.cu_seqlens_q.pin_memory()
-            context_cu_k_cpu = context_batch.cu_seqlens_k.pin_memory()
-            context_seq_lens_cpu = (
-                context_batch.cu_seqlens_k[1:] - context_batch.cu_seqlens_k[:-1]
-            ).pin_memory()
+            # One pinned allocation for the CPU metadata consumed by planning.
+            # The returned views own the storage for the metadata lifetime.
+            q, k = context_batch.cu_seqlens_q, context_batch.cu_seqlens_k
+            lengths = k[1:] - k[:-1]
+            host = torch.empty(q.numel() + k.numel() + lengths.numel(),
+                               dtype=q.dtype, pin_memory=True)
+            context_cu_q_cpu = host[:q.numel()]
+            context_cu_k_cpu = host[q.numel():q.numel() + k.numel()]
+            context_seq_lens_cpu = host[q.numel() + k.numel():]
+            context_cu_q_cpu.copy_(q)
+            context_cu_k_cpu.copy_(k)
+            context_seq_lens_cpu.copy_(lengths)
             return FIContextSegmentMetadata(
                 query_start=0,
                 query_end=context_batch.num_queries,
@@ -415,13 +422,22 @@ class FlashInferBackend(BaseAttnBackend):
             )
 
         if masked_reqs:
+            # The source page vector is identical for full/sliding attention;
+            # only their selected keys and visibility differ. Share within this
+            # batch, never across requests' lifetimes or forward batches.
+            shared_occurrence_pages = None
 
             def _compile_fi_context(sliding_window: int | None):
+                nonlocal shared_occurrence_pages
                 context_batch = (
-                    build_occurrence_attention_batch(occurrence_reqs, sliding_window=sliding_window)
+                    build_occurrence_attention_batch(
+                        occurrence_reqs, sliding_window=sliding_window,
+                        shared_direct_pages=shared_occurrence_pages)
                     if occurrence_reqs
                     else build_context_attention_batch(masked_reqs, sliding_window=sliding_window)
                 )
+                if occurrence_reqs:
+                    shared_occurrence_pages = context_batch.direct_pages
                 if sliding_window is None:
                     for req, cached_tokens, cached_positions in zip(
                         masked_reqs,

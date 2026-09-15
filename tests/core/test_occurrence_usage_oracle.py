@@ -46,6 +46,41 @@ def test_usage_deduplicates_repeated_attention_reads():
     assert audit_request(trace)["expected"]["repos_tokens"] == 1
 
 
+@pytest.mark.parametrize("batch_size", [1, 8])
+@pytest.mark.parametrize("recover", [False, True])
+def test_full_batch_union_keeps_segment_order_and_shared_pages(batch_size, recover):
+    from types import SimpleNamespace
+    import torch
+    from minisgl.attention.base import build_occurrence_attention_batch
+
+    t = lambda x: torch.tensor(x, dtype=torch.int32)
+    reqs = [SimpleNamespace(
+        reposition_execution_mode="paged-occurrence", cached_len=3, device_len=5,
+        extend_len=2, initial_active_cached_len=3,
+        occurrence_raw_tokens=t([0, 1, 2, 3, 4, 1, 2]),
+        occurrence_positions=t([0, 1, 2, 2, 3, 1, 1]),
+        occurrence_segment_query_starts=t([3, 4]),
+        occurrence_segment_query_ends=t([4, 5]),
+        occurrence_segment_key_offsets=t([0, 3, 7]),
+        occurrence_segment_key_indices=t([5, 6, 3, 5, 6, 3, 4]),
+        occurrence_pages=t([10, 11, 12, 13, 14, 21, 22]),
+        occurrence_initial_source_positions=t([0, 1, 2]),
+        occurrence_repositioned_cached_mask=torch.zeros(5, dtype=torch.bool),
+        drop_recovery_plan=(SimpleNamespace(matched_length=3,
+            reusable_prefix=torch.tensor([True, False, True])) if recover else None),
+    ) for _ in range(batch_size)]
+    batch = build_occurrence_attention_batch(reqs)
+    expected_keys = torch.cat([t([5, 6, 3, 5, 6, 3, 4]) + i*7 for i in range(batch_size)])
+    assert torch.equal(batch.key_positions, expected_keys)
+    assert batch.cached_tokens == (1 if recover else 2,)*batch_size
+    for req, used in zip(reqs, batch.cached_positions):
+        assert used.tolist() == ([2] if recover else [1, 2])
+        assert req.occurrence_repositioned_cached_mask.tolist() == [False, False, True, False, False]
+    shared = build_occurrence_attention_batch(reqs, shared_direct_pages=batch.direct_pages)
+    assert shared.direct_pages is batch.direct_pages
+    assert torch.equal(shared.key_positions, batch.key_positions)
+
+
 def test_usage_ignores_rotation_of_visible_token_when_only_unrotated_page_is_read():
     trace = _trace()
     trace["chunks"][0]["attention_reads"][0]["pages"] = [21, 12, 13]

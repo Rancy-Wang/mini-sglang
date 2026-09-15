@@ -585,6 +585,7 @@ def build_occurrence_attention_batch(
     reqs: Sequence,
     *,
     sliding_window: int | None = None,
+    shared_direct_pages: torch.Tensor | None = None,
 ) -> ContextAttentionBatch:
     """Build request-major attention segments over physical occurrence pages."""
 
@@ -597,6 +598,7 @@ def build_occurrence_attention_batch(
         fast_batch = _try_build_occurrence_sliding_attention_batch(
             reqs,
             sliding_window=sliding_window,
+            shared_direct_pages=shared_direct_pages,
         )
         if fast_batch is not None:
             return fast_batch
@@ -641,6 +643,20 @@ def build_occurrence_attention_batch(
         initial_cached_len = (recovery.matched_length if recovery is not None
                               else getattr(req, "initial_active_cached_len", req.cached_len))
         reused_raw_parts = []
+        # Full attention needs a set of actually read cached raw positions, not
+        # repeated concatenation/sorting of each segment's overlapping prefix.
+        import numpy as np
+
+        used_raw = np.zeros(initial_cached_len, dtype=np.bool_)
+        raw_array = occurrence_raw.numpy()
+        position_array = occurrence_positions.numpy()
+        source_positions = getattr(req, "occurrence_initial_source_positions", None)
+        repos_mask = getattr(req, "occurrence_repositioned_cached_mask", None)
+        source_array = None if source_positions is None else source_positions.numpy()
+        repos_array = None if repos_mask is None else repos_mask.numpy()
+        reusable_array = None if recovery is None else recovery.reusable_prefix.numpy()
+        # Convert once per request, rather than once per selected segment.
+        flat_keys_long = flat_keys.to(torch.int64)
         for segment_index, (raw_start_tensor, raw_end_tensor) in enumerate(
             zip(query_starts, query_ends, strict=True)
         ):
@@ -654,7 +670,7 @@ def build_occurrence_attention_batch(
                 raise RuntimeError("Occurrence segments do not preserve flattened query order.")
             key_start = int(offsets[segment_index])
             key_end = int(offsets[segment_index + 1])
-            segment_keys = flat_keys[key_start:key_end].to(torch.int64)
+            segment_keys = flat_keys_long[key_start:key_end]
             prefix_length = len(segment_keys) - (raw_end - raw_start)
             if prefix_length < 0:
                 raise RuntimeError("Occurrence segment has fewer keys than local queries.")
@@ -664,29 +680,26 @@ def build_occurrence_attention_batch(
                 selected_keys = segment_keys[:visible_key_count]
                 query_length = query_end - query_start
                 segment_table_indices.append(0)
-                key_positions.append((selected_keys + occurrence_base).to(torch.int32))
+                selected_np = selected_keys.numpy()
+                key_positions.append(torch.from_numpy(
+                    (selected_np + occurrence_base).astype(np.int32)))
                 query_lengths.append(query_length)
                 key_lengths.append(len(selected_keys))
-                selected_raw = occurrence_raw[selected_keys]
-                reused_raw_parts.append(selected_raw[selected_raw < initial_cached_len])
+                raw_np = raw_array[selected_np]
+                reused = raw_np < initial_cached_len
+                if reusable_array is not None:
+                    reused[reused] &= reusable_array[raw_np[reused]]
+                reused_raw = raw_np[reused]
+                used_raw[reused_raw] = True
                 # Allocation also materializes terminal pages solely for cacheback.
                 # Count a position change only when that occurrence is selected by
                 # full attention. Initial source positions remain canonical across
                 # chunks; terminal reuse does not erase the earlier transformation.
-                source_positions = getattr(req, "occurrence_initial_source_positions", None)
-                repos_mask = getattr(req, "occurrence_repositioned_cached_mask", None)
-                if source_positions is not None and repos_mask is not None:
-                    selected_np = selected_keys.numpy()
-                    raw_np = selected_raw.numpy()
-                    reused = raw_np < initial_cached_len
-                    if recovery is not None:
-                        reused[reused] &= recovery.reusable_prefix.numpy()[raw_np[reused]]
-                    reused_raw = raw_np[reused]
+                if source_array is not None and repos_array is not None:
                     changed = (
-                        occurrence_positions.numpy()[selected_np[reused]]
-                        != source_positions.numpy()[reused_raw]
+                        position_array[selected_np[reused]] != source_array[reused_raw]
                     )
-                    repos_mask.numpy()[reused_raw[changed]] = True
+                    repos_array[reused_raw[changed]] = True
             else:
                 for raw_query in range(query_start, query_end):
                     causal_count = prefix_length + (raw_query - raw_start) + 1
@@ -709,7 +722,9 @@ def build_occurrence_attention_batch(
 
         if local_query != req.device_len:
             raise RuntimeError("Occurrence segments do not cover the request extension.")
-        if reused_raw_parts:
+        if sliding_window is None:
+            used_cached_positions = torch.from_numpy(np.flatnonzero(used_raw))
+        elif reused_raw_parts:
             used_cached_positions = torch.unique(torch.cat(reused_raw_parts).to(torch.int64))
             if recovery is not None:
                 used_cached_positions = used_cached_positions[recovery.reusable_prefix[used_cached_positions]]
@@ -733,7 +748,9 @@ def build_occurrence_attention_batch(
         cu_seqlens_k=cu_seqlens_k,
         max_seqlen_q=max(query_lengths),
         max_seqlen_k=max(key_lengths),
-        direct_pages=torch.cat(direct_page_parts),
+        direct_pages=(shared_direct_pages if shared_direct_pages is not None
+                      else direct_page_parts[0] if len(direct_page_parts) == 1
+                      else torch.cat(direct_page_parts)),
     )
 
 
@@ -741,6 +758,7 @@ def _try_build_occurrence_sliding_attention_batch(
     reqs: Sequence,
     *,
     sliding_window: int,
+    shared_direct_pages: torch.Tensor | None = None,
 ) -> ContextAttentionBatch | None:
     """Pack ordered occurrence windows with one AOT planner call per request."""
 
@@ -838,7 +856,9 @@ def _try_build_occurrence_sliding_attention_batch(
         ),
         max_seqlen_q=1,
         max_seqlen_k=max_key_length,
-        direct_pages=torch.cat(direct_page_parts),
+        direct_pages=(shared_direct_pages if shared_direct_pages is not None
+                      else direct_page_parts[0] if len(direct_page_parts) == 1
+                      else torch.cat(direct_page_parts)),
     )
 
 
