@@ -51,6 +51,11 @@ def replace_callable(owner, name, wrapper):
     return fn, replacement
 
 
+def gpu_detail_enabled(control, phase):
+    # Only the final existing turn; never add a thirteenth request or sync kernels.
+    return bool(control.get("gpu_detail") and control.get("turn") == 11 and phase == "prefill")
+
+
 def install():
     if getattr(install, "done", False):
         return
@@ -65,7 +70,7 @@ def install():
     root = Path(os.environ["MINISGL_TTFT_PROFILE_ROOT"])
     root.mkdir(parents=True, exist_ok=True)
     local = threading.local()
-    events, pending_gpu = [], []
+    events, pending_gpu, pending_ranges = [], [], []
     gate = WaveGate()
     current = {}
     cleared = set()
@@ -80,6 +85,11 @@ def install():
         current.update(json.loads((root / "control.json").read_text()))
 
     def flush():
+        for row, start, stop in pending_ranges:
+            if stop.query():
+                row["gpu_stream_ms"] = start.elapsed_time(stop)
+                events.append(row)
+        pending_ranges[:] = [x for x in pending_ranges if "gpu_stream_ms" not in x[0]]
         for row, start, stop, output in pending_gpu:
             if stop is not None and not stop.query():
                 continue
@@ -192,6 +202,53 @@ def install():
                     setattr(module, name, replacements[value])
     torch.cuda.Event.synchronize = wrap(torch.cuda.Event.synchronize, "CUDA.Event.synchronize")
 
+    def gpu_range(fn, label):
+        @functools.wraps(fn)
+        def measured(*args, **kwargs):
+            if not gpu_detail_enabled(current, getattr(local, "phase", None)):
+                return fn(*args, **kwargs)
+            name = label
+            if label == "matmul_ogs":
+                name += ".w13" if kwargs.get("fused_activation") is not None else ".w2"
+            row = dict(kind="gpu_range", pid=os.getpid(), cell=current["cell"],
+                       turn=current["turn"], name=name, layer=getattr(local, "layer", None),
+                       uids=getattr(local, "uids", [])[:], start_ns=time.perf_counter_ns())
+            start, stop = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            start.record()
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                stop.record()
+                row["end_ns"] = time.perf_counter_ns()
+                pending_ranges.append((row, start, stop))
+        return measured
+
+    # Process-local GPU ranges complement CPU hooks. Events are read at idle,
+    # not synchronized between layers, and do not affect graph capture/replay.
+    from minisgl.models.gpt_oss import GptOssAttention, GptOssSparseMoeBlock, GptOssDecoderLayer
+    from minisgl.layers.attention import AttentionLayer
+    from minisgl.distributed import DistributedCommunicator
+    from minisgl.moe import mxfp4
+    for owner, name in ((GptOssAttention,"forward"), (GptOssSparseMoeBlock,"forward"),
+                        (AttentionLayer,"forward"), (DistributedCommunicator,"all_reduce")):
+        replace_callable(owner, name, lambda fn, label=owner.__name__+"."+name: gpu_range(fn,label))
+    mxfp4._route = gpu_range(mxfp4._route, "mxfp4._route")
+    original_abi = mxfp4._load_triton_kernels_abi
+    def load_abi():
+        abi = original_abi()
+        abi.matmul_ogs = gpu_range(abi.matmul_ogs, "matmul_ogs")
+        return abi
+    mxfp4._load_triton_kernels_abi = load_abi
+    original_layer = GptOssDecoderLayer.forward
+    def layer(self, *args, **kwargs):
+        previous = getattr(local, "layer", None)
+        local.layer = self._layer_id
+        try:
+            return original_layer(self, *args, **kwargs)
+        finally:
+            local.layer = previous
+    GptOssDecoderLayer.forward = layer
+
     original_chat = TokenizeManager._chat_tokenize
     def chat(self, msg):
         control()
@@ -257,7 +314,7 @@ def install():
                    cached=[r.cached_len for r in batch.reqs],
                    graph=self.graph_runner.can_use_cuda_graph(batch), start_ns=time.perf_counter_ns())
         start = stop = None
-        if current.get("detail"):
+        if current.get("detail") or current.get("gpu_detail"):
             start, stop = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
             start.record(self.stream)
         output = original_forward(self, batch, sampling)

@@ -179,6 +179,45 @@ def correlate(requests, events):
     return components, comparison
 
 
+def ttft_function_totals(requests, events):
+    """Inclusive intervals clipped to each wave's TTFT, never sum TP ranks.
+
+    A parent can cross first_token_generated_ns. Its full self/CPU time cannot
+    safely be prorated, so retain those only for contained events and flag clips.
+    Decode preparation overlapping the first sample belongs to this window too.
+    """
+    windows = {}
+    for row in requests:
+        if "uid" not in row:
+            continue
+        metrics = row["response"]["server_metrics"]
+        key = (row["cell"], row["turn"])
+        start, end = metrics["request_received_ns"], metrics["first_token_generated_ns"]
+        old = windows.get(key, (start, end))
+        windows[key] = (min(old[0], start), max(old[1], end))
+    totals = defaultdict(lambda: defaultdict(float))
+    for event in events:
+        if event["kind"] != "function":
+            continue
+        window = windows.get((event.get("cell"), event.get("turn")))
+        if window is None:
+            continue
+        overlap = min(window[1], event["end_ns"])-max(window[0], event["start_ns"])
+        if overlap <= 0:
+            continue
+        key = (event["cell"], event["turn"], event["pid"], event["name"], event["phase"])
+        total = totals[key]
+        total["calls"] += 1
+        total["inclusive_overlap_ms"] += overlap/1e6
+        contained = window[0] <= event["start_ns"] and event["end_ns"] <= window[1]
+        total["clipped_calls"] += not contained
+        if contained:
+            for metric in ("wall_ns", "cpu_ns", "self_ns", "self_cpu_ns"):
+                total["contained_"+metric.replace("_ns", "_ms")] += event[metric]/1e6
+    return [dict(cell=k[0], turn=k[1], pid=k[2], name=k[3], phase=k[4], **value)
+            for k,value in totals.items()]
+
+
 def launch(args, root):
     usage = subprocess.check_output(["nvidia-smi", "--query-gpu=index,memory.used",
                                      "--format=csv,noheader,nounits"], text=True)
@@ -189,11 +228,11 @@ def launch(args, root):
                MINISGL_TTFT_PROFILE_ROOT=str(root), PYTHONDONTWRITEBYTECODE="1",
                HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1", OMP_NUM_THREADS="1",
                NO_PROXY="127.0.0.1,localhost", no_proxy="127.0.0.1,localhost")
-    runtime = root / "runtime"
-    runtime.mkdir()
+    runtime = external(args.compile_cache) if args.compile_cache else root / "runtime"
+    runtime.mkdir(exist_ok=bool(args.compile_cache))
     for key, name in {"TORCH_EXTENSIONS_DIR": "torch", "TRITON_CACHE_DIR": "triton",
                       "TVM_FFI_CACHE_DIR": "tvm", "CUDA_CACHE_PATH": "cuda"}.items():
-        (runtime/name).mkdir()
+        (runtime/name).mkdir(exist_ok=bool(args.compile_cache))
         env[key] = str(runtime/name)
     prefix = Path(sys.executable).parents[1]
     env["PATH"] = str(prefix/"bin") + ":" + env.get("PATH", "")
@@ -215,7 +254,8 @@ def launch(args, root):
             "--tool-call-parser", "gpt-oss", "--reasoning-parser", "gpt-oss"]
     write_json(root / "launch.json", dict(argv=argv, env={k:v for k,v in env.items() if k in
                {"CUDA_VISIBLE_DEVICES", "OMP_NUM_THREADS", "CUDA_HOME", "PATH", "LD_LIBRARY_PATH",
-                "CC", "CXX", "NVCC_CCBIN", "NVCC_PREPEND_FLAGS", "CPATH"}},
+                "CC", "CXX", "NVCC_CCBIN", "NVCC_PREPEND_FLAGS", "CPATH",
+                "TORCH_EXTENSIONS_DIR", "TRITON_CACHE_DIR", "TVM_FFI_CACHE_DIR", "CUDA_CACHE_PATH"}},
                head=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip(),
                gpu_preflight=usage))
     with (root/"server.log").open("w") as log:
@@ -266,7 +306,7 @@ async def run(args):
                         with (cell_dir/"requests.jsonl").open("w") as output:
                             for turn in range(manifest["turns"]):
                                 write_json(root/"control.json", dict(cell=cell, turn=turn,
-                                           concurrency=concurrency, detail=mode=="detail",
+                                           concurrency=concurrency, detail=mode=="detail", gpu_detail=mode=="gpu",
                                            barrier=mode!="natural", nvtx=False))
                                 async def request(case):
                                     spec = case["turns"][turn]
@@ -329,6 +369,7 @@ def report(args):
     components, output_comparison = correlate(requests, events)
     write_json(root/"components.json", components)
     write_json(root/"profile_output_comparison.json", output_comparison)
+    write_json(root/"ttft_functions.json", ttft_function_totals(requests, events))
     summary, functions = [], []
     for cell, rows in by_cell.items():
         batches = [e for e in events if e.get("cell") == cell and e["kind"] == "batch"
@@ -390,8 +431,9 @@ def main():
     run_parser.add_argument("--output", type=Path, required=True)
     run_parser.add_argument("--port", type=int, default=30915)
     run_parser.add_argument("--chunk", type=int, default=65536)
+    run_parser.add_argument("--compile-cache", type=Path, help="Reuse an idle previous experiment's compile caches")
     run_parser.add_argument("--concurrency", type=int, choices=(1,2,4,8), nargs="+", default=[1,2,4,8])
-    run_parser.add_argument("--modes", choices=("baseline", "detail", "natural"), nargs="+", default=["baseline", "detail"])
+    run_parser.add_argument("--modes", choices=("baseline", "detail", "natural", "gpu"), nargs="+", default=["baseline", "detail"])
     report_parser = sub.add_parser("report")
     report_parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()

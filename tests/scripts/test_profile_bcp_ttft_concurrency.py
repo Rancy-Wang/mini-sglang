@@ -112,3 +112,26 @@ def test_uid_clock_partition_does_not_sum_tp_ranks():
     parts, _ = profile.correlate([row],events)
     assert len(parts)==1 and parts[0]["partition_valid"]
     assert parts[0]["sum_ms"]==pytest.approx(.000010)
+
+
+def test_ttft_function_window_excludes_decode_and_does_not_prorate_cpu():
+    rows = [dict(cell="x", turn=0, uid=1, response={"server_metrics":
+             dict(request_received_ns=10, first_token_generated_ns=20)})]
+    def event(pid, start, end):
+        return dict(kind="function", cell="x", turn=0, pid=pid, name="f", phase="decode",
+                    start_ns=start, end_ns=end, wall_ns=end-start, cpu_ns=2,
+                    self_ns=3, self_cpu_ns=1)
+    totals = profile.ttft_function_totals(rows, [event(1,12,17),event(1,18,23),
+                                                event(1,23,30),event(2,12,17)])
+    assert len(totals)==2
+    first = next(t for t in totals if t["pid"]==1)
+    assert first["calls"]==2 and first["clipped_calls"]==1
+    assert first["inclusive_overlap_ms"]==pytest.approx(7/1e6)
+    assert first["contained_cpu_ms"]==pytest.approx(2/1e6)
+
+
+def test_gpu_ranges_only_on_existing_last_turn_prefill():
+    assert hooks.gpu_detail_enabled(dict(gpu_detail=True,turn=11),"prefill")
+    assert not hooks.gpu_detail_enabled(dict(gpu_detail=True,turn=10),"prefill")
+    assert not hooks.gpu_detail_enabled(dict(gpu_detail=True,turn=11),"decode")
+    assert not hooks.gpu_detail_enabled(dict(detail=True,turn=11),"prefill")
