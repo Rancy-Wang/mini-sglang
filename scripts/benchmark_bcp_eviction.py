@@ -226,7 +226,7 @@ def summarize(records, elapsed, expected):
     }
 
 
-def matrix_cells():
+def matrix_cells(stress_count=16):
     cells = []
     # Largest concurrency first fixes a conservative page capacity for each TP.
     for tp in (2, 4):
@@ -236,11 +236,11 @@ def matrix_cells():
                     {
                         "tp": tp,
                         "concurrency": 8,
-                        "count": 32,
+                        "count": stress_count,
                         "workload": "rolling",
                         "phase": "full",
                         "eviction": eviction,
-                        "suite": "stress32",
+                        "suite": f"stress{stress_count}",
                     }
                 )
         for concurrency in (8, 4, 2, 1):
@@ -745,18 +745,23 @@ async def run(args):
     manifest = json.loads((args.input / "manifest.json").read_text())
     if args.model != manifest["model"]:
         raise ValueError("Use the model/tokenizer used to prepare the manifest")
-    cells = matrix_cells()
+    cells = matrix_cells(args.stress_count)
     if args.cell:
         names = set(args.cell)
         cells = [cell for cell in cells if cell_name(cell) in names]
         if len(cells) != len(names):
             raise ValueError("Unknown cell name; use list-cells")
+    if len(manifest["cases"]) < max(cell["count"] for cell in cells):
+        raise ValueError("Input manifest has fewer cases than the requested matrix")
     fingerprint = {
         "manifest_sha256": digest(manifest),
         "head": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip(),
         **{
             key: getattr(args, key)
-            for key in ("model", "gpus", "chunk", "memory_ratio", "pages", "turn_limit", "timeout")
+            for key in (
+                "model", "gpus", "chunk", "memory_ratio", "pages", "turn_limit", "timeout",
+                "stress_count",
+            )
         },
     }
     run_path = output / "run.json"
@@ -932,13 +937,15 @@ def main():
     run_parser.add_argument("--chunk", type=int, default=16384)
     run_parser.add_argument("--memory-ratio", type=float, default=0.9)
     run_parser.add_argument("--pages", type=int)
+    run_parser.add_argument("--stress-count", type=int, choices=(16, 32), default=16)
     run_parser.add_argument("--cell", action="append")
     run_parser.add_argument(
         "--turn-limit", type=int, help="Smoke only; excluded from throughput comparisons"
     )
     run_parser.add_argument("--timeout", type=int, default=7200)
     run_parser.add_argument("--startup-timeout", type=int, default=1800)
-    commands.add_parser("list-cells")
+    list_parser = commands.add_parser("list-cells")
+    list_parser.add_argument("--stress-count", type=int, choices=(16, 32), default=16)
     report_parser = commands.add_parser("report")
     report_parser.add_argument("--output", type=Path, required=True)
     report_parser.add_argument("--plot", action="store_true")
@@ -950,7 +957,7 @@ def main():
     elif args.command == "report":
         report(args)
     else:
-        for cell in matrix_cells():
+        for cell in matrix_cells(args.stress_count):
             print(cell_name(cell))
 
 

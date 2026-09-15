@@ -8,7 +8,7 @@
 `prepare` 用生产 Harmony renderer 和 GPT-OSS-120B tokenizer 统计完整输入，不用字符数、
 旧 rollout 的 active usage 或重复文本替代长度。困难请求定义为最后一次请求 full tokens
 严格大于 131072。按命令行 source 顺序保留每个问题的首个合格轨迹，再按数字 case ID
-排序取32个不同问题。每个 case 只保存一份轨迹，并记录来源 SHA256、逐轮消息 SHA256、
+排序准备32个不同问题；压力测试默认取其中前16个。每个 case 只保存一份轨迹，并记录来源 SHA256、逐轮消息 SHA256、
 轮数和完整长度。`active_tokens_hint` 是消息所有权估计；运行时以服务端 active 指标为准。
 
 每个 assistant 消息之前构成一次请求。当前生成完成后，提交下一段记录前缀；当前输出
@@ -21,7 +21,7 @@ Rolling K=12 只计完整 tool response。第13条响应后删除第1条并 Repo
 
 ## 矩阵和计时
 
-- 32问题、并发8、TP2：普通与 Drop-aware，各自从第一轮回放至完整轨迹末尾。
+- 16问题、并发8、TP2：普通与 Drop-aware，各自从第一轮回放至完整轨迹末尾。
 - TP2/4 × 并发1/2/4/8 × no_drop/rolling × 两种 eviction：32个共同轮次单元。
 - TP2/4 × 并发1/2/4/8 × 两种 eviction：16个完整 rolling 单元。
 
@@ -70,7 +70,7 @@ python scripts/benchmark_bcp_eviction.py run \
   --cell scaling-tp2-c1-no_drop-common-ordinary --turn-limit 2
 python scripts/benchmark_bcp_eviction.py run \
   --input /experiment/inputs --output /experiment/full \
-  --model /path/to/gpt-oss-120b --gpus 0,1,2,3
+  --model /path/to/gpt-oss-120b --gpus 0,1,2,3 --stress-count 16
 python scripts/benchmark_bcp_eviction.py report --output /experiment/full --plot
 ```
 
@@ -83,6 +83,10 @@ GPU分配：TP2取前两张，TP4取前四张。运行前检查指定卡无任�
 单元不会自动重跑；重试失败单元使用单独目录并保留失败证据。
 
 `--cell` 可限制单元，`--turn-limit` 只用于冒烟，报告中禁止冒烟加速比。
+`--stress-count 16`（默认）只调整两个 TP2 压力单元，其余48个扩展单元保持不变；
+可显式指定32复现原设置，`list-cells` 也接受该参数。两种 eviction 取相同的前N个 case，
+单元名分别使用 `stress16` 或 `stress32`，manifest 必须包含足够的 case。
+压力请求数写入恢复指纹，变更时使用新目录并从空缓存重新计时；不拼接旧运行的部分轮次。
 `run.json`、每单元 `launch.json` 保存配置、GPU映射、Git HEAD和精确启动命令；共享
 服务日志和逐 rank audit 保存在 `servers/`，单元 summary 内也保存其 audit 结果。
 `turns.jsonl.gz` 保存实际输出与原始指标，`summary.json` 保存验证和汇总；

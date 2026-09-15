@@ -89,12 +89,16 @@ def test_throughput_retains_failed_and_unattempted_turns_in_denominator_and_stat
     assert result["over_128k_turns"] == 1
 
 
-def test_complete_matrix_has_paired_cells_and_requested_concurrency_counts():
+@pytest.mark.parametrize("stress_count", [16, 32])
+def test_complete_matrix_has_paired_cells_and_requested_concurrency_counts(stress_count):
     m = load()
-    cells = m.matrix_cells()
+    cells = m.matrix_cells(stress_count)
     names = [m.cell_name(c) for c in cells]
     assert len(names) == len(set(names)) == 50
-    assert sum(c["suite"] == "stress32" for c in cells) == 2
+    stress = [c for c in cells if c["suite"] == f"stress{stress_count}"]
+    assert len(stress) == 2
+    assert all(c["count"] == stress_count and c["concurrency"] == 8 for c in stress)
+    assert all(c["tp"] == 2 and c["phase"] == "full" for c in stress)
     assert sum(c["phase"] == "common" for c in cells) == 32
     assert sum(c["phase"] == "full" and c["suite"] == "scaling" for c in cells) == 16
     for cell in cells:
