@@ -34,6 +34,14 @@ def test_committed_comparison_rejects_missing_rank_and_late_token_difference():
     assert not result["passed"]
 
 
+def test_batch_signatures_keep_row_order_and_real_shapes_not_uid_numbers():
+    requests = [dict(cell="x", uid=10, case_id="A"), dict(cell="x", uid=20, case_id="B")]
+    events = [dict(kind="batch", cell="x", turn=9, pid=5, start_ns=1, phase="prefill",
+                   uids=[20,10], extend=[3,4], cached=[6,7], graph=False)]
+    signature = profile.physical_batch_signatures(requests, events)[("x",9)][0][0]
+    assert signature == dict(phase="prefill", graph=False, cases=["B","A"], extend=[3,4], cached=[6,7])
+
+
 def test_fixed_cohort_admits_one_then_seven_without_changing_requests():
     from types import SimpleNamespace as NS
     requests = [NS(uid=i, prompt_tokens=100+i) for i in range(8)]

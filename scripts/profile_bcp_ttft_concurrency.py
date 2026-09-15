@@ -248,7 +248,9 @@ def overlap_report(args):
                     sample_ready_host_ns=copies[0]["end"]-clock["offset_ns"] if len(copies) == 1 else None))
         summary = dict(file=path.name, clock=clock, partitions=partitions,
                        gpu_rows=len(trace["gpu"]), api_rows=len(trace["apis"]),
-                       blocked_copy=blocked_copy_evidence(trace))
+                       blocked_copy=blocked_copy_evidence(trace),
+                       prepared_index_uploads=[g for g in trace["gpu"]
+                           if g["kind"] == "memcpy" and g.get("owner") == "compact.indices.pack"])
         write_json(root/(path.stem+"-parsed.json"), dict(summary=summary, **trace))
         summaries.append(summary)
         plot_overlap_trace(root, path.stem, trace, clock, rows)
@@ -850,6 +852,18 @@ def compare_committed(before_requests, before_events, after_requests, after_even
     return comparisons
 
 
+def physical_batch_signatures(requests, events):
+    identities = {(r["cell"], r["uid"]): str(r["case_id"]) for r in requests if "uid" in r}
+    signatures = defaultdict(lambda: defaultdict(list))
+    for event in sorted((e for e in events if e["kind"] == "batch"), key=lambda e:e["start_ns"]):
+        if all((event["cell"], uid) in identities for uid in event["uids"]):
+            signature = dict(phase=event["phase"], graph=event["graph"],
+                cases=[identities[(event["cell"], uid)] for uid in event["uids"]],
+                extend=event["extend"], cached=event["cached"])
+            signatures[(event["cell"],event["turn"])][event["pid"]].append(signature)
+    return {key: list(ranks.values()) for key,ranks in signatures.items()}
+
+
 def compare_versions(args):
     import matplotlib
     matplotlib.use("Agg")
@@ -862,6 +876,10 @@ def compare_versions(args):
     for root in roots:
         requests = [json.loads(line) for path in sorted(root.glob("*/requests.jsonl"))
                     for line in path.read_text().splitlines()]
+        for row in requests:
+            if "server_metrics" in row.get("response", {}):
+                metrics = row["response"]["server_metrics"]
+                row["e2e_ms"] = (metrics["request_finished_ns"]-metrics["request_received_ns"])/1e6
         events = [json.loads(line) for path in sorted(root.glob("events-*.jsonl"))
                   for line in path.read_text().splitlines()]
         data.append((requests, events))
@@ -869,12 +887,19 @@ def compare_versions(args):
     completed = all((root/"completed.json").exists() for root in roots)
     fixed = [row for row in comparisons if row["mode"] == "fixed"]
     write_json(output/"output-comparison.json", comparisons)
+    batch_signatures = [physical_batch_signatures(*item) for item in data]
+    batch_comparisons = []
+    for key in sorted(batch_signatures[0].keys() | batch_signatures[1].keys()):
+        left, right = [item.get(key, []) for item in batch_signatures]
+        equal = len(left) == len(right) == 2 and left[0] == left[1] == right[0] == right[1]
+        batch_comparisons.append(dict(cell=key[0], turn=key[1], equal=equal, before=left, after=right))
+    write_json(output/"batch-comparison.json", batch_comparisons)
     summary = []
     keys = sorted({(r["mode"], r["concurrency"], r["workload"]) for r in data[0][0]})
     for mode, concurrency, workload in keys:
         for late in (False, True):
             row = dict(mode=mode, concurrency=concurrency, workload=workload, late=late)
-            for metric in ("ttft_ms", "tpot_ms"):
+            for metric in ("ttft_ms", "tpot_ms", "e2e_ms"):
                 values = [[r[metric] for r in requests if r["mode"] == mode and
                            r["concurrency"] == concurrency and r["workload"] == workload and
                            (not late or r["turn"] >= 9) and r.get(metric) is not None]
