@@ -42,6 +42,36 @@ def test_batch_signatures_keep_row_order_and_real_shapes_not_uid_numbers():
     assert signature == dict(phase="prefill", graph=False, cases=["B","A"], extend=[3,4], cached=[6,7])
 
 
+def test_output_comparison_excludes_only_server_random_tool_id():
+    from copy import deepcopy
+    choices = [dict(message=dict(content="text", reasoning_content="reason",
+        tool_calls=[dict(id="call_"+"a"*24, index=0, type="function",
+                         function=dict(name="search", arguments='{"q":"x"}'))]))]
+    changed = deepcopy(choices)
+    changed[0]["message"]["tool_calls"][0]["id"] = "call_"+"b"*24
+    assert choices != changed
+    assert profile.canonical_choices(choices) == profile.canonical_choices(changed)
+    assert choices[0]["message"]["tool_calls"][0]["id"] == "call_"+"a"*24
+    request = dict(cell="x", uid=1, mode="fixed", concurrency=8, workload="rolling",
+        case_id="210", turn=9, request_sha256="same", response=dict(
+            server_metrics=dict(generated_tokens=1), choices=choices, usage={}))
+    other = deepcopy(request)
+    other["response"]["choices"] = changed
+    events = [dict(kind="committed_token", cell="x", uid=1, pid=p, tokens=[3]) for p in (10,11)]
+    result = profile.compare_committed([request], events, [other], events)[0]
+    assert result["passed"] and result["choices_equal"] and not result["raw_choices_equal"]
+    for key in ("content", "reasoning_content"):
+        bad = deepcopy(changed)
+        bad[0]["message"][key] += "changed"
+        assert profile.canonical_choices(choices) != profile.canonical_choices(bad)
+    for key in ("name", "arguments"):
+        bad = deepcopy(changed)
+        bad[0]["message"]["tool_calls"][0]["function"][key] += "changed"
+        assert profile.canonical_choices(choices) != profile.canonical_choices(bad)
+    changed[0]["message"]["tool_calls"][0]["id"] = "model-provided-id"
+    assert profile.canonical_choices(choices) != profile.canonical_choices(changed)
+
+
 def test_fixed_cohort_admits_one_then_seven_without_changing_requests():
     from types import SimpleNamespace as NS
     requests = [NS(uid=i, prompt_tokens=100+i) for i in range(8)]

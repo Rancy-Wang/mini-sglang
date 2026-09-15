@@ -7,10 +7,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import copy
 import gzip
 import hashlib
 import json
 import os
+import re
 import signal
 import sqlite3
 import statistics
@@ -836,6 +838,19 @@ def committed_outputs(requests, events):
     return result
 
 
+def canonical_choices(choices):
+    """GPT-OSS response_parser._tool_call generates random IDs, not model output.
+
+    Preserve every other field, and retain raw choices separately in the report.
+    """
+    value = copy.deepcopy(choices)
+    for choice in value:
+        for call in choice.get("message", {}).get("tool_calls") or []:
+            if re.fullmatch(r"call_[0-9a-f]{24}", str(call.get("id", ""))):
+                call["id"] = "<server-generated-tool-call-id>"
+    return value
+
+
 def compare_committed(before_requests, before_events, after_requests, after_events):
     before = committed_outputs(before_requests, before_events)
     after = committed_outputs(after_requests, after_events)
@@ -845,10 +860,14 @@ def compare_committed(before_requests, before_events, after_requests, after_even
         present = left is not None and right is not None
         flags = {name+"_equal": bool(present and left[name] == right[name])
                  for name in ("tokens", "choices", "usage", "request_sha256")}
+        raw_choices_equal = flags["choices_equal"]
+        flags["choices_equal"] = bool(present and
+            canonical_choices(left["choices"]) == canonical_choices(right["choices"]))
         valid = bool(present and left["commit_valid"] and right["commit_valid"])
         comparisons.append(dict(mode=key[0], concurrency=key[1], workload=key[2],
             case_id=key[3], turn=key[4], before=left, after=right,
-            commits_valid=valid, **flags, passed=valid and all(flags.values())))
+            commits_valid=valid, raw_choices_equal=raw_choices_equal,
+            **flags, passed=valid and all(flags.values())))
     return comparisons
 
 
@@ -914,6 +933,8 @@ def compare_versions(args):
         requests=len(comparisons), completed=completed,
         full_output_pass=completed and bool(comparisons) and all(r["passed"] for r in comparisons),
         fixed_output_pass=completed and bool(fixed) and all(r["passed"] for r in fixed),
+        raw_choices_pass=completed and bool(comparisons) and all(r["raw_choices_equal"] for r in comparisons),
+        output_policy="Exact committed tokens, choices and usage; choices exclude only server-generated call_<24 hex> tool IDs. Raw responses and equality are retained.",
         note="One cohort per cell. Raw timing changes are not statistical confidence or a universal no-regression proof.",
         heads=[json.loads((root/"launch.json").read_text())["head"] for root in roots]))
     for mode, concurrency in sorted({key[:2] for key in keys}):
