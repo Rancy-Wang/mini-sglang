@@ -928,6 +928,30 @@ def physical_batch_signatures(requests, events):
     return {key: list(ranks.values()) for key,ranks in signatures.items()}
 
 
+def short_performance_rows(requests, token_times):
+    result = []
+    for request in requests:
+        if request["turn"] not in (9, 10):
+            continue
+        row = {k: request.get(k) for k in ("uid", "case_id", "turn", "workload",
+                                         "ttft_ms", "tpot_ms", "e2e_ms")}
+        row["group"] = "P1" if str(request["case_id"]) == "210" else "P2"
+        ranks = []
+        count = request["response"]["server_metrics"]["generated_tokens"]
+        for pid, events in sorted(token_times.items()):
+            times = sorted((e for e in events if e["uid"] == request["uid"]), key=lambda e:e["time_ns"])
+            if not times:
+                continue
+            intervals = [(b["time_ns"]-a["time_ns"])/1e6 for a,b in zip(times, times[1:])]
+            ranks.append(dict(pid=pid, count_valid=sum(e["count"] for e in times) == count,
+                              first_to_second_ms=intervals[0] if intervals else None,
+                              subsequent_mean_ms=statistics.mean(intervals[1:]) if len(intervals)>1 else None,
+                              intervals_ms=intervals))
+        row["token_intervals"] = ranks
+        result.append(row)
+    return result
+
+
 def compare_versions(args):
     import matplotlib
     matplotlib.use("Agg")
@@ -948,6 +972,29 @@ def compare_versions(args):
                   for line in path.read_text().splitlines()]
         data.append((requests, events))
     comparisons = compare_committed(*data[0], *data[1])
+    short = all((root/"selection.json").exists() and
+                json.loads((root/"selection.json").read_text()).get("short_validation") for root in roots)
+    if short:
+        measurements = []
+        for root, (requests, _) in zip(roots, data):
+            token_times = {path.stem: [json.loads(line) for line in path.read_text().splitlines()]
+                           for path in root.glob("token-times-*.jsonl")}
+            measurements.append(short_performance_rows(requests, token_times))
+        write_json(output/"short-per-request.json", dict(before=measurements[0], after=measurements[1]))
+        grouped = []
+        for workload in ("no_drop", "rolling"):
+            for group in ("all", "P1", "P2"):
+                row = dict(workload=workload, group=group)
+                for metric in ("ttft_ms", "tpot_ms", "e2e_ms"):
+                    means = []
+                    for version in measurements:
+                        values = [r[metric] for r in version if r["workload"] == workload
+                                  and (group == "all" or r["group"] == group) and r[metric] is not None]
+                        means.append(statistics.mean(values) if values else None)
+                    row[metric] = dict(before=means[0], after=means[1],
+                        change_pct=100*(means[1]/means[0]-1) if all(means) else None)
+                grouped.append(row)
+        write_json(output/"short-performance.json", grouped)
     completed = all((root/"completed.json").exists() for root in roots)
     fixed = [row for row in comparisons if row["mode"] == "fixed"]
     write_json(output/"output-comparison.json", comparisons)
@@ -987,14 +1034,14 @@ def compare_versions(args):
         for version, (requests, _) in zip(("Before", "After"), data):
             for workload, color in (("no_drop", "tab:blue"), ("rolling", "tab:orange")):
                 rows = [r for r in requests if (r["mode"],r["concurrency"],r["workload"]) == (mode,concurrency,workload)]
-                turns = sorted({r["turn"] for r in rows})
+                turns = sorted({r["turn"] for r in rows if not short or r["turn"] in (9, 10)})
                 for ax, metric in zip(axes, ("ttft_ms", "tpot_ms")):
                     values = [statistics.mean(r[metric] for r in rows if r["turn"] == turn and r.get(metric) is not None) for turn in turns]
                     ax.plot(turns, values, "o--" if version == "Before" else "s-", color=color,
                             label=f"{version} | {workload}")
                     ax.set_ylabel(metric); ax.grid(alpha=.2)
         axes[0].legend(); axes[1].set_xlabel("Turn (zero-based); all peaks retained")
-        fig.suptitle(f"R4 | GPT-OSS-120B TP2 | {mode} C{concurrency} | one cohort")
+        fig.suptitle(f"{'R1 short TR8 seed' if short else 'R4'} | GPT-OSS-120B TP2 | {mode} C{concurrency} | one cohort")
         fig.tight_layout(); fig.savefig(output/f"{mode}-c{concurrency}.png", dpi=150); plt.close(fig)
 
 

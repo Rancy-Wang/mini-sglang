@@ -25,6 +25,20 @@ def test_short_validation_selects_real_tr8_tr9_tr10_only():
         profile.short_validation_turns(cases)
 
 
+def test_short_performance_keeps_first_decode_wait_separate():
+    request = dict(uid=4, case_id="210", turn=9, workload="rolling",
+                   ttft_ms=10, tpot_ms=51, e2e_ms=112,
+                   response=dict(server_metrics=dict(generated_tokens=3)))
+    times = {"rank0": [dict(uid=4, count=1, time_ns=t) for t in (0, 100_000_000, 102_000_000)]}
+    rows = profile.short_performance_rows([dict(request, turn=8), request], times)
+    assert len(rows) == 1 and rows[0]["group"] == "P1"
+    assert rows[0]["tpot_ms"] == 51
+    measured = rows[0]["token_intervals"][0]
+    assert measured["count_valid"]
+    assert measured["first_to_second_ms"] == 100
+    assert measured["subsequent_mean_ms"] == 2
+
+
 def test_committed_comparison_rejects_missing_rank_and_late_token_difference():
     from copy import deepcopy
     request = dict(cell="fixed-c8-rolling", uid=1, mode="fixed", concurrency=8,
