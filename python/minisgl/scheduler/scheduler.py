@@ -796,9 +796,14 @@ class Scheduler(SchedulerIOMixin):
         if birth_owned is not None and req.occurrence_birth_indices is not None:
             assert req.occurrence_terminal_indices is not None
             assert req.occurrence_birth_pages is not None
-            obsolete = birth_owned & (
+            obsolete = (
                 req.occurrence_birth_indices != req.occurrence_terminal_indices
             )
+            if req.drop_recovery_plan is not None and req.full_keep_mask is not None:
+                # Drop-aware execution never retains dropped terminal candidates,
+                # even when their birth and terminal occurrence IDs coincide.
+                obsolete |= ~req.full_keep_mask.to(torch.bool)
+            obsolete &= birth_owned
             indices = torch.nonzero(obsolete, as_tuple=False).view(-1)
             if len(indices):
                 device_indices = indices.pin_memory().to(
