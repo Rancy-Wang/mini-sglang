@@ -860,19 +860,23 @@ class Scheduler(SchedulerIOMixin):
         input_mapping = _make_input_tuple(batch, self.device)
         write_mapping = _make_write_tuple(batch, self.device)
         if occurrence_reqs:
+            from .metadata_indices import pack_cpu_metadata
+
             birth_pages = []
             source_pages = []
             destination_pages = []
             position_pairs = []
+            birth_cpu = []
             for req in occurrence_reqs:
                 if req.occurrence_pages is None or req.occurrence_birth_indices is None:
                     raise RuntimeError("Occurrence request is missing allocated birth pages.")
-                birth_ids = (
+                birth_cpu.append(
                     req.occurrence_birth_indices[req.cached_len : req.device_len]
                     .to(torch.int64)
-                    .pin_memory()
-                    .to(self.device, non_blocking=True)
                 )
+            for req, birth_ids in zip(
+                occurrence_reqs, pack_cpu_metadata(birth_cpu, self.device), strict=True
+            ):
                 birth_pages.append(req.occurrence_pages[birth_ids])
                 if (
                     req.occurrence_transform_source_pages is None
