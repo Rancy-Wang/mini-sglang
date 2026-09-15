@@ -84,7 +84,7 @@ def prepare(args):
     manager = TokenizeManager(AutoTokenizer.from_pretrained(args.tokenizer, local_files_only=True),
                               radix_drop_key_mode="delta-marker")
     tools = browsecomp_plus_tools()
-    candidates, sources = {}, []
+    candidates, sources = [], []
     for source in args.source:
         for path in sorted(Path(source).glob("shard*/trajectories.jsonl")):
             raw = path.read_bytes()
@@ -93,25 +93,28 @@ def prepare(args):
             for line_number, line in enumerate(raw.splitlines(), 1):
                 row = json.loads(line)
                 key = str(row["case_id"])
-                if key in candidates:
-                    continue
                 trajectory = row["trajectory"]
                 ends = [i for i, m in enumerate(trajectory) if m.get("role") == "assistant"]
                 if not ends:
                     continue
                 ids, _, _ = manager._render_harmony_message_drop(
                     trajectory[:ends[-1]], enable_thinking=None, tools=tools)
-                candidates[key] = dict(case_id=key, trajectory=trajectory, ends=ends,
+                candidates.append(dict(case_id=key, trajectory=trajectory, ends=ends,
                                        full_tokens=len(ids), source=str(path),
-                                       source_line=line_number, source_sha256=sha)
-            print(json.dumps({"scanned": str(path), "distinct": len(candidates)}), flush=True)
-    groups = [[r for r in candidates.values() if (r["full_tokens"] > LIMIT) == long]
-              for long in (True, False)]
-    for group in groups:
-        group.sort(key=lambda r: int(r["case_id"]))
-    if min(map(len, groups)) < 40:
-        raise ValueError(f"Need 40 long + 40 short DISTINCT cases, found {list(map(len, groups))}")
-    selected = [row for pair in zip(groups[0][:40], groups[1][:40]) for row in pair]
+                                       source_line=line_number, source_sha256=sha))
+            print(json.dumps({"scanned": str(path), "trajectories": len(candidates)}), flush=True)
+    groups = [{}, {}]
+    for row in candidates:
+        groups[0 if row["full_tokens"] > LIMIT else 1].setdefault(row["case_id"], row)
+    # A case may have multiple real trials. Choose the first qualifying trial in
+    # its class, and reserve long-only IDs first so short alternatives stay usable.
+    longs = sorted(groups[0].values(), key=lambda r: (r["case_id"] in groups[1], int(r["case_id"])))[:40]
+    long_ids = {r["case_id"] for r in longs}
+    shorts = sorted((r for k, r in groups[1].items() if k not in long_ids), key=lambda r: int(r["case_id"]))[:40]
+    if len(longs) != 40 or len(shorts) != 40:
+        raise ValueError(f"Need 40 long + 40 short DISTINCT cases, qualifying classes={list(map(len, groups))}, disjoint selection={[len(longs), len(shorts)]}")
+    longs.sort(key=lambda r: int(r["case_id"]))
+    selected = [row for pair in zip(longs, shorts) for row in pair]
     cases = []
     for row in selected:
         trajectory, ends = row.pop("trajectory"), row.pop("ends")

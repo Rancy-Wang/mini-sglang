@@ -26,7 +26,8 @@ POST 采用 OpenAI Chat Completions SSE，工具定义和历史记录来自 mani
 完整模板输入超过131072 token。数据准备记录源文件 SHA256、逐 turn 消息摘要、完整
 token 数、Drop/Reposition 计划，并逐 turn 用生产编译器验证 position 长度。
 前12/24/48个分别用于并发4/8/16，保证一半长任务。不能把字符数或 active tokens
-当作 full context。源目录依参数顺序决定同 task 的轨迹优先级，不按测速表现选轨迹。
+当作 full context。同task有多次真实轨迹时，在长/短类别内按source顺序取首次合格轨迹；
+优先选择只有长轨迹的task，为短组保留足够不同ID，不按测速表现选轨迹。
 
 Rolling Drop 保留最近12条完整工具响应：TR13后删除TR1，TR14后删除TR2。
 Reposition 独立于 Drop 频率：当前 position 长度达到98304后，在消息结束边界压缩，
