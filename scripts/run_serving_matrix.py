@@ -245,7 +245,11 @@ async def run(args):
                  input_hash=args.input_hash, started_at=time.time(), pairs=[])
     bench.write_json(root / 'matrix_status.json', state)
     try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=7200)) as session:
+        # Template initialization can outlast the API's idle keepalive timeout.
+        # Administrative probes must not reuse a stale pooled connection. Timed
+        # benchmark traffic has its own concurrency-sized pool in bench.run.
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=7200),
+                                         connector=aiohttp.TCPConnector(force_close=True)) as session:
             for mode, gpus, port in modes:
                 service_root = root / mode / ('server-' + str(time.time_ns()))
                 service_root.mkdir(parents=True)
