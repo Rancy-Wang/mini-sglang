@@ -218,13 +218,20 @@ async def drop_smoke(session, url, args, root):
         stream=True, stream_options={'include_usage': True}, temperature=0,
         drop_message=schedule['drop_message'], reposition=schedule['reposition']))
     bench.write_json(root / 'drop_third.json', third)
-    details = (second['usage'] or {}).get('prompt_tokens_details') or {}
-    passed = (second['success'] and third['success'] and second['tbt_complete'] and third['tbt_complete']
-              and details.get('drop_skipped_tokens', 0) > 0
-              and (second['server_metrics'] or {}).get('reposition_transition_count', 0) > 0
-              and all(schedule['drop_message'][k] == v for k, v in previous['drop_message'].items())
-              and schedule['reposition'][:len(previous['reposition'])] == previous['reposition'])
-    bench.write_json(root / 'drop_reposition.json', dict(passed=passed, synthetic=True,
+    details = (third['usage'] or {}).get('prompt_tokens_details') or {}
+    # drop_skipped_tokens describes unused cache hits, not total dropped spans;
+    # it may legitimately be zero when the long tool results were initially cold.
+    checks = dict(
+        exact_generation=second['success'] and third['success'],
+        complete_tbt=second['tbt_complete'] and third['tbt_complete'],
+        reposition_executed=(second['server_metrics'] or {}).get('reposition_transition_count', 0) > 0,
+        long_prefix_reused=details.get('cached_tokens', 0) > previous['active_tokens'] * 0.9,
+        small_incremental_prefill=0 < (third['server_metrics'] or {}).get('prefill_compute_tokens', full) < full * 0.1,
+        old_drops_retained=all(schedule['drop_message'][k] == v for k, v in previous['drop_message'].items()),
+        old_repositions_retained=schedule['reposition'][:len(previous['reposition'])] == previous['reposition'],
+    )
+    passed = all(checks.values())
+    bench.write_json(root / 'drop_reposition.json', dict(passed=passed, checks=checks, synthetic=True,
                      first=first, second=second, third=third, previous=previous, final=schedule))
     if not passed:
         raise RuntimeError('Drop/reposition smoke failed; inspect saved response')
