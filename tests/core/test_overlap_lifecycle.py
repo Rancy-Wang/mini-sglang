@@ -73,7 +73,7 @@ def test_cpu_plan_matches_original_compaction_without_mutating_request(owned, pa
     mask[0] = 1
     req = SimpleNamespace(
         input_ids=torch.arange(17, dtype=torch.int32), radix_input_ids=torch.arange(17),
-        raw_positions=raw, true_positions=raw.clone(), radix_positions=torch.arange(34),
+        raw_positions=raw, true_positions=raw.clone(), radix_positions=torch.arange(34) // 2,
         context_post_prefill_keep_mask=mask, initial_active_cached_len=5,
         retry_transformed_mask=torch.tensor([False, True, False, True, False]),
         inactive_cached_positions=torch.tensor([99], dtype=torch.int32),
@@ -92,7 +92,7 @@ def test_cpu_plan_matches_original_compaction_without_mutating_request(owned, pa
     assert torch.equal(plan.dropped_indices, ((~keep) & expected_owned).nonzero().view(-1))
     assert torch.equal(plan.input_ids, req.input_ids[keep])
     assert torch.equal(plan.raw_positions, raw[keep])
-    assert torch.equal(plan.true_positions, raw[keep])
+    assert torch.equal(plan.true_positions, (raw // 2 if paged else raw)[keep])
     assert plan.initial_cached_len == int(keep[:5].sum())
     assert torch.equal(plan.retry_mask, req.retry_transformed_mask[keep[:5]])
     assert torch.equal(plan.inactive_positions, torch.cat((

@@ -85,7 +85,7 @@ def test_external_sample_write_uses_post_forward_cached_length():
     table.occurrence_tokens(slot)[:9] = torch.arange(9)
     req = SimpleNamespace(
         occurrence_external_storage=True, table_idx=slot, cached_len=7,
-        device_len=9, can_decode=True,
+        device_len=9, can_decode=True, uid=1, extend_len=2,
     )
     batch = SimpleNamespace(reqs=[req], padded_reqs=[req])
 
@@ -99,6 +99,7 @@ def test_external_sample_write_uses_post_forward_cached_length():
     scheduler.table_manager = table
     scheduler.token_pool = table.token_pool
     scheduler.engine = SimpleNamespace(forward_batch=forward)
+    scheduler.request_metrics = {}
     scheduler.decode_manager = SimpleNamespace(filter_reqs=lambda _: None)
     scheduler._forward(ForwardInput(
         batch, None, (torch.tensor([slot, slot]), torch.tensor([0, 0])),
@@ -109,7 +110,8 @@ def test_external_sample_write_uses_post_forward_cached_length():
 
 @pytest.mark.parametrize("external", [False, True])
 @pytest.mark.parametrize("prepared", [False, True])
-def test_compaction_lease_preserves_pages_positions_sample_and_ownership(external, prepared, monkeypatch):
+@pytest.mark.parametrize("planned", [False, True])
+def test_compaction_lease_preserves_pages_positions_sample_and_ownership(external, prepared, planned, monkeypatch):
     from minisgl.core import Req, SamplingParams
 
     table = TableManager(1, torch.full((2, 8 if external else 16), -1, dtype=torch.int32))
@@ -143,6 +145,12 @@ def test_compaction_lease_preserves_pages_positions_sample_and_ownership(externa
     req.true_positions = req.raw_positions = torch.arange(10, dtype=torch.int32)
     scheduler = object.__new__(Scheduler)
     scheduler.table_manager = table
+    if planned:
+        from minisgl.scheduler.overlap_state import CompactPlan
+        req.context_compact_plan = CompactPlan.build(req, 9)
+        def no_rebuild(*args, **kwargs):
+            raise AssertionError("Prepared CPU compaction must not be rebuilt after forward")
+        monkeypatch.setattr(CompactPlan, "build", no_rebuild)
     retired = []
     if prepared:
         req.context_decode_keep_mask = keep.bool()
