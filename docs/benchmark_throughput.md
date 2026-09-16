@@ -95,17 +95,22 @@ python tests/benchmark/throughput_compute.py matrix \
   --root /path/matrix-v1 --evidence /path/compute-evidence.json
 ```
 
-旧版本 f089bf6 的 mask、paged-occurrence、page-size=1 且终场两 rank 审计确认没有
-Drop eviction/孔洞恢复时，可以还原 Prefill：三类 usage 互斥，先求
+旧版本 f089bf6 的 mask、paged-occurrence、page-size=1，普通 eviction 或整场 no_drop，
+且终场两 rank 审计通过时，可以还原 Prefill：三类 usage 互斥，先求
 `M = cached_tokens + drop_skipped_tokens + repos_tokens`。
 普通/full-mask/paged-occurrence 的 Extend 总数为 `prompt_tokens - M`。
 mask-free 路径通过原轨迹生产 tokenizer 的 Drop 边界重新判断 planner 分支，另外扣除
 尚未命中但已不必计算的死 token。不能对任意系统或存在孔洞恢复的运行机械套用相减。
+特别注意：Drop-aware + drop 在 cache 写入时就可能插入 -1 空洞，并不增加
+`drop_pages`。即便 drop_pages/hole_fills 全部为零，也不能把 resident token 数当成
+logical matched prefix 长度。旧响应缺这个长度，因而该组合的 Prefill/All 必须是
+unknown/null；单凭相减得到的数字不能当实际计算量。已完成实验不重跑。
 证据不满足时输出 unknown/null；审计和元数据不能证明未记录的工作量。
 
 旧服务没记录 overlap 前向次数。若成功输出 G 个 token，已确认 Decode 至少 G-1，
 至多 G（多一次尚未确认终止的前向）；达到请求输出上限时没有额外预算，区间收窄。
-因此旧报告给精确 Prefill、Decode/All 的上下界，缺精确值的字段为 null。
+因此旧报告在可恢复时给精确 Prefill 和 Decode/All 上下界；DA+drop 只给 Decode
+上下界，Prefill/All 留空，缺精确值的字段为 null。
 `generated_output_throughput` 另存 usage 输出吞吐，不冒充实际 Decode 次数。
 不重复推理、不通过估计填造精确值。逐轮按完成窗口归属整条 HTTP turn，跨轮的 GPU
 计算时间无法从旧终场信息重新切分，因此它是完成归属的轮次吞吐，不是 GPU 时间切片。

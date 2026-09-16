@@ -47,7 +47,7 @@ def legacy_proof(status, evidence, manifest_hash):
                 a.get("eviction", {}).get("hole_fills") == 0 for a in audits))
 
 
-def turn_compute(record, *, legacy=False, evidence=None):
+def turn_compute(record, *, legacy=False, evidence=None, allow_prefix_reconstruction=True):
     """Exact forward counters first; narrowly verified legacy reconstruction second.
 
     Request eligibility follows strict successful HTTP turns. A failed/aborted
@@ -79,7 +79,12 @@ def turn_compute(record, *, legacy=False, evidence=None):
         raise ValueError("Invalid resident prefix accounting")
     path = "ordinary"
     prefill = prompt - matched
-    if record.get("reposition"):
+    if not allow_prefix_reconstruction:
+        # Drop-aware cache_req may INSERT -1 entries without a drop eviction.
+        # Zero eviction/hole-fill counters do not prove a dense matched prefix.
+        # usage exposes resident count, not that prefix's logical length.
+        prefill, path = None, "drop_aware_prefix_length_not_recorded"
+    elif record.get("reposition"):
         path = "paged_occurrence_no_holes"
     elif record.get("drop_events"):
         key = f"{record['case_id']}:{record['turn']}"
@@ -95,7 +100,7 @@ def turn_compute(record, *, legacy=False, evidence=None):
     # of whether Prefill priority prevented that speculative batch.
     lower = max(generated - 1, 0)
     upper = lower if generated >= record["requested_max_tokens"] else generated
-    return dict(included=True, source="verified_legacy_usage", path=path,
+    return dict(included=True, source="verified_legacy_usage" if prefill is not None else "legacy_missing_prefix", path=path,
                 prefill_tokens=prefill, decode_tokens=lower if lower == upper else None,
                 decode_lower=lower, decode_upper=upper, generated_tokens=generated,
                 excluded_reuse=excluded)
@@ -141,7 +146,9 @@ def recalculate_document(document, status, evidence):
         raise ValueError("Audit does not belong to this measurement setting")
     records = []
     for record in document["turns"]:
-        records.append(dict(record, compute=turn_compute(record, legacy=verified, evidence=evidence)))
+        records.append(dict(record, compute=turn_compute(record, legacy=verified, evidence=evidence,
+            allow_prefix_reconstruction=not (status and status.get("eviction") == "drop-aware"
+                                            and status.get("drop")))))
     def window(original):
         start, end = original["start_time"], original["end_time"]
         own = [r for r in records if start < r["end_time"] <= end]
@@ -155,13 +162,17 @@ def recalculate_document(document, status, evidence):
         if "cumulative" in original:
             result["cumulative"] = window(original["cumulative"])
         return result
-    return dict(schema=2, legacy_reconstruction_verified=verified,
+    return dict(schema=2, legacy_profile_verified=verified,
+                legacy_reconstruction_verified=verified and all(
+                    not r["compute"]["included"] or r["compute"].get("prefill_tokens") is not None
+                    for r in records),
                 manifest_sha256=document["manifest_sha256"], engine_head=(status or {}).get("head"),
                 overall=window(document["overall"]), rounds=[window(r) for r in document["rounds"]],
                 turns=[{k: r.get(k) for k in ("case_id", "turn", "instance", "filler", "compute")} for r in records],
                 excluded_at_cutoff=len(document.get("excluded_at_cutoff", [])),
                 notes=["No inference rerun; raw responses remain unchanged.",
-                       "Legacy Decode/All bounds reflect unrecorded overlap work; null is not zero.",
+                       "Legacy Decode bounds reflect unrecorded overlap work; null is not zero.",
+                       "Drop-aware+drop may insert holes without eviction; missing raw matched lengths prevent exact historical Prefill/All.",
                        "Rates use benchmark wall time, not GPU busy time or FLOPS.",
                        "Whole turns are attributed to their completion window, not exact GPU-time slices."])
 
@@ -274,12 +285,15 @@ def main():
     elif args.command == "recalculate":
         recalculate_file(args.result, args.status, args.evidence, args.output)
     else:
+        import subprocess
+        current_head = subprocess.check_output(["git", "rev-parse", "HEAD"],
+            cwd=Path(__file__).resolve().parents[2], text=True).strip()
         for status_path in sorted(Path(args.root).glob("*/*/status.json")):
             status = json.loads(status_path.read_text())
             if status.get("state") == "completed" and status.get("result"):
                 result = Path(status["result"])
                 target = result.with_suffix(".compute.json")
-                if not target.exists():
+                if not target.exists() or json.loads(target.read_text()).get("analysis_head") != current_head:
                     recalculate_file(result, status_path, args.evidence, target)
 
 

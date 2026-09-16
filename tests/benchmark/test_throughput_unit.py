@@ -371,5 +371,16 @@ class ComputeAccountingTests(unittest.TestCase):
                 recalculate_file(source, output_path=source)
 
 
+    def test_drop_aware_insertion_holes_are_not_eviction_counters(self):
+        from throughput_compute import turn_compute
+        r = record()
+        r.update(prompt_len=100, requested_max_tokens=10, usage={"prompt_tokens": 100,
+            "completion_tokens": 3, "prompt_tokens_details": {"cached_tokens": 40}}, reposition=[10])
+        counts = turn_compute(r, legacy=True, allow_prefix_reconstruction=False)
+        self.assertIsNone(counts["prefill_tokens"])
+        self.assertIsNone(counts["decode_tokens"])
+        self.assertEqual((counts["decode_lower"], counts["decode_upper"]), (2, 3))
+
+
 if __name__ == "__main__":
     unittest.main()
