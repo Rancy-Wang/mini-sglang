@@ -139,6 +139,66 @@ def compute_summary(records, duration):
                 generated_output_throughput=sum(r.get("generated_tokens") or 0 for r in rows) / duration)
 
 
+def require_exact_result(document):
+    """Reject incomplete measurements before the matrix marks a cell completed.
+
+    Recompute from saved terminal server counters, including each round and its
+    first-pass/filler/cumulative views. Logical metrics and legacy bounds cannot
+    satisfy this gate.
+    """
+    import math
+
+    if document.get("valid") is not True:
+        raise ValueError("Exact measurement requires valid=true")
+    records = [dict(r, compute=turn_compute(r)) for r in document["turns"]]
+    if not any(r["compute"]["included"] for r in records):
+        raise ValueError("Exact measurement requires successful turns")
+    expected_rounds = document["args"]["num_requests"] // document["args"]["concurrency"]
+    if len(document["rounds"]) != expected_rounds:
+        raise ValueError("Incomplete measurement rounds")
+
+    def check_summary(actual, own, duration):
+        expected = compute_summary(own, duration)
+        if actual.get("exact") is not True or not expected["exact"]:
+            raise ValueError("Missing exact forward counters")
+        for key in ("unknown_prefill_turns", "unknown_decode_turns", "completed_turns"):
+            if actual.get(key) != expected[key]:
+                raise ValueError(f"Incorrect {key}")
+        for kind in ("prefill", "decode", "all"):
+            key = kind + "_tokens"
+            value = actual.get(key)
+            if type(value) is not int or value != expected[key]:
+                raise ValueError(f"Incorrect {key}")
+            key = kind + "_throughput"
+            value = actual.get(key)
+            if not isinstance(value, (int, float)) or not math.isclose(
+                value, expected[key], rel_tol=1e-12, abs_tol=1e-12
+            ):
+                raise ValueError(f"Incorrect {key}")
+        if not math.isclose(actual["duration_s"], duration, rel_tol=1e-12):
+            raise ValueError("Incorrect measurement duration")
+
+    def window(row):
+        start, end = row["start_time"], row["end_time"]
+        own = [r for r in records if start < r["end_time"] <= end]
+        check_summary(row["compute_metrics"], own, end - start)
+        check_summary(row["first_pass_compute"], [r for r in own if not r["filler"]], end - start)
+        check_summary(row["filler_compute"], [r for r in own if r["filler"]], end - start)
+        if "cumulative" in row:
+            window(row["cumulative"])
+
+    window(document["overall"])
+    previous = document["overall"]["start_time"]
+    for row in document["rounds"]:
+        if row["start_time"] != previous or row["end_time"] > document["overall"]["end_time"]:
+            raise ValueError("Invalid round measurement boundaries")
+        window(row)
+        previous = row["end_time"]
+    if document["args"]["num_requests"] % document["args"]["concurrency"] == 0:
+        if previous != document["overall"]["end_time"]:
+            raise ValueError("Rounds do not cover the whole measurement")
+
+
 def recalculate_document(document, status, evidence):
     verified = legacy_proof(status, evidence, document["manifest_sha256"])
     if verified and (document["args"]["concurrency"] != status.get("concurrency") or

@@ -232,6 +232,34 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ComputeAccountingTests(unittest.TestCase):
+    def test_exact_acceptance_rejects_unknown_corrupt_and_incomplete_rounds(self):
+        from copy import deepcopy
+        from throughput_compute import require_exact_result
+        rows = [record(1, 3), record(2, 5, filler=True)]
+        for r in rows:
+            r["events"] = [{"data": {"server_metrics": dict(
+                prefill_compute_tokens=8, decode_compute_tokens=2, context_stage_count=1)}}]
+        rounds = [bench.summarize(rows, 0, 3), bench.summarize(rows, 3, 5)]
+        rounds[1]["cumulative"] = bench.summarize(rows, 0, 5)
+        doc = dict(valid=True, args=dict(num_requests=4, concurrency=2), turns=rows,
+                   overall=bench.summarize(rows, 0, 5), rounds=rounds)
+        require_exact_result(doc)
+        for change in ("missing_counter", "bad_round_rate", "bad_filler", "missing_round", "invalid"):
+            with self.subTest(change=change):
+                bad = deepcopy(doc)
+                if change == "missing_counter":
+                    bad["turns"][0]["events"] = []
+                elif change == "bad_round_rate":
+                    bad["rounds"][0]["compute_metrics"]["prefill_throughput"] = 9999
+                elif change == "bad_filler":
+                    bad["overall"]["filler_compute"]["decode_tokens"] += 1
+                elif change == "missing_round":
+                    bad["rounds"].pop()
+                else:
+                    bad["valid"] = False
+                with self.assertRaises(ValueError):
+                    require_exact_result(bad)
+
     def test_reuse_rope_and_first_token(self):
         from throughput_compute import turn_compute, compute_summary
         r = record()

@@ -104,7 +104,7 @@ mask-free 路径通过原轨迹生产 tokenizer 的 Drop 边界重新判断 plan
 特别注意：Drop-aware + drop 在 cache 写入时就可能插入 -1 空洞，并不增加
 `drop_pages`。即便 drop_pages/hole_fills 全部为零，也不能把 resident token 数当成
 logical matched prefix 长度。旧响应缺这个长度，因而该组合的 Prefill/All 必须是
-unknown/null；单凭相减得到的数字不能当实际计算量。已完成实验不重跑。
+unknown/null；单凭相减得到的数字不能当实际计算量。
 证据不满足时输出 unknown/null；审计和元数据不能证明未记录的工作量。
 
 旧服务没记录 overlap 前向次数。若成功输出 G 个 token，已确认 Decode 至少 G-1，
@@ -112,15 +112,19 @@ unknown/null；单凭相减得到的数字不能当实际计算量。已完成�
 因此旧报告在可恢复时给精确 Prefill 和 Decode/All 上下界；DA+drop 只给 Decode
 上下界，Prefill/All 留空，缺精确值的字段为 null。
 `generated_output_throughput` 另存 usage 输出吞吐，不冒充实际 Decode 次数。
-不重复推理、不通过估计填造精确值。逐轮按完成窗口归属整条 HTTP turn，跨轮的 GPU
+离线重算本身不执行推理，不通过估计填造精确值。逐轮按完成窗口归属整条 HTTP turn，跨轮的 GPU
 计算时间无法从旧终场信息重新切分，因此它是完成归属的轮次吞吐，不是 GPU 时间切片。
 
-已启动的旧实验维持原引擎 HEAD，使用独立分析 checkout 重算，不改变其工作树或
-重跑完成项。旧协调器可单独暂停分发，已运行的客户端和服务继续；待客户端全部完成、
-结果保存及终场审计通过后，结束本任务旧服务。剩余尚未启动项使用独立输出目录和
-新 checkout，例如 `--only-cell 8 --only-cell 9 --only-cell 10`。两批 engine_head 分开
-记录，生产变化只有计数；不能将跨版本性能差异全部归因于 eviction。
-新矩阵每项初始审计同时检查实际计数字段，缺失则拒绝正式测速。
+若最终验收要求全部精确，而旧记录无法恢复计数，应使用有直接前向计数的版本重测
+受影响项，保留旧记录并使用新的输出目录。2026-09-16 用户已明确授权此类重测，
+替代此前“已完成实验不重跑”的限制：旧1–7项需要重测，8–10项首次运行，
+统一写入 `matrix-exact-v3`。旧 HEAD 和原始数据保留作历史证据，不覆盖或拼接成新结果。
+
+新矩阵每项初始审计检查实际计数字段，缺失则拒绝正式测速。结束时
+`throughput_compute.require_exact_result` 从保存的终场服务端计数重新汇总，检查
+整体、每轮、累计、首遍及补位的 token 数和吞吐公式、轮数和时间窗口。
+只有 `valid=true`、所有窗口 `exact=true`、计数与复算一致且两 rank 终场页面
+审计通过，启动器才将该项标为 completed。范围、缺失值和逻辑吞吐不能通过验收。
 
 ## SGLang 指标兼容性与 Abort
 

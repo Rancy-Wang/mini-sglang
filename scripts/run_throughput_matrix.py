@@ -20,7 +20,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "tests/benchmark"))
 from test_throughput import DEFAULT_INPUT, digest, write_json
-from throughput_compute import recalculate_file
+from throughput_compute import recalculate_file, require_exact_result
 
 
 def install_observer():
@@ -215,6 +215,7 @@ async def group_run(args, group, gpus, port):
                 if status_path.exists():
                     old = json.loads(status_path.read_text())
                     if old.get("state") == "completed" and old.get("head") == args.head and old.get("input_hash") == args.input_hash:
+                        require_exact_result(json.loads(Path(old["result"]).read_text()))
                         continue
                 label = f"{number}-{time.time_ns()}"
                 await audit(session, url, root, "initial-" + label, args.model, require_compute=True)
@@ -239,6 +240,12 @@ async def group_run(args, group, gpus, port):
                     status["state"] = "failed"
                     write_json(status_path, status)
                     raise RuntimeError(f"Cell {number} failed: {cell_root}")
+                try:
+                    require_exact_result(json.loads(Path(status["result"]).read_text()))
+                except (ValueError, KeyError, TypeError, OSError) as exc:
+                    status.update(state="failed", accounting_error=str(exc))
+                    write_json(status_path, status)
+                    raise RuntimeError(f"Cell {number} lacks verified exact throughput: {exc}") from exc
                 status["audit"] = await audit(session, url, root, "final-" + label, args.model, require_compute=True)
                 status["state"] = "completed"
                 write_json(status_path, status)
