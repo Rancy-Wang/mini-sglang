@@ -179,9 +179,9 @@ class CacheManager:
                 key_match_indices = retry_indices
                 matched_virtual_mask = retry_virtual
                 used_retry = True
-        full_match_indices = key_match_indices[
-            (~matched_virtual_mask).to(device=key_match_indices.device, non_blocking=True)
-        ]
+        from .metadata_indices import select_cpu_mask
+
+        full_match_indices = select_cpu_mask(key_match_indices, ~matched_virtual_mask)
         result = self._derive_active_match(req, handle, full_match_indices)
         if self.drop_aware_eviction:
             handle = result.handle
@@ -312,13 +312,11 @@ class CacheManager:
             keep_mask_cpu = (req.prefix_keep_mask[: len(full_match_indices)] != 0).to(
                 device="cpu", dtype=torch.bool
             )
-            keep_mask = keep_mask_cpu.to(
-                device=full_match_indices.device,
-                dtype=torch.bool,
-                non_blocking=True,
-            )
-            active_match_indices = full_match_indices[keep_mask]
-            active_full_positions = torch.nonzero(keep_mask_cpu, as_tuple=False).view(-1)
+            from .metadata_indices import cpu_mask_indices, pack_cpu_metadata
+
+            active_full_positions = cpu_mask_indices(keep_mask_cpu)
+            keep_indices = pack_cpu_metadata([active_full_positions], full_match_indices.device)[0]
+            active_match_indices = full_match_indices.index_select(0, keep_indices)
         return ContextMatchResult(
             handle=handle,
             full_match_indices=full_match_indices,

@@ -30,9 +30,11 @@ from minisgl.message.tokenizer import get_gpt_oss_terminal_stop_token_ids
 from minisgl.utils import init_logger, load_tokenizer
 
 from .cache import CacheManager
+from .compact_indices import CompactIndexPool
 from .config import SchedulerConfig
 from .decode import DecodeManager
 from .io import SchedulerIOMixin
+from .overlap_state import CompactPlan, TransitionFence, TransitionRetirement
 from .prefill import (
     ChunkedReq,
     OccurrenceInputError,
@@ -122,6 +124,7 @@ class Scheduler(SchedulerIOMixin):
             drop_aware_eviction=config.drop_aware_eviction,
         )
         self.decode_manager = DecodeManager(config.page_size)
+        self.transition_retirement = TransitionRetirement()
         rotary_config = config.model_config.rotary_config
         retry_rope = get_rope(
             head_dim=rotary_config.head_dim,
@@ -140,6 +143,13 @@ class Scheduler(SchedulerIOMixin):
             retry_rope_cache=retry_rope.cos_sin_cache,
         )
         startup_prewarm_started_ns = time.perf_counter_ns()
+        self.compact_index_pool = CompactIndexPool(
+            self.device,
+            # Cap startup reservation at two 8-MiB pairs, even with a large
+            # max-running setting. Exceptional raw streams grow before forward.
+            min(1 << 20, max(config.max_extend_tokens,
+                            config.max_running_req * self.engine.page_table.shape[1])),
+        )
         if config.radix_drop_key_mode == "delta-marker":
             # Delta-marker Radix queries are structured [N, 4] records.  Load
             # their CPU AOT comparator before the first real prefix lookup.
@@ -212,6 +222,7 @@ class Scheduler(SchedulerIOMixin):
         """Called when the scheduler is idle to perform background tasks."""
         logger.info_rank0("Scheduler is idle, waiting for new reqs...")
         self.cache_manager.check_integrity()
+        self.transition_retirement.collect()
 
     def overlap_loop(self, last_data: ForwardData | None) -> ForwardData | None:
         """
@@ -275,6 +286,8 @@ class Scheduler(SchedulerIOMixin):
 
     def shutdown(self) -> None:
         torch.cuda.synchronize(self.device)
+        self.compact_index_pool.clear_after_synchronize()
+        self.transition_retirement.clear_after_synchronize()
         self.sync_all_ranks()
         self.engine.shutdown()
 
@@ -289,6 +302,7 @@ class Scheduler(SchedulerIOMixin):
         new_finished_reqs: Set[Req] = set()
         with self.cache_manager.lazy_free_region():
             for i, req in enumerate(batch.reqs):
+                self._wait_for_transition(req)
                 if isinstance(req, ChunkedReq):
                     self.prefill_manager.complete_chunk(req)
                     if req in self.finished_reqs and req.occurrence_abort_deferred:
@@ -391,20 +405,14 @@ class Scheduler(SchedulerIOMixin):
         prompt_len = req.cached_len
         if prompt_len != len(req.input_ids) or req.device_len != prompt_len + 1:
             raise RuntimeError("Post-Prefill compaction must run immediately after prompt Prefill.")
-        prompt_raw = req.raw_positions[:prompt_len].to(dtype=torch.int64, device="cpu")
-        if len(prompt_raw) == 0 or int(prompt_raw[-1]) >= len(keep_mask):
-            raise RuntimeError("Post-Prefill keep mask does not cover the prompt raw positions.")
-        keep = req.context_decode_keep_mask
-        keep_indices = req.context_decode_keep_indices
-        dropped_owned_indices = req.context_decode_dropped_owned_indices
-        if keep is None:
-            keep = (keep_mask[prompt_raw] != 0).to(dtype=torch.bool, device="cpu")
-        elif len(keep) != prompt_len:
-            raise RuntimeError("Prepared Decode keep mask does not cover the prompt.")
-        if not bool(torch.any(keep).item()):
-            raise RuntimeError("Cannot Drop every prompt token before generation.")
-        if keep_indices is None:
-            keep_indices = torch.nonzero(keep, as_tuple=False).view(-1)
+        plan = req.context_compact_plan
+        if plan is None:
+            plan = CompactPlan.build(req, prompt_len)
+        if plan.prompt_len != prompt_len:
+            raise RuntimeError("Prepared compaction plan does not cover the completed prompt.")
+        keep_indices = plan.keep_indices
+        dropped_owned_indices = plan.dropped_indices
+        index_lease = req.context_decode_index_lease
 
         external_storage = req.occurrence_external_storage
         page_row = (
@@ -413,31 +421,17 @@ class Scheduler(SchedulerIOMixin):
             else self.table_manager.page_table[req.table_idx]
         )
         pages = page_row[:prompt_len].clone()
-        active_slots = torch.arange(prompt_len, dtype=torch.int64, device="cpu")
-        if req.occurrence_terminal_owned_mask is not None:
-            if len(req.occurrence_terminal_owned_mask) != prompt_len:
-                raise RuntimeError("Occurrence-owned pages do not cover the prompt stream.")
-            owned = req.occurrence_terminal_owned_mask.clone()
-        else:
-            owned = active_slots >= req.initial_active_cached_len
-            if req.retry_transformed_mask is not None:
-                owned[: len(req.retry_transformed_mask)] |= req.retry_transformed_mask
-        dropped_owned = (~keep) & owned
-        if dropped_owned_indices is None:
-            dropped_owned_indices = torch.nonzero(dropped_owned, as_tuple=False).view(-1)
         if len(dropped_owned_indices) > 0:
-            dropped_device = dropped_owned_indices.to(device=pages.device, non_blocking=True)
-            dropped_positions = prompt_raw[dropped_owned]
+            dropped_device = (
+                index_lease.dropped_owned if index_lease is not None
+                else dropped_owned_indices.to(device=pages.device, non_blocking=True)
+            )
             dropped_pages = pages.index_select(0, dropped_device)
-            if req.inactive_cached_positions is None:
-                req.inactive_cached_positions = dropped_positions
+            if req.inactive_cached_pages is None:
                 req.inactive_cached_pages = dropped_pages
             else:
-                assert req.inactive_cached_pages is not None
-                req.inactive_cached_positions = torch.cat(
-                    (req.inactive_cached_positions, dropped_positions)
-                )
                 req.inactive_cached_pages = torch.cat((req.inactive_cached_pages, dropped_pages))
+        req.inactive_cached_positions = plan.inactive_positions
 
         kept_count = len(keep_indices)
         if kept_count + 1 > self.table_manager.page_table.shape[1]:
@@ -447,7 +441,10 @@ class Scheduler(SchedulerIOMixin):
             if external_storage
             else self.table_manager.token_pool[req.table_idx]
         )
-        keep_device = keep_indices.to(device=pages.device, non_blocking=True)
+        keep_device = (
+            index_lease.keep if index_lease is not None
+            else keep_indices.to(device=pages.device, non_blocking=True)
+        )
         self.table_manager.page_table[req.table_idx, :kept_count].copy_(
             pages.index_select(0, keep_device)
         )
@@ -455,34 +452,24 @@ class Scheduler(SchedulerIOMixin):
             tokens[:prompt_len].index_select(0, keep_device)
         )
         self.table_manager.token_pool[req.table_idx, kept_count].copy_(tokens[prompt_len])
+        self._release_compact_indices(req)
         if external_storage:
             self.table_manager.release_occurrence(req.table_idx)
         req.occurrence_external_storage = False
 
         queued_true_position = req.true_positions[prompt_len:].clone()
         queued_raw_position = req.raw_positions[prompt_len:].clone()
-        req.input_ids = req.input_ids[keep].contiguous()
-        prompt_true_positions = req.true_positions[:prompt_len]
-        if req.reposition_execution_mode == "paged-occurrence":
-            if req.radix_positions is None:
-                raise RuntimeError("Paged-occurrence compaction requires final Radix positions.")
-            prompt_true_positions = req.radix_positions[prompt_raw]
+        req.input_ids = plan.input_ids
         req.true_positions = torch.cat(
-            (prompt_true_positions[keep].contiguous(), queued_true_position)
+            (plan.true_positions, queued_true_position)
         )
         req.raw_positions = torch.cat(
-            (req.raw_positions[:prompt_len][keep].contiguous(), queued_raw_position)
+            (plan.raw_positions, queued_raw_position)
         )
-        req.radix_input_ids = req.radix_input_ids[keep].contiguous()
-
-        initial_keep = keep[: req.initial_active_cached_len]
-        req.initial_active_cached_len = int(torch.count_nonzero(initial_keep).item())
-        if req.retry_transformed_mask is not None:
-            req.retry_transformed_mask = req.retry_transformed_mask[initial_keep].contiguous()
-        if req.occurrence_terminal_owned_mask is not None:
-            req.occurrence_terminal_owned_mask = req.occurrence_terminal_owned_mask[
-                keep
-            ].contiguous()
+        req.radix_input_ids = plan.radix_input_ids
+        req.initial_active_cached_len = plan.initial_cached_len
+        req.retry_transformed_mask = plan.retry_mask
+        req.occurrence_terminal_owned_mask = plan.terminal_owned
         removed = prompt_len - kept_count
         req.cached_len = kept_count
         req.device_len = kept_count + 1
@@ -493,6 +480,7 @@ class Scheduler(SchedulerIOMixin):
         req.context_decode_keep_mask = None
         req.context_decode_keep_indices = None
         req.context_decode_dropped_owned_indices = None
+        req.context_compact_plan = None
         req.full_input_ids = None
         req.full_token_visible_until = None
         req.full_keep_mask = None
@@ -745,6 +733,8 @@ class Scheduler(SchedulerIOMixin):
         return removed_state or removed_uid
 
     def _free_req_resources(self, req: Req) -> None:
+        self._wait_for_transition(req)
+        self._release_compact_indices(req)
         engine = getattr(self, "engine", None)
         if engine is not None:
             engine.sampler.discard(req)
@@ -769,8 +759,43 @@ class Scheduler(SchedulerIOMixin):
         self.cache_manager.free_occurrence_pages(pages)
         req.occurrence_transient_pages = None
         req.occurrence_inflight = False
+        # This is the final Prefill completion (intermediate chunks use
+        # PrefillManager.complete_chunk). No later query needs birth-position
+        # copies distinct from terminal candidates. Fresh owned occurrences
+        # have distinct allocations, so CPU occurrence IDs establish aliasing
+        # without a GPU page-set comparison or a device synchronization.
+        birth_owned = req.occurrence_birth_owned_mask
+        if birth_owned is not None and req.occurrence_birth_indices is not None:
+            assert req.occurrence_terminal_indices is not None
+            assert req.occurrence_birth_pages is not None
+            obsolete = (
+                req.occurrence_birth_indices != req.occurrence_terminal_indices
+            )
+            if req.drop_recovery_plan is not None and req.full_keep_mask is not None:
+                # Drop-aware execution never retains dropped terminal candidates,
+                # even when their birth and terminal occurrence IDs coincide.
+                obsolete |= ~req.full_keep_mask.to(torch.bool)
+            obsolete &= birth_owned
+            indices = torch.nonzero(obsolete, as_tuple=False).view(-1)
+            if len(indices):
+                device_indices = indices.pin_memory().to(
+                    req.occurrence_birth_pages.device, non_blocking=True
+                )
+                self.cache_manager.free_occurrence_pages(
+                    req.occurrence_birth_pages.index_select(0, device_indices)
+                )
+                req.occurrence_birth_pages.index_fill_(0, device_indices, -1)
+                birth_owned[indices] = False
+
+    def _release_compact_indices(self, req: Req) -> None:
+        lease = getattr(req, "context_decode_index_lease", None)
+        if lease is not None:
+            lease.release(torch.cuda.current_stream(self.device))
+            req.context_decode_index_lease = None
 
     def _free_aborted_occurrence_resources(self, req: Req) -> None:
+        self._wait_for_transition(req)
+        self._release_compact_indices(req)
         try:
             released = []
             transient = req.occurrence_transient_pages
@@ -823,6 +848,8 @@ class Scheduler(SchedulerIOMixin):
                 self._close_context_sequence(req.uid)
 
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
+        for req in batch.reqs:
+            self._wait_for_transition(req)
         self.engine.graph_runner.pad_batch(batch)
         occurrence_reqs = [
             req for req in batch.reqs if req.reposition_execution_mode == "paged-occurrence"
@@ -835,19 +862,23 @@ class Scheduler(SchedulerIOMixin):
         input_mapping = _make_input_tuple(batch, self.device)
         write_mapping = _make_write_tuple(batch, self.device)
         if occurrence_reqs:
+            from .metadata_indices import pack_cpu_metadata
+
             birth_pages = []
             source_pages = []
             destination_pages = []
             position_pairs = []
+            birth_cpu = []
             for req in occurrence_reqs:
                 if req.occurrence_pages is None or req.occurrence_birth_indices is None:
                     raise RuntimeError("Occurrence request is missing allocated birth pages.")
-                birth_ids = (
+                birth_cpu.append(
                     req.occurrence_birth_indices[req.cached_len : req.device_len]
                     .to(torch.int64)
-                    .pin_memory()
-                    .to(self.device, non_blocking=True)
                 )
+            for req, birth_ids in zip(
+                occurrence_reqs, pack_cpu_metadata(birth_cpu, self.device), strict=True
+            ):
                 birth_pages.append(req.occurrence_pages[birth_ids])
                 if (
                     req.occurrence_transform_source_pages is None
@@ -874,32 +905,31 @@ class Scheduler(SchedulerIOMixin):
         else:
             batch.out_loc = self.engine.page_table[input_mapping]
         self.engine.attn_backend.prepare_metadata(batch)
+        compact_reqs = []
         for req in batch.reqs:
             if isinstance(req, ChunkedReq) or req.context_post_prefill_keep_mask is None:
                 continue
-            prompt_len = req.device_len
-            prompt_raw = req.raw_positions[:prompt_len].to(dtype=torch.int64, device="cpu")
-            keep = (req.context_post_prefill_keep_mask[prompt_raw] != 0).to(torch.bool)
-            if not bool(torch.any(keep).item()):
-                raise RuntimeError("Cannot Drop every prompt token before generation.")
-            owned = torch.arange(prompt_len, dtype=torch.int64) >= req.initial_active_cached_len
-            if req.occurrence_terminal_owned_mask is not None:
-                if len(req.occurrence_terminal_owned_mask) != prompt_len:
-                    raise RuntimeError("Occurrence-owned pages do not cover the prompt stream.")
-                owned = req.occurrence_terminal_owned_mask
-            elif req.retry_transformed_mask is not None:
-                owned[: len(req.retry_transformed_mask)] |= req.retry_transformed_mask
-            req.context_decode_keep_mask = keep
-            req.context_decode_keep_indices = torch.nonzero(keep, as_tuple=False).view(-1)
-            req.context_decode_dropped_owned_indices = torch.nonzero(
-                (~keep) & owned, as_tuple=False
-            ).view(-1)
+            plan = CompactPlan.build(req, req.device_len)
+            req.context_compact_plan = plan
+            req.context_decode_keep_mask = plan.keep
+            req.context_decode_keep_indices = plan.keep_indices
+            req.context_decode_dropped_owned_indices = plan.dropped_indices
+            compact_reqs.append(req)
         forward_input = ForwardInput(
             batch=batch,
             sample_args=self.engine.sampler.prepare(batch),
             input_tuple=input_mapping,
             write_tuple=write_mapping,
         )
+        if compact_reqs:
+            if any(req.context_decode_index_lease is not None for req in compact_reqs):
+                raise RuntimeError("A request still owns its previous compact indices.")
+            leases = self.compact_index_pool.pack([
+                (req.context_decode_keep_indices, req.context_decode_dropped_owned_indices)
+                for req in compact_reqs
+            ])
+            for req, lease in zip(compact_reqs, leases, strict=True):
+                req.context_decode_index_lease = lease
         for req in occurrence_reqs:
             req.occurrence_inflight = True
         return forward_input
@@ -947,7 +977,18 @@ class Scheduler(SchedulerIOMixin):
                     for req in batch.padded_reqs
                 ]
             )
+        # Snapshot before complete_one() advances cached_len/device_len. Count
+        # real requests only; CUDA Graph padding and RoPE-only page transforms
+        # are not model-forward tokens belonging to a request.
+        compute_tokens = [(req.uid, req.extend_len) for req in batch.reqs]
         forward_output = self.engine.forward_batch(batch, sample_args)
+        for uid, count in compute_tokens:
+            metrics = self.request_metrics.get(uid)
+            if metrics is not None:
+                if batch.is_prefill:
+                    metrics.prefill_compute_tokens += count
+                else:
+                    metrics.decode_compute_tokens += count
         self.token_pool[output_mapping] = forward_output.next_tokens_gpu
         for index, req in enumerate(batch.reqs):
             if req.occurrence_external_storage and not isinstance(req, ChunkedReq):
@@ -955,21 +996,39 @@ class Scheduler(SchedulerIOMixin):
                 self.table_manager.occurrence_tokens(req.table_idx)[req.cached_len].copy_(
                     forward_output.next_tokens_gpu[index]
                 )
-        transitioned = False
+        transitioned = []
+        resources = []
         for req in batch.reqs:
             if not isinstance(req, ChunkedReq) and getattr(
                 req, "context_post_prefill_keep_mask", None
             ) is not None:
+                # Tensor storage allocated on the scheduler stream must remain
+                # alive until the engine-stream gather/copy has consumed it.
+                resources.extend((
+                    self.table_manager.occurrence_pages(req.table_idx),
+                    self.table_manager.occurrence_tokens(req.table_idx),
+                ))
+                if req.inactive_cached_pages is not None:
+                    # cat() below replaces this scheduler-allocated tensor;
+                    # its old storage is still read asynchronously by engine.
+                    resources.append(req.inactive_cached_pages)
                 self._compact_context_after_prefill(req)
-                transitioned = True
+                transitioned.append(req)
         if transitioned:
-            # The scheduler stream may prepare the next Decode immediately, but
-            # its graph-visible table reads must follow the engine-stream copy.
             transition_done = torch.cuda.Event()
             transition_done.record(self.engine.stream)
-            self.stream.wait_event(transition_done)
+            fence = TransitionFence(transition_done, tuple(resources))
+            self.transition_retirement.add(fence)
+            for req in transitioned:
+                req.context_transition = fence
         self.decode_manager.filter_reqs(forward_input.batch.reqs)
         return forward_output
+
+    def _wait_for_transition(self, req: Req) -> None:
+        """Fence dependent table/cache consumers, not an unrelated P2 prefill."""
+        fence = getattr(req, "context_transition", None)
+        if fence is not None:
+            fence.wait_on(torch.cuda.current_stream(self.device))
 
 
 def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:
