@@ -222,6 +222,7 @@ class Scheduler(SchedulerIOMixin):
         """Called when the scheduler is idle to perform background tasks."""
         logger.info_rank0("Scheduler is idle, waiting for new reqs...")
         self.cache_manager.check_integrity()
+        self.transition_retirement.collect()
 
     def overlap_loop(self, last_data: ForwardData | None) -> ForwardData | None:
         """

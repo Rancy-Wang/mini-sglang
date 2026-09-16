@@ -2,6 +2,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import torch
+import pytest
 
 from minisgl.attention.fi import FlashInferBackend, FIMetadata
 
@@ -82,3 +83,57 @@ def test_full_and_sliding_segments_are_preplanned_with_distinct_storage(monkeypa
     assert sliding.plan.call_args.kwargs["window_left"] == -1
     assert obj._plan_events[full].synchronize.call_count == 0
     assert obj._plan_events[sliding].synchronize.call_count == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_real_two_slot_prefill_plans_preserve_outputs_across_queued_batches():
+    """Real FI H2D/plan/run, full and sliding, without changing model math."""
+    from flashinfer import BatchPrefillWithPagedKVCacheWrapper
+    device = torch.device("cuda", 0)
+    stream = torch.cuda.Stream(device=device)
+    torch.manual_seed(13)
+    with torch.cuda.stream(stream):
+        workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
+        obj = object.__new__(FlashInferBackend)
+        obj.config = SimpleNamespace(head_dim=64, sliding_window=128)
+        obj.qo_head_local, obj.kv_head_local = 4, 2
+        obj.kvcache = SimpleNamespace(dtype=torch.bfloat16)
+        obj._plan_slot = 0
+        def wrapper():
+            return BatchPrefillWithPagedKVCacheWrapper(workspace, kv_layout="NHD", backend="fa2")
+        obj._wrapper_slots = {(False, "ordinary", window): (wrapper(), wrapper())
+                              for window in (-1, 127)}
+        reference_wrapper = wrapper()
+        k = torch.randn((400, 1, 2, 64), dtype=torch.bfloat16, device=device)
+        v = torch.randn_like(k)
+        inputs = []
+        for size in (1, 7, 1, 7):
+            data = metadata()
+            data.cu_seqlens_q_cpu = torch.arange(size + 1, dtype=torch.int32) * 3
+            data.cu_seqlens_k_cpu = torch.arange(size + 1, dtype=torch.int32) * 48
+            data.indices = torch.randperm(400, device=device)[:size * 48].to(torch.int32)
+            data.last_page_len_cpu = torch.ones(size, dtype=torch.int32)
+            data.seq_lens_cpu = torch.full((size,), 48, dtype=torch.int32)
+            q = torch.randn((size * 3, 4, 64), dtype=torch.bfloat16, device=device)
+            inputs.append((data, q))
+        references = []
+        for data, q in inputs:
+            pair = []
+            for window in (-1, 127):
+                # Independent synchronous reference, same FA2 plan and inputs.
+                data.initialized_wrappers.clear()
+                obj._initialize_metadata_once(data, reference_wrapper,
+                                              is_decode=False, window_left=window)
+                pair.append(reference_wrapper.run(q, (k, v), window_left=window).clone())
+                stream.synchronize()
+            data.initialized_wrappers.clear()
+            references.append(pair)
+        outputs = []
+        for data, q in inputs:
+            obj.prepare_for_forward(SimpleNamespace(attn_metadata=data))
+            outputs.append([data.wrappers[window].run(q, (k, v), window_left=window)
+                            for window in (-1, 127)])
+        stream.synchronize()
+        for expected, actual in zip(references, outputs, strict=True):
+            for left, right in zip(expected, actual, strict=True):
+                torch.testing.assert_close(left, right, rtol=0, atol=0)
