@@ -145,12 +145,20 @@ def stop(child):
     child.wait()
 
 
-async def audit(session, url, root, label, model):
+async def audit(session, url, root, label, model, require_compute=False):
     write_json(root / "audit-command.json", {"id": label})
     async with session.post(url + "/v1/chat/completions", json=dict(
         model=model, messages=[{"role": "user", "content": "Reply OK."}], max_tokens=1)) as response:
         response.raise_for_status()
-        await response.read()
+        probe = await response.json()
+        if require_compute:
+            counters = probe.get("server_metrics", {})
+            if not (isinstance(counters.get("prefill_compute_tokens"), int)
+                    and counters["prefill_compute_tokens"] > 0
+                    and isinstance(counters.get("decode_compute_tokens"), int)
+                    and counters["decode_compute_tokens"] >= 0):
+                raise RuntimeError("Server did not return actual forward counters")
+            write_json(root / f"compute-probe-{label}.json", counters)
     deadline = time.monotonic() + 300
     while len(list(root.glob(f"audit-{label}-*.json"))) < 2:
         if time.monotonic() > deadline:
@@ -167,6 +175,10 @@ async def group_run(args, group, gpus, port):
     cells = [(1,4,True),(2,4,False),(5,8,True),(6,8,False),(9,16,True),(10,16,False)] if group == "drop-aware" else [(3,4,True),(4,4,False),(7,8,False),(8,8,True)]
     if args.smoke:
         cells = [(0,2,True),(-1,2,True)]
+    if args.only_cell:
+        cells = [cell for cell in cells if cell[0] in args.only_cell]
+    if not cells:
+        return
     group_root = Path(args.output) / group
     group_root.mkdir(parents=True, exist_ok=True)
     root = group_root / ("server-" + str(time.time_ns()))
@@ -205,7 +217,7 @@ async def group_run(args, group, gpus, port):
                     if old.get("state") == "completed" and old.get("head") == args.head and old.get("input_hash") == args.input_hash:
                         continue
                 label = f"{number}-{time.time_ns()}"
-                await audit(session, url, root, "initial-" + label, args.model)
+                await audit(session, url, root, "initial-" + label, args.model, require_compute=True)
                 status = dict(cell=number, concurrency=concurrency, drop=drop, eviction=group,
                               state="running", head=args.head, input_hash=args.input_hash,
                               gpus=gpus, pages=ready[0]["num_pages"], started_at=time.time())
@@ -227,7 +239,7 @@ async def group_run(args, group, gpus, port):
                     status["state"] = "failed"
                     write_json(status_path, status)
                     raise RuntimeError(f"Cell {number} failed: {cell_root}")
-                status["audit"] = await audit(session, url, root, "final-" + label, args.model)
+                status["audit"] = await audit(session, url, root, "final-" + label, args.model, require_compute=True)
                 status["state"] = "completed"
                 write_json(status_path, status)
                 status["compute_result"] = str(recalculate_file(status["result"], status_path))
@@ -245,7 +257,7 @@ async def run(args):
         raise ValueError("Output must be outside repository")
     root.mkdir(parents=True, exist_ok=True)
     write_json(root / "matrix.json", dict(head=args.head, input_hash=args.input_hash,
-                                         model=args.model, smoke=args.smoke, rounds=3))
+                                         model=args.model, smoke=args.smoke, rounds=3, only_cells=args.only_cell))
     if set(args.drop_aware_gpus.split(",")) & set(args.ordinary_gpus.split(",")):
         raise ValueError("TP2 service GPU sets must be disjoint")
     if any(len(set(gpus.split(","))) != 2 for gpus in (args.drop_aware_gpus, args.ordinary_gpus)):
@@ -275,6 +287,8 @@ def main():
     parser.add_argument("--drop-aware-gpus", default="0,1")
     parser.add_argument("--ordinary-gpus", default="2,3")
     parser.add_argument("--smoke", action="store_true")
+    parser.add_argument("--only-cell", action="append", type=int, choices=range(1, 11),
+                        help="Run only these not-yet-started cell numbers in a separate output root")
     asyncio.run(run(parser.parse_args()))
 
 
