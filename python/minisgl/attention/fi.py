@@ -4,6 +4,7 @@ import math
 from dataclasses import dataclass, field
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, Dict, List, Literal
+from weakref import WeakKeyDictionary
 
 import torch
 from minisgl.core import Batch, get_global_ctx
@@ -86,6 +87,7 @@ class FIMetadata(BaseAttnMetadata):
     sliding_context_segments: FIContextSegmentMetadata | None = None
     graph_bs:           int | None = None
     initialized_wrappers: set[int] = field(default_factory=set)
+    wrappers: Dict[int, Any] = field(default_factory=dict)
     # fmt: on
 
     def __post_init__(self) -> None:
@@ -140,8 +142,20 @@ class FlashInferBackend(BaseAttnBackend):
         self.max_graph_bs = 0
         self.graph_wrappers: Dict[tuple[int, int], CUDAGraphBatchDecodeWithPagedKVCacheWrapper] = {}
         self.capture: FICaptureData | None = None
-        self.last_event = torch.cuda.Event()
-        self.last_event.record()
+        self._plan_events = WeakKeyDictionary()
+        # Two slots match the scheduler's single-batch lookahead. Device plans
+        # and attention still execute serially on the engine stream. Only the
+        # pinned host staging buffer needs a CPU reuse fence.
+        self._plan_slot = 0
+        self._wrapper_slots = {}
+        for decode in (False, True):
+            factory = self._new_decode_wrapper if decode else self._new_prefill_wrapper
+            ordinary = self.decode_wrappers if decode else self.prefill_wrappers
+            for window, wrapper in ordinary.items():
+                self._wrapper_slots[(decode, "ordinary", window)] = (wrapper, factory())
+            self._wrapper_slots[(decode, "full", -1)] = (factory(), factory())
+            if config.sliding_window is not None:
+                self._wrapper_slots[(decode, "sliding", -1)] = (factory(), factory())
 
     def validate_context_mask_prefill(self, device: torch.device | int | None = None) -> None:
         return None
@@ -195,7 +209,15 @@ class FlashInferBackend(BaseAttnBackend):
         dtype = getattr(metadata, "dtype", self.kvcache.dtype)
         # FlashInfer planning reuses a pinned host staging buffer and launches an
         # async H2D copy. Wait here before the next plan mutates that host buffer.
-        self.last_event.synchronize()
+        events = getattr(self, "_plan_events", None)
+        if events is None:
+            self._plan_events = events = WeakKeyDictionary()
+        event = events.get(wrapper)
+        if event is not None:
+            event.synchronize()
+        else:
+            event = torch.cuda.Event()
+            events[wrapper] = event
         if is_decode:
             wrapper.plan(
                 indptr=metadata.cu_seqlens_k_cpu,
@@ -235,17 +257,47 @@ class FlashInferBackend(BaseAttnBackend):
                 causal=True,
             )
         metadata.initialized_wrappers.add(wrapper_id)
-        self.last_event.record()
+        event.record()
 
     def _ordinary_wrapper(self, metadata: FIMetadata, window_left: int):
         if metadata.graph_bs is not None:
             return self.graph_wrappers[(metadata.graph_bs, window_left)]
+        if window_left in metadata.wrappers:
+            return metadata.wrappers[window_left]
         wrappers = self.decode_wrappers if metadata.is_decode else self.prefill_wrappers
         if window_left not in wrappers:
             wrappers[window_left] = (
                 self._new_decode_wrapper() if metadata.is_decode else self._new_prefill_wrapper()
             )
         return wrappers[window_left]
+
+    def prepare_for_forward(self, batch: Batch) -> None:
+        """Plan both attention types before queuing model kernels.
+
+        Do not wait for a different wrapper's H2D at the first sliding/full
+        layer. Graph wrappers remain fixed and use prepare_for_replay instead.
+        """
+        metadata = batch.attn_metadata
+        assert isinstance(metadata, FIMetadata)
+        slot = self._plan_slot
+        self._plan_slot = 1 - slot
+        windows = [-1]
+        if self.config.sliding_window is not None:
+            windows.append(self.config.sliding_window - 1)
+        for window in windows:
+            segment = (metadata.sliding_context_segments if window != -1
+                       else metadata.context_segments)
+            if segment is not None:
+                kind = "sliding" if window != -1 else "full"
+                wrapper = self._wrapper_slots[(segment.is_decode, kind, -1)][slot]
+                segment.wrappers[-1] = wrapper
+                self._initialize_metadata_once(
+                    segment, wrapper, is_decode=segment.is_decode, window_left=-1)
+            else:
+                wrapper = self._wrapper_slots[(metadata.is_decode, "ordinary", window)][slot]
+                metadata.wrappers[window] = wrapper
+                self._initialize_metadata_once(
+                    metadata, wrapper, is_decode=metadata.is_decode, window_left=window)
 
     def _get_ones_cpu(self, bs: int) -> torch.Tensor:
         if bs <= len(self.cached_ones_cpu):
