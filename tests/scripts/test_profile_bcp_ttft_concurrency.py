@@ -17,6 +17,14 @@ profile = load("profile_bcp_ttft_concurrency")
 hooks = load("bcp_ttft_profile_hooks")
 
 
+def test_profile_observer_can_be_pinned_independently_of_source(tmp_path):
+    observer = ROOT / "scripts/bcp_ttft_profile_hooks.py"
+    assert profile.profile_hooks_path(ROOT) == observer.resolve()
+    assert profile.profile_hooks_path(tmp_path, observer) == observer.resolve()
+    with pytest.raises(ValueError, match="does not exist"):
+        profile.profile_hooks_path(tmp_path)
+
+
 def test_short_validation_selects_real_tr8_tr9_tr10_only():
     cases = [dict(turns=[dict(turn=i, tool_responses=i) for i in range(12)]) for _ in range(8)]
     assert profile.short_validation_turns(cases) == [8, 9, 10]

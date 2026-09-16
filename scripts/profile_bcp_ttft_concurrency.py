@@ -10,6 +10,7 @@ import asyncio
 import copy
 import gzip
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -24,6 +25,15 @@ from pathlib import Path
 
 REPO = Path(os.environ.get("MINISGL_SOURCE_REPO", Path(__file__).resolve().parents[1])).resolve()
 sys.path[:0] = [str(REPO), str(REPO / "python")]
+
+
+def profile_hooks_path(source_repo, override=None):
+    """Freeze observer code independently of the production source checkout."""
+    path = Path(override) if override else Path(source_repo) / "scripts/bcp_ttft_profile_hooks.py"
+    path = path.resolve()
+    if not path.is_file():
+        raise ValueError(f"Profile hooks file does not exist: {path}")
+    return path
 
 
 def digest(value):
@@ -598,8 +608,10 @@ def launch(args, root):
         raise RuntimeError(f"Selected TP2 GPUs not idle/distinct; refusing launch: {gpus}, {used}")
     source = getattr(args, "source_repo", None) or REPO
     source = source.resolve()
+    hooks = profile_hooks_path(source, os.environ.get("MINISGL_PROFILE_HOOKS_FILE"))
     env = dict(os.environ, CUDA_VISIBLE_DEVICES=",".join(map(str, gpus)),
                MINISGL_SOURCE_REPO=str(source), PYTHONPATH=f"{source}:{source / 'python'}",
+               MINISGL_PROFILE_HOOKS_FILE=str(hooks),
                MINISGL_SHORT_TIMING="1" if getattr(args, "short_validation", False) else "0",
                MINISGL_TTFT_PROFILE_ROOT=str(root), PYTHONDONTWRITEBYTECODE="1",
                HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1", OMP_NUM_THREADS="1",
@@ -647,6 +659,7 @@ def launch(args, root):
                 "TORCH_EXTENSIONS_DIR", "TRITON_CACHE_DIR", "TVM_FFI_CACHE_DIR", "CUDA_CACHE_PATH"}},
                head=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source, text=True).strip(),
                source_repo=str(source), short_validation=getattr(args, "short_validation", False),
+               hooks_file=str(hooks), hooks_sha256=hashlib.sha256(hooks.read_bytes()).hexdigest(),
                gpu_preflight=usage))
     with (root/"server.log").open("w") as log:
         return subprocess.Popen(argv, cwd=REPO, env=env, stdout=log, stderr=subprocess.STDOUT,
@@ -1147,8 +1160,12 @@ def install_short_token_timing():
 
 
 if os.environ.get("MINISGL_TTFT_PROFILE_ROOT"):
-    from scripts.bcp_ttft_profile_hooks import install
-    install()
+    hook_path = profile_hooks_path(REPO, os.environ.get("MINISGL_PROFILE_HOOKS_FILE"))
+    hook_spec = importlib.util.spec_from_file_location("_bcp_frozen_profile_hooks", hook_path)
+    hook_module = importlib.util.module_from_spec(hook_spec)
+    sys.modules[hook_spec.name] = hook_module
+    hook_spec.loader.exec_module(hook_module)
+    hook_module.install()
     if os.environ.get("MINISGL_SHORT_TIMING") == "1":
         install_short_token_timing()
 
