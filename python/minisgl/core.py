@@ -188,6 +188,8 @@ class Req:
     context_decode_keep_indices: torch.Tensor | None = None
     context_decode_dropped_owned_indices: torch.Tensor | None = None
     context_decode_index_lease: CompactIndexLease | None = None
+    context_compact_plan: Any | None = None
+    context_transition: Any | None = None
     radix_key_virtual_mask: torch.Tensor | None = None
     radix_key_to_token: torch.Tensor | None = None
     radix_token_to_key: torch.Tensor | None = None
