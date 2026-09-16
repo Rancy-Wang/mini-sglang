@@ -119,7 +119,7 @@ def install():
     @contextmanager
     def span(name, uids, **extra):
         """R3: host ranges, never a device synchronization or a GPU timer."""
-        if not overlap_enabled(current):
+        if not (overlap_enabled(current) or current.get("light_trace")):
             yield
             return
         start, cpu = time.perf_counter_ns(), time.thread_time_ns()
@@ -157,7 +157,7 @@ def install():
     def scoped(fn, name):
         @functools.wraps(fn)
         def call(self, value, *args, **kwargs):
-            if not overlap_enabled(current):
+            if not (overlap_enabled(current) or current.get("light_trace")):
                 return fn(self, value, *args, **kwargs)
             if name == "result.collect":
                 uids = result_uids(value)
@@ -172,6 +172,8 @@ def install():
                     previous = getattr(local, "compact_uid", None)
                     local.compact_uid = value.uid
                     try:
+                        if current.get("light_trace"):
+                            return fn(self, value, *args, **kwargs)
                         with CompactObserver(value.uid):
                             return fn(self, value, *args, **kwargs)
                     finally:
@@ -513,7 +515,7 @@ def install():
                    cached=[r.cached_len for r in batch.reqs],
                    graph=self.graph_runner.can_use_cuda_graph(batch), start_ns=time.perf_counter_ns())
         start = stop = None
-        if current.get("detail") or current.get("gpu_detail"):
+        if current.get("detail") or current.get("gpu_detail") or current.get("light_trace"):
             start, stop = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
             start.record(self.stream)
         with span("engine.forward", local.uids[:], batch=batch_number):

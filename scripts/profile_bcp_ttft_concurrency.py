@@ -723,6 +723,7 @@ async def run(args):
                                 control = wave_control(mode, turn, seed_wave)
                                 write_json(root/"control.json", dict(cell=cell, turn=turn,
                                            concurrency=concurrency,
+                                           light_trace=short and not seed_wave,
                                            cohort=[dict(case_id=c["case_id"], tokens=c["turns"][turn]["full_tokens"])
                                                    for c in sorted(cases[:concurrency], key=lambda c:
                                                        ["210","215","229","236","226","223","231","233"].index(str(c["case_id"])))],
@@ -744,6 +745,7 @@ async def run(args):
                                         body = {"non_json_error": response.text}
                                     row = dict(cell=cell, concurrency=concurrency, mode=mode,
                                                workload=workload, case_id=case["case_id"], turn=turn,
+                                               measurement=not seed_wave,
                                                source=spec, request_sha256=digest(payload),
                                                client_start_ns=start, client_end_ns=time.perf_counter_ns(),
                                                status=response.status_code, response=body)
@@ -935,14 +937,33 @@ def physical_batch_signatures(requests, events):
     return {key: list(ranks.values()) for key,ranks in signatures.items()}
 
 
-def short_performance_rows(requests, token_times):
+def short_performance_rows(requests, token_times, batches):
+    """Identify the two physical batches from BOTH ranks, never from a case ID."""
+    groups = {}
+    waves = defaultdict(lambda: defaultdict(list))
+    for event in batches:
+        if event.get("kind") == "batch" and event.get("phase") == "prefill":
+            waves[(event["cell"], event["turn"])][event["pid"]].append(event)
+    for key, ranks in waves.items():
+        partitions = []
+        for events in ranks.values():
+            ordered = sorted(events, key=lambda event: event["start_ns"])
+            partitions.append([tuple(event["uids"]) for event in ordered])
+        if (len(partitions) == 2 and partitions[0] == partitions[1]
+                and list(map(len, partitions[0])) == [1, 7]):
+            for label, uids in zip(("P1", "P2"), partitions[0]):
+                for uid in uids:
+                    groups[(*key, uid)] = label
     result = []
     for request in requests:
-        if request["turn"] not in (9, 10):
+        if not request.get("measurement", request.get("source", {}).get("tool_responses") in (9, 10)):
             continue
         row = {k: request.get(k) for k in ("uid", "case_id", "turn", "workload",
                                          "ttft_ms", "tpot_ms", "e2e_ms")}
-        row["group"] = "P1" if str(request["case_id"]) == "210" else "P2"
+        key = (request["cell"], request["turn"], request["uid"])
+        if key not in groups:
+            raise ValueError(f"Missing or inconsistent TP2 physical 1+7 batches: {key}")
+        row["group"] = groups[key]
         ranks = []
         count = request["response"]["server_metrics"]["generated_tokens"]
         for pid, events in sorted(token_times.items()):
@@ -983,10 +1004,10 @@ def compare_versions(args):
                 json.loads((root/"selection.json").read_text()).get("short_validation") for root in roots)
     if short:
         measurements = []
-        for root, (requests, _) in zip(roots, data):
+        for root, (requests, events) in zip(roots, data):
             token_times = {path.stem: [json.loads(line) for line in path.read_text().splitlines()]
                            for path in root.glob("token-times-*.jsonl")}
-            measurements.append(short_performance_rows(requests, token_times))
+            measurements.append(short_performance_rows(requests, token_times, events))
         write_json(output/"short-per-request.json", dict(before=measurements[0], after=measurements[1]))
         grouped = []
         for workload in ("no_drop", "rolling"):
@@ -1020,7 +1041,8 @@ def compare_versions(args):
             for metric in ("ttft_ms", "tpot_ms", "e2e_ms"):
                 values = [[r[metric] for r in requests if r["mode"] == mode and
                            r["concurrency"] == concurrency and r["workload"] == workload and
-                           (not late or r["turn"] >= 9) and r.get(metric) is not None]
+                           (not late or (r.get("measurement", False) if short else r["turn"] >= 9))
+                           and r.get(metric) is not None]
                           for requests, _ in data]
                 for name, group in zip(("before", "after"), values):
                     row[name+"_"+metric] = statistics.mean(group) if group else None
@@ -1041,7 +1063,7 @@ def compare_versions(args):
         for version, (requests, _) in zip(("Before", "After"), data):
             for workload, color in (("no_drop", "tab:blue"), ("rolling", "tab:orange")):
                 rows = [r for r in requests if (r["mode"],r["concurrency"],r["workload"]) == (mode,concurrency,workload)]
-                turns = sorted({r["turn"] for r in rows if not short or r["turn"] in (9, 10)})
+                turns = sorted({r["turn"] for r in rows if not short or r.get("measurement", False)})
                 for ax, metric in zip(axes, ("ttft_ms", "tpot_ms")):
                     values = [statistics.mean(r[metric] for r in rows if r["turn"] == turn and r.get(metric) is not None) for turn in turns]
                     ax.plot(turns, values, "o--" if version == "Before" else "s-", color=color,
