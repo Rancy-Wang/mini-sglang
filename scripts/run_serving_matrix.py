@@ -259,6 +259,11 @@ async def run(args):
                 await audit(session, url, service_root, 'warmup', args.model, require_compute=True)
             if len(set(capacities)) != 1:
                 raise RuntimeError(f'Unequal KV capacities: {capacities}; rerun with common --pages')
+            # Baseline signatures must include observed capacity, not merely "auto".
+            args.pages = capacities[0]
+            state['gpu_inventory'] = subprocess.check_output([
+                'nvidia-smi', '--query-gpu=index,uuid,name,memory.total', '--format=csv'], text=True)
+            state['model_config_sha256'] = bench.file_hash(Path(args.model) / 'config.json')
             state.update(state='running', num_pages=capacities[0])
             bench.write_json(root / 'matrix_status.json', state)
 
