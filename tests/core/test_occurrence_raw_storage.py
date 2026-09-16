@@ -108,6 +108,45 @@ def test_external_sample_write_uses_post_forward_cached_length():
     assert table.occurrence_tokens(slot)[9] == 999
 
 
+def test_transition_retains_replaced_inactive_page_indices(monkeypatch):
+    from minisgl.scheduler.overlap_state import TransitionRetirement
+
+    table = TableManager(1, torch.zeros((2, 8), dtype=torch.int32))
+    slot = table.allocate()
+    table.prepare_occurrence(slot, 9)
+    old_indices = torch.tensor([41, 42], dtype=torch.int32)
+    req = SimpleNamespace(
+        occurrence_external_storage=True, table_idx=slot, cached_len=7,
+        device_len=9, uid=1, extend_len=2, context_post_prefill_keep_mask=torch.ones(9),
+        inactive_cached_pages=old_indices,
+    )
+    batch = SimpleNamespace(reqs=[req], padded_reqs=[req])
+    def forward(*args):
+        req.cached_len, req.device_len = 9, 10
+        return SimpleNamespace(next_tokens_gpu=torch.tensor([99], dtype=torch.int32))
+    scheduler = object.__new__(Scheduler)
+    scheduler.table_manager, scheduler.token_pool = table, table.token_pool
+    scheduler.engine = SimpleNamespace(forward_batch=forward, stream=object())
+    scheduler.request_metrics = {}
+    scheduler.decode_manager = SimpleNamespace(filter_reqs=lambda _: None)
+    scheduler.transition_retirement = TransitionRetirement()
+    event = SimpleNamespace(record=lambda stream: None, query=lambda: False)
+    monkeypatch.setattr(torch.cuda, "Event", lambda: event)
+    def compact(request):
+        request.inactive_cached_pages = torch.tensor([41, 42, 43])
+        table.release_occurrence(slot)
+        request.occurrence_external_storage = False
+    scheduler._compact_context_after_prefill = compact
+    scheduler._forward(ForwardInput(
+        batch, None, (torch.tensor([slot, slot]), torch.tensor([0, 0])),
+        (torch.tensor([slot]), torch.tensor([-1])),
+    ))
+    fence = req.context_transition
+    assert any(resource is old_indices for resource in fence.resources)
+    assert len(fence.resources) == 3 and not fence.release_if_ready()
+    assert not table.has_occurrence_storage(slot)
+
+
 @pytest.mark.parametrize("external", [False, True])
 @pytest.mark.parametrize("prepared", [False, True])
 @pytest.mark.parametrize("planned", [False, True])

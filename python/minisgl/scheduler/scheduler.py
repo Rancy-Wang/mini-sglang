@@ -1008,6 +1008,10 @@ class Scheduler(SchedulerIOMixin):
                     self.table_manager.occurrence_pages(req.table_idx),
                     self.table_manager.occurrence_tokens(req.table_idx),
                 ))
+                if req.inactive_cached_pages is not None:
+                    # cat() below replaces this scheduler-allocated tensor;
+                    # its old storage is still read asynchronously by engine.
+                    resources.append(req.inactive_cached_pages)
                 self._compact_context_after_prefill(req)
                 transitioned.append(req)
         if transitioned:
