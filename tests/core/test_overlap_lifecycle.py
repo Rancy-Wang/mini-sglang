@@ -106,3 +106,83 @@ def test_plan_rejects_all_dropped():
                           raw_positions=torch.arange(4))
     with pytest.raises(RuntimeError, match="every prompt token"):
         module.CompactPlan.build(req, 4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_real_compaction_fence_with_external_storage_and_independent_preparation():
+    from minisgl.core import Req, SamplingParams
+    from minisgl.scheduler.compact_indices import CompactIndexPool
+    from minisgl.scheduler.overlap_state import CompactPlan, TransitionRetirement
+    from minisgl.scheduler.scheduler import ForwardInput, Scheduler
+    from minisgl.scheduler.table import TableManager
+
+    device = torch.device("cuda", 0)
+    prepare, engine = torch.cuda.Stream(device=device), torch.cuda.Stream(device=device)
+    scheduler = object.__new__(Scheduler)
+    scheduler.device = device
+    scheduler.transition_retirement = TransitionRetirement()
+    scheduler.request_metrics = {}
+    scheduler.decode_manager = SimpleNamespace(filter_reqs=lambda _: None)
+    with torch.cuda.stream(prepare):
+        table = TableManager(1, torch.full((2, 8), -1, dtype=torch.int32, device=device))
+        slot = table.allocate()
+        table.prepare_occurrence(slot, 9)
+        table.occurrence_pages(slot).copy_(torch.arange(10, 19, dtype=torch.int32))
+        table.occurrence_tokens(slot)[:9].copy_(torch.arange(100, 109, dtype=torch.int32))
+        scheduler.table_manager, scheduler.token_pool = table, table.token_pool
+        scheduler.compact_index_pool = CompactIndexPool(device, capacity=32)
+        raw = torch.arange(9, dtype=torch.int32)
+        prompt = raw + 100
+        keep = torch.tensor([1, 0, 1, 0, 1, 0, 1, 0, 1], dtype=torch.int32)
+        req = Req(
+            input_ids=prompt, true_positions=raw, raw_positions=raw,
+            radix_input_ids=prompt.long(), radix_match_ids=prompt.long(), true_seq_len=9,
+            table_idx=slot, cached_len=3, output_len=2, uid=1,
+            sampling_params=SamplingParams(max_tokens=2), cache_handle=SimpleNamespace(),
+            initial_active_cached_len=3,
+            initial_full_match_indices=torch.arange(10, 13, dtype=torch.int32, device=device),
+            context_post_prefill_keep_mask=keep, occurrence_external_storage=True,
+            reposition_execution_mode="paged-occurrence", radix_positions=raw,
+            occurrence_raw_tokens=raw, occurrence_positions=raw,
+            occurrence_birth_indices=raw, occurrence_terminal_indices=raw,
+            occurrence_segment_query_starts=torch.tensor([0], dtype=torch.int32),
+            occurrence_segment_query_ends=torch.tensor([9], dtype=torch.int32),
+            occurrence_segment_key_offsets=torch.tensor([0, 9], dtype=torch.int32),
+            occurrence_segment_key_indices=raw,
+            occurrence_birth_pages=torch.arange(10, 19, dtype=torch.int32, device=device),
+            occurrence_birth_owned_mask=(raw >= 3) | (raw == 1),
+            retry_transformed_mask=torch.tensor([False, True, False]),
+            inactive_cached_positions=torch.tensor([99], dtype=torch.int32),
+            inactive_cached_pages=torch.tensor([40], dtype=torch.int32, device=device),
+        )
+        req.context_compact_plan = plan = CompactPlan.build(req, 9)
+        req.context_decode_index_lease = scheduler.compact_index_pool.pack([
+            (plan.keep_indices, plan.dropped_indices)])[0]
+        batch = SimpleNamespace(reqs=[req], padded_reqs=[req])
+        mapping = (torch.full((6,), slot, dtype=torch.int64, device=device),
+                   torch.zeros(6, dtype=torch.int64, device=device))
+        output_mapping = (torch.tensor([slot], device=device), torch.tensor([-1], device=device))
+    def forward(*args):
+        torch.cuda._sleep(5_000_000)
+        req.complete_one()
+        return SimpleNamespace(next_tokens_gpu=torch.tensor([999], dtype=torch.int32, device=device))
+    scheduler.engine = SimpleNamespace(stream=engine, forward_batch=forward)
+    with torch.cuda.stream(engine):
+        engine.wait_stream(prepare)
+        scheduler._forward(ForwardInput(batch, None, mapping, output_mapping))
+    assert req.context_transition.resources and not table.has_occurrence_storage(slot)
+    with torch.cuda.stream(prepare):
+        # Unrelated preparation has no P1 table dependency or blanket wait.
+        unrelated = torch.arange(4096, dtype=torch.int32, device=device)
+        scheduler._wait_for_transition(req)
+        active = table.page_table[slot, :5].clone()
+        tokens = table.token_pool[slot, :6].clone()
+        inactive = req.inactive_cached_pages.clone()
+    prepare.synchronize()
+    assert active.tolist() == [10, 12, 14, 16, 18]
+    assert tokens.tolist() == [100, 102, 104, 106, 108, 999]
+    assert inactive.tolist() == [40, 11, 13, 15, 17]
+    assert unrelated[-1].item() == 4095
+    scheduler.transition_retirement.collect()
+    assert scheduler.transition_retirement.pending == []
+    assert req.context_transition.resources == ()

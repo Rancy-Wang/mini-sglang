@@ -225,9 +225,6 @@ class Engine:
             if self.graph_runner.can_use_cuda_graph(batch):
                 logits = self.graph_runner.replay(batch)
             else:
-                prepare = getattr(self.attn_backend, "prepare_for_forward", None)
-                if prepare is not None:
-                    prepare(batch)
                 logits = self.model.forward()
 
         for req in batch.reqs:
