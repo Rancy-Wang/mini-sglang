@@ -1,3 +1,4 @@
+import pytest
 import torch
 from minisgl.core import SamplingParams
 from minisgl.message import TokenizeMsg
@@ -185,3 +186,30 @@ def test_harmony_thinking_drop_removes_only_analysis_content_tokens():
     # Harmony protocol/channel delimiters are owner metadata, not reasoning content.
     assert "analysis" in active
     assert result.drop_event_positions.numel() == 1
+
+
+@pytest.mark.parametrize("context", ["ordinary", "drop", "reposition"])
+@pytest.mark.parametrize("ignore_eos", [False, True])
+@pytest.mark.parametrize("explicit_stop", [False, True])
+def test_harmony_ignore_eos_only_disables_automatic_terminal_stops(
+    context, ignore_eos, explicit_stop
+):
+    manager = TokenizeManager(GptOssTokenizerStub(), radix_drop_key_mode="delta-marker")
+    messages = [
+        {"role": "user", "content": "First question"},
+        {"role": "assistant", "content": "First answer"},
+        {"role": "user", "content": "Continue"},
+    ]
+    stop = ["CUSTOM_STOP"] if explicit_stop else None
+    result = manager.tokenize([TokenizeMsg(
+        uid=1, text=messages,
+        sampling_params=SamplingParams(max_tokens=256, ignore_eos=ignore_eos),
+        stop=stop,
+        drop_message={2: [0]} if context != "ordinary" else None,
+        reposition=[2] if context == "reposition" else None,
+    )])[0]
+    actual = result.stop_token_seqs or []
+    expected = [manager.tokenizer.encode("CUSTOM_STOP")] if explicit_stop else []
+    if not ignore_eos:
+        expected += [[token] for token in get_gpt_oss_terminal_stop_token_ids()]
+    assert actual == expected

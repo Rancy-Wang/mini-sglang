@@ -211,7 +211,9 @@ class TokenizeManager:
             radix_match_ids=records,
             prefix_keep_mask=torch.ones(max(len(input_ids) - 1, 0), dtype=torch.int32),
             prompt_tokens=len(input_ids),
-            stop_token_seqs=self._build_stop_token_seqs(msg.stop),
+            stop_token_seqs=self._build_stop_token_seqs(
+                msg.stop, ignore_eos=msg.sampling_params.ignore_eos
+            ),
             message_meta=message_meta,
             tokenize_invocations=self._tokenize_invocations,
             chat_template_invocations=self._chat_template_invocations,
@@ -1338,7 +1340,9 @@ class TokenizeManager:
             )
         return target_msg_id
 
-    def _build_stop_token_seqs(self, stop: List[str] | None) -> List[List[int]] | None:
+    def _build_stop_token_seqs(
+        self, stop: List[str] | None, *, ignore_eos: bool = False
+    ) -> List[List[int]] | None:
         dedup: set[tuple[int, ...]] = set()
         result: List[List[int]] = []
         for raw in stop or []:
@@ -1356,7 +1360,9 @@ class TokenizeManager:
                 continue
             dedup.add(key)
             result.append(token_ids)
-        if self.is_gpt_oss:
+        # Explicit stop strings remain effective; only automatic terminal stops
+        # follow ignore_eos, matching the scheduler EOS branch.
+        if self.is_gpt_oss and not ignore_eos:
             for token_id in get_gpt_oss_terminal_stop_token_ids():
                 key = (int(token_id),)
                 if key not in dedup:
@@ -1816,7 +1822,9 @@ class TokenizeManager:
                 layout.current_reposition if layout is not None else -1
             ),
             reposition_layout=layout,
-            stop_token_seqs=self._build_stop_token_seqs(msg.stop),
+            stop_token_seqs=self._build_stop_token_seqs(
+                msg.stop, ignore_eos=msg.sampling_params.ignore_eos
+            ),
             message_meta={
                 "raw_len_with_gen": len(full_with_gen_tensor),
                 "raw_len_no_gen": len(full_no_gen),

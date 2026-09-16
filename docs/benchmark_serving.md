@@ -16,7 +16,7 @@
 
 原始历史不裁剪、不覆盖。无权限的原始 HTTP 文件不属于已核实证据。加载时先固定种子打乱去重列表，再选择前 N 个；各并发度使用嵌套前缀。
 
-每轮发送新增源输入和累计历史；长度使用该轮源 `completion_tokens`。参数 `ignore_eos=true`，温度 0，不发送 stop 字符串。响应中的实际 reasoning/content/tool_calls 增量合并成 assistant 消息后才进入下一轮。源 assistant 输出仅用于保留来源，不用于后续请求。源 tool response 的名称由源 tool-call ID 恢复，所以不会依赖新生成的 tool-call ID。
+每轮发送新增源输入和累计历史；长度使用该轮源 `completion_tokens`。参数 `ignore_eos=true`，温度 0，不发送 stop 字符串。GPT-OSS 的自动 Harmony 终止 token 也必须遵守该开关：tokenizer 在普通和 Context 路径均不为 `ignore_eos=true` 追加自动 stop 序列；用户显式提供的 stop 字符串仍生效。修复前 GPU 对照发现开关两种取值都在 20 tokens 提前停止，不能仅凭 API 接收参数断言支持。响应中的实际 reasoning/content/tool_calls 增量合并成 assistant 消息后才进入下一轮。源 assistant 输出仅用于保留来源，不用于后续请求。源 tool response 的名称由源 tool-call ID 恢复，所以不会依赖新生成的 tool-call ID。
 
 这种 message 重建有损，未验证原始 sampled token 能全部往返；它模拟用户提交行为。`server_metrics.generated_tokens` 是长度检查的优先依据，因为隐藏的终止 token 不一定计入 API 的可见 completion_tokens；无服务扩展时退回 usage。任何少生成、多生成、缺 usage/DONE、流内 error、异常终止均不算成功。服务端可能按上下文余量裁剪长度，客户端将其视为失败，不主动缩小 max_tokens。
 
@@ -73,7 +73,7 @@ PYTHONPATH=python python scripts/run_serving_matrix.py --phase smoke --output-di
 
 smoke 单独占 GPU0,1，完成 EOS 对照、故意拒绝、合成 96K Drop/Reposition 增量历史和一个完整真实 source trajectory。`--smoke` 只是标签，不截断源 turn，不减少源输出长度。合成数据单独标记，不混入 full-context 数据集。
 
-用户审阅 walkthrough、数据和 smoke 后才能执行下列阶段：
+用户已在批准 `PLAN-CS-20260917-R4` 时授权：修复后完整 smoke 通过即可直接执行基线和正式矩阵，无需再次审批：
 
 ```bash
 PYTHONPATH=python python scripts/run_serving_matrix.py --phase baseline --output-dir /mnt/public/wangruoxi/local/serving_baseline_UNIQUE
