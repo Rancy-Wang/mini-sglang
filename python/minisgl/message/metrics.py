@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict
+import os
+from dataclasses import dataclass, field
+from typing import Any, Dict
 
 
 @dataclass(frozen=True)
@@ -28,6 +29,9 @@ class ServerMetrics:
     drop_skipped_tokens: int = 0
     prefill_compute_tokens: int | None = None
     decode_compute_tokens: int | None = None
+    # Scheduler-observed intervals, including hidden/special sampled tokens.
+    # None means recording was disabled; an empty tuple means one token.
+    token_intervals_ns: tuple[int, ...] | None = None
 
     def __post_init__(self) -> None:
         timestamps = (
@@ -43,6 +47,13 @@ class ServerMetrics:
             raise ValueError("completion_tokens must be between zero and generated_tokens.")
         if self.generated_tokens == 0:
             raise ValueError("A terminal generation must contain at least one sampled token.")
+        if self.token_intervals_ns is not None:
+            if len(self.token_intervals_ns) != self.generated_tokens - 1:
+                raise ValueError("Token interval count must equal generated_tokens - 1.")
+            if any(x < 0 for x in self.token_intervals_ns):
+                raise ValueError("Token intervals must be non-negative.")
+            if sum(self.token_intervals_ns) > self.request_finished_ns - self.first_token_generated_ns:
+                raise ValueError("Token intervals exceed request duration.")
         if any(value is not None and value < 0 for value in (
             self.prefill_compute_tokens, self.decode_compute_tokens
         )):
@@ -63,7 +74,7 @@ class ServerMetrics:
         if self.tokenize_invocations < 1 or any(value < 0 for value in counters[1:]):
             raise ValueError("Serving performance counters must be non-negative.")
 
-    def as_api_dict(self) -> Dict[str, int | None]:
+    def as_api_dict(self) -> Dict[str, Any]:
         return {
             "request_received_ns": self.request_received_ns,
             "first_token_generated_ns": self.first_token_generated_ns,
@@ -85,6 +96,8 @@ class ServerMetrics:
             "drop_skipped_tokens": self.drop_skipped_tokens,
             "prefill_compute_tokens": self.prefill_compute_tokens,
             "decode_compute_tokens": self.decode_compute_tokens,
+            "token_intervals_ns": (list(self.token_intervals_ns)
+                                   if self.token_intervals_ns is not None else None),
         }
 
 
@@ -112,6 +125,9 @@ class RequestMetricsState:
     drop_skipped_tokens: int = 0
     prefill_compute_tokens: int = 0
     decode_compute_tokens: int = 0
+    token_intervals_ns: list[int] | None = field(default_factory=lambda: (
+        [] if os.environ.get("MINISGL_RECORD_TOKEN_TIMINGS") == "1" else None
+    ))
 
     def observe_reposition(
         self,
@@ -135,6 +151,8 @@ class RequestMetricsState:
             raise ValueError("Generated token timestamps must be monotonic.")
         if self.first_token_generated_ns is None:
             self.first_token_generated_ns = generated_ns
+        if self.token_intervals_ns is not None and self.last_token_generated_ns is not None:
+            self.token_intervals_ns.append(generated_ns - self.last_token_generated_ns)
         self.last_token_generated_ns = generated_ns
         self.generated_tokens += 1
         if visible:
@@ -164,4 +182,6 @@ class RequestMetricsState:
             drop_skipped_tokens=self.drop_skipped_tokens,
             prefill_compute_tokens=self.prefill_compute_tokens,
             decode_compute_tokens=self.decode_compute_tokens,
+            token_intervals_ns=(tuple(self.token_intervals_ns)
+                                if self.token_intervals_ns is not None else None),
         )

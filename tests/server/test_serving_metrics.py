@@ -195,3 +195,37 @@ def test_nonstream_response_propagates_request_start_and_real_usage(monkeypatch)
         "completion_tokens": 4,
         "total_tokens": 16,
     }
+
+
+def test_optional_token_intervals_include_hidden_tokens_and_round_trip(monkeypatch):
+    monkeypatch.setenv('MINISGL_RECORD_TOKEN_TIMINGS', '1')
+    state = RequestMetricsState(request_received_ns=100, prompt_tokens=12, active_prompt_tokens=8)
+    for timestamp, visible in [(250, True), (400, False), (550, True)]:
+        state.observe_token(timestamp, visible=visible)
+    metrics = state.finish(550)
+    assert metrics.token_intervals_ns == (150, 150)
+    assert metrics.as_api_dict()['token_intervals_ns'] == [150, 150]
+    message = DetokenizeMsg(uid=1, next_token=42, finished=True, server_metrics=metrics)
+    restored = BaseTokenizerMsg.decoder(BaseTokenizerMsg.encoder(message))
+    assert restored.server_metrics == metrics
+
+
+def test_timing_disabled_and_single_token(monkeypatch):
+    monkeypatch.delenv('MINISGL_RECORD_TOKEN_TIMINGS', raising=False)
+    state = RequestMetricsState(request_received_ns=0, prompt_tokens=1, active_prompt_tokens=1)
+    state.observe_token(1, visible=True)
+    assert state.finish(1).token_intervals_ns is None
+    monkeypatch.setenv('MINISGL_RECORD_TOKEN_TIMINGS', '1')
+    state = RequestMetricsState(request_received_ns=0, prompt_tokens=1, active_prompt_tokens=1)
+    state.observe_token(1, visible=False)
+    assert state.finish(1).token_intervals_ns == ()
+
+
+def test_token_intervals_reject_inconsistent_terminal_metrics():
+    from dataclasses import replace
+    with pytest.raises(ValueError, match='count'):
+        replace(_metrics(), token_intervals_ns=(1,))
+    with pytest.raises(ValueError, match='non-negative'):
+        replace(_metrics(), token_intervals_ns=(1, -1, 2))
+    with pytest.raises(ValueError, match='duration'):
+        replace(_metrics(), token_intervals_ns=(1000, 1000, 1000))
