@@ -78,7 +78,7 @@ def test_completion_usage_counts_committed_tokens_not_overlap_lookahead(structur
     assert req.reported_completion_tokens == 0
     req.append_host(torch.tensor([21], dtype=torch.int32))
     assert req.reported_completion_tokens == 1
-    assert not req.can_decode  # Reporting must not change the stopping rule.
+    assert not req.can_decode  # No more GPU work; one host output is still pending.
     req.append_host(torch.tensor([22], dtype=torch.int32))
     assert req.reported_completion_tokens == 2
 
@@ -161,3 +161,79 @@ def test_match_stop_checks_only_a_bounded_suffix(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setattr(torch.Tensor, "tolist", record_tolist)
     assert req.match_stop() == (True, "long")
     assert observed_lengths == [2]
+
+
+def _host_scheduler():
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+
+    from minisgl.scheduler.decode import DecodeManager
+    from minisgl.scheduler.scheduler import Scheduler
+
+    scheduler = object.__new__(Scheduler)
+    scheduler.finished_reqs = set()
+    scheduler.request_metrics = {}
+    scheduler.eos_token_ids = {99}
+    scheduler.decode_manager = DecodeManager(page_size=1)
+    scheduler.cache_manager = SimpleNamespace(
+        lazy_free_region=nullcontext, cache_req=lambda *args, **kwargs: None,
+    )
+    scheduler._wait_for_transition = lambda req: None
+    freed, replies = [], []
+    scheduler._free_req_resources = freed.append
+    scheduler.send_result = replies.extend
+    return scheduler, freed, replies
+
+
+def _deliver(scheduler, req, token):
+    from types import SimpleNamespace
+
+    batch = SimpleNamespace(reqs=[req], is_prefill=False)
+    copy_done = SimpleNamespace(synchronize=lambda: None)
+    scheduler._process_last_data((SimpleNamespace(batch=batch),
+                                 (None, torch.tensor([token]), copy_done)))
+
+
+@pytest.mark.parametrize("structured", [False, True])
+@pytest.mark.parametrize("overlap", [False, True])
+@pytest.mark.parametrize("output_len", [1, 2, 5])
+def test_scheduler_drains_exact_length_before_freeing(structured, overlap, output_len):
+    req = _req(structured=structured, output_len=output_len)
+    req.sampling_params.ignore_eos = True
+    scheduler, freed, replies = _host_scheduler()
+    submitted = 0
+    for committed in range(output_len):
+        target = min(output_len, committed + (2 if overlap else 1))
+        while submitted < target:
+            req.complete_one()
+            scheduler.decode_manager.filter_reqs([req])
+            submitted += 1
+        # Even an EOS sample must be delivered when ignore_eos is enabled.
+        _deliver(scheduler, req, 99)
+        final = committed == output_len - 1
+        assert replies[-1].finished is final
+        assert replies[-1].finish_reason == ("length" if final else None)
+        assert freed == ([req] if final else [])
+    assert [reply.next_token for reply in replies] == [99] * output_len
+    assert replies[-1].completion_tokens == output_len
+    assert req.reported_completion_tokens == output_len
+    assert not scheduler.decode_manager.runnable
+
+
+@pytest.mark.parametrize("stop_kind", ["eos", "explicit"])
+def test_scheduler_early_stop_drains_stale_overlap_without_double_free(stop_kind):
+    req = _req(structured=True, output_len=5)
+    req.sampling_params.ignore_eos = stop_kind == "explicit"
+    if stop_kind == "explicit":
+        req.stop_token_seqs, req.stop = [[99]], ["custom stop"]
+    scheduler, freed, replies = _host_scheduler()
+    req.complete_one()
+    req.complete_one()
+    scheduler.decode_manager.filter_reqs([req])
+    _deliver(scheduler, req, 99)
+    _deliver(scheduler, req, 21)
+    assert len(replies) == 1
+    assert replies[0].finished and replies[0].finish_reason == "stop"
+    assert req.reported_completion_tokens == 1
+    assert freed == [req]
+    assert not scheduler.decode_manager.runnable

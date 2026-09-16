@@ -344,7 +344,11 @@ class Scheduler(SchedulerIOMixin):
                     next_token_tensor = next_tokens_cpu[i]
                     req.append_host(next_token_tensor.unsqueeze(0))
                     next_token = int(next_token_tensor.item())
-                    finished = not req.can_decode
+                    # Overlap may already have submitted the final forward while
+                    # this is still the penultimate token. Drain all requested
+                    # host outputs before releasing the request; can_decode only
+                    # controls whether another GPU forward may be scheduled.
+                    finished = req.reported_completion_tokens >= req.output_len
                     finish_reason = "length" if finished else None
                     matched_stop: str | None = None
                     if not req.sampling_params.ignore_eos and next_token in self.eos_token_ids:

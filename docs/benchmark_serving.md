@@ -94,6 +94,12 @@ python tests/benchmark/test_serving.py run --host http://example --port 8000 --p
 
 ## 验证
 
+Overlap 下计算进度可能领先于已交付 token。`Scheduler._process_last_data` 使用
+`Req.reported_completion_tokens >= Req.output_len` 判定长度结束；`Req.can_decode`
+继续控制新 GPU forward 的调度，EOS 和显式 stop 的提前结束规则保持不变。
+`tests/core/test_req_decode_metadata.py` 覆盖两种调度方式的精确输出长度和提前停止后
+在途结果的排空，避免最后一个 token 尚未交付便释放请求。
+
 ```bash
 python -m unittest discover -s tests/benchmark -p 'test_serving_unit.py'
 python -m unittest discover -s tests/scripts -p 'test_run_serving_matrix.py'
@@ -118,6 +124,6 @@ CPU 测试覆盖 source 对齐、增量历史、滚动窗口/当前位置、不�
 | 每轮实际 assistant 历史 | `tests/benchmark/test_serving.py:519`，`run` |
 | 可选 token 观察 | `python/minisgl/message/metrics.py:147`，`RequestMetricsState.observe_token` |
 | API 传递 ignore_eos | `python/minisgl/server/api_server.py:977`，chat handler 的 `SamplingParams` |
-| EOS 停止门槛 | `python/minisgl/scheduler/scheduler.py:350`，`Scheduler._process_last_data` |
-| forward 计数位置 | `python/minisgl/scheduler/scheduler.py:983`，`compute_tokens` |
+| 长度与 EOS 停止门槛 | `python/minisgl/scheduler/scheduler.py:349`，`Scheduler._process_last_data` |
+| forward 计数位置 | `python/minisgl/scheduler/scheduler.py:987`，`compute_tokens` |
 | 真正 EOS 对照及 96K smoke | `scripts/run_serving_matrix.py:160`，`protocol_smoke`；`:179`，`drop_smoke` |
