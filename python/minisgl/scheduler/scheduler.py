@@ -1014,7 +1014,18 @@ class Scheduler(SchedulerIOMixin):
                     for req in batch.padded_reqs
                 ]
             )
+        # Snapshot before complete_one() advances cached_len/device_len. Count
+        # real requests only; CUDA Graph padding and RoPE-only page transforms
+        # are not model-forward tokens belonging to a request.
+        compute_tokens = [(req.uid, req.extend_len) for req in batch.reqs]
         forward_output = self.engine.forward_batch(batch, sample_args)
+        for uid, count in compute_tokens:
+            metrics = self.request_metrics.get(uid)
+            if metrics is not None:
+                if batch.is_prefill:
+                    metrics.prefill_compute_tokens += count
+                else:
+                    metrics.decode_compute_tokens += count
         self.token_pool[output_mapping] = forward_output.next_tokens_gpu
         for index, req in enumerate(batch.reqs):
             if req.occurrence_external_storage and not isinstance(req, ChunkedReq):

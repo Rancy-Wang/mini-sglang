@@ -229,5 +229,147 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
             await runner.cleanup()
 
 
+
+
+class ComputeAccountingTests(unittest.TestCase):
+    def test_reuse_rope_and_first_token(self):
+        from throughput_compute import turn_compute, compute_summary
+        r = record()
+        r.update(prompt_len=100, requested_max_tokens=10, usage={"prompt_tokens": 100,
+            "completion_tokens": 3, "prompt_tokens_details": {
+                "cached_tokens": 40, "drop_skipped_tokens": 20, "repos_tokens": 10}},
+            reposition=[10], events=[{"data": {"server_metrics": {"generated_tokens": 3}}}])
+        r["compute"] = turn_compute(r, legacy=True)
+        self.assertEqual(r["compute"]["prefill_tokens"], 30)
+        self.assertEqual(r["compute"]["decode_lower"], 2)
+        self.assertEqual(r["compute"]["decode_upper"], 3)
+        summary = compute_summary([r, record(success=False)], 2)
+        self.assertEqual(summary["prefill_throughput"], 15)
+        self.assertIsNone(summary["decode_throughput"])
+        self.assertEqual(summary["all_throughput_lower"], 16)
+        self.assertEqual(summary["all_throughput_upper"], 16.5)
+        self.assertEqual(summary["completed_turns"], 1)
+        self.assertIsNone(turn_compute(r)["prefill_tokens"])
+
+    def test_mask_free_can_skip_uncached_dead_tokens(self):
+        from throughput_compute import mask_extend
+        # A dead suffix before the first surviving uncached query needs no forward.
+        self.assertEqual(mask_extend(100, 20, [[20, 40, 40]]), (60, "compact_mask_free"))
+        # A surviving query still needs those keys before their expiry: full mask.
+        self.assertEqual(mask_extend(100, 20, [[20, 40, 50]]), (80, "full_mask"))
+        # Warm compact cache: all dead keys are already inside the resident prefix.
+        self.assertEqual(mask_extend(100, 60, [[20, 40, 50]]), (40, "compact_mask_free"))
+
+    def test_explicit_counters_and_abort_override_usage(self):
+        from throughput_compute import turn_compute, compute_summary
+        r = record()
+        r["events"] = [{"data": {"server_metrics": dict(prefill_compute_tokens=8,
+            decode_compute_tokens=3, generated_tokens=3, context_stage_count=1)}}]
+        r["compute"] = turn_compute(r)
+        self.assertEqual(compute_summary([r], 2)["all_throughput"], 5.5)
+        r["strict_success"] = False
+        self.assertFalse(turn_compute(r)["included"])
+
+    def test_hole_audit_rejects_legacy_reconstruction(self):
+        from throughput_compute import LEGACY_HEAD, legacy_proof
+        status = dict(state="completed", head=LEGACY_HEAD, input_hash="h", audit=[
+            dict(passed=True, eviction=dict(drop_pages=0, hole_fills=0)) for _ in range(2)])
+        evidence = dict(engine_head=LEGACY_HEAD, manifest_sha256="h",
+                        profile="mask-paged-occurrence-page1-no-holes")
+        self.assertTrue(legacy_proof(status, evidence, "h"))
+        status["audit"][0]["eviction"]["drop_pages"] = 1
+        self.assertFalse(legacy_proof(status, evidence, "h"))
+
+    def test_forward_counts_snapshot_chunks_and_real_decode_rows(self):
+        # Execute the production scheduler method with a fake engine; no CUDA is
+        # needed to verify the accounting around complete_one's length mutation.
+        import runpy
+        repo = Path(__file__).resolve().parents[2]
+        State = runpy.run_path(str(repo / "python/minisgl/message/metrics.py"))["RequestMetricsState"]
+        tree = ast.parse((repo / "python/minisgl/scheduler/scheduler.py").read_text())
+        cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Scheduler")
+        method = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "_forward")
+        module = ast.Module(body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), method], type_ignores=[])
+        chunk_type = type("ChunkedReq", (), {})
+        env = dict(ChunkedReq=chunk_type)
+        exec(compile(ast.fix_missing_locations(module), "scheduler._forward", "exec"), env)
+        state = State(request_received_ns=0, prompt_tokens=50, active_prompt_tokens=40)
+        req = types.SimpleNamespace(uid=1, extend_len=7, occurrence_external_storage=False,
+                                    context_post_prefill_keep_mask=None)
+        def forward(batch, _):
+            req.extend_len = 1
+            return types.SimpleNamespace(next_tokens_gpu=[1])
+        obj = types.SimpleNamespace(token_pool={"in": [1]}, request_metrics={1: state},
+            engine=types.SimpleNamespace(forward_batch=forward),
+            decode_manager=types.SimpleNamespace(filter_reqs=lambda _: None))
+        batch = types.SimpleNamespace(reqs=[req], is_prefill=True)
+        class Input(tuple):
+            @property
+            def batch(self):
+                return self[0]
+        data = Input((batch, None, "in", "out"))
+        env["_forward"](obj, data)
+        req.extend_len = 4
+        env["_forward"](obj, data)
+        batch.is_prefill = False
+        env["_forward"](obj, data)
+        self.assertEqual(state.prefill_compute_tokens, 11)
+        self.assertEqual(state.decode_compute_tokens, 1)
+        state.observe_token(1, visible=True)
+        api = state.finish(2).as_api_dict()
+        self.assertEqual(api["prefill_compute_tokens"], 11)
+        self.assertEqual(api["decode_compute_tokens"], 1)
+
+    def test_mask_reconstruction_matches_production_reference(self):
+        from throughput_compute import mask_extend
+        try:
+            import torch
+            from minisgl.scheduler.prefill import _mask_free_context_reason_reference
+        except ImportError:
+            self.skipTest("Production planner comparison requires remote minisgl/torch runtime")
+        prompt = 200
+        spans = [[10, 30, 60], [75, 90, 110], [120, 145, 145]]
+        keep = torch.ones(prompt, dtype=torch.int32)
+        expiry = torch.full((prompt,), prompt+1, dtype=torch.int32)
+        for lo, hi, event in spans:
+            keep[lo:hi] = 0
+            expiry[lo:hi] = event
+        active = torch.nonzero(keep, as_tuple=False).flatten()
+        req = types.SimpleNamespace(full_input_ids=torch.arange(prompt), full_keep_mask=keep,
+                                    full_token_visible_until=expiry, raw_positions=active)
+        for matched in range(prompt):
+            cached = int(keep[:matched].sum())
+            reason = _mask_free_context_reason_reference(req, active_cached_len=cached, has_sliding_window=False)
+            expected = len(active)-cached if reason is None else prompt-matched
+            actual, _ = mask_extend(prompt, matched, spans)
+            self.assertEqual(actual, expected, msg=f"matched={matched}, reason={reason}")
+
+
+    def test_recalculation_preserves_raw_and_round_additivity(self):
+        import json
+        import tempfile
+        from throughput_compute import recalculate_file
+        rows = [record(1, 3), record(2, 5, filler=True)]
+        for r in rows:
+            r["events"] = [{"data": {"server_metrics": dict(prefill_compute_tokens=8,
+                decode_compute_tokens=2, generated_tokens=3)}}]
+        overall = bench.summarize(rows, 0, 5)
+        rounds = [bench.summarize(rows, 0, 3), bench.summarize(rows, 3, 5)]
+        doc = dict(manifest_sha256="h", turns=rows, overall=overall, rounds=rounds)
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "raw.json"
+            bench.write_json(source, doc)
+            raw = source.read_bytes()
+            report_path = recalculate_file(source)
+            report = json.loads(report_path.read_text())
+            self.assertEqual(source.read_bytes(), raw)
+            self.assertEqual(report["overall"]["compute_metrics"]["prefill_tokens"], 16)
+            self.assertEqual(sum(r["compute_metrics"]["prefill_tokens"] for r in report["rounds"]), 16)
+            self.assertEqual(report["overall"]["sglang_logical_metrics"], overall["metrics"])
+            self.assertEqual(report["overall"]["filler_compute"]["decode_tokens"], 2)
+            with self.assertRaises(ValueError):
+                recalculate_file(source, output_path=source)
+
+
 if __name__ == "__main__":
     unittest.main()

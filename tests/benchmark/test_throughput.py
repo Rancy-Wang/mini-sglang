@@ -21,6 +21,8 @@ from pathlib import Path
 
 import numpy as np
 
+from throughput_compute import compute_summary
+
 REFERENCE = "03ea13a54557de52da5faab2c422da07c3727407"
 DEFAULT_INPUT = "/share/public/wangruoxi/local/throughput_bcp/manifest.json"
 LIMIT = 128 * 1024
@@ -373,6 +375,9 @@ def summarize(records, start, end):
     strict = [dict(r, success=r["strict_success"]) for r in included]
     fillers = [r for r in included if r["filler"]]
     return dict(start_time=start, end_time=end, duration_s=end - start, metrics=metrics,
+                sglang_logical_metrics=metrics, compute_metrics=compute_summary(included, end - start),
+                first_pass_compute=compute_summary([r for r in included if not r["filler"]], end - start),
+                filler_compute=compute_summary(fillers, end - start),
                 output_lens=lens, strict_metrics=calculate_metrics(strict, end - start)[0],
                 first_pass_metrics=calculate_metrics([r for r in included if not r["filler"]], end - start)[0],
                 filler_metrics=calculate_metrics(fillers, end - start)[0], http_turns=len(included),
@@ -513,13 +518,15 @@ async def run(args):
                   completion_order=[x["instance"]["case_id"] for x in scheduler.completed],
                   cutoff=cutoff, excluded_at_cutoff=[r for r in records if r["end_time"] > cutoff],
                   turns=[r for r in records if r["end_time"] <= cutoff], journal=str(journal_path),
-                  notes=["input throughput is logical prompt tokens/wall time, not physical GPU prefill work",
+                  notes=["compute_metrics uses actual server forward tokens; missing telemetry is null",
+                         "metrics/sglang_logical_metrics are SGLang logical compatibility only",
                          "ITL and peak output count nonempty text SSE events, not exact token timestamps",
                          "round metrics assign whole HTTP turns to their completion window",
                          "compatibility metrics accept clean HTTP200 EOF; strict metrics require usage/DONE/normal finish"])
     write_json(result_path, result)
     write_json(root / "latest.json", {"result": str(result_path), "valid": result["valid"]})
-    print(json.dumps({"result": str(result_path), "valid": result["valid"], "metrics": overall["metrics"]}), flush=True)
+    print(json.dumps({"result": str(result_path), "valid": result["valid"], "compute_metrics": overall["compute_metrics"],
+                      "sglang_logical_metrics": overall["metrics"]}), flush=True)
     if not result["valid"]:
         raise SystemExit(2)
 

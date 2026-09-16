@@ -26,6 +26,8 @@ class ServerMetrics:
     reposition_d2h_bytes: int = 0
     reposition_ipc_tensor_bytes: int = 0
     drop_skipped_tokens: int = 0
+    prefill_compute_tokens: int | None = None
+    decode_compute_tokens: int | None = None
 
     def __post_init__(self) -> None:
         timestamps = (
@@ -41,6 +43,10 @@ class ServerMetrics:
             raise ValueError("completion_tokens must be between zero and generated_tokens.")
         if self.generated_tokens == 0:
             raise ValueError("A terminal generation must contain at least one sampled token.")
+        if any(value is not None and value < 0 for value in (
+            self.prefill_compute_tokens, self.decode_compute_tokens
+        )):
+            raise ValueError("Forward token counters must be non-negative.")
         counters = (
             self.tokenize_invocations,
             self.chat_template_invocations,
@@ -57,7 +63,7 @@ class ServerMetrics:
         if self.tokenize_invocations < 1 or any(value < 0 for value in counters[1:]):
             raise ValueError("Serving performance counters must be non-negative.")
 
-    def as_api_dict(self) -> Dict[str, int]:
+    def as_api_dict(self) -> Dict[str, int | None]:
         return {
             "request_received_ns": self.request_received_ns,
             "first_token_generated_ns": self.first_token_generated_ns,
@@ -77,6 +83,8 @@ class ServerMetrics:
             "reposition_d2h_bytes": self.reposition_d2h_bytes,
             "reposition_ipc_tensor_bytes": self.reposition_ipc_tensor_bytes,
             "drop_skipped_tokens": self.drop_skipped_tokens,
+            "prefill_compute_tokens": self.prefill_compute_tokens,
+            "decode_compute_tokens": self.decode_compute_tokens,
         }
 
 
@@ -102,6 +110,8 @@ class RequestMetricsState:
     reposition_d2h_bytes: int = 0
     reposition_ipc_tensor_bytes: int = 0
     drop_skipped_tokens: int = 0
+    prefill_compute_tokens: int = 0
+    decode_compute_tokens: int = 0
 
     def observe_reposition(
         self,
@@ -152,4 +162,6 @@ class RequestMetricsState:
             reposition_d2h_bytes=self.reposition_d2h_bytes,
             reposition_ipc_tensor_bytes=self.reposition_ipc_tensor_bytes,
             drop_skipped_tokens=self.drop_skipped_tokens,
+            prefill_compute_tokens=self.prefill_compute_tokens,
+            decode_compute_tokens=self.decode_compute_tokens,
         )

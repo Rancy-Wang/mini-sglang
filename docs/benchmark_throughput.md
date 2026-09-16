@@ -56,6 +56,63 @@ no_drop 不截断历史。prompt 达131072时标记正常的 `context_limit_reac
 不足C个的最后一组不形成轮次，但进入 overall。每轮指标在后台写入 `.round-N.json`，
 最终文件整合 `overall/rounds/tasks/turns/excluded_at_cutoff`；事件流水逐条持久化。
 
+## 实际模型前向吞吐（正式报告口径）
+
+正式结果读取 `compute_metrics`。`metrics`/`sglang_logical_metrics` 仅保留 SGLang
+兼容性，**不能再把其中 input_throughput 标成实际 Prefill throughput**。
+
+- Prefill token 数：逐次模型前向之前的真实请求 `Req.extend_len` 累计。
+  Chunked Prefill 每个 chunk 分别累计；不计 cache hit、drop skip、仅做 RoPE
+  变换的 Reposition token，也不计 CUDA Graph 的 padding 行。
+- Decode token 数：真实 Decode batch 的请求输入 token 累计。Prefill 已产生首个
+  输出 token，不再把它当一次 Decode。计数包含结束信号确认前已发起的 overlap
+  Decode；它与 `usage.completion_tokens`（采样输出数）不相同。
+- Prefill/Decode/All throughput 分别为上述两个计数及其和，除以同一个测量窗口的
+  墙钟时间。不是 GPU 忙碌时间吞吐，也不是 FLOPS。
+- 服务端 `server_metrics.prefill_compute_tokens/decode_compute_tokens` 返回直接
+  计数。采样位置在 `scheduler/scheduler.py::Scheduler._forward` 的
+  `engine.forward_batch` 周围；必须在 `Req.complete_one()` 改变长度前取样。
+  `message/metrics.py::RequestMetricsState.finish` 将计数带入最终 SSE/JSON。
+- 当前支持请求内的 mask / paged-occurrence 路径。缺计数或多次内部 staged 请求
+  没有完整聚合时返回 null，不能将缺失当作零或退回逻辑 prompt 数。
+
+成功请求采用 strict_success（完整 usage/DONE/正常结束且无错误）；失败和 Abort
+的部分工作排除，分母仍包含其占用时间。这是成功请求的实际前向 token 吞吐，不是
+包含所有失败计算、padding、RoPE 操作的 GPU 总工作量。SGLang 适配器的宽松成功
+行为仍在兼容列中保留。成功的补位 turn 正常计入，cutoff 未完成 turn 排除。
+
+### 旧实验离线重算
+
+入口 `tests/benchmark/throughput_compute.py`，输出 `.compute.json`，保留原始 JSON
+及 SHA256，记录 engine_head 和 analysis_head。整体、逐轮、累计、首遍及补位均重算。
+
+```bash
+# 仅 CPU 分词；PYTHONPATH 指向当时运行的引擎 checkout。
+PYTHONPATH=/path/to/old-engine/python python tests/benchmark/throughput_compute.py evidence \
+  --manifest /path/manifest.json --engine-repo /path/to/old-engine \
+  --launch /path/server/launch.json --output /path/compute-evidence.json
+python tests/benchmark/throughput_compute.py matrix \
+  --root /path/matrix-v1 --evidence /path/compute-evidence.json
+```
+
+旧版本 f089bf6 的 mask、paged-occurrence、page-size=1 且终场两 rank 审计确认没有
+Drop eviction/孔洞恢复时，可以还原 Prefill：三类 usage 互斥，先求
+`M = cached_tokens + drop_skipped_tokens + repos_tokens`。
+普通/full-mask/paged-occurrence 的 Extend 总数为 `prompt_tokens - M`。
+mask-free 路径通过原轨迹生产 tokenizer 的 Drop 边界重新判断 planner 分支，另外扣除
+尚未命中但已不必计算的死 token。不能对任意系统或存在孔洞恢复的运行机械套用相减。
+证据不满足时输出 unknown/null；审计和元数据不能证明未记录的工作量。
+
+旧服务没记录 overlap 前向次数。若成功输出 G 个 token，已确认 Decode 至少 G-1，
+至多 G（多一次尚未确认终止的前向）；达到请求输出上限时没有额外预算，区间收窄。
+因此旧报告给精确 Prefill、Decode/All 的上下界，缺精确值的字段为 null。
+`generated_output_throughput` 另存 usage 输出吞吐，不冒充实际 Decode 次数。
+不重复推理、不通过估计填造精确值。逐轮按完成窗口归属整条 HTTP turn，跨轮的 GPU
+计算时间无法从旧终场信息重新切分，因此它是完成归属的轮次吞吐，不是 GPU 时间切片。
+
+正在运行的旧矩阵维持原引擎 HEAD，使用独立分析 checkout 重算；不得 pull 改变其
+工作树或重跑完成项。新启动的矩阵自动记录前向计数并生成 compute 报告。
+
 ## SGLang 指标兼容性与 Abort
 
 对照版本：SGLang `03ea13a54557de52da5faab2c422da07c3727407`，
@@ -64,9 +121,9 @@ no_drop 不截断历史。prompt 达131072时标记正常的 `context_limit_reac
 latency、TTFT、ITL，加整段持续时间及 tokenizer。输出为 BenchmarkMetrics 全部数值字段
 与逐请求 output_lens。单元测试提取该版本函数，随机输入逐字段比对。
 
-- Prefill = input_throughput = 成功请求的逻辑 prompt token 总数 / 墙钟秒数。
-- Decode = output_throughput = 成功请求 usage.completion_tokens 总数 / 墙钟秒数。
-- All = total_throughput = 前两者之和。
+- 逻辑输入 input_throughput = 成功请求的逻辑 prompt token 总数 / 墙钟秒数。
+- 输出 output_throughput = 成功请求 usage.completion_tokens 总数 / 墙钟秒数。
+- 逻辑总量 total_throughput = 前两者之和。
 - output_throughput_retokenized 使用生成文本重新 tokenize；同时提供对应 All。
 - TPOT = (latency - TTFT)/(output_len-1)，output_len<=1不进入 TPOT 分布。
 - TTFT/TPOT/ITL/E2E 提供 mean/median/std/p90/p95/p99，ITL还含max。

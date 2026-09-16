@@ -20,6 +20,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "tests/benchmark"))
 from test_throughput import DEFAULT_INPUT, digest, write_json
+from throughput_compute import recalculate_file
 
 
 def install_observer():
@@ -228,6 +229,8 @@ async def group_run(args, group, gpus, port):
                     raise RuntimeError(f"Cell {number} failed: {cell_root}")
                 status["audit"] = await audit(session, url, root, "final-" + label, args.model)
                 status["state"] = "completed"
+                write_json(status_path, status)
+                status["compute_result"] = str(recalculate_file(status["result"], status_path))
                 write_json(status_path, status)
                 print(json.dumps(status), flush=True)
     finally:
