@@ -152,7 +152,7 @@ def test_real_compaction_fence_with_external_storage_and_independent_preparation
             occurrence_birth_pages=torch.arange(10, 19, dtype=torch.int32, device=device),
             occurrence_birth_owned_mask=(raw >= 3) | (raw == 1),
             retry_transformed_mask=torch.tensor([False, True, False]),
-            inactive_cached_positions=torch.tensor([99], dtype=torch.int32),
+            inactive_cached_positions=torch.tensor([99], dtype=torch.int64),
             inactive_cached_pages=torch.tensor([40], dtype=torch.int32, device=device),
         )
         req.context_compact_plan = plan = CompactPlan.build(req, 9)
