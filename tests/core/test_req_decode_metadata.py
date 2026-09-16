@@ -31,6 +31,8 @@ def _req(*, structured: bool, output_len: int = 2) -> Req:
         radix_match_ids=keys.clone(),
         initial_full_match_indices=torch.empty(0, dtype=torch.int32),
         initial_active_cached_len=0,
+        usage_cached_tokens=0,
+        usage_repos_tokens=0,
         true_seq_len=3,
         table_idx=0,
         cached_len=0,
