@@ -48,6 +48,7 @@ def launch(args, mode, gpus, port, root):
         raise RuntimeError(f'Selected GPUs occupied: {usage}; no automatic process killing')
     env = dict(os.environ, CUDA_VISIBLE_DEVICES=gpus, PYTHONPATH=str(REPO / 'python'),
                HF_HUB_OFFLINE='1', TRANSFORMERS_OFFLINE='1', MINISGL_RECORD_TOKEN_TIMINGS='1',
+               MINISGL_PRESERVE_HARMONY_HISTORY='1',
                MINISGL_THROUGHPUT_OBSERVER=str(root))
     for key in ('TORCH_EXTENSIONS_DIR', 'TRITON_CACHE_DIR', 'TVM_FFI_CACHE_DIR', 'CUDA_CACHE_PATH', 'TMPDIR'):
         path = root.parent / 'runtime' / key.lower()
@@ -76,7 +77,8 @@ def launch(args, mode, gpus, port, root):
                                  stdin=subprocess.DEVNULL, start_new_session=True)
     bench.write_json(root / 'launch.json', dict(argv=argv, pid=child.pid, gpus=gpus, head=args.head,
                      env={k: v for k, v in env.items() if k.endswith('_DIR') or k in
-                          ('CUDA_VISIBLE_DEVICES', 'MINISGL_RECORD_TOKEN_TIMINGS', 'CXX', 'CC')}))
+                          ('CUDA_VISIBLE_DEVICES', 'MINISGL_RECORD_TOKEN_TIMINGS',
+                           'MINISGL_PRESERVE_HARMONY_HISTORY', 'CXX', 'CC')}))
     return child
 
 
@@ -101,7 +103,7 @@ def cell_args(args, mode, port, output, c, n, *, baseline=False, baseline_path=N
               '--tokenizer', args.model, '--protocol', 'minisgl-harmony',
               '--requests-path', args.requests_path, '--output-dir', str(output),
               '--concurrency', str(c), '--num-tasks', str(n), '--seed', str(args.seed),
-              '--system-tag', f'{mode}:head={args.head}:pages={args.pages or "auto"}:graph32:TP2',
+              '--system-tag', f'{mode}:head={args.head}:pages={args.pages or "auto"}:graph32:TP2:retain-harmony',
               '--drop' if mode == 'drop-aware' else '--no-drop']
     if baseline:
         values.append('--baseline')

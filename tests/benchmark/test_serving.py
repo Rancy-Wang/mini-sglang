@@ -217,7 +217,8 @@ class TemplateAdapter:
             if self.tokenizer is None:
                 raise ValueError('Harmony Drop requires --tokenizer')
             from minisgl.tokenizer.tokenize import TokenizeManager
-            self.manager = TokenizeManager(self.tokenizer, radix_drop_key_mode='delta-marker')
+            self.manager = TokenizeManager(self.tokenizer, radix_drop_key_mode='delta-marker',
+                                           preserve_harmony_history=True)
 
     def render(self, messages, tools):
         if self.manager:

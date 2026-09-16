@@ -8,6 +8,7 @@ from datetime import date
 from typing import Any, Callable, Dict, List
 
 import torch
+from minisgl.env import ENV
 from minisgl.kernel.radix_reposition import (
     RadixRepositionLayout,
     compile_radix_reposition_layout,
@@ -123,6 +124,7 @@ class TokenizeManager:
         tokenizer: PreTrainedTokenizerBase,
         *,
         radix_drop_key_mode: str = "delta-marker",
+        preserve_harmony_history: bool | None = None,
     ) -> None:
         if radix_drop_key_mode not in {"bitmask", "symbol", "delta-marker"}:
             raise ValueError(f"Unsupported radix drop key mode: {radix_drop_key_mode}")
@@ -144,7 +146,11 @@ class TokenizeManager:
         )
         self._reasoning_effort: str | None = None
         self._harmony_encoding = None
-        self._preserve_harmony_thinking = False
+        self._retain_harmony_history = (
+            bool(ENV.PRESERVE_HARMONY_HISTORY)
+            if preserve_harmony_history is None else preserve_harmony_history
+        )
+        self._preserve_harmony_thinking = self._retain_harmony_history
         self._harmony_thinking_ranges: dict[int, List[tuple[int, int]]] = {}
         self._chat_template_override: str | None = None
         self._chat_template_kwargs: dict[str, Any] = {}
@@ -1427,7 +1433,7 @@ class TokenizeManager:
         self._tokenize_invocations = 0
         self._chat_template_invocations = 0
         self._reasoning_effort = msg.reasoning_effort
-        self._preserve_harmony_thinking = False
+        self._preserve_harmony_thinking = self._retain_harmony_history
         self._harmony_thinking_ranges = {}
         self._chat_template_override = None
         self._chat_template_kwargs = {}

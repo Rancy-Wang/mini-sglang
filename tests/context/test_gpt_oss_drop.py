@@ -30,6 +30,35 @@ class CountingHarmonyEncoding:
         return self.inner.render_conversation_for_completion(*args, **kwargs)
 
 
+@pytest.mark.parametrize("preserve", [False, True])
+@pytest.mark.parametrize("mode", ["ordinary", "drop", "reposition"])
+def test_opt_in_harmony_history_survives_later_final(preserve, mode, monkeypatch):
+    from minisgl.env import ENV
+
+    monkeypatch.setattr(ENV.PRESERVE_HARMONY_HISTORY, "value", preserve)
+    manager = TokenizeManager(GptOssTokenizerStub())
+    history = [
+        {"role": "user", "content": "Question"},
+        {"role": "assistant", "reasoning_content": "EARLY_REASONING_KEEP", "content": ""},
+        {"role": "tool", "name": "search", "content": "First result"},
+    ]
+    before, _, boundary = manager._render_harmony_message_drop(history, enable_thinking=None)
+    history += [
+        {"role": "assistant", "content": "Later final response"},
+        {"role": "tool", "name": "search", "content": "Next result"},
+    ]
+    kwargs = {} if mode == "ordinary" else {"drop_message": {4: [2]}}
+    if mode == "reposition":
+        kwargs["reposition"] = [4]
+    # Exercise per-request reset as well as the direct template renderer.
+    manager.tokenize([TokenizeMsg(uid=101, text=history,
+        sampling_params=SamplingParams(max_tokens=8, ignore_eos=True), **kwargs)])
+    after, _, _ = manager._render_harmony_message_drop(history, enable_thinking=None)
+    text = manager._get_harmony_encoding().decode(after)
+    assert ("EARLY_REASONING_KEEP" in text) is preserve
+    assert (before[:boundary] == after[:boundary]) is preserve
+
+
 def test_harmony_analysis_boundary_is_not_a_terminal_generation_stop():
     encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
     message_end = "".join(("<", "|", "end", "|", ">"))

@@ -22,6 +22,11 @@
 
 ## Drop 与位置
 
+实验服务显式设置 `MINISGL_PRESERVE_HARMONY_HISTORY=1`，客户端 Harmony 适配器使用相同
+保留策略。默认服务行为不变；该开关防止后续 final 回复触发模板自动删除较早 reasoning，
+从而改变已提交历史的 token 边界。普通与 Drop 两套实验均启用并记录此设置；独立连接
+minisgl-harmony 服务时也必须启用。它不保证有损 message 重建能还原全部 sampled tokens。
+
 `RollingState.extend` 在实际累积的历史上，只追加事件。按 task 独立数 tool response：TR13 Drop TR1，保留最新 12 条。Drop 完整工具结果，不删除 assistant reasoning/tool call。
 
 `TemplateAdapter.render` 的 minisgl-harmony 适配器调用生产模板的完整渲染和 message owner 映射；不是逐消息独立 tokenize 后相加。每次核对旧消息哈希和旧边界，防止改写已提交历史。Drop 后幸存 token 的位置不重排；只有当前绝对位置达到 98,304，且存在新空洞时，在合法消息末尾追加 Reposition。Reposition 后以压缩位置继续计数。generation suffix 没有公开 message owner，不凭空创建事件。后续请求携带全部旧事件及新增事件。
@@ -117,13 +122,13 @@ CPU 测试覆盖 source 对齐、增量历史、滚动窗口/当前位置、不�
 | 源 history 与新输入切片 | `tests/benchmark/test_serving.py:52`，`compile_case` |
 | append-only Drop/位置检查 | `tests/benchmark/test_serving.py:167`，`RollingState` |
 | 完整模板适配 | `tests/benchmark/test_serving.py:210`，`TemplateAdapter` |
-| 流、长度及 TBT | `tests/benchmark/test_serving.py:273`，`request` |
-| 不同 task 的补齐和 cutoff | `tests/benchmark/test_serving.py:347`，`Scheduler` |
-| 成功分子与计算计数 | `tests/benchmark/test_serving.py:428`，`summary` |
-| slowdown 匹配与阈值 | `tests/benchmark/test_serving.py:473`，`slo_report` |
-| 每轮实际 assistant 历史 | `tests/benchmark/test_serving.py:519`，`run` |
+| 流、长度及 TBT | `tests/benchmark/test_serving.py:274`，`request` |
+| 不同 task 的补齐和 cutoff | `tests/benchmark/test_serving.py:348`，`Scheduler` |
+| 成功分子与计算计数 | `tests/benchmark/test_serving.py:429`，`summary` |
+| slowdown 匹配与阈值 | `tests/benchmark/test_serving.py:474`，`slo_report` |
+| 每轮实际 assistant 历史 | `tests/benchmark/test_serving.py:520`，`run` |
 | 可选 token 观察 | `python/minisgl/message/metrics.py:147`，`RequestMetricsState.observe_token` |
 | API 传递 ignore_eos | `python/minisgl/server/api_server.py:977`，chat handler 的 `SamplingParams` |
 | 长度与 EOS 停止门槛 | `python/minisgl/scheduler/scheduler.py:349`，`Scheduler._process_last_data` |
 | forward 计数位置 | `python/minisgl/scheduler/scheduler.py:987`，`compute_tokens` |
-| 真正 EOS 对照及 96K smoke | `scripts/run_serving_matrix.py:160`，`protocol_smoke`；`:179`，`drop_smoke` |
+| 真正 EOS 对照及 96K smoke | `scripts/run_serving_matrix.py:162`，`protocol_smoke`；`:181`，`drop_smoke` |
