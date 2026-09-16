@@ -188,8 +188,9 @@ async def drop_smoke(session, url, args, root):
     first = await bench.request(session, url + '/v1/chat/completions', dict(
         model=args.model, messages=history, tools=tools, max_tokens=32, ignore_eos=True,
         stream=True, stream_options={'include_usage': True}, temperature=0))
+    bench.write_json(root / 'drop_first.json', first)
     if not first['success']:
-        raise RuntimeError('First drop smoke generation failed')
+        raise RuntimeError(f"First drop smoke generation failed: {first['status']}: {first['error']}")
     history.append(first['assistant'])
     history.extend({'role': 'tool', 'name': 'search', 'tool_call_id': f'smoke_{i}',
                     'content': ' smoke' * 7100} for i in range(14))
@@ -201,6 +202,9 @@ async def drop_smoke(session, url, args, root):
         model=args.model, messages=history, tools=tools, max_tokens=32, ignore_eos=True,
         stream=True, stream_options={'include_usage': True}, temperature=0,
         drop_message=schedule['drop_message'], reposition=schedule['reposition']))
+    bench.write_json(root / 'drop_second.json', second)
+    if not second['success']:
+        raise RuntimeError(f"Second drop smoke generation failed: {second['status']}: {second['error']}")
     # A third query verifies that historical events survive verbatim while new ones append.
     previous = bench.copy.deepcopy(schedule)
     history.append(second['assistant'])
@@ -211,6 +215,7 @@ async def drop_smoke(session, url, args, root):
         model=args.model, messages=history, tools=tools, max_tokens=32, ignore_eos=True,
         stream=True, stream_options={'include_usage': True}, temperature=0,
         drop_message=schedule['drop_message'], reposition=schedule['reposition']))
+    bench.write_json(root / 'drop_third.json', third)
     details = (second['usage'] or {}).get('prompt_tokens_details') or {}
     passed = (second['success'] and third['success'] and second['tbt_complete'] and third['tbt_complete']
               and details.get('drop_skipped_tokens', 0) > 0
