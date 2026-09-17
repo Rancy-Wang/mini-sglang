@@ -38,6 +38,22 @@ def validate_resources(groups):
         ports.add(port)
 
 
+def selected_resources(args):
+    if args.phase == 'experiment':
+        if not 1 <= args.concurrency <= 32 or args.rounds < 1:
+            raise ValueError('Experiment requires concurrency 1..32 and positive rounds')
+        if args.concurrency * args.rounds > 160:
+            raise ValueError('Experiment task count exceeds 160')
+        gpus = args.drop_aware_gpus if args.mode == 'drop-aware' else args.ordinary_gpus
+        groups = [(args.mode, gpus, args.port)]
+    else:
+        groups = [('drop-aware', args.drop_aware_gpus, args.port)]
+        if args.phase != 'smoke':
+            groups.append(('ordinary', args.ordinary_gpus, args.port + 1))
+    validate_resources(groups)
+    return groups
+
+
 def launch(args, mode, gpus, port, root):
     with socket.socket() as sock:
         sock.bind(('127.0.0.1', port))
@@ -245,10 +261,10 @@ async def run(args):
     if root == REPO or REPO in root.parents:
         raise ValueError('Outputs must be outside repository')
     root.mkdir(parents=True, exist_ok=True)
-    modes = [('drop-aware', args.drop_aware_gpus, args.port)]
-    if args.phase != 'smoke':
-        modes.append(('ordinary', args.ordinary_gpus, args.port + 1))
-    validate_resources(modes)
+    modes = selected_resources(args)
+    if args.phase == 'experiment':
+        # Reject unavailable distinct tasks before reserving GPU resources.
+        bench.load_cases(args.requests_path, args.concurrency * args.rounds, args.seed)
     children, resources = [], {}
     state = dict(phase=args.phase, head=args.head, state='starting', hardware='A800 TP2',
                  input_hash=args.input_hash, started_at=time.time(), pairs=[])
@@ -301,6 +317,23 @@ async def run(args):
                 state['trajectory_result'] = str(await cell(args, mode, port, root / mode / 'trajectory-smoke',
                                                             1, 1, case_id=shortest['case_id']))
                 await clear(mode, 'after-smoke')
+            elif args.phase == 'experiment':
+                mode, _, port = modes[0]
+                _, url, _ = resources[mode]
+                await protocol_smoke(session, url, args, root)
+                if mode == 'drop-aware':
+                    await clear(mode, 'before-drop-smoke')
+                    await drop_smoke(session, url, args, root)
+                await clear(mode, 'before-experiment')
+                c, n = args.concurrency, args.concurrency * args.rounds
+                state.update(concurrency=c, tasks=n, mode=mode, preflight_passed=True)
+                bench.write_json(root / 'matrix_status.json', state)
+                result = await cell(args, mode, port, root / mode / f'C{c}', c, n)
+                if not json.loads(result.read_text())['valid']:
+                    raise RuntimeError(f'Experiment did not complete all tasks: {result}')
+                state['pairs'].append(dict(concurrency=c, tasks=n, results=[str(result)]))
+                bench.write_json(root / 'matrix_status.json', state)
+                await clear(mode, 'after-experiment')
             elif args.phase == 'baseline':
                 async def baseline(mode):
                     port, _, _ = resources[mode]
@@ -342,7 +375,10 @@ def main():
         launch_server()
         return
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--phase', required=True, choices=['smoke', 'baseline', 'matrix'])
+    p.add_argument('--phase', required=True, choices=['smoke', 'baseline', 'matrix', 'experiment'])
+    p.add_argument('--mode', choices=['drop-aware', 'ordinary'], default='drop-aware')
+    p.add_argument('--concurrency', type=int, default=32)
+    p.add_argument('--rounds', type=int, default=3)
     p.add_argument('--model', default='/mnt/public/wangruoxi/models/gpt-oss-120b')
     p.add_argument('--requests-path', default=bench.DEFAULT_INPUT)
     p.add_argument('--output-dir', required=True)

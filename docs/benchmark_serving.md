@@ -89,6 +89,15 @@ PYTHONPATH=python python scripts/run_serving_matrix.py --phase matrix --baseline
 
 各阶段独立调用，没有 smoke 自动进入 baseline/matrix 的路径。恢复只跳过代码版本、数据哈希、模式、模型、容量参数、seed、基线哈希相同且结果文件哈希/valid 均通过的单元；失败的单元重新从头测量，不拼接跨进程时钟。
 
+只有两张卡时，可用 `--phase experiment --mode drop-aware --concurrency 32 --rounds 3`
+启动单组 96-task 实验；结束并释放服务后，再以 `--mode ordinary --ordinary-gpus 0,1`
+运行另一组。两次指定不同的 `--output-dir`，以及相同的 `--pages`、模型和数据。
+`--model` 和 `--requests-path` 应显式使用当前主机的实际路径。此入口在计时前完成
+ignore_eos/TBT 检查、Drop 组的 96K Reposition 检查及冷缓存审计，计时后再审计并停止
+自建服务。并发限 1..32，任务数为 concurrency × rounds，仍要求足够的不同任务。
+此入口不自动运行 C1 baseline，结果中的 SLO 标为 unavailable；其他主机或代码版本的
+基线只能作为单独标注的参考分析，不能伪装为配置签名一致的本机 SLO。
+
 直接使用其他服务：
 
 ```bash
@@ -131,4 +140,4 @@ CPU 测试覆盖 source 对齐、增量历史、滚动窗口/当前位置、不�
 | API 传递 ignore_eos | `python/minisgl/server/api_server.py:977`，chat handler 的 `SamplingParams` |
 | 长度与 EOS 停止门槛 | `python/minisgl/scheduler/scheduler.py:349`，`Scheduler._process_last_data` |
 | forward 计数位置 | `python/minisgl/scheduler/scheduler.py:987`，`compute_tokens` |
-| 真正 EOS 对照及 96K smoke | `scripts/run_serving_matrix.py:162`，`protocol_smoke`；`:181`，`drop_smoke` |
+| 真正 EOS 对照及 96K smoke | `scripts/run_serving_matrix.py:178`，`protocol_smoke`；`:197`，`drop_smoke` |

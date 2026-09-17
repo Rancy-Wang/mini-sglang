@@ -3,6 +3,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'scripts'))
 import run_serving_matrix as runner
@@ -34,6 +35,23 @@ class MatrixTests(unittest.TestCase):
             result.write_text(json.dumps({'valid': False}))
             with self.assertRaises(ValueError):
                 runner.reusable(status, identity)
+
+    def test_single_experiment_uses_only_selected_gpu_pair(self):
+        args = SimpleNamespace(phase='experiment', mode='drop-aware', concurrency=32,
+                               rounds=3, drop_aware_gpus='0,1', ordinary_gpus='0,1', port=31080)
+        self.assertEqual(runner.selected_resources(args), [('drop-aware', '0,1', 31080)])
+        args.mode = 'ordinary'
+        self.assertEqual(runner.selected_resources(args), [('ordinary', '0,1', 31080)])
+        args.phase = 'matrix'
+        with self.assertRaises(ValueError):
+            runner.selected_resources(args)
+
+    def test_experiment_rejects_unsupported_capacity_and_task_counts(self):
+        for c, rounds in [(0, 3), (33, 3), (32, 0), (32, 6)]:
+            args = SimpleNamespace(phase='experiment', mode='drop-aware', concurrency=c,
+                                   rounds=rounds, drop_aware_gpus='0,1', port=31080)
+            with self.assertRaises(ValueError):
+                runner.selected_resources(args)
 
 
 if __name__ == '__main__':
