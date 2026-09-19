@@ -176,6 +176,33 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(active)
         self.assertIsNotNone(scheduler.cutoff)
 
+    async def test_no_filler_finishes_each_trajectory_before_reusing_slot(self):
+        for concurrency in (1, 2, 4, 8):
+            cases = [dict(case_id=str(i), trial=0) for i in range(3 * concurrency)]
+            slots, turns, ended = {}, {}, set()
+            async def execute(case, instance):
+                key, slot = case['case_id'], instance['slot']
+                self.assertNotIn(slot, slots)
+                self.assertNotIn(key, turns)
+                self.assertFalse(instance['filler'])
+                slots[slot] = key
+                turns[key] = []
+                for turn in range(3):
+                    turns[key].append(turn)
+                    await asyncio.sleep(.002 if key == '0' else 0)
+                    self.assertEqual(slots[slot], key)
+                ended.add(key)
+                del slots[slot]
+                return 'http_error' if key == '1' else 'all_turns_completed'
+            scheduler = await s.Scheduler(cases, concurrency, execute, filler=False).run()
+            self.assertEqual(len(scheduler.instances), 3 * concurrency)
+            self.assertEqual(ended, {case['case_id'] for case in cases})
+            self.assertTrue(all(value == [0, 1, 2] for value in turns.values()))
+            self.assertEqual(len(scheduler.round_ends), 3)
+            self.assertFalse(slots)
+            self.assertTrue(all(x['status'] != 'cutoff_cancelled' for x in scheduler.instances))
+            self.assertEqual(sum(x['status'] == 'http_error' for x in scheduler.instances), 1)
+
     async def test_failure_is_terminal_and_duplicate_ids_rejected(self):
         cases = [dict(case_id='a', trial=0)]
         async def execute(*args):

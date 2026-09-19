@@ -346,7 +346,7 @@ async def request(session, url, payload):
 
 
 class Scheduler:
-    def __init__(self, cases, concurrency, execute, emit=lambda e: None, baseline=False):
+    def __init__(self, cases, concurrency, execute, emit=lambda e: None, baseline=False, filler=True):
         if not 1 <= concurrency <= len(cases) <= 160:
             raise ValueError('Require 1 <= concurrency <= task count <= 160')
         if len({x['case_id'] for x in cases}) != len(cases):
@@ -359,13 +359,14 @@ class Scheduler:
         self.cutoff = None
         self.cursor = 0
         self.baseline = baseline
+        self.filler = filler
 
     def choose(self):
         if self.cutoff is not None:
             return None
         if self.pending:
             return self.pending.popleft(), False
-        if self.baseline:
+        if self.baseline or not self.filler:
             return None
         for _ in self.completed:
             case = self.completed[self.cursor % len(self.completed)]['case']
@@ -593,7 +594,7 @@ async def run(args, before_task=None):
                 # Never substitute the source assistant output.
                 history.append(copy.deepcopy(r['assistant']))
             return 'all_turns_completed'
-        scheduler = Scheduler(cases, args.concurrency, execute, emit, baseline=args.baseline)
+        scheduler = Scheduler(cases, args.concurrency, execute, emit, baseline=args.baseline, filler=args.filler)
         try:
             await scheduler.run()
         finally:
@@ -678,6 +679,7 @@ def parser():
     runp.add_argument('--baseline-path')
     runp.add_argument('--system-tag', default='unspecified')
     runp.add_argument('--baseline', action='store_true')
+    runp.add_argument('--filler', action=argparse.BooleanOptionalAction, default=True)
     runp.add_argument('--smoke', action='store_true', help='Label only; never truncates turns or output lengths')
     report = sub.add_parser('report')
     report.add_argument('result')
