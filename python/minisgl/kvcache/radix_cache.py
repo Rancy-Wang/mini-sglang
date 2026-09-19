@@ -390,12 +390,13 @@ class RadixPrefixCache(BasePrefixCache):
         self._candidates.pop(node.uuid, None)
         if node.ref_count:
             return
-        if node.is_leaf():
+        # A proven Drop edge keeps its priority even after becoming a leaf.
+        if node.drop_eligible and node.page_length:
+            kind, heap = 1, self._drop_candidates
+        elif node.is_leaf():
             if not node.page_length and node.path_ref_count:
                 return
             kind, heap = 0, self._leaf_candidates
-        elif node.drop_eligible and node.page_length:
-            kind, heap = 1, self._drop_candidates
         else:
             return
         entry = (node.timestamp, node.uuid, node._candidate_version, node)
@@ -682,7 +683,7 @@ class RadixPrefixCache(BasePrefixCache):
         freed, count = [], 0
         while count < size:
             chosen = None
-            for heap in (self._leaf_candidates, self._drop_candidates):
+            for heap in (self._drop_candidates, self._leaf_candidates):
                 while heap:
                     entry = heapq.heappop(heap)
                     node = entry[-1]

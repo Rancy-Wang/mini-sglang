@@ -68,7 +68,7 @@ def test_locked_middle_evict_fill_and_unlock_after_split(shared):
     assert c.size_info.total_size == 0
 
 
-def test_leaf_cascade_has_priority_over_dropped_middle():
+def test_dropped_middle_has_priority_over_leaf_cascade():
     c = cache()
     _, handle = insert(c)
     c.configure_drop_lock(handle, torch.tensor([True, False, False, True, True]))
@@ -76,11 +76,74 @@ def test_leaf_cascade_has_priority_over_dropped_middle():
     cold = torch.tensor([[0, 91, -1, 0], [0, 92, -1, 1]], dtype=torch.int32)
     c.insert_prefix(cold, torch.tensor([8, 9], dtype=torch.int32))
     c.match_prefix(cold[:1])  # Split, so eviction must discover the new leaf parent.
-    assert set(c.evict(2).tolist()) == {8, 9}
-    assert c.eviction_stats["drop_pages"] == 0
     assert set(c.evict(2).tolist()) == {1, 2}
+    assert c.eviction_stats["leaf_pages"] == 0
+    assert c.match_prefix(cold).cuda_handle.get_matched_indices().tolist() == [8, 9]
+    assert set(c.evict(2).tolist()) == {8, 9}
+    assert c.eviction_stats["drop_pages"] == 2
     assert c.eviction_stats["leaf_pages"] == 2
     c.lock_handle(handle, unlock=True)
+
+
+@pytest.mark.parametrize("shared", [False, True])
+def test_exhausted_pool_reclaims_all_drop_pages_before_any_leaf(shared):
+    from minisgl.scheduler.cache import CacheManager
+
+    manager = CacheManager(14, 1, torch.full((1, 16), -1, dtype=torch.int32),
+                           "radix", track_shared_page_owners=shared,
+                           drop_aware_eviction=True)
+    c = manager.prefix_cache
+    leases, dropped, protected = [], set(), set()
+    for offset in (0, 100):
+        keys = torch.tensor([[0, 10 + offset, -1, 0], [0, 11 + offset, -1, 1],
+                             [0, 12 + offset, -1, 2], [0, 13 + offset, -1, 3],
+                             [1, -2, -4, -1], [0, 20 + offset, -1, 4]],
+                            dtype=torch.int32)
+        slots = manager._allocate(5)
+        values = torch.full((6,), -1, dtype=torch.int32)
+        values[keys[:, 0] == 0] = slots
+        handle = c.insert_prefix(keys, values, keys[:, 0] != 0).handle
+        c.configure_drop_lock(handle, torch.tensor([True, False, False, True, True]))
+        c.lock_handle(handle)
+        leases.append((handle, values.clone()))
+        dropped.update(slots[1:3].tolist())
+        protected.update(slots[[0, 3, 4]].tolist())
+    cold = torch.tensor([[0, 900 + i, -1, i] for i in range(4)], dtype=torch.int32)
+    cold_slots = manager._allocate(4)
+    c.insert_prefix(cold, cold_slots)
+    assert manager.free_slots.numel() == 0
+
+    # One real allocation exhausts both Drop branches, then the ordinary leaf.
+    reused = manager._allocate(8)
+    assert set(reused[:4].tolist()) == dropped
+    assert set(reused[4:].tolist()) == set(cold_slots.tolist())
+    assert len(torch.unique(reused)) == 8 and bool((reused >= 0).all())
+    assert not set(reused.tolist()) & protected
+    assert c.eviction_stats == {"drop_pages": 4, "leaf_pages": 4, "hole_fills": 0}
+    for handle, before in leases:
+        current = handle.get_matched_indices()
+        assert current[[1, 2]].tolist() == [-1, -1]
+        assert torch.equal(current[[0, 3, 5]], before[[0, 3, 5]])
+        assert bool((current[[0, 3, 5]] >= 0).all())
+        c.lock_handle(handle, unlock=True)
+    manager._free(reused)
+    manager._free(c.evict(c.evictable_size))
+    manager.check_integrity()
+    assert sorted(manager.free_slots.tolist()) == list(range(14))
+
+
+def test_drop_leaf_candidate_keeps_drop_priority():
+    c = cache()
+    cold = torch.tensor([91], dtype=torch.int32)
+    c.insert_prefix(cold, torch.tensor([8], dtype=torch.int32))
+    drop = c.insert_prefix(torch.tensor([92], dtype=torch.int32),
+                           torch.tensor([9], dtype=torch.int32)).handle.node
+    # Unit-test classification of the state after a proven Drop edge becomes a leaf.
+    drop.drop_eligible = True
+    c._update_candidate(drop)
+    assert c.evict(1).tolist() == [9]
+    assert c.eviction_stats["drop_pages"] == 1
+    assert c.match_prefix(cold).cuda_handle.get_matched_indices().tolist() == [8]
 
 
 def test_no_matched_delta_cannot_reduce_parent_ref():
