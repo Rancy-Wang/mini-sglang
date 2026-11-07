@@ -222,9 +222,10 @@ def test_reposition_uses_one_public_tokenization_without_frontend_warmups() -> N
 
 
 @pytest.mark.parametrize(
-    "mode,hit_ratio,dispatches", [("mask", 0.0, 0), ("staged", 0.95, 1), ("staged", 0.94, 3)]
+    "mode,hit_ratio,dispatches",
+    [("mask", 0.0, 0), ("staged", 0.0, 3), ("staged", 0.95, 3), ("staged", 1.0, 3)],
 )
-def test_drop_only_warmup_preserves_complete_usage(mode, hit_ratio, dispatches) -> None:
+def test_drop_only_stages_all_history_without_a_compact_probe(mode, hit_ratio, dispatches) -> None:
     manager = FrontendManager(
         config=SimpleNamespace(contextual_prefill_mode=mode),
         send_tokenizer=None,
@@ -253,7 +254,7 @@ def test_drop_only_warmup_preserves_complete_usage(mode, hit_ratio, dispatches) 
     ]
     drop_rule = {
         "type": "message_drop",
-        "drop_messages": {"1": [0]},
+        "drop_messages": {"2": [0]},
     }
 
     report = asyncio.run(
@@ -268,9 +269,9 @@ def test_drop_only_warmup_preserves_complete_usage(mode, hit_ratio, dispatches) 
         )
     )
 
-    if mode == "mask":
-        assert report is None
-    else:
-        assert (report.cached_tokens, report.drop_skipped_tokens) == (2, 3)
+    assert report is None  # Final public reply owns final-epoch usage.
     assert len(sent) == dispatches
     assert all(msg.reposition is None for msg in sent)
+    assert [msg.text for msg in sent] == [messages[:end] for end in range(1, dispatches + 1)]
+    assert [msg.target_msg_id for msg in sent] == list(range(dispatches))
+    assert all(msg.use_context_mask and msg.is_warmup for msg in sent)

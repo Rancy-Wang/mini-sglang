@@ -94,6 +94,33 @@ def test_ordinary_chat_renders_and_encodes_exactly_once(monkeypatch) -> None:
     assert not hasattr(result, "radix_commit_token_len")
 
 
+def test_visibility_guarded_warmup_never_publishes_generation_footer() -> None:
+    manager = TokenizeManager(_SinglePassTokenizer())
+    messages = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "answer"},
+        {"role": "user", "content": "last history"},
+    ]
+    history = "<user>old<assistant>answer<user>last history"
+    for guarded in (False, True):
+        result = manager._chat_tokenize(
+            TokenizeMsg(
+                uid=40,
+                text=messages,
+                sampling_params=SamplingParams(max_tokens=1),
+                drop_message={2: [0]},
+                target_msg_id=2,
+                is_warmup=True,
+                use_context_mask=guarded,
+            )
+        )
+        assert result.radix_commit_key_len is not None
+        committed = result.radix_match_ids[:result.radix_commit_key_len]
+        virtual = result.radix_key_virtual_mask[:result.radix_commit_key_len]
+        assert committed[~virtual, 1].tolist() == [ord(c) for c in history]
+        assert result.true_positions.tolist() == list(range(len(result.input_ids)))
+
+
 def test_structured_drop_and_reposition_render_and_encode_exactly_once() -> None:
     tokenizer = _SinglePassTokenizer()
     manager = TokenizeManager(tokenizer)

@@ -1675,7 +1675,7 @@ class TokenizeManager:
             )
         warmup_commit_token_len = (
             bisect_right(query_epoch_with_gen, len(messages) - 1)
-            if msg.is_warmup and not msg.use_context_mask
+            if msg.is_warmup
             else None
         )
 

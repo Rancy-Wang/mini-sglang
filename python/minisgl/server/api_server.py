@@ -610,30 +610,10 @@ class FrontendManager:
             # template and make stage sources independently evictable.
             return None
 
-        warmup_target = max(len(messages) - 1, 0)
-        warmup_uid = self.new_user()
-        await self.send_one(
-            TokenizeMsg(
-                uid=warmup_uid,
-                text=messages,
-                sampling_params=SamplingParams(max_tokens=1, ignore_eos=True),
-                target_msg_id=warmup_target,
-                drop_rule=drop_rule,
-                reposition=reposition,
-                enable_thinking=enable_thinking,
-                reasoning_effort=reasoning_effort,
-                tools=tools,
-                tool_choice=tool_choice,
-                is_warmup=True,
-                internal_uid=warmup_uid,
-            )
-        )
-        warmup_ack = await self.wait_for_warmup(warmup_uid)
-        if warmup_ack.hit_ratio >= 0.95:
-            return CacheUsageReport.from_reply(warmup_ack)
-
-        # Fallback: staged prefill by message prefixes.
-        for end in range(1, len(messages)):
+        # A full-history compact probe would compute historical queries after
+        # applying future Drops. Execute every prefix in order, including the
+        # last message, before the public request applies the final Drop.
+        for end in range(1, len(messages) + 1):
             staged_uid = self.new_user()
             staged_rule = (
                 project_drop_rule_for_prefix(drop_rule, end) if drop_rule is not None else None
@@ -657,10 +637,16 @@ class FrontendManager:
                     tool_choice=tool_choice,
                     is_warmup=True,
                     internal_uid=staged_uid,
+                    # Prefixes can miss after eviction or template changes.
+                    # Native admission selects compact Extend only when its
+                    # read set is equivalent to the historical visibility rule.
+                    use_context_mask=True,
                 )
             )
             await self.wait_for_warmup(staged_uid)
-        return CacheUsageReport.from_reply(warmup_ack)
+        # Prefix replies overlap and use different Drop epochs. Only the public
+        # reply describes the final prompt's cached/Drop-skipped token counts.
+        return None
 
     async def stream_generate(self, uid: int):
         try:
@@ -990,7 +976,9 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
             tool_choice=normalized_tool_choice,
             stop=effective_stop,
             request_received_ns=request_received_ns,
-            use_context_mask=single_context_prefill,
+            # Staged warmups are independently evictable. A miss here must
+            # recover historical visibility as well as in the default mode.
+            use_context_mask=(wire_drop_rule is not None and not req.reposition),
         )
     )
 
